@@ -1,0 +1,14 @@
+take5: 1 2 w=6
+sel regs: 1041 41 w=41
+sel store: 1 7 w=3 3 9 w=3
+branch vreg: 24 -1 w=13 sink=13
+select: 10 20 10 sink=298
+vreg: 3 4 3 sink=601
+changed: 2 1 2 sink=500
+weaker: 5 5 6 sink=602
+signedness: 7 8 7 sink=606
+two selects: 13 11 14 12 sink=204
+three: 3 4 4 sink=311
+select then test: 103 -2 109 sink=307
+loop: 4 4000 4 sink=1508
+header: 21 22 23 sink=2402

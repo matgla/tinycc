@@ -470,9 +470,9 @@ static int lbt_try_backedge(TCCIRState *ir, int be, int level)
   if (!lbt_operand_reusable(ir, cmp_src1) || !lbt_operand_reusable(ir, cmp_src2))
     return 0;
   /* A CMP fused with a barrel shift or any other orig_index-keyed annotation
-   * cannot be duplicated: the copy gets a fresh index and would compare the
-   * unshifted value (the pr71083 family).  Nothing sets these before regalloc
-   * today, but the check costs nothing and pins the assumption. */
+   * cannot be duplicated as is: the copy gets a fresh index and would compare
+   * the unshifted value (the pr71083 family).  Barrel fusion runs before the
+   * SSA loop passes, so such CMPs do reach here. */
   if (tcc_ir_barrel_shift_at(ir, cmp_q))
     return 0;
 
@@ -615,7 +615,12 @@ int ssa_opt_loop_bottom_test(TCCIRState *ir)
  *     a header that reads one of its own TEMPs before defining it.  VAR/PARAM
  *     destinations are shared with the header (the copy IS the header's next
  *     execution) and SSA renames them;
- *   - the header is at most LHD_MAX_PREFIX real instructions (code growth);
+ *   - the header is at most LHD_MAX_PREFIX real instructions (code growth):
+ *     a copy or a constant (lhd_is_copy) does not count, since SSA and
+ *     constant folding remove it from the copy as they do from the header --
+ *     an inlined zig_u32_bitCast_u32 binds its argument and its `#-1` mask
+ *     through VARs that fold only after this pass -- and at most
+ *     LHD_MAX_HEADER instructions are copied in all;
  *   - the function takes no label address and has no IJUMP: computed-goto
  *     targets are not renumbered by insert_instr_at.
  *
@@ -630,7 +635,9 @@ int ssa_opt_loop_bottom_test(TCCIRState *ir)
  * split -- either way the iteration costs what it did before, just with the
  * taken branch moved.  Disableable via TCC_DISABLE_PASS=ssa:loop_header_dup. */
 #define LHD_MAX_PREFIX 8
+#define LHD_MAX_HEADER 16
 #define LHD_MAX_REWRITES 64
+#define LHD_MAX_ONTO 8
 
 static int lhd_op_allowed(int op)
 {
@@ -655,6 +662,23 @@ static int lhd_op_allowed(int op)
   default:
     return 0;
   }
+}
+
+/* A copy of a constant, register or local VAR into a register or local VAR:
+ * free once SSA has renamed the header copy. */
+static int lhd_is_copy(TCCIRState *ir, IRQuadCompact *q)
+{
+  if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LOAD && q->op != TCCIR_OP_STORE)
+    return 0;
+  IROperand d = tcc_ir_op_get_dest(ir, q), s = tcc_ir_op_get_src1(ir, q);
+  if (irop_get_btype(d) != irop_get_btype(s) || irop_is_64bit(d) || s.is_complex)
+    return 0;
+  if (irop_is_immediate(s))
+    return !s.is_lval && !s.is_sym;
+  int32_t vr = irop_get_vreg(s);
+  if (s.tag != IROP_TAG_VREG || vr < 0 || s.is_llocal || s.is_sym)
+    return 0;
+  return !s.is_lval || (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && s.is_local);
 }
 
 /* A source the copy may read again: re-reading is exactly what the header
@@ -695,8 +719,8 @@ static int lhd_vreg_listed(const int32_t *list, int n, int32_t vr)
 
 typedef struct
 {
-  int32_t from[LHD_MAX_PREFIX];
-  int32_t to[LHD_MAX_PREFIX];
+  int32_t from[LHD_MAX_HEADER];
+  int32_t to[LHD_MAX_HEADER];
   int n;
 } LhdRename;
 
@@ -717,8 +741,35 @@ static int lhd_try_backedge(TCCIRState *ir, int be)
 {
   int n = ir->next_instruction_index;
   IRQuadCompact *jmp_q = &ir->compact_instructions[be];
-  if (jmp_q->op != TCCIR_OP_JUMP || jmp_q->is_jump_target)
+  if (jmp_q->op != TCCIR_OP_JUMP)
     return 0;
+  /* A branch onto the back-edge JUMP (`if (!hit) continue;` ending the
+   * body) is taken along: it lands on the copy, which runs what the JUMP
+   * would have run next.  Switch arms are not retargeted. */
+  int onto[LHD_MAX_ONTO];
+  int nonto = 0;
+  if (jmp_q->is_jump_target)
+  {
+    for (int t = 0; t < ir->num_switch_tables; t++)
+    {
+      TCCIRSwitchTable *table = &ir->switch_tables[t];
+      if (table->default_target == be)
+        return 0;
+      for (int j = 0; table->targets && j < table->num_entries; j++)
+        if (table->targets[j] == be)
+          return 0;
+    }
+    for (int j = 0; j < n; j++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[j];
+      if ((q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) && (int)tcc_ir_op_dest_imm(ir, q) == be)
+      {
+        if (nonto >= LHD_MAX_ONTO)
+          return 0;
+        onto[nonto++] = j;
+      }
+    }
+  }
   int hi = (int)tcc_ir_op_dest_imm(ir, jmp_q);
   if (hi < 0 || hi >= be)
     return 0;
@@ -732,8 +783,8 @@ static int lhd_try_backedge(TCCIRState *ir, int be)
   }
 
   /* header = prefix instructions, then CMP, then JUMPIF */
-  int prefix[LHD_MAX_PREFIX];
-  int nprefix = 0;
+  int prefix[LHD_MAX_HEADER];
+  int nprefix = 0, ncost = 0;
   int cmp = -1;
   for (int i = hi; i < be; i++)
   {
@@ -747,7 +798,9 @@ static int lhd_try_backedge(TCCIRState *ir, int be)
       cmp = i;
       break;
     }
-    if (nprefix >= LHD_MAX_PREFIX || !lhd_op_allowed(q->op))
+    if (nprefix >= LHD_MAX_HEADER || !lhd_op_allowed(q->op))
+      return 0;
+    if (!lhd_is_copy(ir, q) && ++ncost > LHD_MAX_PREFIX)
       return 0;
     prefix[nprefix++] = i;
   }
@@ -782,7 +835,7 @@ static int lhd_try_backedge(TCCIRState *ir, int be)
     return 0;
 
   /* prefix operands, and the TEMPs the header defines */
-  int32_t tdefs[LHD_MAX_PREFIX];
+  int32_t tdefs[LHD_MAX_HEADER];
   int ntdefs = 0;
   for (int k = 0; k < nprefix; k++)
   {
@@ -805,7 +858,7 @@ static int lhd_try_backedge(TCCIRState *ir, int be)
   }
   /* A TEMP read before the header defines it carries a value round the loop. */
   {
-    int32_t seen[LHD_MAX_PREFIX];
+    int32_t seen[LHD_MAX_HEADER];
     int nseen = 0;
     for (int k = 0; k <= nprefix; k++)
     {
@@ -862,7 +915,7 @@ static int lhd_try_backedge(TCCIRState *ir, int be)
     int orig;
     int line;
     IROperand d, s1, s2, s3;
-  } cp[LHD_MAX_PREFIX + 1];
+  } cp[LHD_MAX_HEADER + 1];
   for (int k = 0; k < ncopy; k++)
   {
     IRQuadCompact *q = &ir->compact_instructions[k < nprefix ? prefix[k] : cmp];
@@ -901,6 +954,12 @@ static int lhd_try_backedge(TCCIRState *ir, int be)
       return 0;
     exit_target++;
   }
+  /* The branches onto the JUMP followed it to jmp_pos: send them to the copy. */
+  for (int k = 0; k < nonto; k++)
+  {
+    int j = onto[k] + (onto[k] >= be ? ncopy + need_exit_jump : 0);
+    tcc_ir_op_set_dest(ir, &ir->compact_instructions[j], irop_make_imm32(-1, be, IROP_BTYPE_INT32));
+  }
 
   LhdRename rn = {{0}, {0}, 0};
   for (int k = 0; k < ncopy; k++)
@@ -929,6 +988,8 @@ static int lhd_try_backedge(TCCIRState *ir, int be)
     ir->compact_instructions[pos].line_num = cp[k].line;
   }
 
+  if (nonto)
+    ir->compact_instructions[be].is_jump_target = 1;
   ir->compact_instructions[jmp_pos].op = TCCIR_OP_NOP;
   write_instr_at_nop(ir, jmp_pos, TCCIR_OP_JUMPIF, irop_make_imm32(-1, body_start, IROP_BTYPE_INT32),
                      irop_make_imm32(-1, inv_cond, IROP_BTYPE_INT32), none_op);
@@ -948,6 +1009,114 @@ static int lhd_try_backedge(TCCIRState *ir, int be)
   LOG_IR_GEN("[LOOP-HEADER-DUP] header=%d prefix=%d body_start=%d -> tail copy@%d JUMPIF@%d exit=%d", hi, nprefix,
              body_start, be, jmp_pos, exit_target);
   return 1;
+}
+
+/* Same value on both sides: the same register or direct VAR, or the same
+ * plain immediate. */
+static int lhd_same_operand(const TCCIRState *ir, IROperand a, IROperand b)
+{
+  if (irop_get_tag(a) != irop_get_tag(b) || a.is_lval != b.is_lval || a.is_local != b.is_local ||
+      a.is_llocal != b.is_llocal || a.is_sym || b.is_sym)
+    return 0;
+  if (irop_is_immediate(a))
+    return !a.is_lval && irop_get_imm64_ex(ir, a) == irop_get_imm64_ex(ir, b);
+  int32_t vr = irop_get_vreg(a);
+  if (vr < 0 || vr != irop_get_vreg(b))
+    return 0;
+  return !a.is_lval || (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && a.is_local &&
+                        !tcc_ir_access_is_volatile(ir, a) && !tcc_ir_operand_names_volatile_var(ir, a));
+}
+
+/* Drop a `CMP a,b; JUMPIF c -> X` that straight-line code reaches only after
+ * an identical `CMP a,b; JUMPIF c -> X` which did not branch: the second
+ * branch is never taken.  What may sit between them: register computations
+ * that redefine neither a nor b.  This is the zero-trip test a header copy
+ * leaves behind once the loop has been bottom-tested: ssa:licm_field_ptr
+ * puts a copy of a top-tested loop's test in front of the loads it hoists. */
+static int lhd_drop_repeated_guards(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int dropped = 0;
+  /* is_jump_target goes stale when a rewrite moves a branch away; recount. */
+  uint8_t *joined = tcc_mallocz(n + 1);
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+    {
+      int t = (int)tcc_ir_op_dest_imm(ir, q);
+      if (t >= 0 && t <= n)
+        joined[t] = 1;
+    }
+  }
+  for (int t = 0; t < ir->num_switch_tables; t++)
+  {
+    TCCIRSwitchTable *table = &ir->switch_tables[t];
+    if (table->default_target >= 0 && table->default_target <= n)
+      joined[table->default_target] = 1;
+    for (int k = 0; table->targets && k < table->num_entries; k++)
+      if (table->targets[k] >= 0 && table->targets[k] <= n)
+        joined[table->targets[k]] = 1;
+  }
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *cq = &ir->compact_instructions[i];
+    if (cq->op != TCCIR_OP_CMP || joined[i])
+      continue;
+    int j = lbt_skip_nops(ir, i + 1);
+    if (j >= n || ir->compact_instructions[j].op != TCCIR_OP_JUMPIF)
+      continue;
+    int joins = 0;
+    for (int k = i + 1; k <= j; k++)
+      joins |= joined[k];
+    if (joins || tcc_ir_barrel_shift_at(ir, cq) || tcc_ir_instr_access_is_volatile(ir, cq))
+      continue;
+    IROperand a = tcc_ir_op_get_src1(ir, cq), b = tcc_ir_op_get_src2(ir, cq);
+    IRQuadCompact *jq = &ir->compact_instructions[j];
+    int target = (int)tcc_ir_op_dest_imm(ir, jq);
+    int cond = (int)tcc_ir_op_src1_imm(ir, jq);
+
+    /* Walk back over transparent code to the previous JUMPIF. */
+    int k = i - 1, steps = 0, ok = 1;
+    for (; k >= 0 && ok; k--)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[k];
+      if (q->op == TCCIR_OP_JUMPIF)
+        break;
+      if (joined[k] || (q->op != TCCIR_OP_NOP && (++steps > LHD_MAX_PREFIX || !lhd_op_allowed(q->op))))
+      {
+        ok = 0;
+        break;
+      }
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      int32_t dv = irop_get_vreg(d);
+      if (d.is_lval || dv < 0 || dv == irop_get_vreg(a) || dv == irop_get_vreg(b))
+        ok = 0;
+    }
+    if (!ok || k < 0)
+      continue;
+    IRQuadCompact *pjq = &ir->compact_instructions[k];
+    if (joined[k] || (int)tcc_ir_op_dest_imm(ir, pjq) != target ||
+        (int)tcc_ir_op_src1_imm(ir, pjq) != cond)
+      continue;
+    int pc = k - 1;
+    while (pc >= 0 && ir->compact_instructions[pc].op == TCCIR_OP_NOP && !joined[pc])
+      pc--;
+    if (pc < 0)
+      continue;
+    IRQuadCompact *pcq = &ir->compact_instructions[pc];
+    if (pcq->op != TCCIR_OP_CMP || tcc_ir_barrel_shift_at(ir, pcq) ||
+        !lhd_same_operand(ir, tcc_ir_op_get_src1(ir, pcq), a) || !lhd_same_operand(ir, tcc_ir_op_get_src2(ir, pcq), b))
+      continue;
+    cq->op = TCCIR_OP_NOP;
+    jq->op = TCCIR_OP_NOP;
+    LOG_IR_GEN("[LOOP-HEADER-DUP] repeated guard CMP@%d JUMPIF@%d (first at %d) dropped", i, j, pc);
+    dropped++;
+  }
+  tcc_free(joined);
+  return dropped;
 }
 
 int ssa_opt_loop_header_dup(TCCIRState *ir)
@@ -979,5 +1148,5 @@ int ssa_opt_loop_header_dup(TCCIRState *ir)
     if (!hit)
       break;
   }
-  return total;
+  return total + lhd_drop_repeated_guards(ir);
 }

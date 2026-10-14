@@ -79,6 +79,152 @@ int tcc_ir_opt_bool_diamond_branch(TCCIRState *ir)
       continue;
     int fall_target = ir_skip_nops_forward(ir, j + 1, n);
 
+    /* Mirrored orientation: the constant arm is a JUMP into the test.
+     *
+     * The Zig C backend writes `c1 || c2` the other way round from the shape
+     * below: the SETIF arm falls through into the test while the constant arm
+     * jumps in from above —
+     *
+     *     0005: JMP to 7  if "!="          ; !c1
+     *     0006: T3 <-- #1 [ASSIGN]         ; true arm of the first check
+     *     (p) JMP to 10                    ; -> the merge test
+     *     0007: T3 <-- (cond)              ; false arm: the second check
+     *     0010: TEST_ZERO T3               ; <- p lands here
+     *     0011: JMP to 15  if "=="
+     *
+     * Arriving through p fixes T3 to 1, so that edge can go straight to
+     * whichever side of 0011 the constant selects.  The SETIF arm then
+     * reaches the test on its own — the shape setif fusion collapses — and
+     * the arm's ASSIGN, though now unread, still executes for any later
+     * reader of T3, so unlike the orientation below no single-reader scan is
+     * needed: only the pure TEST/JUMPIF pair is bypassed. */
+    int mirrored = 0;
+    int arm_idx[8], arm_count = 0;
+    for (int p = 0; p < n; p++)
+    {
+      IRQuadCompact *qp = &ir->compact_instructions[p];
+      if (qp->op != TCCIR_OP_JUMP)
+        continue;
+      if (tcc_ir_op_dest_u_imm32(ir, qp) != m)
+        continue;
+      int k = p - 1;
+      while (k >= 0 && ir->compact_instructions[k].op == TCCIR_OP_NOP)
+        k--;
+      if (k < 0)
+        continue;
+      IRQuadCompact *qk = &ir->compact_instructions[k];
+      if (qk->op != TCCIR_OP_ASSIGN)
+        continue;
+      if (tcc_ir_op_dest_is_lval(ir, qk) || tcc_ir_op_dest_vreg(ir, qk) != tvr)
+        continue;
+      if (tcc_ir_op_src1_is_lval(ir, qk) || !tcc_ir_op_src1_is_imm(ir, qk))
+        continue;
+      /* A label between the ASSIGN and its JUMP would enter the arm past the
+       * assignment, arriving at the test with some other T3. */
+      int past_label = 0;
+      for (int t = k + 1; t < p; t++)
+        if (ir->compact_instructions[t].is_jump_target)
+          past_label = 1;
+      if (past_label)
+        continue;
+
+      int is_zero = ((int32_t)tcc_ir_op_src1_imm(ir, qk) == 0);
+      int taken = (cond == TOK_EQ) ? is_zero : !is_zero;
+      int new_target = taken ? taken_target : fall_target;
+      if (new_target == m || new_target >= n)
+        continue;
+
+      IROperand pd = tcc_ir_op_get_dest(ir, qp);
+      pd.u.imm32 = new_target;
+      tcc_ir_op_set_dest(ir, qp, pd);
+      ir->compact_instructions[new_target].is_jump_target = 1;
+      if (arm_count < 8)
+        arm_idx[arm_count++] = k;
+      mirrored++;
+      changes++;
+    }
+    /* The redirected arms' `Tv <-- #C` no longer reaches the test on any
+     * path; with no other reader of Tv they are dead, and leaving them
+     * extends Tv's live range across the SETIF arm's whole computation --
+     * one callee-saved register more in the prologue (frame_undef
+     * two_values).  The arm is entered by the guard's fall-through and the
+     * assign is its only instruction besides the JUMP, so the block empties
+     * and the branch cleanups fold it away. */
+    if (mirrored && arm_count == mirrored)
+    {
+      int other_read = 0;
+      for (int i = 0; i < n && !other_read; i++)
+      {
+        if (i == m)
+          continue;
+        IRQuadCompact *qi = &ir->compact_instructions[i];
+        if (qi->op == TCCIR_OP_NOP)
+          continue;
+        for (int slot = 0; slot < 3 && !other_read; slot++)
+        {
+          IROperand o;
+          if (slot == 0)
+          {
+            if (!irop_config[qi->op].has_src1)
+              continue;
+            o = tcc_ir_op_get_src1(ir, qi);
+          }
+          else if (slot == 1)
+          {
+            if (!irop_config[qi->op].has_src2)
+              continue;
+            o = tcc_ir_op_get_src2(ir, qi);
+          }
+          else
+          {
+            if (!ir_op_has(qi->op, IROP_A_SLOT3))
+              continue;
+            o = ir->iroperand_pool[qi->operand_base + 3];
+          }
+          if (irop_get_vreg(o) == tvr)
+            other_read = 1;
+        }
+        if (!other_read && irop_config[qi->op].has_dest)
+        {
+          if (tcc_ir_op_dest_is_lval(ir, qi) && tcc_ir_op_dest_vreg(ir, qi) == tvr)
+            other_read = 1;
+        }
+      }
+      if (!other_read)
+        for (int a = 0; a < arm_count; a++)
+          ir->compact_instructions[arm_idx[a]].op = TCCIR_OP_NOP;
+    }
+    if (mirrored)
+    {
+      /* The redirects may have left the test with no incoming edge; say so,
+       * or the fuse passes still see the stale jump-target flag and decline
+       * the now-single-def SETIF arm.  An indirect jump or switch table
+       * keeps the flag: its targets are not in the scan. */
+      int still_targeted = 0;
+      for (int p = 0; p < n && !still_targeted; p++)
+      {
+        IRQuadCompact *qp = &ir->compact_instructions[p];
+        if (qp->op == TCCIR_OP_SWITCH_TABLE || qp->op == TCCIR_OP_IJUMP ||
+            ir_op_has(qp->op, IROP_A_MAY_BRANCH))
+          still_targeted = 1;
+        if (qp->op != TCCIR_OP_JUMP && qp->op != TCCIR_OP_JUMPIF)
+          continue;
+        if (tcc_ir_op_dest_u_imm32(ir, qp) == m)
+          still_targeted = 1;
+      }
+      for (int t = 0; t < ir->num_switch_tables && !still_targeted; t++)
+      {
+        TCCIRSwitchTable *tbl = &ir->switch_tables[t];
+        if (tbl->default_target == m)
+          still_targeted = 1;
+        for (int e = 0; e < tbl->num_entries && !still_targeted; e++)
+          if (tbl->targets[e] == m)
+            still_targeted = 1;
+      }
+      if (!still_targeted)
+        qt->is_jump_target = 0;
+    }
+
     /* The constant arm: the block immediately above the test must be nothing
      * but `Tv <-- #C`, entered only by an explicit jump. */
     int k = m - 1;

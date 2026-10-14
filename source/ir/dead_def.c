@@ -118,6 +118,23 @@ static int dd_annotated(TCCIRState *ir, IRQuadCompact *q)
          tcc_ir_bfi_params_at(ir, q);
 }
 
+/* Can reading this operand access memory?  An immediate (a SETIF's condition
+ * code, a constant) or a TEMP read as a value is a register, never a volatile
+ * access; an unmarked one counted as possibly volatile kept every dead SETIF of
+ * a function that touches volatile memory at all. */
+static int dd_may_read_memory(IROperand o)
+{
+  if (irop_is_none(o))
+    return 0;
+  if (o.is_lval || o.is_llocal)
+    return 1;
+  const int tag = irop_get_tag(o);
+  if (tag == IROP_TAG_IMM32 || tag == IROP_TAG_F32 || tag == IROP_TAG_I64 || tag == IROP_TAG_F64)
+    return 0;
+  const int32_t vr = irop_get_vreg(o);
+  return !(tag == IROP_TAG_VREG && vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP);
+}
+
 /* Instructions that end a straight run: after them the next instruction in
  * the array is not the only continuation. */
 static int dd_ends_run(int op)
@@ -201,7 +218,7 @@ int tcc_ir_dead_def(TCCIRState *ir)
       for (int s = 1; s < 4 && !vol; s++)
       {
         IROperand o = dd_slot(ir, q, s);
-        vol = !irop_is_none(o) && tcc_ir_access_is_volatile(ir, o);
+        vol = dd_may_read_memory(o) && tcc_ir_access_is_volatile(ir, o);
       }
       if (vol)
         continue;

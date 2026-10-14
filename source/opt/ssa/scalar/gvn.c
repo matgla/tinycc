@@ -66,6 +66,8 @@ static int gvn_is_pure_alu(int op)
   case TCCIR_OP_ADD:
   case TCCIR_OP_SUB:
   case TCCIR_OP_MUL:
+  case TCCIR_OP_UMULL:
+  case TCCIR_OP_ZEXT:
   case TCCIR_OP_MLA: /* dest = src1 * src2 + accum (also pure, has 3rd operand) */
   case TCCIR_OP_AND:
   case TCCIR_OP_OR:
@@ -681,7 +683,11 @@ static int gvn_try_assign_narrow(IRSSAOptCtx *ctx, GVNEntry **table, int i)
   if (irop_get_btype(src) != IROP_BTYPE_INT64)
     return 0;
   int32_t src_vr = irop_get_vreg(src);
-  if (src_vr < 0 || TCCIR_DECODE_VREG_TYPE(src_vr) != TCCIR_VREG_TYPE_TEMP)
+  if (src_vr < 0 || (TCCIR_DECODE_VREG_TYPE(src_vr) != TCCIR_VREG_TYPE_TEMP &&
+                     TCCIR_DECODE_VREG_TYPE(src_vr) != TCCIR_VREG_TYPE_PARAM))
+    return 0;
+  IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, src_vr);
+  if (li && li->is_volatile)
     return 0;
   /* Dominator-scoped table entries require an SSA-stable source. */
   if (gvn_src_class(ctx, src) != 0)
@@ -934,7 +940,8 @@ static int gvn_visit(IRSSAOptCtx *ctx, int b, void *state)
 
     if (!gvn_is_pure_alu(q->op))
       continue;
-    if (!irop_config[q->op].has_src1 || !irop_config[q->op].has_src2)
+    int is_zext = q->op == TCCIR_OP_ZEXT;
+    if (!irop_config[q->op].has_src1 || (!irop_config[q->op].has_src2 && !is_zext))
       continue;
 
     /* A barrel-shift side-table annotation (ir->barrel_shifts[orig_index],
@@ -961,7 +968,11 @@ static int gvn_visit(IRSSAOptCtx *ctx, int b, void *state)
       continue;
 
     IROperand src1 = tcc_ir_op_get_src1(ir, q);
-    IROperand src2 = tcc_ir_op_get_src2(ir, q);
+    /* ZEXT's unused second key records both widths: extending a byte differs from extending a word. */
+    IROperand src2 = is_zext ? irop_make_imm32(-1, (irop_get_btype(src1) << 8) | irop_get_btype(dest),
+                                             IROP_BTYPE_INT32) : tcc_ir_op_get_src2(ir, q);
+    if (is_zext && (src1.is_complex || dest.is_complex))
+      continue;
 
     int c1 = gvn_src_class(ctx, src1);
     int c2 = gvn_src_class(ctx, src2);

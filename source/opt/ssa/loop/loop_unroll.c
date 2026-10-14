@@ -345,6 +345,157 @@ int ssa_opt_loop_unroll(TCCIRState *ir)
   return lcs_run_outermost(ir, SSA_LOOP_UNROLL_MAX_PASSES, 1, unroll_try_candidate);
 }
 
+/* A plain full-width register value; late counters have no addressable slot. */
+static int late_unroll_value(IROperand o)
+{
+  return irop_get_tag(o) == IROP_TAG_VREG && !o.is_lval && !o.is_llocal &&
+         irop_get_btype(o) == IROP_BTYPE_INT32;
+}
+
+static int late_unroll_def(TCCIRState *ir, int32_t vr, int start, int end)
+{
+  int def = -1;
+  for (int i = start; i <= end; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_NOP && irop_config[q->op].has_dest &&
+        tcc_ir_op_dest_vreg(ir, q) == vr && irop_dest_defines_vreg(tcc_ir_op_get_dest(ir, q)))
+    {
+      if (def >= 0)
+        return -1;
+      def = i;
+    }
+  }
+  return def;
+}
+
+static int late_unroll_candidate(TCCIRState *ir, IRCFG *cfg, int header_b,
+                                 uint8_t *member, uint8_t *scratch)
+{
+  LcsSpan sp;
+  if (!lcs_cand_span(ir, cfg, header_b, member, scratch, SSA_UNROLL_MAX_SPAN, &sp))
+    return 0;
+  if (ir->compact_instructions[sp.end].no_unroll)
+    return 0;
+  int cmp = next_real(ir, sp.header, sp.end);
+  IRQuadCompact *cq = &ir->compact_instructions[cmp];
+  if (cq->op != TCCIR_OP_CMP || !late_unroll_value(tcc_ir_op_get_src1(ir, cq)) ||
+      !tcc_ir_op_src2_is_imm(ir, cq))
+    return 0;
+  int32_t vr = tcc_ir_op_src1_vreg(ir, cq);
+  if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+    return 0;
+  int update = late_unroll_def(ir, vr, sp.start, sp.end);
+  if (update < 0)
+    return 0;
+  int d = update;
+  for (int depth = 0; depth < 4; depth++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[d];
+    if (q->op != TCCIR_OP_ASSIGN || !late_unroll_value(tcc_ir_op_get_src1(ir, q)))
+      break;
+    int next = late_unroll_def(ir, tcc_ir_op_src1_vreg(ir, q), sp.start, d - 1);
+    if (next < 0)
+      return 0;
+    d = next;
+  }
+  IRQuadCompact *inc = &ir->compact_instructions[d];
+  if (inc->op != TCCIR_OP_ADD || !late_unroll_value(tcc_ir_op_get_dest(ir, inc)) ||
+      !late_unroll_value(tcc_ir_op_get_src1(ir, inc)) ||
+      tcc_ir_op_src1_vreg(ir, inc) != vr || !tcc_ir_op_src2_is_imm(ir, inc) ||
+      tcc_ir_barrel_shift_at(ir, inc))
+    return 0;
+  int init = -1;
+  for (int i = sp.start - 1, scanned = 0; i >= 0 && scanned < 64; i--)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    scanned++;
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+      break;
+    if (irop_config[q->op].has_dest && tcc_ir_op_dest_vreg(ir, q) == vr)
+    {
+      if (q->op == TCCIR_OP_ASSIGN && tcc_ir_op_src1_is_imm(ir, q))
+        init = i;
+      break;
+    }
+    if (q->is_jump_target)
+      break;
+  }
+  if (init < 0)
+    return 0;
+  int init_block = cfg->instr_to_block[init];
+  if (init_block < 0 || member[init_block] || !tcc_ir_cfg_dominates(cfg, init_block, header_b))
+    return 0;
+  /* Keep this tier for tiny read-only table walks, with no overflow in the counter. */
+  int64_t first = tcc_ir_op_src1_imm(ir, &ir->compact_instructions[init]);
+  int64_t limit = tcc_ir_op_src2_imm(ir, cq);
+  if (tcc_ir_op_src2_imm(ir, inc) != 1 || first < 0 || limit <= first || limit > first + 4 ||
+      limit > INT32_MAX)
+    return 0;
+  /* The shared unroller's final-IV repair does not cover address operands. */
+  for (int i = 0; i < ir->next_instruction_index; i++)
+    if (i != init && (i < sp.start || i > sp.end) &&
+        insn_mentions_vreg(ir, &ir->compact_instructions[i], vr))
+      return 0;
+  int table_read = 0;
+  /* Linear bodies only: dropping a forward jump must not execute skipped work. */
+  for (int i = sp.start; i <= sp.end; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    switch (q->op)
+    {
+    case TCCIR_OP_NOP: case TCCIR_OP_ASSIGN: case TCCIR_OP_LOAD:
+    case TCCIR_OP_LOAD_INDEXED: case TCCIR_OP_ADD: case TCCIR_OP_SUB:
+    case TCCIR_OP_XOR: case TCCIR_OP_OR: case TCCIR_OP_AND:
+    case TCCIR_OP_SHL: case TCCIR_OP_SHR: case TCCIR_OP_SAR:
+    case TCCIR_OP_CMP: case TCCIR_OP_JUMP: case TCCIR_OP_JUMPIF:
+    case TCCIR_OP_LEA: case TCCIR_OP_ZEXT:
+      break;
+    default:
+      return 0;
+    }
+    if (irop_config[q->op].has_dest && q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF &&
+        !irop_dest_defines_vreg(tcc_ir_op_get_dest(ir, q)))
+      return 0;
+    if (q->op == TCCIR_OP_LOAD_INDEXED && tcc_ir_op_src2_vreg(ir, q) == vr)
+      table_read = 1;
+    if (q->op == TCCIR_OP_JUMP && i != sp.end &&
+        next_real(ir, i + 1, sp.end) != next_real(ir, tcc_ir_op_dest_imm(ir, q), sp.end))
+      return 0;
+    if (irop_config[q->op].has_src1 && tcc_ir_op_src1_vreg(ir, q) == vr &&
+        !late_unroll_value(tcc_ir_op_get_src1(ir, q)))
+      return 0;
+    if (irop_config[q->op].has_src2 && tcc_ir_op_src2_vreg(ir, q) == vr &&
+        !late_unroll_value(tcc_ir_op_get_src2(ir, q)))
+      return 0;
+  }
+  if (!table_read)
+    return 0;
+  InductionVar iv = {0};
+  iv.vreg = vr;
+  iv.init_idx = init;
+  iv.init_val = (int)tcc_ir_op_src1_imm(ir, &ir->compact_instructions[init]);
+  iv.step = (int)tcc_ir_op_src2_imm(ir, inc);
+  iv.def_idx = update;
+  IRLoop loop = {0};
+  loop.header_idx = cmp;
+  loop.start_idx = sp.start;
+  loop.end_idx = sp.end;
+  loop.preheader_idx = sp.preheader;
+  loop.depth = 1;
+  IRLoops one = {0};
+  one.loops = &loop;
+  one.num_loops = one.capacity = 1;
+  return try_unroll_loop_ivs(ir, &loop, &one, 0, &iv, 1);
+}
+
+int ssa_opt_loop_unroll_late(TCCIRState *ir)
+{
+  return lcs_run_outermost(ir, SSA_LOOP_UNROLL_MAX_PASSES, 1, late_unroll_candidate);
+}
+
 /* ------------------------------------------------------------------------
  * Constant-trip unrolling of loops with an exit anywhere in the body
  * (ssa:loop_unroll_midexit).

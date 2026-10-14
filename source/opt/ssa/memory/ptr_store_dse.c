@@ -13,6 +13,7 @@
 #include "ssa_opt.h"
 #include "opt_utils.h"
 #include "opt_alias.h"
+#include "opt_range.h"
 
 
 /* A store through a pointer is named by the root vreg its address derives from
@@ -210,5 +211,119 @@ int tcc_ir_ssa_opt_ptr_store_dse(IRSSAOptCtx *ctx)
   }
   tcc_free(param_redef);
   tcc_free(is_target);
+  return changes;
+}
+
+/* ---- silent stores through a pointer ------------------------------------
+ *
+ * A store of the value a load just read through the same address changes no
+ * memory: `w = p[i]; p[i] = w | m` once m folds to 0, which is what Zig's
+ * bit_set.setRangeValue's second half becomes expanded with value == false
+ * (a reload of the masks pointer, a reload of the word and a store, three
+ * instructions per TmpPageAllocator.free).  The store goes when the two name
+ * the address with the same operands, nothing between them may write memory,
+ * branch, or redefine those operands, and no other path enters at the store.
+ * The loads it fed then die with it. */
+
+/* The address operands of a load or store: the deref operand of a plain one,
+ * base / index / scale of an indexed one, and the width of the access. */
+typedef struct PSSAddr
+{
+  IROperand base, index;
+  int32_t scale;
+  int btype;
+} PSSAddr;
+
+static int pss_addr(TCCIRState *ir, IRQuadCompact *q, int is_store, PSSAddr *a, IROperand *value)
+{
+  memset(a, 0, sizeof(*a));
+  if (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_STORE)
+  {
+    a->base = is_store ? tcc_ir_op_get_dest(ir, q) : tcc_ir_op_get_src1(ir, q);
+    *value = is_store ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_dest(ir, q);
+    if (!a->base.is_lval)
+      return 0;
+    a->btype = irop_get_btype(a->base);
+  }
+  else
+  {
+    a->base = is_store ? tcc_ir_op_get_dest(ir, q) : tcc_ir_op_get_src1(ir, q);
+    *value = is_store ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_dest(ir, q);
+    a->index = tcc_ir_op_get_src2(ir, q);
+    IROperand sc = tcc_ir_op_get_scale(ir, q);
+    if (a->base.is_lval || irop_get_tag(sc) != IROP_TAG_IMM32 || a->index.is_lval || a->index.is_sym ||
+        (irop_get_tag(a->index) != IROP_TAG_VREG && irop_get_tag(a->index) != IROP_TAG_IMM32))
+      return 0;
+    a->scale = irop_get_imm32(sc);
+    a->btype = irop_get_btype(*value);
+  }
+  /* A pointer held in a vreg, read as a value. */
+  return irop_get_tag(a->base) == IROP_TAG_VREG && irop_get_vreg(a->base) >= 0 && !a->base.is_local &&
+         !a->base.is_llocal && !a->base.is_sym && !value->is_lval && !tcc_ir_barrel_shift_at(ir, q) &&
+         !tcc_ir_shift64_dead_half_at(ir, q) && !tcc_ir_zero_half64_at(ir, q);
+}
+
+static int pss_same_operand(IROperand x, IROperand y)
+{
+  if (irop_get_tag(x) != irop_get_tag(y) || irop_get_vreg(x) != irop_get_vreg(y) || x.is_lval != y.is_lval)
+    return 0;
+  return irop_get_tag(x) != IROP_TAG_IMM32 || irop_get_imm32(x) == irop_get_imm32(y);
+}
+
+/* Does instruction q define vreg vr? */
+static int pss_defines(TCCIRState *ir, IRQuadCompact *q, int32_t vr)
+{
+  if (vr < 0 || !irop_config[q->op].has_dest)
+    return 0;
+  IROperand d = tcc_ir_op_get_dest(ir, q);
+  return !d.is_lval && irop_get_vreg(d) == vr;
+}
+
+int tcc_ir_ssa_opt_ptr_silent_store(IRSSAOptCtx *ctx)
+{
+  TCCIRState *ir = ctx->ir;
+  const int n = ir->next_instruction_index;
+  int changes = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *st = &ir->compact_instructions[i];
+    if ((st->op != TCCIR_OP_STORE && st->op != TCCIR_OP_STORE_INDEXED) || tcc_ir_instr_access_is_volatile(ir, st))
+      continue;
+    PSSAddr sa, la;
+    IROperand sv, lv;
+    if (!pss_addr(ir, st, 1, &sa, &sv))
+      continue;
+    const int32_t vr = irop_get_vreg(sv);
+    if (vr < 0 || irop_get_tag(sv) != IROP_TAG_VREG || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+      continue;
+    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
+    if (!vi || ssa_opt_def_total(vi) != 1 || vi->def_instr < 0 || vi->def_instr >= i)
+      continue;
+    const int ld = vi->def_instr;
+    IRQuadCompact *lq = &ir->compact_instructions[ld];
+    if (lq->op != (st->op == TCCIR_OP_STORE ? TCCIR_OP_LOAD : TCCIR_OP_LOAD_INDEXED) ||
+        tcc_ir_instr_access_is_volatile(ir, lq) || !pss_addr(ir, lq, 0, &la, &lv))
+      continue;
+    if (!pss_same_operand(sa.base, la.base) || sa.btype != la.btype || irop_get_btype(lv) != irop_get_btype(sv) ||
+        (st->op == TCCIR_OP_STORE_INDEXED && (!pss_same_operand(sa.index, la.index) || sa.scale != la.scale)))
+      continue;
+    /* Nothing between may write memory, leave the run, or let another path
+     * arrive at the store. */
+    if (!ir_range_safe(ir, ld, i,
+                       IR_HZ_ALL & ~(IR_HZ_MEM_READ | IR_HZ_SRC_LVAL | IR_HZ_FLAGS_SET | IR_HZ_FLAGS_READ | IR_HZ_HINT)) ||
+        st->is_jump_target)
+      continue;
+    const int32_t bv = irop_get_vreg(sa.base), iv = irop_get_tag(sa.index) == IROP_TAG_VREG ? irop_get_vreg(sa.index) : -1;
+    int redefined = 0;
+    for (int k = ld + 1; k < i && !redefined; k++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[k];
+      redefined = q->op != TCCIR_OP_NOP && (pss_defines(ir, q, bv) || pss_defines(ir, q, iv) || pss_defines(ir, q, vr));
+    }
+    if (redefined)
+      continue;
+    ssa_opt_nop_instr(ctx, i);
+    changes++;
+  }
   return changes;
 }

@@ -875,6 +875,10 @@ static void *kb_begin(IROptCtx *ctx)
       if (target >= 0 && target <= i && target < n)
         st->backedge_target[target] = 1;
     }
+    /* An asm goto label at or above its asm is a back-edge target as well. */
+    for (int k = 0, target; q->op == TCCIR_OP_INLINE_ASM && (target = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+      if (target <= i && target < n)
+        st->backedge_target[target] = 1;
   }
   return st;
 }

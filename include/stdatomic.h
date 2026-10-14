@@ -16,12 +16,15 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* tccdefs.h predefines these, as gcc and clang do. */
+#ifndef __ATOMIC_RELAXED
 #define __ATOMIC_RELAXED 0
 #define __ATOMIC_CONSUME 1
 #define __ATOMIC_ACQUIRE 2
 #define __ATOMIC_RELEASE 3
 #define __ATOMIC_ACQ_REL 4
 #define __ATOMIC_SEQ_CST 5
+#endif
 
 /* Memory ordering */
 typedef enum {

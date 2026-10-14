@@ -115,6 +115,7 @@ int tcc_ir_ssa_opt_guard_collapse_ex(IRSSAOptCtx *ctx, int idle_cleanup);
 /* Same-block store-store DSE for full-width stores through single-def
  * TEMP pointer derefs (bitfield RMW chains after store→load forwarding). */
 int tcc_ir_ssa_opt_ptr_store_dse(IRSSAOptCtx *ctx);
+int tcc_ir_ssa_opt_ptr_silent_store(IRSSAOptCtx *ctx);
 /* Run only the target-specific generators registered via
  * tcc_ir_ssa_opt_register_target. Iterates a few times for convergence. */
 int tcc_ir_ssa_opt_run_target(IRSSAOptCtx *ctx);
@@ -211,6 +212,8 @@ int ssa_opt_loop_const_sim(struct TCCIRState *ir);
  * ssa_opt_loop_const_sim.  Gated by opt_loop_unroll (-O2).
  * See docs/plan_legacy_loop_unroll_ssa.md. */
 int ssa_opt_loop_unroll(struct TCCIRState *ir);
+/* Tiny read-only loops after phi resolution and byte-load combining. */
+int ssa_opt_loop_unroll_late(struct TCCIRState *ir);
 /* Constant-trip unrolling of loops with a mid-body exit (Zig readInt). */
 int ssa_opt_loop_unroll_midexit(struct TCCIRState *ir);
 /* Combine OR-chains of consecutive zero-extended byte loads into one halfword/word load. */

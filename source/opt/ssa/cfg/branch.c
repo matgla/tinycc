@@ -1780,6 +1780,80 @@ static int ssa_fold_redundant_flag_cmps(IRSSAOptCtx *ctx)
   return changes;
 }
 
+/* ---- converging branch: both edges reach the same block through empty blocks ---- */
+
+/* Follow `b` through phi-free blocks holding nothing but NOPs and an optional
+ * trailing JUMP.  Returns the first block that does real work (or has phis);
+ * *pred is the block control enters it from, starting from `from`. */
+static int ssa_skip_empty_blocks(IRSSAOptCtx *ctx, int from, int b, int *pred)
+{
+  IRCFG *cfg = ctx->cfg;
+  TCCIRState *ir = ctx->ir;
+  *pred = from;
+  for (int hops = 0; hops < 8 && b >= 0 && b != from; hops++) {
+    if (ctx->ssa->block_phis[b])
+      return b;
+    IRBasicBlock *bb = &cfg->blocks[b];
+    int next = -2;
+    for (int i = bb->start_idx; i < bb->end_idx; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      if (q->op != TCCIR_OP_JUMP)   /* a JUMP always ends its block */
+        return b;
+      /* -1: a jump to the function exit, which is no block */
+      next = ssa_block_for_instr(cfg, (int)tcc_ir_op_dest_u_imm32(ir, q));
+    }
+    if (next == -2)
+      next = ssa_block_for_instr(cfg, bb->end_idx);
+    if (next < 0)
+      return b;
+    *pred = b;
+    b = next;
+  }
+  return b;
+}
+
+/* Operand a phi takes along the edge from `pred`, or -2 when it has none. */
+static int32_t ssa_phi_operand_from(const IRPhiNode *phi, int pred)
+{
+  for (int i = 0; i < phi->num_operands; i++)
+    if (phi->operands[i].pred_block == pred)
+      return phi->operands[i].vreg;
+  return -2;
+}
+
+/* A JUMPIF whose two edges reach the same block M through empty blocks, carrying
+ * the same value into every phi of M, decides nothing: drop it and fall through.
+ * This is what is left of a select once both arms fold to the same value
+ * (zig.h's full-width signed truncate after vrp + phi_simplify); the compare
+ * then becomes an orphan and its operand dead. */
+static int ssa_fold_converging_jumpif(IRSSAOptCtx *ctx, int j)
+{
+  TCCIRState *ir = ctx->ir;
+  IRCFG *cfg = ctx->cfg;
+  if (!cfg || !ctx->ssa || !ctx->ssa->block_phis)
+    return 0;
+  IRQuadCompact *jq = &ir->compact_instructions[j];
+  int b = ssa_block_for_instr(cfg, j);
+  int tb = ssa_block_for_instr(cfg, (int)tcc_ir_op_dest_u_imm32(ir, jq));
+  int fb = ssa_block_for_instr(cfg, j + 1);
+  if (b < 0 || tb < 0 || fb < 0)
+    return 0;
+  int tpred, fpred;
+  int tm = ssa_skip_empty_blocks(ctx, b, tb, &tpred);
+  int fm = ssa_skip_empty_blocks(ctx, b, fb, &fpred);
+  if (tm != fm || tm == b)
+    return 0;
+  for (IRPhiNode *phi = ctx->ssa->block_phis[tm]; phi; phi = phi->next) {
+    int32_t tv = ssa_phi_operand_from(phi, tpred);
+    if (tv == -2 || tv != ssa_phi_operand_from(phi, fpred))
+      return 0;
+  }
+  ssa_rewrite_jumpif(ctx, j, 0);
+  return 1;
+}
+
 /* ---- pass driver ---- */
 
 static const IRSSAOptGen branch_gens[] = {
@@ -1788,6 +1862,7 @@ static const IRSSAOptGen branch_gens[] = {
   { TCCIR_OP_FUNCCALLVOID, ssa_fold_nonneg_cmp, "branch_nonneg" },
   { TCCIR_OP_FCMP,         ssa_fold_nonneg_fcmp, "branch_nonneg_fcmp" },
   { TCCIR_OP_RETURNVALUE,  ssa_fold_return_const_reuse, "branch_retreuse" },
+  { TCCIR_OP_JUMPIF,       ssa_fold_converging_jumpif, "branch_converge" },
 };
 
 int ssa_opt_branch(IRSSAOptCtx *ctx)

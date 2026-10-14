@@ -237,7 +237,7 @@ int tcc_ir_opt_symref_const_prop(struct TCCIRState *ir);
 
 /* Packs a constant-initialized _Complex float local used as a single FUNCPARAMVAL into a 64-bit immediate. */
 
-/* Sets sym->f.func_pure_via_sret when the only observable effect is writes through the sret-pointer parameter. */
+/* Sets sym->a.pure_via_sret when the only observable effect is writes through the sret-pointer parameter. */
 void tcc_ir_analyze_pure_via_sret(struct TCCIRState *ir, struct Sym *func_sym);
 
 /* Per-pointer-parameter must-write byte map; run at end-of-IR-opts into a TU-scoped Sym*-keyed table for dead_init_via_call. */

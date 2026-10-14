@@ -310,6 +310,71 @@ static int dse_cascade_pure_call_params(DseTempDce *t, int call_idx)
   return changes;
 }
 
+static int dse_overwritten_addrvar_stores(TCCIRState *ir)
+{
+  int changes = 0;
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *lea = &ir->compact_instructions[i];
+    if (lea->op != TCCIR_OP_LEA)
+      continue;
+    IROperand addr = tcc_ir_op_get_dest(ir, lea);
+    IROperand var = tcc_ir_op_get_src1(ir, lea);
+    int32_t avr = irop_get_vreg(addr), vvr = irop_get_vreg(var);
+    if (!irop_is_vreg_value(addr) || avr < 0 || TCCIR_DECODE_VREG_TYPE(avr) != TCCIR_VREG_TYPE_TEMP ||
+        vvr < 0 || TCCIR_DECODE_VREG_TYPE(vvr) != TCCIR_VREG_TYPE_VAR || var.is_llocal ||
+        tcc_ir_access_is_volatile(ir, var) || tcc_ir_operand_names_volatile_var(ir, var))
+      continue;
+
+    int stores = 0;
+    int64_t end = 0;
+    for (int j = i + 1; j < ir->next_instruction_index; j++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[j];
+      if (q->is_jump_target)
+        break;
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      IROperand value = tcc_ir_op_get_src1(ir, q);
+      if (q->op == TCCIR_OP_STORE_INDEXED)
+      {
+        IROperand index = tcc_ir_op_get_src2(ir, q);
+        IROperand scale = tcc_ir_op_get_scale(ir, q);
+        int width = ir_opt_store_btype_size_bytes(value.btype);
+        if (!irop_is_vreg_value(dest) || irop_get_vreg(dest) != avr ||
+            !irop_is_immediate(value) || value.is_sym || value.is_complex || width <= 0 ||
+            irop_get_tag(index) != IROP_TAG_IMM32 || index.is_lval || index.u.imm32 < 0 ||
+            irop_get_tag(scale) != IROP_TAG_IMM32 || scale.is_lval || scale.u.imm32 != 0 ||
+            tcc_ir_access_is_volatile(ir, dest))
+          break;
+        int64_t hi = (int64_t)index.u.imm32 + width;
+        if (hi > end)
+          end = hi;
+        stores++;
+        continue;
+      }
+      if (!stores || (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_LOAD) ||
+          !irop_dest_defines_vreg(dest) || irop_get_vreg(dest) != vvr || dest.is_complex ||
+          ir_opt_store_btype_size_bytes(dest.btype) < end || tcc_ir_access_is_volatile(ir, dest) ||
+          tcc_ir_instr_access_is_volatile(ir, q) ||
+          (!irop_is_immediate(value) && !irop_is_vreg_value(value) && !value.is_lval) ||
+          irop_get_vreg(value) == vvr)
+        break;
+      /* Only constant indexed stores and NOPs separate the LEA from the covering write. */
+      for (int k = i + 1; k < j; k++)
+        if (ir->compact_instructions[k].op == TCCIR_OP_STORE_INDEXED)
+        {
+          ir->compact_instructions[k].op = TCCIR_OP_NOP;
+          changes++;
+        }
+      LOG_IR_GEN("DSE: removed %d overwritten indexed stores to VAR %d at i=%d", stores, vvr, j);
+      break;
+    }
+  }
+  return changes;
+}
+
 static int tcc_ir_opt_dse__timed(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -378,7 +443,7 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
   }
 
   /* Must precede use_count[] build: FUNCCALLVOID has no dest TMP to seed the cascade. */
-  int pure_call_changes = 0;
+  int pure_call_changes = dse_overwritten_addrvar_stores(ir);
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -626,14 +691,19 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
     }
   }
 
-  /* Eliminate stores to never-read, never-addressed anonymous StackLoc offsets; skip if the function uses a static chain (cross-frame reads/writes). */
+  /* Eliminate stores to never-read, never-addressed anonymous StackLoc offsets;
+   * skip if the function uses a static chain (cross-frame reads/writes) or
+   * hands its frame to a nested function, by a call (SET_CHAIN) or through a
+   * trampoline (INIT_CHAIN_SLOT): the nested function reads the captures
+   * there, invisible to this IR. */
   {
     if (ir->has_static_chain)
       goto skip_dead_stackloc;
 
     for (int i = 0; i < n; i++)
     {
-      if (ir->compact_instructions[i].op == TCCIR_OP_SET_CHAIN)
+      const int op = ir->compact_instructions[i].op;
+      if (op == TCCIR_OP_SET_CHAIN || op == TCCIR_OP_INIT_CHAIN_SLOT)
         goto skip_dead_stackloc;
     }
     uint8_t stackloc_read[STACKLOC_HASH_SIZE];

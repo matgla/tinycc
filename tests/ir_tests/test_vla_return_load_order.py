@@ -35,7 +35,9 @@ def test_return_load_precedes_vla_release(tmp_path, opt, fn):
     src = tmp_path / "t.c"
     src.write_text(SRC)
     obj = tmp_path / "t.o"
-    r = subprocess.run([TCC, "-B", str(ROOT), "-I", str(ROOT / "include"), opt, "-c", str(src), "-o", str(obj)],
+    r = subprocess.run([TCC, "-B", str(ROOT), "-I", str(ROOT / "include"), opt,
+                        "-fno-pic", "-mno-sb-relative-got", "-fno-module-local-calls",
+                        "-c", str(src), "-o", str(obj)],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     dis = subprocess.run([OBJDUMP, "-d", "-marm", "-Mforce-thumb", str(obj)],

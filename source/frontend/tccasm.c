@@ -116,14 +116,28 @@ static int asm2cname(int v, int *addeddot)
   return v;
 }
 
+/* The file-scope C symbol whose asm label (`__asm__("name")` on its
+ * declaration) is LABEL: the asm names that symbol, not a new one.  A static
+ * one would otherwise get a second, undefined global of the same name. */
+static Sym *asm_label_c_sym(int label)
+{
+  for (Sym *s = global_stack; s; s = s->prev)
+    if (s->asm_label == label && !s->sym_scope && s->v >= TOK_IDENT && s->v < SYM_FIRST_ANOM && !IS_ASM_SYM(s) &&
+        ((s->type.t & VT_BTYPE) == VT_FUNC || (s->r & VT_SYM)))
+      return s;
+  return NULL;
+}
+
 static Sym *asm_label_find(int v)
 {
   Sym *sym;
-  int addeddot;
+  int addeddot, label = v;
   v = asm2cname(v, &addeddot);
   sym = sym_find(v);
   while (sym && sym->sym_scope && !(sym->type.t & VT_STATIC))
     sym = sym->prev_tok;
+  if (!sym)
+    sym = asm_label_c_sym(label);
   return sym;
 }
 
@@ -270,7 +284,7 @@ static void asm_expr_unary(TCCState *s1, ExprValue *pe)
     {
       ElfSym *esym;
       /* label case : if the label was not found, add one */
-      sym = get_asm_sym(tok, NULL);
+      sym = gfunc_regpair_asm_sym(get_asm_sym(tok, NULL), REGPAIR_ASM_ADDRESS);
       esym = elfsym(sym);
       if (esym && esym->st_shndx == SHN_ABS)
       {
@@ -511,7 +525,7 @@ static Sym *asm_new_label1(TCCState *s1, int label, int is_local, int sh_num, in
   Sym *sym;
   ElfSym *esym;
 
-  sym = asm_label_find(label);
+  sym = gfunc_regpair_asm_sym(asm_label_find(label), REGPAIR_ASM_DEFINE);
   if (sym)
   {
     esym = elfsym(sym);
@@ -957,7 +971,8 @@ static void asm_parse_directive(TCCState *s1, int global)
     {
       Sym *sym;
       next();
-      sym = get_asm_sym(tok, NULL);
+      sym = gfunc_regpair_asm_sym(get_asm_sym(tok, NULL),
+                                  tok1 == TOK_ASMDIR_hidden ? REGPAIR_ASM_MENTION : REGPAIR_ASM_DEFINE);
       if (tok1 != TOK_ASMDIR_hidden)
         sym->type.t &= ~VT_STATIC;
       if (tok1 == TOK_ASMDIR_weak)
@@ -1085,7 +1100,7 @@ static void asm_parse_directive(TCCState *s1, int global)
     int st_type;
 
     next();
-    sym = get_asm_sym(tok, NULL);
+    sym = gfunc_regpair_asm_sym(get_asm_sym(tok, NULL), REGPAIR_ASM_MENTION);
     next();
     skip(',');
     if (tok == TOK_STR)
@@ -1990,6 +2005,8 @@ ST_FUNC void asm_instr(void)
               put_extern_sym2(csym, SHN_UNDEF, 0, 0, 1);
             get_asm_sym(asmname, csym);
             operands[nb_operands + nb_labels - 1].is_label = asmname;
+            operands[nb_operands + nb_labels - 1].label_sym = csym->c;
+            operands[nb_operands + nb_labels - 1].label_jind = csym->r == LABEL_DEFINED ? csym->jind : -1;
 
             if (tok != ',')
               break;

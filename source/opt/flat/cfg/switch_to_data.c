@@ -17,6 +17,19 @@
 
 #define SWITCHDATA_MAX_BODY_OPS 1
 
+/* Does the IMM32's value fit an integer of btype bt as it is? */
+static int sd_imm_fits(IROperand imm, int bt, int is_unsigned)
+{
+  int64_t k = (int32_t)imm.u.imm32;
+  int bits = bt == IROP_BTYPE_INT8 ? 8 : bt == IROP_BTYPE_INT16 ? 16 : bt == IROP_BTYPE_INT32 ? 32 : 0;
+  if (!bits)
+    return 0;
+  if (bits == 32)
+    return 1;
+  return is_unsigned ? k >= 0 && k < ((int64_t)1 << bits)
+                     : k >= -((int64_t)1 << (bits - 1)) && k < ((int64_t)1 << (bits - 1));
+}
+
 /* Matches `[NOP..] ASSIGN dst<-const [NOP..] JMP merge` with no intervening jump_target; returns 0 on match. */
 static int sd_check_case_body(TCCIRState *ir, int target,
                               IROperand *out_dest, IROperand *out_val, int *out_merge,
@@ -71,8 +84,13 @@ static int sd_check_case_body(TCCIRState *ir, int target,
    * enum, say); the value table still holds whole-word constants and the
    * join read keeps its own type. */
   if (qi->op == TCCIR_OP_ASSIGN) {
-    if ((dbt != IROP_BTYPE_INT32 && dbt != IROP_BTYPE_FUNC) ||
-        (sbt != IROP_BTYPE_INT32 && sbt != IROP_BTYPE_FUNC))
+    /* A narrow dest or constant (a byte enum's promoted phi) takes the
+     * constant as the word it is when every type involved holds the value
+     * as is: that word is what the ASSIGN would have put in the register. */
+    int narrow_ok = tag == IROP_TAG_IMM32 && sd_imm_fits(src, sbt, src.is_unsigned) &&
+                    sd_imm_fits(src, dbt, dest.is_unsigned);
+    if (!narrow_ok && ((dbt != IROP_BTYPE_INT32 && dbt != IROP_BTYPE_FUNC) ||
+                       (sbt != IROP_BTYPE_INT32 && sbt != IROP_BTYPE_FUNC)))
       return 1;
   }
 

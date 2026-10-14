@@ -64,7 +64,7 @@ static int tcc_ir_opt_dce__timed(TCCIRState *ir)
     if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
       return 0;
   }
-  /* Likewise for `asm goto`: its labels are edges the IR does not record. */
+  /* This instruction worklist does not enumerate the CFG's asm-goto edges. */
   if (ir->func_has_asm_goto)
     return 0;
 

@@ -643,9 +643,21 @@ struct SymAttr
                                      #pragma GCC visibility, so -fvisibility=
                                      does not apply (visibility("default")
                                      is STV_DEFAULT == 0, like no attribute). */
-      tu_unused : 1;              /* a static nothing live in the TU refers to
+      tu_unused : 1,              /* a static nothing live in the TU refers to
                                      (prune_unused_statics): never emitted. */
+      guard_head : 1,             /* has a tcc_state->guard_heads entry */
+      regpair_ret : 2,            /* REGPAIR_RET_*: an internal function's
+                                     8-byte aggregate comes back in r0/r1
+                                     (gfunc_regpair_ret), decided once. */
+      pure_via_sret : 1;          /* inferred: the function's only observable
+                                     effect is its aggregate result (*sret_arg
+                                     writes, or r0/r1).  In SymAttr, not
+                                     FuncAttr: a global Sym's f is its
+                                     sym_scope word. */
 };
+#define REGPAIR_RET_UNKNOWN 0
+#define REGPAIR_RET_NO 1
+#define REGPAIR_RET_YES 2
 
 /* function attributes or temporary attributes for parsing */
 struct FuncAttr
@@ -684,7 +696,6 @@ struct FuncAttr
       func_const_arg_loop : 1,          /* post-opt body is a register-only loop: keep tokens so an
                                            all-constant call site can inline it and let
                                            ssa:loop_const_sim fold the loop to its final value */
-      func_pure_via_sret : 1,           /* inferred: only observable side effect is *sret_arg writes */
       func_late_reopt : 1,              /* body kept for end-of-TU re-optimization (non-const static global fold) */
       tu_static_writer : 1,             /* function writes >=1 non-const static global (set during summary collection) */
       tu_reachable : 1,                 /* function is reachable from a TU root (non-static or addr-taken) per call graph */
@@ -698,6 +709,9 @@ struct FuncAttr
                                             whatever its size (-finline-functions-called-once) */
       func_inl_wrapper : 1,             /* static acyclic forwarder of a few ops around one call: inlined at most
                                             INLINE_WRAPPER_PER_CALLER times into one function (gen_function) */
+      func_inl_sret_loop : 1,           /* small aggregate-return loop, bounded per caller */
+      func_inl_few_callers : 1,         /* static leaf with a few call sites, each one inlines it: the TU
+                                            grows by (sites - 1) bodies (gen_function, few_callers) */
       func_small_leaf : 1,              /* static leaf whose optimized body is a few straight-line ops: inlined
                                             whatever its token length (see gen_function's post-opt promotion) */
       func_ret_zext : 2;                /* r0 at every return is zero-extended from 1/8/16 bits (1/2/3), as
@@ -758,6 +772,14 @@ struct Sym
 };
 #define SYM_SHORT_SIZE (offsetof(struct Sym, prev) + sizeof(struct Sym *))
 
+/* A function's key in the TU's by-token analysis caches (purity, constant
+ * result, switch snapshot): 0, never cached, for a GNU nested function, whose
+ * name other functions of the TU (file-scope or nested) may share. */
+static inline int func_cache_token(const struct Sym *s)
+{
+  return s->a.nested_func ? 0 : s->v;
+}
+
 static inline long long sym_enum_val(const struct Sym *s)
 {
   long long v;
@@ -790,6 +812,7 @@ typedef struct SymLocalFacts
   unsigned char *const_init_data;
   int const_init_size;
   uint32_t param_nocapture; /* compiled static function: borrowed parameter bits */
+  struct Sym *knr_proto;    /* old-style definition: the prototype its calls take */
   unsigned char objsize_max_valid;
   unsigned char objsize_strlen_valid;
   unsigned char const_init_valid;
@@ -1060,6 +1083,19 @@ typedef struct InlineFunc
   int *pack;        /* #pragma pack state at the body (pp_pack_snapshot), NULL = default */
   int inline_count; /* number of auto-inline expansions performed so far (call-heavy budget) */
   int caller_gen, caller_count; /* expansions into the function being compiled (tcc_state->inline_caller_gen) */
+  /* As a small leaf (not a wrapper): its cost, flat backward jumps and whether
+   * it is bounded per caller (func_inl_sret_loop), for a caller wrapping it
+   * (tcc_state->inline_leaf_ops). */
+  int leaf_ops, leaf_backedges, leaf_bounded;
+  int few_callers_left; /* func_inl_few_callers: expansions still allowed in the TU */
+  int *guard_free;      /* guard head: the names it reads but does not bind, [0] = count */
+  /* A nested function's copy: what each name of its body (in order) bound to at
+   * the definition (inline_record_def_bindings), and where that was. */
+  struct Sym **def_binds;
+  struct Sym *def_func, *def_scope_top;
+  struct NestedFunc *def_nf;
+  int def_has_capture;
+  int *spliced; /* a __builtin_va_arg_pack clone: the caller's argument names, [0] = ranges, then [start, end) */
   char filename[1];
 } InlineFunc;
 
@@ -1072,6 +1108,9 @@ typedef struct DeferredFunc
   Section *section;
   TokenString *body;
   int *pack; /* #pragma pack state at the body (pp_pack_snapshot), NULL = default */
+  /* A static function referenced only by this many direct calls (>= 2), none
+   * from itself and none from code emitted before the end of the TU; else 0. */
+  int call_sites;
   char filename[1];
 } DeferredFunc;
 
@@ -1124,6 +1163,22 @@ typedef struct NestedFunc
   int parent_typedef_tokens[MAX_CAPTURED_VARS];  /* token IDs */
   CType parent_typedef_types[MAX_CAPTURED_VARS]; /* saved types */
   int nb_parent_typedefs;                        /* count of saved typedefs */
+  /* Parent scope enumeration constants visible to the nested function body
+   * (copied: a constant's own Sym is freed with its scope when its value is 0) */
+  int parent_enum_tokens[MAX_CAPTURED_VARS];
+  CType parent_enum_types[MAX_CAPTURED_VARS];
+  long long parent_enum_vals[MAX_CAPTURED_VARS];
+  int nb_parent_enums;
+  /* Parent scope static locals and block-scope extern variables visible to
+   * the nested function body: their Syms outlive the scope (c is the ELF
+   * symbol), relinked like the struct tags while the body is compiled. */
+  Sym *parent_static_syms[MAX_CAPTURED_VARS];
+  int nb_parent_statics;
+  /* The GNU nested functions whose names were bound at the definition, itself
+   * included (nested_define); compile_nested_functions binds them for the
+   * body.  Owned, freed by nested_func_release. */
+  Sym **def_vis;
+  int nb_def_vis;
   /* Parent scope struct/union/enum tags visible to nested function body.
    * We store pointers to the original Sym (which survives pop_local_syms
    * because completed struct tags have c != 0). */
@@ -1205,6 +1260,8 @@ typedef struct ASMOperand
   int is_memory;    /* true if memory operand */
   int is_rw;        /* for '+' modifier */
   int is_label;     /* for asm goto */
+  int label_sym;    /* ELF symbol identity, including block-scoped labels. */
+  int label_jind;   /* Original IR label position, resolved at its definition. */
   int addr_read;    /* IR: a memory output addressed through a register; its
                        ASM_INPUT marker keeps that address live (tccasm.c) */
 } ASMOperand;
@@ -1576,6 +1633,11 @@ struct TCCState
   int inline_fn_by_tok_size;
   int inline_fn_by_tok_count;
   int inline_fn_indexed; /* inline_fns entries already in inline_fn_by_tok */
+  /* One per SymAttr.guard_head symbol (docs/inline_guard_heads.md). */
+  struct InlineFunc **guard_heads;
+  int nb_guard_heads;
+  struct InlineFnSlot *guard_head_by_tok; /* guard_heads by symbol token, as inline_fn_by_tok */
+  int guard_head_by_tok_size;
   /* Function bodies saved at their definition for end-of-TU generation
    * (-finline-functions-called-once, gen_deferred_function_bodies). */
   struct DeferredFunc **deferred_fns;
@@ -1605,6 +1667,10 @@ struct TCCState
   /* Body length (saved-token ints) the function being generated may still
    * absorb by expanding called-once functions (called_once_budget_begin). */
   int called_once_budget;
+  /* The deferred body being generated and its DeferredFunc.call_sites, for
+   * gen_function's few-callers inline class (define_deferred_function). */
+  struct Sym *deferred_sym;
+  int deferred_call_sites;
   /* The function body being compiled: its token length (the giant-caller rule)
    * and a generation counter that resets per-caller expansion counts. */
   int inline_caller_len, inline_caller_gen;
@@ -1835,6 +1901,23 @@ struct TCCState
   /* Tokens nested auto-inline expansions may still add to the function being
    * compiled (reset by gen_function): helpers calling helpers can fan out. */
   int nested_inline_budget;
+  /* r0/r1-returning internal functions whose address something takes, and
+   * the AAPCS adapter each address names (gfunc_regpair_address_sym). */
+  struct Sym **regpair_fns, **regpair_adapters;
+  int nb_regpair_fns, nb_regpair_adapters;
+  /* The function a direct r0/r1 call is being put for: its call target keeps
+   * the function itself, not the adapter. */
+  struct Sym *regpair_direct_call;
+  /* Every name the asm statements of the saved function bodies spell out
+   * (gfunc_regpair_note_asm_names): asm run after the TU is parsed must not
+   * meet a function already decided r0/r1. */
+  char **regpair_asm_names;
+  int nb_regpair_asm_names;
+  /* The small leaves expanded at the first level of the function being
+   * compiled (reset by gen_function): their count, summed cost, backward jumps
+   * and per-caller-bounded ones, for sizing a wrapper by the ops it adds
+   * (ir_body_wraps_small_leaf). */
+  int inline_leaf_sites, inline_leaf_ops, inline_leaf_backedges, inline_leaf_bounded;
   int inline_return_loc;       /* stack offset for storing return value */
   int inline_return_vr;        /* vreg bound to that slot for scalar returns,
                                 * -1 when the return goes through memory only.
@@ -2661,6 +2744,7 @@ ST_FUNC void vpop(void);
  * (`*p;`, a comma operand, a for-loop increment).  vpop alone drops the lvalue
  * without ever loading it, which silently deletes the read-to-clear idiom. */
 ST_FUNC void gv_discarded_volatile(void);
+ST_FUNC void vpop_discarded(void);
 #if PTR_SIZE == 4
 ST_FUNC void lexpand(void);
 #endif
@@ -2842,6 +2926,20 @@ ST_FUNC void gsym(int t);
 ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret, int *align, int *regsize);
 ST_FUNC int gfunc_hfa(CType *type, int *base_size);
 ST_FUNC int gfunc_sret_vfp_words(CType *vt, int variadic);
+ST_FUNC int gfunc_regpair_ret(Sym *fsym);
+ST_FUNC int gfunc_sret_fn(Sym *fsym, CType *vt, int variadic, CType *ret, int *align, int *regsize);
+ST_FUNC Sym *gfunc_regpair_address_sym(Sym *sym);
+/* How asm text names a C function (gfunc_regpair_asm_sym). */
+#define REGPAIR_ASM_ADDRESS 0 /* an operand: the address of its AAPCS entry */
+#define REGPAIR_ASM_DEFINE 1  /* a label definition, .global, .weak */
+#define REGPAIR_ASM_MENTION 2 /* .type, .hidden */
+ST_FUNC Sym *gfunc_regpair_asm_sym(Sym *sym, int how);
+ST_FUNC void gfunc_regpair_check_redecl(Sym *fn);
+ST_FUNC void gfunc_regpair_note_asm_names(TokenString *body);
+ST_FUNC int gfunc_regpair_asm_named(Sym *fn);
+ST_FUNC void gfunc_regpair_emit_adapters(TCCState *s1);
+ST_FUNC void gfunc_regpair_reset(TCCState *s1);
+ST_FUNC void gfunc_regpair_emit_adapter(TCCState *s1, Sym *fn, Sym *adapter, Section *sec);
 ST_FUNC int gen_vfp_ret_transfer(const SValue *ptr, int words, int load);
 ST_FUNC void gfunc_call(int nb_args);
 ST_FUNC void gfunc_prolog(Sym *func_sym);
@@ -3133,6 +3231,10 @@ ST_FUNC void tcc_gen_machine_data_processing_mop(MachineOperand src1, MachineOpe
  * register nothing wrote. */
 ST_FUNC void tcc_gen_machine_data_processing_mop_flags(MachineOperand src1, MachineOperand src2, MachineOperand dest,
                                                        TccIrOp op, uint32_t barrel_shift);
+/* Whether `ANDS rd, rn, <src2>` is one instruction: a register, or an
+ * immediate the AND encoding holds (a mask UXTB/UXTH/UBFX/BIC would lower
+ * needs a materialized constant once it must set flags). */
+ST_FUNC int tcc_gen_machine_ands_is_direct(MachineOperand src2);
 ST_FUNC void tcc_gen_machine_cmp_eq64_mop(MachineOperand src1, MachineOperand src2);
 /* SUBS+IT peephole helper: emits `SUBS dest, src1, src2; IT NE; MOVNE dest, #1`
  * collapsing a CMP+SELECT(1,0,NE) / SELECT(0,1,EQ) pair into 3 instructions.
@@ -3209,6 +3311,10 @@ ST_FUNC int tcc_gen_machine_abi_assign_call_args(const TCCAbiArgDesc *args, int 
 ST_FUNC void tcc_gen_machine_save_call_context(void);
 ST_FUNC void tcc_gen_machine_restore_call_context(void);
 ST_FUNC int tcc_gen_machine_jump_mop(TccIrOp op, int32_t target_ir, int ir_idx);
+/* ir/codegen.c: the real pass drops this JUMP / return jump (span is code-free). */
+int tcc_ir_codegen_jump_elidable(struct TCCIRState *ir, int i);
+/* ir/codegen.c: ... or a JUMP a JUMPIF other than fused_jumpif inverts over. */
+int tcc_ir_codegen_jump_may_drop(struct TCCIRState *ir, int i, int fused_jumpif);
 ST_FUNC int tcc_gen_machine_conditional_jump_mop(int32_t condition, TccIrOp op, int32_t target_ir, int ir_idx);
 ST_FUNC void tcc_gen_machine_dry_run_set_rehearsal(int on);
 ST_FUNC int tcc_gen_machine_cbz_forward_ok(int32_t target_ir, int current_ir_idx);
@@ -3218,20 +3324,31 @@ ST_FUNC int tcc_gen_machine_pool_entries_total(void);
 /* Pad the instruction stream with a 2-byte NOP when the next instruction would
  * land halfword-odd.  Called for an IRQuadCompact carrying `align_target`; see
  * that field in tccir.h for the RP2350 measurement that motivates it. */
-ST_FUNC void tcc_gen_machine_align_branch_target(int align);
+/* widen_from: start of the code a branch to the pad's address could come from
+ * (the last IR op that emitted code, or TCC_ALIGN_WIDEN_FROM_PROLOG when none
+ * has), or -1 when the pad must stay NOPs. */
+#define TCC_ALIGN_WIDEN_FROM_PROLOG (-2)
+ST_FUNC void tcc_gen_machine_align_branch_target(int align, int widen_from);
 ST_FUNC int tcc_gen_machine_const_needs_pool(int32_t value);
 ST_FUNC int tcc_gen_machine_pending_pool_size(void);
 ST_FUNC int tcc_gen_machine_cbz_jump_mop(int rn, int nonzero, int32_t target_ir, int ir_idx);
+/* An inline compare-exchange whose result the next CMP + JUMPIF tests: offer
+ * that branch before the call, ask after it whether the loop took it. */
+ST_FUNC void tcc_gen_machine_cas_branch_offer(MachineOperand lhs, MachineOperand rhs, int cond, int target_ir,
+                                              int cmp_ir);
+ST_FUNC int tcc_gen_machine_cas_branch_taken(int *branch_addr);
 ST_FUNC int tcc_gen_machine_switch_table_dry_run_size(int num_entries);
 ST_FUNC void tcc_gen_machine_switch_table_mop(MachineOperand src, struct TCCIRSwitchTable *table, struct TCCIRState *ir,
                                               int ir_idx);
 ST_FUNC int tcc_gen_machine_switch_load_dry_run_size(int num_entries);
 ST_FUNC void tcc_gen_machine_switch_load_mop(MachineOperand src, MachineOperand dest,
                                              struct TCCIRSwitchValueTable *vtab, struct TCCIRState *ir, int ir_idx);
-ST_FUNC void tcc_gen_machine_set_chain(void);
+ST_FUNC void tcc_gen_machine_set_chain(int level);
+ST_FUNC void tcc_gen_machine_chain_reset(void);
+ST_FUNC void tcc_gen_machine_flush_chain(void);
 ST_FUNC int tcc_gen_machine_frame_top_offset(void);
 ST_FUNC void tcc_gen_machine_restore_chain(void);
-ST_FUNC void tcc_gen_machine_init_chain_slot(IROperand src1);
+ST_FUNC void tcc_gen_machine_init_chain_slot(IROperand src1, int level);
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset);
 ST_FUNC void tcc_gen_machine_end_instruction(void);
 
@@ -3241,6 +3358,9 @@ ST_FUNC void tcc_gen_machine_dry_run_start(void);
 ST_FUNC void tcc_gen_machine_dry_run_end(void);
 ST_FUNC int tcc_gen_machine_dry_run_get_lr_push_count(void);
 ST_FUNC uint32_t tcc_gen_machine_dry_run_get_scratch_regs_pushed(void);
+ST_FUNC int tcc_gen_machine_dry_run_get_scratch_push_count(void);
+ST_FUNC void tcc_gen_machine_dry_run_set_prolog_pushes(uint32_t regs);
+ST_FUNC uint32_t tcc_gen_machine_dry_run_get_prolog_pushes_used(void);
 ST_FUNC int tcc_gen_machine_dry_run_get_max_nested_saves(void);
 /* Shared-.rodata base hoisting: claim() picks a callee-saved register for the
  * body and returns the mask the prologue must additionally push (0 = keep the
@@ -3260,6 +3380,8 @@ ST_FUNC int tcc_gen_machine_real_run_had_scratch_push(void);
 ST_FUNC void tcc_gen_machine_insn_scratch_reset(void);
 ST_FUNC int tcc_gen_machine_insn_scratch_count(void);
 ST_FUNC uint16_t tcc_gen_machine_insn_scratch_saves_mask(void);
+ST_FUNC int tcc_gen_machine_insn_scratch_save_count(void);
+ST_FUNC uint32_t tcc_gen_machine_insn_scratch_exclude(void);
 
 /* Branch optimization interface */
 ST_FUNC void tcc_gen_machine_branch_opt_init(void);
@@ -3317,6 +3439,12 @@ ST_FUNC int tcc_gen_machine_spill_block_copy_free(int32_t src_spill_off, int32_t
  * pointer deref) or MACH_BLOCK_COPY_FRAME, through registers the caller owns */
 ST_FUNC int tcc_gen_machine_reg_block_copy(int src_base, int32_t src_off, int dst_base, int32_t dst_off,
                                            const int *regs, int nwords, int end_idx);
+/* Copy `nwords` words base+src_off -> base+dst_off that the IR copies one word
+ * at a time over [start_idx, end_idx], through `word_regs` and registers free
+ * across that run, as LDRD/STRD pairs or LDM/STM chunks; 0 when neither is
+ * shorter (nothing emitted). */
+ST_FUNC int tcc_gen_machine_interleaved_word_copy(int base, int32_t src_off, int32_t dst_off, int nwords,
+                                                  uint32_t word_regs, int start_idx, int end_idx);
 
 /* Conditional select: dest = (cond) ? then_val : else_val (ITE on ARM) */
 ST_FUNC void tcc_gen_machine_select_mop(MachineOperand then_val, MachineOperand else_val, MachineOperand dest,

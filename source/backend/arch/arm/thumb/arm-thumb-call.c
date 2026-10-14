@@ -506,12 +506,62 @@ static uint32_t arg_move_write_set(const ThumbArgMove *m)
   return set;
 }
 
+/* Registers an arg move reads at emit time: a REG move's source, and the
+ * address (or value pair) register of a MOP or STRUCT move whose operand is a
+ * register -- `f(..., *p)` loads through p's register when it is emitted, so
+ * a move into that register must wait for it like a REG move's source. */
+static uint32_t arg_move_read_set(const ThumbArgMove *m)
+{
+  switch (m->kind)
+  {
+  case THUMB_ARG_MOVE_REG:
+    return 1u << m->src_reg;
+  case THUMB_ARG_MOVE_MOP:
+  case THUMB_ARG_MOVE_STRUCT:
+  {
+    uint32_t set = 0;
+    if (m->mop.kind != MACH_OP_REG)
+      return 0;
+    if (thumb_is_hw_reg(m->mop.u.reg.r0))
+      set |= 1u << m->mop.u.reg.r0;
+    if (thumb_is_hw_reg(m->mop.u.reg.r1))
+      set |= 1u << m->mop.u.reg.r1;
+    return set;
+  }
+  default:
+    return 0;
+  }
+}
+
+/* Point every read of `from` in move `m` at `to`. */
+static void arg_move_redirect_read(ThumbArgMove *m, int from, int to)
+{
+  if (m->kind == THUMB_ARG_MOVE_REG)
+  {
+    if (m->src_reg == from)
+      m->src_reg = to;
+    return;
+  }
+  if ((m->kind == THUMB_ARG_MOVE_MOP || m->kind == THUMB_ARG_MOVE_STRUCT) && m->mop.kind == MACH_OP_REG)
+  {
+    if (m->mop.u.reg.r0 == from)
+      m->mop.u.reg.r0 = to;
+    if (m->mop.u.reg.r1 == from)
+      m->mop.u.reg.r1 = to;
+  }
+}
+
 /* Schedule register argument setup as a parallel assignment.
  * This avoids clobbering a source register needed for another argument.
  * Example: r0 <- r6, r1 <- r0 must be emitted as:
  *   mov r1, r0
  *   mov r0, r6
- */
+ * A move is ready once no OTHER pending move reads a register it writes (a
+ * move may read its own destination: `ldr r0, [r0]`).  When none is ready the
+ * moves form a cycle -- `mov r2, r1` with `ldr r1, [r2]` is one -- broken by
+ * copying a register that a pending move reads and another writes into a
+ * scratch, and pointing its readers there.  A scratch stays reserved while a
+ * pending move reads it, so a second cycle takes another. */
 static void thumb_emit_parallel_arg_moves(ThumbArgMove *moves, int move_count)
 {
   if (move_count <= 0)
@@ -520,72 +570,71 @@ static void thumb_emit_parallel_arg_moves(ThumbArgMove *moves, int move_count)
   uint8_t done[16];
   memset(done, 0, sizeof(done));
 
-  ScratchRegAlloc tmp_alloc = (ScratchRegAlloc){0};
-  int have_tmp = 0;
+  ScratchRegAlloc tmp_alloc[4];
+  int ntmp = 0;
 
   for (int remaining = move_count; remaining > 0;)
   {
-    uint32_t src_set = 0;
-    for (int i = 0; i < move_count; ++i)
-    {
-      if (done[i])
-        continue;
-      if (moves[i].kind == THUMB_ARG_MOVE_REG)
-        src_set |= (1u << moves[i].src_reg);
-    }
-
     int chosen = -1;
-    for (int i = 0; i < move_count; ++i)
+    for (int i = 0; i < move_count && chosen < 0; ++i)
     {
       if (done[i])
         continue;
-      /* Check ALL destination registers of this move against pending sources.
-       * Multi-reg writes (IMM64, 64-bit MOP, STRUCT) must not clobber any
-       * register that a pending REG move still needs to read. */
-      if ((src_set & arg_move_write_set(&moves[i])) == 0)
-      {
+      /* Check ALL destination registers of this move against what the other
+       * pending moves read.  Multi-reg writes (IMM64, 64-bit MOP, STRUCT) must
+       * not clobber any of them. */
+      uint32_t reads = 0;
+      for (int j = 0; j < move_count; ++j)
+        if (j != i && !done[j])
+          reads |= arg_move_read_set(&moves[j]);
+      if ((reads & arg_move_write_set(&moves[i])) == 0)
         chosen = i;
-        break;
-      }
     }
 
     if (chosen < 0)
     {
-      /* Cycle among register moves. Break it with a scratch temp. */
-      int cyc = -1;
+      /* Cycle.  Pick a register some pending move reads and another writes. */
+      uint32_t writes = 0, reads = 0, involved = 0;
       for (int i = 0; i < move_count; ++i)
       {
-        if (!done[i] && moves[i].kind == THUMB_ARG_MOVE_REG)
-        {
-          cyc = i;
-          break;
-        }
+        if (done[i])
+          continue;
+        writes |= arg_move_write_set(&moves[i]);
+        reads |= arg_move_read_set(&moves[i]);
       }
-      if (cyc < 0)
-        tcc_ice("arg move cycle without reg sources");
-
-      if (!have_tmp)
+      involved = writes | reads;
+      int victim = -1;
+      for (int i = 0; i < move_count && victim < 0; ++i)
       {
-        /* Exclude all regs involved in the parallel move. */
-        uint32_t exclude = 0;
-        for (int i = 0; i < move_count; ++i)
-        {
-          if (done[i])
-            continue;
-          exclude |= arg_move_write_set(&moves[i]);
-          if (moves[i].kind == THUMB_ARG_MOVE_REG)
-            exclude |= (1u << moves[i].src_reg);
-        }
-        /* Also exclude SP/PC. */
-        exclude |= (1u << ARM_SP) | (1u << ARM_PC);
-        tmp_alloc = get_scratch_reg_with_save(exclude);
-        have_tmp = 1;
+        if (done[i])
+          continue;
+        uint32_t other_writes = 0;
+        for (int j = 0; j < move_count; ++j)
+          if (j != i && !done[j])
+            other_writes |= arg_move_write_set(&moves[j]);
+        uint32_t clash = arg_move_read_set(&moves[i]) & other_writes;
+        if (clash)
+          victim = __builtin_ctz(clash);
       }
+      if (victim < 0)
+        tcc_ice("arg move cycle without a shared register");
 
-      thumb_require_materialized_reg("thumb_emit_parallel_arg_moves", "tmp", tmp_alloc.reg);
-      ot_check_mov_reg(tmp_alloc.reg, moves[cyc].src_reg, flags_safe(), THUMB_SHIFT_DEFAULT,
-                       ENFORCE_ENCODING_NONE, false);
-      moves[cyc].src_reg = tmp_alloc.reg;
+      /* Reuse the last scratch only once nothing pending reads it. */
+      if (ntmp == 0 || (reads & (1u << tmp_alloc[ntmp - 1].reg)))
+      {
+        if (ntmp == (int)(sizeof(tmp_alloc) / sizeof(tmp_alloc[0])))
+          tcc_ice("arg move cycles need more than %d scratch registers", ntmp);
+        uint32_t exclude = involved | (1u << ARM_SP) | (1u << ARM_PC);
+        for (int t = 0; t < ntmp; ++t)
+          exclude |= 1u << tmp_alloc[t].reg;
+        tmp_alloc[ntmp++] = get_scratch_reg_with_save(exclude);
+      }
+      const int tmp = tmp_alloc[ntmp - 1].reg;
+      thumb_require_materialized_reg("thumb_emit_parallel_arg_moves", "tmp", tmp);
+      ot_check_mov_reg(tmp, victim, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+      for (int i = 0; i < move_count; ++i)
+        if (!done[i])
+          arg_move_redirect_read(&moves[i], victim, tmp);
       continue;
     }
 
@@ -594,8 +643,8 @@ static void thumb_emit_parallel_arg_moves(ThumbArgMove *moves, int move_count)
     --remaining;
   }
 
-  if (have_tmp && tmp_alloc.saved)
-    ot_check(th_pop(1u << tmp_alloc.reg));
+  for (int t = ntmp - 1; t >= 0; --t)
+    restore_scratch_reg(&tmp_alloc[t]);
 }
 
 /* ========================================================================
@@ -2543,14 +2592,71 @@ static void thumb_atomic_load_ex(int size, int acq, uint32_t rt, uint32_t rn)
     ot_check(acq ? th_ldaex(rt, rn) : th_ldrex(rt, rn, 0));
 }
 
-static void thumb_atomic_store_ex(int size, int rel, uint32_t rd, uint32_t rt, uint32_t rn)
+static thumb_opcode thumb_atomic_store_ex(int size, int rel, uint32_t rd, uint32_t rt, uint32_t rn)
 {
   if (size == 1)
-    ot_check(rel ? th_stlexb(rd, rt, rn) : th_strexb(rd, rt, rn));
-  else if (size == 2)
-    ot_check(rel ? th_stlexh(rd, rt, rn) : th_strexh(rd, rt, rn));
-  else
-    ot_check(rel ? th_stlex(rd, rt, rn) : th_strex(rd, rt, rn, 0));
+    return rel ? th_stlexb(rd, rt, rn) : th_strexb(rd, rt, rn);
+  if (size == 2)
+    return rel ? th_stlexh(rd, rt, rn) : th_strexh(rd, rt, rn);
+  return rel ? th_stlex(rd, rt, rn) : th_strex(rd, rt, rn, 0);
+}
+
+/* The test of a compare-exchange's result right after it (ir/codegen.c
+ * ir_codegen_offer_cas_branch): `CMP lhs, rhs; JUMPIF EQ -> target_ir`, the
+ * CMP at cmp_ir.
+ * When lhs is the old value and rhs the expected one, the loop's own exits
+ * are that branch -- a mismatch falls to the JUMPIF's fall-through, a
+ * successful store branches to target_ir -- so
+ * thumb_inline_atomic_call emits them as the branch and the CMP and JUMPIF
+ * emit nothing; branch_addr is then the conditional branch to target_ir,
+ * which the JUMPIF's backpatch resolves. */
+static struct
+{
+  int offered, taken;
+  MachineOperand lhs, rhs;
+  int cond; /* TOK_EQ or TOK_NE */
+  int target_ir, cmp_ir;
+  int branch_addr;
+} cas_branch;
+
+static int cbz_forward_ok_biased(int32_t target_ir, int current_ir_idx, int bias);
+
+ST_FUNC void tcc_gen_machine_cas_branch_offer(MachineOperand lhs, MachineOperand rhs, int cond, int target_ir,
+                                              int cmp_ir)
+{
+  cas_branch.offered = 1;
+  cas_branch.taken = 0;
+  cas_branch.lhs = lhs;
+  cas_branch.rhs = rhs;
+  cas_branch.cond = cond;
+  cas_branch.target_ir = target_ir;
+  cas_branch.cmp_ir = cmp_ir;
+}
+
+/* After the call: whether it took the offer, and where its branch is. */
+ST_FUNC int tcc_gen_machine_cas_branch_taken(int *branch_addr)
+{
+  const int taken = cas_branch.taken;
+  if (taken)
+    *branch_addr = cas_branch.branch_addr;
+  cas_branch.offered = cas_branch.taken = 0;
+  return taken;
+}
+
+static int mach_same_reg(const MachineOperand *a, int reg)
+{
+  return a->kind == MACH_OP_REG && !a->needs_deref && !a->is_64bit && a->u.reg.r0 == reg;
+}
+
+/* rhs is the compare-exchange's expected operand: the same register, or the
+ * same 32-bit constant. */
+static int cas_branch_expected_is(const MachineOperand *rhs, const MachineOperand *expected)
+{
+  if (rhs->is_64bit || expected->is_64bit || rhs->needs_deref || expected->needs_deref)
+    return 0;
+  if (expected->kind == MACH_OP_IMM)
+    return rhs->kind == MACH_OP_IMM && (uint32_t)rhs->u.imm.val == (uint32_t)expected->u.imm.val;
+  return expected->kind == MACH_OP_REG && !expected->needs_deref && mach_same_reg(rhs, expected->u.reg.r0);
 }
 
 static void thumb_inline_atomic_call(TCCIRState *ir, int call_idx, int call_id, int argc, MachineOperand func_mop,
@@ -2599,12 +2705,12 @@ static void thumb_inline_atomic_call(TCCIRState *ir, int call_idx, int call_id, 
   const MachineOperand *mops = ThumbMachineOperandSequence_data(&mops_owner);
   MachineCodegenContext mctx = {0};
   uint32_t used = 0;
-  const int ptr = mach_ensure_in_reg(&mctx, &mops[0], used);
+  int ptr = mach_ensure_in_reg(&mctx, &mops[0], used);
   used |= 1u << ptr;
   const int v8 = arm_target_dependent.feat.ldaex;
   if (op == AX_LDA)
   {
-    /* An acquire load (inline_atomic_access): LDA, or LDR; DMB. */
+    /* An acquire or seq_cst load (inline_atomic_access): LDA, or LDR; DMB. */
     if (layout.locs)
       tcc_free(layout.locs);
     int rt = !drop_value && dest_mop.kind != MACH_OP_NONE ? mach_get_dest_reg(&mctx, &dest_mop, used)
@@ -2640,7 +2746,8 @@ static void thumb_inline_atomic_call(TCCIRState *ir, int call_idx, int call_id, 
     used |= 1u << val;
   if (op == AX_STL)
   {
-    /* A release store (inline_atomic_access): STL, or DMB; STR. */
+    /* A release or seq_cst store (inline_atomic_access): STL, or DMB; STR
+     * and, for seq_cst (flags 4), a DMB after. */
     if (layout.locs)
       tcc_free(layout.locs);
     if (v8)
@@ -2654,6 +2761,8 @@ static void thumb_inline_atomic_call(TCCIRState *ir, int call_idx, int call_id, 
         ot_check(th_strh_imm(val, ptr, 0, 6, ENFORCE_ENCODING_NONE));
       else
         ot_check_str_imm(val, ptr, 0, 6, ENFORCE_ENCODING_NONE);
+      if (flags & 4)
+        ot_check(th_dmb(0xf));
     }
     mach_release_all(&mctx);
     return;
@@ -2671,6 +2780,28 @@ static void thumb_inline_atomic_call(TCCIRState *ir, int call_idx, int call_id, 
   int rout = -1, old;
   if (!drop_value && dest_mop.kind != MACH_OP_NONE)
     rout = mach_get_dest_reg(&mctx, &dest_mop, used);
+  /* The result's test as the loop's exits (cas_branch): `CMP old, expected;
+   * JUMPIF EQ` on old in the result's own register, a 32-bit compare, and no
+   * DMB after the loop (ARMv7-M acquire / seq_cst): every exit leaves straight
+   * from the loop. */
+  int fuse = cas_branch.offered && cas_branch.cond == TOK_EQ && op == AX_CAS && size == 4 &&
+             !(!v8 && (flags & 5)) && rout >= 0 && rout != val && mach_same_reg(&dest_mop, rout) &&
+             mach_same_reg(&cas_branch.lhs, rout) && cas_branch_expected_is(&cas_branch.rhs, &mops[1]);
+  cas_branch.offered = 0;
+  if (fuse && (used >> rout & 1))
+  {
+    /* The pointer or the desired value is in the result's register, which
+     * the call frees: the loop reads it from a scratch copy and loads old
+     * into the result's register, so no move follows the loop. */
+    const int copy = mach_alloc_scratch(&mctx, used);
+    used |= 1u << copy;
+    ot_check_mov_reg(copy, rout, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+    if (ptr == rout)
+      ptr = copy;
+    if (desired == rout)
+      desired = copy;
+    used &= ~(1u << rout);
+  }
   if (rout >= 0 && !(used >> rout & 1))
     old = rout;
   else
@@ -2697,6 +2828,12 @@ static void thumb_inline_atomic_call(TCCIRState *ir, int call_idx, int call_id, 
   }
 
   const int acq = v8 && (flags & 1), rel = v8 && (flags & 2);
+  /* No scratch saved around the loop: its exits skip the restore. */
+  if (fuse && old != rout)
+    fuse = 0;
+  for (int k = 0; fuse && k < mctx.n_scratch; k++)
+    if (mctx.scratches[k].saved)
+      fuse = 0;
   if (!v8 && (flags & 2))
     ot_check(th_dmb(0xf));
   /* The loop in one piece: no literal pool inside, and no IT block split. */
@@ -2706,31 +2843,91 @@ static void thumb_inline_atomic_call(TCCIRState *ir, int call_idx, int call_id, 
   if (op == AX_CAS)
   {
     /*  top:  ldrex   old, [ptr]
-     *        cmp     old, expected
-     *        itt     eq
-     *        strexeq status, desired, [ptr]
-     *        cmpeq   status, #1           (the store failed: try again)
-     *        beq     top
-     *        clrex
+     *        cmp     old, expected     (cbnz old, out: expected 0)
+     *        bne     out
+     *        strex   status, desired, [ptr]
+     *        cmp     status, #0        (the store failed: try again)
+     *        bne     top
+     *  out:
      * Strong, so also a valid weak compare-exchange; success is old ==
-     * expected, which the frontend tests. */
-    if (cas_imm >= 0)
-      ot_check(th_cmp_imm(old, (uint32_t)cas_imm, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+     * expected, which the frontend tests (as the exits below when that test
+     * comes right after the call).  A mismatch leaves the reservation
+     * open: the frontend closes it with a CLREX on its failure path
+     * (inline_atomic_rmw), as the runtime and LLVM do -- a spin lock waits
+     * next with WFE, and an open reservation keeps the WFE from sleeping.
+     * After a successful store it is already closed, so the success path
+     * runs no CLREX and no IT block. */
+    const thumb_opcode store = thumb_atomic_store_ex(size, rel, status, desired, ptr);
+    const thumb_opcode retry = th_cmp_imm(status, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE);
+    if (!store.size || !retry.size)
+      tcc_ice("inline atomic: no compare-exchange store");
+    if (fuse)
+    {
+      /*  top:  ldrex   old, [ptr]
+       *        cmp     old, expected     (cbnz old, out: expected 0)
+       *        bne     out
+       *        strex   status, desired, [ptr]
+       *        cmp     status, #0        (cbz status, <target>: a low
+       *        beq     <target>           status, the target in its reach)
+       *        b       top
+       *  out:  (the JUMPIF's fall-through: the failure path)
+       * The CBZ ends the call's code 2 bytes after it, where the CMP the
+       * rehearsal measured from (its address map) starts: no bias.  The
+       * rehearsal emits `cmp; beq.w` here, which a branch over the loop
+       * bounds by rehearsal_max_shrink_between (ir_call_is_inline_cas). */
+      if (cas_imm == 0 && old < 8)
+        ot_check(th_cbz((uint16_t)old, 0, 1));
+      else
+      {
+        if (cas_imm >= 0)
+          ot_check(th_cmp_imm(old, (uint32_t)cas_imm, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+        else
+          ot_check(th_cmp_reg(0, old, value, FLAGS_BEHAVIOUR_SET, no_shift, ENFORCE_ENCODING_NONE));
+        ot_check(th_b_t1(1 /* NE */, 0));
+      }
+      const int mismatch_branch = ind - 2;
+      ot_check(store);
+      int n;
+      if (status < 8 && cas_branch.cmp_ir > call_idx && !dry_run_state.active &&
+          !tcc_gen_machine_outline_suppressing() && cbz_forward_ok_biased(cas_branch.target_ir, cas_branch.cmp_ir, 0))
+      {
+        ot_check(th_cbz((uint16_t)status, 0, 0));
+        n = 2;
+      }
+      else
+      {
+        ot_check(retry);
+        n = tcc_gen_machine_conditional_jump_mop(TOK_EQ, TCCIR_OP_JUMPIF, cas_branch.target_ir, call_idx);
+      }
+      cas_branch.branch_addr = ind - n;
+      const int off = top - (ind + 4);
+      if (off < -2048)
+        tcc_ice("inline atomic loop out of branch range");
+      ot_check(th_b_t2(off));
+      if (!dry_run_state.active)
+        th_patch_call(mismatch_branch, ind);
+      cas_branch.taken = 1;
+      mach_release_all(&mctx);
+      return;
+    }
+    /* From the branch's pc + 4 (the store's address + 2) to out. */
+    const uint32_t skip = (uint32_t)(store.size + retry.size);
+    if (cas_imm == 0 && old < 8)
+      ot_check(th_cbz((uint16_t)old, skip, 1));
     else
-      ot_check(th_cmp_reg(0, old, value, FLAGS_BEHAVIOUR_SET, no_shift, ENFORCE_ENCODING_NONE));
-    ot_check(th_it(0 /* EQ */, 0x4 /* TT */));
-    thumb_atomic_store_ex(size, rel, status, desired, ptr);
-    ot_check(th_cmp_imm(status, 1, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+    {
+      if (cas_imm >= 0)
+        ot_check(th_cmp_imm(old, (uint32_t)cas_imm, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+      else
+        ot_check(th_cmp_reg(0, old, value, FLAGS_BEHAVIOUR_SET, no_shift, ENFORCE_ENCODING_NONE));
+      ot_check(th_b_t1(1 /* NE */, skip >> 1));
+    }
+    ot_check(store);
+    ot_check(retry);
     const int off = top - (ind + 4);
     if (off < -256)
       tcc_ice("inline atomic loop out of branch range");
-    ot_check(th_b_t1(0 /* EQ */, (uint32_t)(off >> 1)));
-    /* A mismatch leaves the reservation open.  Close it, as the runtime and
-     * LLVM do: a spin lock waits next with WFE, and an open reservation keeps
-     * the WFE from sleeping -- on QEMU each contended kernel lock_irqsave
-     * spun at full speed instead (+4.5% instructions per launch).  After a
-     * successful store it is already closed. */
-    ot_check(th_clrex());
+    ot_check(th_b_t1(1 /* NE */, (uint32_t)(off >> 1)));
   }
   else
   {
@@ -2760,14 +2957,17 @@ static void thumb_inline_atomic_call(TCCIRState *ir, int call_idx, int call_id, 
       ot_check(th_eor_reg(value, old, val, FLAGS_BEHAVIOUR_NOT_IMPORTANT, no_shift, ENFORCE_ENCODING_NONE));
       break;
     }
-    thumb_atomic_store_ex(size, rel, status, value, ptr);
+    ot_check(thumb_atomic_store_ex(size, rel, status, value, ptr));
     ot_check(th_cmp_imm(status, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
     const int off = top - (ind + 4);
     if (off < -256)
       tcc_ice("inline atomic loop out of branch range");
     ot_check(th_b_t1(1 /* NE */, (uint32_t)(off >> 1)));
   }
-  if (flags & 4 || (!v8 && (flags & 1)))
+  /* ARMv7-M: a DMB after an acquire or seq_cst loop (and before a release
+   * one, above).  ARMv8-M needs none even for seq_cst: LDAEX/STLEX order it
+   * against the LDA/STL of every other seq_cst access. */
+  if (!v8 && (flags & 5))
     ot_check(th_dmb(0xf));
   if (rout >= 0)
   {
@@ -2828,6 +3028,8 @@ static void thumb_machine_insn_call(TCCIRState *ir, int call_idx, int call_id, i
       ot_check(th_dsb(0xf));
     else if (!strcmp(code, "dmb"))
       ot_check(th_dmb(0xf));
+    else if (!strcmp(code, "clrex"))
+      ot_check(th_clrex());
     else if (!strncmp(code, "cpsi", 4) && (code[4] == 'd' || code[4] == 'e') && code[5])
       ot_check(th_cps(code[4] == 'd', strchr(code + 5, 'i') != NULL, strchr(code + 5, 'f') != NULL));
     else if (!strncmp(code, "mrs", 3) && n == 5)
@@ -3155,13 +3357,12 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
      * which put r0 in arg_move_dst_mask and so offered it as scratch -- and
      * the stack-arg placement that took it destroyed the value the first move
      * was about to copy.  The parallel-move scheduler below already respects
-     * this (see the src_set it builds); placement, which runs first, did not. */
+     * this (see arg_move_read_set); placement, which runs first, did not. */
     uint32_t arg_move_src_mask = 0;
     for (int i = 0; i < reg_move_count; i++)
     {
       arg_move_dst_mask |= arg_move_write_set(&reg_moves[i]);
-      if (reg_moves[i].kind == THUMB_ARG_MOVE_REG)
-        arg_move_src_mask |= (1u << reg_moves[i].src_reg);
+      arg_move_src_mask |= arg_move_read_set(&reg_moves[i]);
     }
 
     /* Compute all register-arg destination registers from the ABI layout. */
@@ -3242,7 +3443,22 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
       ot_check(th_pop(callee_pop));
   }
 
+  /* A leaf whose calls are all noreturn saves LR here, in the cold block, not
+   * in the prologue (tcc_ir_call_saves_lr_itself): the hot path keeps its
+   * `bx lr`, the callee still finds our caller's return address on the stack,
+   * and SP stays 8-aligned at the `bl`.  The arguments are all in registers
+   * (ir/codegen.c keeps a call with stack arguments non-leaf), so nothing
+   * SP-relative follows the push, and the call does not come back to pop. */
+  if (!tail_call_pending && ir->leaffunc && !(pushed_registers & (1u << R_LR)) &&
+      tcc_ir_call_saves_lr_itself(ir, &ir->compact_instructions[call_idx]))
+  {
+    if (stack_size || dyn_extra)
+      tcc_ice("noreturn call with stack arguments in a leaf function");
+    ot_check(th_push((uint16_t)((scratch_push_sp_bias() & 4 ? 0 : 1u << R3) | (1u << ARM_LR))));
+  }
+
   /* === Emit call === */
+  tcc_gen_machine_flush_chain();
   if (vfp_xfer)
     ot_check(th_vldmstm(vfp_load, 0, R0, 0, (1u << vfp_xfer) - 1u, 0));
   else if (tail_call_pending || !thumb_inline_aligned_copy_call(ir, func_mop, ctx.args, ctx.argc))
@@ -3395,11 +3611,26 @@ static int rehearsal_max_growth_between(TCCIRState *ir, int from_ir, int to_ir)
   return pads * align_pad_max;
 }
 
+/* Is instruction k a call of an -minline-atomics compare-exchange? */
+static int ir_call_is_inline_cas(TCCIRState *ir, int k)
+{
+  IRQuadCompact *q = &ir->compact_instructions[k];
+  if (q->op != TCCIR_OP_FUNCCALLVAL)
+    return 0;
+  IROperand f = tcc_ir_op_get_src1(ir, q);
+  Sym *sym = irop_get_tag(f) == IROP_TAG_SYMREF ? irop_get_sym_ex(ir, f) : NULL;
+  return sym && !strncmp(get_tok_str(sym->v, NULL), "__tcc_ax_cas", 12);
+}
+
 /* Upper bound on how many bytes the real pass can shed, relative to the
  * rehearsal, strictly between two IR instructions.  The rehearsal emits every
  * branch wide and never fuses CBZ, so the only shrink sources are:
  *   - a wide branch narrowed to its 16-bit form            (4 -> 2, saves 2)
- *   - a CMP+B.W pair fused into a single CBZ/CBNZ          (6 -> 2, saves 4)
+ *   - a jump over code-free ops dropped, or one a JUMPIF   (4 -> 0, saves 4)
+ *     inverts over (not when that JUMPIF is the one being fused: a CBZ
+ *     keeps its plain form, and the jump with it)
+ *   - a CMP+B.W pair fused into a single CBZ/CBNZ          (6 -> 2, saves 4;
+ *     an inline CAS's `cmp status, #0; beq.w`: up to 8 -> 2)
  *   - a word-alignment pad the rehearsal needed and the real pass does not
  * Only a JUMPIF right after its CMP or TEST_ZERO can be fused, which is the
  * shape the codegen.c peepholes look for (NOPs between are skipped there too);
@@ -3411,18 +3642,39 @@ static int rehearsal_max_growth_between(TCCIRState *ir, int from_ir, int to_ir)
 static int rehearsal_max_shrink_between(TCCIRState *ir, int from_ir, int to_ir)
 {
   int shrink = 0;
-  int prev_op = TCCIR_OP_NOP;
-  for (int k = from_ir; k >= 0 && prev_op == TCCIR_OP_NOP; k--)
-    prev_op = ir->compact_instructions[k].op;
+  int prev_op = TCCIR_OP_NOP, prev2 = -1; /* prev2: the instruction before prev_op's */
+  for (int k = from_ir; k >= 0 && prev2 < 0; k--)
+  {
+    if (ir->compact_instructions[k].op == TCCIR_OP_NOP)
+      continue;
+    if (prev_op == TCCIR_OP_NOP)
+      prev_op = ir->compact_instructions[k].op;
+    else
+      prev2 = k;
+  }
   for (int k = from_ir + 1; k < to_ir; k++)
   {
     TccIrOp op = (TccIrOp)ir->compact_instructions[k].op;
     if (op == TCCIR_OP_JUMPIF)
-      shrink += (prev_op == TCCIR_OP_CMP || prev_op == TCCIR_OP_TEST_ZERO) ? 4 : 2;
+    {
+      /* An inline CAS's fused test (thumb_inline_atomic_call) sheds its
+       * whole `cmp status, #0; beq.w` for a CBZ: 6 bytes when that CMP is
+       * wide. */
+      if (prev_op == TCCIR_OP_CMP || prev_op == TCCIR_OP_TEST_ZERO)
+        shrink += prev2 >= 0 && ir_call_is_inline_cas(ir, prev2) ? 6 : 4;
+      else
+        shrink += 2;
+    }
     else if (op == TCCIR_OP_JUMP || op == TCCIR_OP_RETURNVALUE || op == TCCIR_OP_RETURNVOID)
-      shrink += 2;
+      shrink += tcc_ir_codegen_jump_may_drop(ir, k, from_ir) ? 4 : 2; /* dropped, or narrowed */
     if (op != TCCIR_OP_NOP)
+    {
+      int last = k - 1;
+      while (last >= 0 && ir->compact_instructions[last].op == TCCIR_OP_NOP)
+        last--;
+      prev2 = prev_op == TCCIR_OP_NOP ? -1 : last;
       prev_op = op;
+    }
   }
   /* ... a window the -Os outliner calls instead, and a pad the rehearsal
    * needed can be gone (parity flipped back). */
@@ -3458,19 +3710,32 @@ static int rehearsal_range_has_asm(TCCIRState *ir, int from_ir, int to_ir)
  *
  * The fusion itself removes 6 bytes (CMP + wide branch) and puts back 2 at the
  * branch site, which is why the base offset is dry_dist - 8 rather than the
- * dry_dist - 4 that plain narrowing uses. */
+ * dry_dist - 4 that plain narrowing uses.  target_ir == next_instruction_index
+ * is the epilogue, where the rehearsal's body ended. */
 ST_FUNC int tcc_gen_machine_cbz_forward_ok(int32_t target_ir, int current_ir_idx)
+{
+  return cbz_forward_ok_biased(target_ir, current_ir_idx, -8);
+}
+
+/* The same for a CBZ whose real offset is the rehearsal's distance from
+ * current_ir_idx to target_ir plus `bias` (less what the range sheds). */
+static int cbz_forward_ok_biased(int32_t target_ir, int current_ir_idx, int bias)
 {
   TCCIRState *ir = tcc_state->ir;
   if (!ir || !ir->codegen_cbz_dry_mapping || !ir->codegen_dry_pool_entries)
     return 0;
   if (current_ir_idx < 0 || target_ir <= current_ir_idx)
     return 0;
-  if (target_ir >= ir->ir_to_code_mapping_size || target_ir >= ir->next_instruction_index)
+  const int to_epilogue = target_ir == ir->next_instruction_index;
+  if (to_epilogue ? ir->codegen_rehearsal_end == 0
+                  : target_ir >= ir->ir_to_code_mapping_size || target_ir >= ir->next_instruction_index)
     return 0;
 
   const uint32_t *dry = ir->codegen_cbz_dry_mapping;
-  int dry_dist = (int)dry[target_ir] - (int)dry[current_ir_idx];
+  const uint32_t dry_target = to_epilogue ? ir->codegen_rehearsal_end : dry[target_ir];
+  const int pool_at_target =
+      to_epilogue ? (int)ir->codegen_rehearsal_end_pool_entries : (int)ir->codegen_dry_pool_entries[target_ir];
+  int dry_dist = (int)dry_target - (int)dry[current_ir_idx];
   if (dry_dist < 0)
     return 0;
 
@@ -3481,8 +3746,8 @@ ST_FUNC int tcc_gen_machine_cbz_forward_ok(int32_t target_ir, int current_ir_idx
     jump_ir++;
   if (jump_ir >= target_ir || ir->compact_instructions[jump_ir].op != TCCIR_OP_JUMPIF)
     return 0;
-  int max_offset = dry_dist - 8 + rehearsal_max_growth_between(ir, current_ir_idx, target_ir);
-  int min_offset = dry_dist - 8 - rehearsal_max_shrink_between(ir, jump_ir, target_ir);
+  int max_offset = dry_dist + bias + rehearsal_max_growth_between(ir, current_ir_idx, target_ir);
+  int min_offset = dry_dist + bias - rehearsal_max_shrink_between(ir, jump_ir, target_ir);
   if (min_offset < 0 || max_offset > 126)
     return 0;
   if (rehearsal_range_has_asm(ir, current_ir_idx, target_ir))
@@ -3493,8 +3758,7 @@ ST_FUNC int tcc_gen_machine_cbz_forward_ok(int32_t target_ir, int current_ir_idx
    * can_narrow_forward_branch. */
   if (th_literal_pool_would_flush_for(2))
     return 0;
-  int entries_in_range =
-      (int)ir->codegen_dry_pool_entries[target_ir] - (int)ir->codegen_dry_pool_entries[current_ir_idx];
+  int entries_in_range = pool_at_target - (int)ir->codegen_dry_pool_entries[current_ir_idx];
   if (entries_in_range < 0)
     return 0;
   /* The emitter flushes when th_pool_span_after() reaches the range limit,
@@ -3533,8 +3797,9 @@ static int pool_flush_growth_bound(int entries_in_range)
  * where the epilogue begins — so the same monotonicity argument applies: the
  * real pass is never larger, so a distance that fits in the rehearsal fits for
  * real.  Same pool-flush bound as the forward case, using the running entry
- * total at the end of the function. */
-static int can_narrow_epilogue_branch(int32_t target_ir, int current_ir_idx)
+ * total at the end of the function.  A conditional branch gets here only
+ * with target_ir == next_instruction_index. */
+static int can_narrow_epilogue_branch(int32_t target_ir, int is_conditional, int current_ir_idx)
 {
   TCCIRState *ir = tcc_state->ir;
   /* A jump to the end label (target == next_instruction_index) lands on the
@@ -3553,7 +3818,8 @@ static int can_narrow_epilogue_branch(int32_t target_ir, int current_ir_idx)
     return 0;
   const int est_offset =
       dry_dist - 4 + rehearsal_max_growth_between(ir, current_ir_idx, ir->next_instruction_index - 1);
-  if (!branch_fits_t2(est_offset))
+  int (*const fits)(int) = is_conditional ? branch_fits_t1 : branch_fits_t2;
+  if (!fits(est_offset))
     return 0;
   if (rehearsal_range_has_asm(ir, current_ir_idx, ir->next_instruction_index - 1))
     return 0;
@@ -3564,14 +3830,13 @@ static int can_narrow_epilogue_branch(int32_t target_ir, int current_ir_idx)
   /* Bound the pool pressure over the whole remaining body: entries added from
    * here to the last instruction is the most that can accumulate before the
    * epilogue. */
-  int last = ir->next_instruction_index - 1;
-  int entries_in_range = (int)ir->codegen_dry_pool_entries[last] -
-                         (int)ir->codegen_dry_pool_entries[current_ir_idx];
+  int entries_in_range =
+      (int)ir->codegen_rehearsal_end_pool_entries - (int)ir->codegen_dry_pool_entries[current_ir_idx];
   if (entries_in_range < 0)
     return 0;
   int pressure = th_pool_span_after(8) + dry_dist + entries_in_range * 4;
   if (pressure >= THUMB_POOL_RANGE_LIMIT - THUMB_POOL_FLUSH_SLACK &&
-      !branch_fits_t2(est_offset + pool_flush_growth_bound(entries_in_range)))
+      !fits(est_offset + pool_flush_growth_bound(entries_in_range)))
     return 0;
 
   return 1;
@@ -3632,7 +3897,7 @@ ST_FUNC int tcc_gen_machine_jump_mop(TccIrOp op, int32_t target_ir, int ir_idx)
 
   /* Real pass: try narrow encoding, backward first then forward */
   if (can_narrow_backward_branch(target_ir, 0, ir_idx) || can_narrow_forward_branch(target_ir, 0, ir_idx) ||
-      can_narrow_epilogue_branch(target_ir, ir_idx))
+      can_narrow_epilogue_branch(target_ir, 0, ir_idx))
   {
     ot_check(th_b_t2(0)); /* 16-bit unconditional */
     return 2;
@@ -3656,7 +3921,8 @@ ST_FUNC int tcc_gen_machine_conditional_jump_mop(int32_t condition, TccIrOp op, 
   }
 
   /* Real pass: try narrow encoding, backward first then forward */
-  if (can_narrow_backward_branch(target_ir, 1, ir_idx) || can_narrow_forward_branch(target_ir, 1, ir_idx))
+  if (can_narrow_backward_branch(target_ir, 1, ir_idx) || can_narrow_forward_branch(target_ir, 1, ir_idx) ||
+      can_narrow_epilogue_branch(target_ir, 1, ir_idx))
   {
     ot_check(th_b_t1(cond, 0)); /* 16-bit conditional */
     return 2;
@@ -3711,10 +3977,49 @@ ST_FUNC int tcc_gen_machine_frame_top_offset(void)
   return allocated_stack_size;
 }
 
-/* Set static chain register: R10 = this frame's top (emit_frame_top). */
-ST_FUNC void tcc_gen_machine_set_chain(void)
+/* The static chain the next call passes, recorded by SET_CHAIN (which the
+ * frontend emits right before the FUNCCALL) and written to R10 only at the
+ * branch: the call's argument code may still read captures through our own
+ * chain.  -1: none pending. */
+static int pending_chain_level = -1;
+
+/* SET_CHAIN: the next call passes the static chain at `level`
+ * (nested_chain_level). */
+ST_FUNC void tcc_gen_machine_set_chain(int level)
 {
-  emit_frame_top(architecture_config.static_chain_reg);
+  pending_chain_level = level;
+}
+
+ST_FUNC void tcc_gen_machine_chain_reset(void)
+{
+  pending_chain_level = -1;
+}
+
+/* reg = the static chain at `level`: this frame's top for 0, else our
+ * incoming chain (R10, which holds it between calls in a function with a
+ * chain) walked up level - 1 frames through each frame's saved chain at its
+ * top - 4. */
+static void emit_chain_level(int reg, int level)
+{
+  if (level <= 0)
+  {
+    emit_frame_top(reg);
+    return;
+  }
+  const int chain_reg = architecture_config.static_chain_reg;
+  if (reg != chain_reg)
+    ot_check_mov_reg(reg, chain_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+  for (int h = 1; h < level; h++)
+    load_from_base(reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 4 /* abs */, 1 /* negative */, reg);
+}
+
+/* Write the pending chain to R10, just before the branch. */
+ST_FUNC void tcc_gen_machine_flush_chain(void)
+{
+  const int level = pending_chain_level;
+  pending_chain_level = -1;
+  if (level >= 0)
+    emit_chain_level(architecture_config.static_chain_reg, level);
 }
 
 /* Reload static chain register from the chain save slot (frame offset -4).
@@ -3737,7 +4042,7 @@ ST_FUNC void tcc_gen_machine_restore_chain(void)
 
 /* Store this frame's top into chain slot in .data for nested function trampoline.
  * src1 carries the chain slot symbol via SYMREF so we can emit a relocation. */
-ST_FUNC void tcc_gen_machine_init_chain_slot(IROperand src1)
+ST_FUNC void tcc_gen_machine_init_chain_slot(IROperand src1, int level)
 {
   /* Extract the chain slot Sym* from the IROperand */
   Sym *chain_sym = irop_get_sym(src1);
@@ -3751,10 +4056,10 @@ ST_FUNC void tcc_gen_machine_init_chain_slot(IROperand src1)
   _lfc_sym = chain_sym;
   load_full_const(scratch.reg, PREG_NONE, 0, 0);
 
-  /* STR top, [scratch, #0] — store this frame's top (the static chain the
-   * trampoline hands the nested function, emit_frame_top) into the slot */
+  /* STR chain, [scratch, #0] — store the static chain the trampoline hands
+   * the nested function (emit_chain_level) into the slot */
   ScratchRegAlloc top = get_scratch_reg_with_save(1u << scratch.reg);
-  emit_frame_top(top.reg);
+  emit_chain_level(top.reg, level);
   ot_check_str_imm(top.reg, scratch.reg, 0, 6, ENFORCE_ENCODING_NONE);
 
   /* Restore scratch registers */
@@ -4573,6 +4878,205 @@ ST_FUNC int tcc_gen_machine_reg_block_copy(int src_base, int32_t src_off, int ds
   if (add_dst.size)
     ot_check(add_dst);
   ot_check(stm);
+  return 1;
+}
+
+/* Registers free at instruction `idx` outside `excl`. */
+static uint32_t block_copy_free_at(TCCIRState *ir, int idx, uint32_t excl)
+{
+  uint32_t set = 0;
+  for (;;)
+  {
+    const int r = tcc_ls_find_free_scratch_reg(&ir->ls, idx, excl | set, ir->leaffunc);
+    if (r < 0 || r == PREG_NONE || r >= 16 || ((excl | set) & (1u << (uint32_t)r)))
+      return set;
+    set |= 1u << (uint32_t)r;
+  }
+}
+
+/* One word access `reg <-> [base, #off]` as the encoder lays it out (size 0
+ * when it does not encode). */
+static thumb_opcode interleaved_copy_word(int reg, int base, int32_t off, int is_store)
+{
+  const int neg = off < 0;
+  const int a = neg ? -off : off;
+  return is_store ? th_str_imm(reg, base, a, neg ? 4 : 6, ENFORCE_ENCODING_NONE)
+                  : th_ldr_imm(reg, base, a, neg ? 4 : 6, ENFORCE_ENCODING_NONE);
+}
+
+/* The copy as LDRD/STRD pairs through `ra`/`rb`, a lone last word as LDR/STR.
+ * Returns its size (and *insns), emitting it when `emit`; -1 when an address
+ * does not encode. */
+static int interleaved_copy_pairs(int base, int32_t src, int32_t dst, int nwords, int ra, int rb, int emit,
+                                  int *insns)
+{
+  int size = 0;
+  *insns = 0;
+  for (int w = 0; w < nwords; w += 2)
+  {
+    const int32_t so = src + 4 * w, d = dst + 4 * w;
+    thumb_opcode l, s;
+    if (w + 1 < nwords)
+    {
+      l = th_ldrd_imm(ra, rb, base, so < 0 ? -so : so, so < 0 ? 4 : 6);
+      s = th_strd_imm(ra, rb, base, d < 0 ? -d : d, d < 0 ? 4 : 6);
+    }
+    else
+    {
+      l = interleaved_copy_word(ra, base, so, 0);
+      s = interleaved_copy_word(ra, base, d, 1);
+    }
+    if (!l.size || !s.size)
+      return -1;
+    size += l.size + s.size;
+    *insns += 2;
+    if (emit)
+    {
+      ot_check(l);
+      ot_check(s);
+    }
+  }
+  return size;
+}
+
+/* The copy as chunks of at most `k` words through regs[0..k):
+ *   add rA, base, #src (rA in the list; none at offset 0); ldm rA, {..}
+ *   add rB, base, #dst (first chunk only); stmia rB!, {..}
+ * The words are spread evenly over the chunks, so none holds a lone word.
+ * Returns its size (and *insns), emitting it when `emit`; -1 when an address
+ * does not encode or a chunk would hold one word. */
+static int interleaved_copy_chunks(int base, int32_t src, int32_t dst, int nwords, const int *regs, int k, int rb,
+                                   int emit, int *insns)
+{
+  const int nchunks = (nwords + k - 1) / k;
+  int size = 0, w = 0;
+  *insns = 0;
+  for (int chunk = 0; chunk < nchunks; chunk++)
+  {
+    const int n = (nwords - w) / (nchunks - chunk);
+    if (n < 2)
+      return -1;
+    uint32_t list = 0;
+    int all_low = 1, la = -1;
+    for (int i = 0; i < n; i++)
+    {
+      list |= 1u << (uint32_t)regs[i];
+      if (regs[i] > R7)
+        all_low = 0;
+      else if (regs[i] > la)
+        la = regs[i];
+    }
+    if (la < 0)
+      la = regs[0];
+    const int32_t so = src + 4 * w;
+    thumb_opcode a = {0}, b = {0}, ldm, stm;
+    if (so != 0)
+    {
+      a = so < 0 ? th_sub_imm(la, base, (uint32_t)-so, flags_safe(), ENFORCE_ENCODING_NONE)
+                 : th_add_imm(la, base, (uint32_t)so, flags_safe(), ENFORCE_ENCODING_NONE);
+      if (!a.size)
+        return -1;
+      ldm = all_low && la <= R7 ? (thumb_opcode){.size = 2, .opcode = 0xC800u | ((uint32_t)la << 8) | list}
+                                : (thumb_opcode){.size = 4, .opcode = ((0xE890u | (uint32_t)la) << 16) | list};
+    }
+    else /* the base itself, which stays: no writeback, so the wide form */
+      ldm = (thumb_opcode){.size = 4, .opcode = ((0xE890u | (uint32_t)base) << 16) | list};
+    if (chunk == 0)
+    {
+      b = dst < 0 ? th_sub_imm(rb, base, (uint32_t)-dst, flags_safe(), ENFORCE_ENCODING_NONE)
+                  : th_add_imm(rb, base, (uint32_t)dst, flags_safe(), ENFORCE_ENCODING_NONE);
+      if (!b.size)
+        return -1;
+    }
+    stm = all_low && rb <= R7 ? (thumb_opcode){.size = 2, .opcode = 0xC000u | ((uint32_t)rb << 8) | list}
+                              : (thumb_opcode){.size = 4, .opcode = ((0xE8A0u | (uint32_t)rb) << 16) | list};
+    size += a.size + ldm.size + b.size + stm.size;
+    *insns += (a.size != 0) + 1 + (b.size != 0) + 1;
+    if (emit)
+    {
+      if (a.size)
+        ot_check(a);
+      ot_check(ldm);
+      if (b.size)
+        ot_check(b);
+      ot_check(stm);
+    }
+    w += n;
+  }
+  return size;
+}
+
+/* Is plan (insns, size) better than (best_insns, best_size)?  Fewer
+ * instructions first, smaller code first under -Os. */
+static int interleaved_copy_better(int insns, int size, int best_insns, int best_size)
+{
+  if (size < 0)
+    return 0;
+  if (TCC_OPT(tcc_state, optimize_size))
+    return size < best_size || (size == best_size && insns < best_insns);
+  return insns < best_insns || (insns == best_insns && size < best_size);
+}
+
+/* A word copy the IR does one word at a time -- `ldr rW,[base,#src+4k];
+ * str rW,[base,#dst+4k]`, each word dying at its store -- with the scan having
+ * proven that no store lands on a word a later load reads.  The words then may
+ * move in pairs (LDRD/STRD) or chunks (LDM/STM) through the run's own
+ * registers and those free at both of its ends: nothing inside the run writes
+ * anything else, so those are free throughout.  The base is never one of them.
+ * Returns 0, having emitted nothing, when no plan beats the word-at-a-time
+ * copy. */
+ST_FUNC int tcc_gen_machine_interleaved_word_copy(int base, int32_t src_off, int32_t dst_off, int nwords,
+                                                  uint32_t word_regs, int start_idx, int end_idx)
+{
+  TCCIRState *ir = tcc_state->ir;
+  if (!ir || nwords < 2 || base < 0 || base >= 16 || base == R_SP || (src_off & 3) || (dst_off & 3))
+    return 0;
+  const uint32_t excl = (1u << (uint32_t)base) | (1u << R_SP) | (1u << R_PC) | scratch_global_exclude;
+  const uint32_t freeset = (word_regs & ~excl) |
+                           (block_copy_free_at(ir, start_idx, excl) & block_copy_free_at(ir, end_idx, excl));
+  if (__builtin_popcount(freeset) < 2)
+    return 0;
+
+  int plain = 0;
+  for (int w = 0; w < nwords; w++)
+  {
+    const int l = interleaved_copy_word(R0, base, src_off + 4 * w, 0).size;
+    const int s = interleaved_copy_word(R0, base, dst_off + 4 * w, 1).size;
+    if (!l || !s)
+      return 0;
+    plain += l + s;
+  }
+  int best = 0, best_insns = 2 * nwords, best_size = plain + 1;
+  int best_k = 0, regs_low[16], nlow = 0, regs_all[16], nall = 0, ins;
+  const int rb = __builtin_ctz(freeset);
+  for (int r = 0; r < 16; r++)
+    if (r != rb && (freeset & (1u << (uint32_t)r)))
+    {
+      regs_all[nall++] = r;
+      if (r <= R7)
+        regs_low[nlow++] = r;
+    }
+  const int pa = __builtin_ctz(freeset), pb = __builtin_ctz(freeset & ~(1u << (uint32_t)pa));
+  int sz = interleaved_copy_pairs(base, src_off, dst_off, nwords, pa, pb, 0, &ins);
+  if (interleaved_copy_better(ins, sz, best_insns, best_size))
+    best = 1, best_insns = ins, best_size = sz;
+  for (int k = 2; k <= nall && k <= nwords; k++)
+  {
+    sz = interleaved_copy_chunks(base, src_off, dst_off, nwords, regs_all, k, rb, 0, &ins);
+    if (interleaved_copy_better(ins, sz, best_insns, best_size))
+      best = 2, best_k = k, best_insns = ins, best_size = sz;
+    if (k > nlow || rb > R7)
+      continue;
+    sz = interleaved_copy_chunks(base, src_off, dst_off, nwords, regs_low, k, rb, 0, &ins);
+    if (interleaved_copy_better(ins, sz, best_insns, best_size))
+      best = 3, best_k = k, best_insns = ins, best_size = sz;
+  }
+  if (!best || best_insns >= 2 * nwords || best_size > plain)
+    return 0;
+  if (best == 1)
+    interleaved_copy_pairs(base, src_off, dst_off, nwords, pa, pb, 1, &ins);
+  else
+    interleaved_copy_chunks(base, src_off, dst_off, nwords, best == 2 ? regs_all : regs_low, best_k, rb, 1, &ins);
   return 1;
 }
 

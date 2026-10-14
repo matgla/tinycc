@@ -1431,6 +1431,11 @@ ST_FUNC void vstore(void)
 
     if (delayed_cast)
     {
+      /* The source may still be an unloaded lvalue: its LOAD below is built
+       * from the destination type, so keep the qualifier that says it is
+       * volatile (as gen_cast does at `done:`). */
+      if (vtop->type.t & VT_VOLATILE)
+        vtop->volatile_access = 1;
       vtop->r |= BFVAL(VT_MUSTCAST, (sbt == VT_LLONG) + 1);
       // tcc_warning("deley cast %x -> %x", sbt, dbt);
       vtop->type.t = ft & VT_TYPE;
@@ -1488,7 +1493,10 @@ ST_FUNC void vstore(void)
       {
         int op = TCCIR_OP_STORE;
 
-        /* Keep the original destination type for a 64-bit store. */
+        /* Keep the original destination type for a 64-bit store.  The bare
+         * basic type drops VT_VOLATILE, so record it on the operand first. */
+        if (vtop[-1].type.t & VT_VOLATILE)
+          vtop[-1].volatile_access = 1;
         vtop[-1].type.t = dbt;
 
         /* Match the single-word behavior: local vreg destinations use ASSIGN. */

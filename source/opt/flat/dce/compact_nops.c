@@ -42,6 +42,7 @@ int tcc_ir_opt_compact_nops(TCCIRState *ir)
   }
   if (!has_nops)
     return 0;
+  tcc_ir_label_sync(ir);
 
   /* Build old_to_new mapping and compact in one forward pass */
   int *old_to_new = tcc_malloc(n * sizeof(int));
@@ -205,6 +206,7 @@ int tcc_ir_opt_compact_nops(TCCIRState *ir)
 
   ir->next_instruction_index = write_pos;
   tcc_ir_frame_scope_remap(ir, old_to_new, n, write_pos);
+  tcc_ir_asm_mark_targets(ir);
 
   tcc_free(old_to_new);
 

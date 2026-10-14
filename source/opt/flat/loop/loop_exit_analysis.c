@@ -95,11 +95,16 @@ int find_loop_exit_condition(TCCIRState *ir, IRLoop *loop, int iv_vreg, int *out
 
       int limit = (int)irop_get_imm64_ex(ir, cmp_src2);
 
-      /* Next instruction must be JUMPIF */
-      IRQuadCompact *jq = &ir->compact_instructions[i + 1];
+      /* Flag fusion leaves NOPs between the comparison and its branch. */
+      int ji = i + 1;
+      while (ji <= loop->end_idx && ir->compact_instructions[ji].op == TCCIR_OP_NOP)
+        ji++;
+      if (ji > loop->end_idx)
+        continue;
+      IRQuadCompact *jq = &ir->compact_instructions[ji];
       if (jq->op != TCCIR_OP_JUMPIF)
       {
-        LOG_LOOP_OPT("[%d] CMP ok but [%d] is op=%d (not JUMPIF)", i, i + 1, jq->op);
+        LOG_LOOP_OPT("[%d] CMP ok but [%d] is op=%d (not JUMPIF)", i, ji, jq->op);
         continue;
       }
 
@@ -113,9 +118,9 @@ int find_loop_exit_condition(TCCIRState *ir, IRLoop *loop, int iv_vreg, int *out
       if (jmp_target > loop->end_idx)
       {
         LOG_LOOP_OPT("[%d] FOUND top-tested exit: CMP VAR%d,#%d JUMPIF@%d exit=%d cond=%d", i,
-                     TCCIR_DECODE_VREG_POSITION(iv_vreg), limit, i + 1, jmp_target, cond);
+                     TCCIR_DECODE_VREG_POSITION(iv_vreg), limit, ji, jmp_target, cond);
         *out_cmp_idx = i;
-        *out_jmpif_idx = i + 1;
+        *out_jmpif_idx = ji;
         *out_limit = limit;
         *out_cond = cond;
         *out_exit_target = jmp_target;
@@ -125,7 +130,7 @@ int find_loop_exit_condition(TCCIRState *ir, IRLoop *loop, int iv_vreg, int *out
       /* Bottom-tested (rotated): JUMPIF is the back-edge, exit is fall-through; invert cond. */
       if (jmp_target >= loop->start_idx && jmp_target <= loop->end_idx)
       {
-        int exit_target = i + 2; /* fall-through past the JUMPIF */
+        int exit_target = ji + 1; /* fall-through past the JUMPIF */
         int inv_cond;
         switch (cond)
         {
@@ -169,9 +174,9 @@ int find_loop_exit_condition(TCCIRState *ir, IRLoop *loop, int iv_vreg, int *out
           continue;
         }
         LOG_LOOP_OPT("[%d] FOUND bottom-tested exit: CMP VAR%d,#%d JUMPIF@%d back=%d exit=%d cond=%d->%d", i,
-                     TCCIR_DECODE_VREG_POSITION(iv_vreg), limit, i + 1, jmp_target, exit_target, cond, inv_cond);
+                     TCCIR_DECODE_VREG_POSITION(iv_vreg), limit, ji, jmp_target, exit_target, cond, inv_cond);
         *out_cmp_idx = i;
-        *out_jmpif_idx = i + 1;
+        *out_jmpif_idx = ji;
         *out_limit = limit;
         *out_cond = inv_cond;
         *out_exit_target = exit_target;

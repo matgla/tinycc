@@ -17,6 +17,7 @@
 #include "opt_xform.h"
 #include "opt_utils.h"
 #include "opt_loop_utils.h"
+#include "opt_range.h"
 
 
 /* Taint-track the derived-IV address value; return 1 iff it never escapes to memory (docs/bugs.md #2, va-arg-24). */
@@ -178,6 +179,45 @@ static void sr_rewrite_indexed_through(TCCIRState *ir, IRQuadCompact *q, IROpera
   q->operand_base = operand_base;
 }
 
+/* transform_derived_iv evaluates the base once, in the preheader.  A base
+ * that reads memory -- a deref, a global or frame slot, an address-taken
+ * VAR -- has the same value on every iteration only when the loop writes no
+ * memory and calls nothing; a vreg base's own defs are checked separately. */
+static int sr_memory_base_invariant(TCCIRState *ir, IRLoop *loop, IROperand base)
+{
+  /* A VAR's own slot (`V`, is_local) changes only at V's defs unless its
+   * address is taken (a PARAM likewise); any other lvalue reads memory. */
+  int32_t vr = irop_get_vreg(base);
+  int own_slot = vr >= 0 &&
+                 (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR ||
+                  TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_PARAM) &&
+                 !base.is_llocal &&
+                 (base.is_local || !base.is_lval);
+  int reads_memory = base.is_lval || base.is_llocal;
+  if (own_slot)
+  {
+    IRLiveInterval *vi = tcc_ir_get_live_interval(ir, vr);
+    reads_memory = !vi || vi->addrtaken || vi->is_volatile;
+  }
+  if (!reads_memory)
+    return 1;
+  if (tcc_ir_access_is_volatile(ir, base))
+    return 0;
+  const uint32_t writes = IR_HZ_CALL | IR_HZ_CALL_SEQ | IR_HZ_MEM_WRITE | IR_HZ_UPDATES_SRC | IR_HZ_ASM |
+                          IR_HZ_NONLOCAL | IR_HZ_CHAIN | IR_HZ_VLA | IR_HZ_VOLATILE | IR_HZ_DEST_LVAL |
+                          IR_HZ_DEST_STACKOFF;
+  for (int i = loop->start_idx; i <= loop->end_idx && i < ir->next_instruction_index; i++)
+    if (ir_q_hazards(ir, &ir->compact_instructions[i], writes))
+      return 0;
+  for (int b = 0; b < loop->num_body_instrs; b++)
+  {
+    int i = loop->body_instrs[b];
+    if (i >= 0 && i < ir->next_instruction_index && ir_q_hazards(ir, &ir->compact_instructions[i], writes))
+      return 0;
+  }
+  return 1;
+}
+
 /* Does the derived address use at use_idx read the IV after its in-loop update
  * at def_idx, in the same iteration -- the update and then a straight run of
  * code reaching the use?  That is the one shape whose `ptr += stride`
@@ -226,6 +266,12 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
   /* Shared-pointer rewrites unsupported (no escape analysis for the duplicate's use site); defer to re-detection (docs/bugs.md #2). */
   if (shared_ptr_vreg >= 0)
     return 0;
+
+  if (!sr_memory_base_invariant(ir, loop, div->base_op))
+  {
+    LOG_IV_SR("IV_SR: Skipping DIV transform — base reads memory the loop may write");
+    return 0;
+  }
 
   /* Bail if the DIV's address value can reach a memory access or escape the register domain; scan the full body range including the detached body_instrs (va-arg-24). */
   if (div->use_idx >= 0 && div->use_idx < ir->next_instruction_index)

@@ -757,6 +757,7 @@ void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   out.instrs = tcc_mallocz(out.cap * sizeof(IRQuadCompact));
   out.wp = 0;
   out.pool_wp = ir->iroperand_pool_count;
+  tcc_ir_label_sync(ir);
   int *old_to_new = tcc_malloc(old_n * sizeof(int));
 
   RAPhiPredIndex phi_pred_idx;
@@ -948,6 +949,8 @@ void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
       if (tgt >= 0 && tgt < wp) new_instrs[tgt].is_jump_target = 1;
     }
   }
+
+  tcc_ir_asm_mark_targets(ir);
 
   /* The remaining steps (live-interval remap/extend, live_regs bitmap)
    * only apply when phi resolution runs after register allocation.
@@ -1428,6 +1431,15 @@ static int ra_co_class_gapless(const SSAInterval *intervals, const int *iv_of, c
   tcc_free(st);
   return ok;
 }
+/* Longest class (end - start, in instructions) that merges into an enclosing
+ * class without the pressure test.  The scan spills by use count, so a long
+ * inner class with many uses makes the merged class a register the whole outer
+ * range keeps, and the hot values around it spill instead (Zig's Wyhash.hash:
+ * +124 bytes, +8k instructions per kernel battery with no limit).  kernel.c
+ * .text / the IR + gcc-torture corpus at -O2 against no nested merges:
+ * 32 +270 / -300, 64 -14 / -596, 256 -534 / -1,740, 512 -664 / -1,864 B. */
+#define RA_CO_NEST_SPAN 256
+
 void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
                               int max_vreg_pos)
 {
@@ -2081,6 +2093,18 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
         int stop = 0;
         RA_CO_FOR_NEIGHBOR(c, x, stop, { (void)x; cdeg[c]++; });
       }
+      /* Extent [lo, hi] and crosses-call flag of every class: the interval its
+       * representative occupies once Stage 5 applies the class. */
+      const int nested = !tcc_ir_opt_pass_disabled("ra:co_nested");
+      uint32_t *clo = tcc_malloc(sizeof(uint32_t) * ncand);
+      uint32_t *chi = tcc_malloc(sizeof(uint32_t) * ncand);
+      uint8_t *cxc = tcc_malloc(ncand);
+      for (int c = 0; c < ncand; c++) {
+        const SSAInterval *iv = &intervals[iv_of[cand_vidx[c]]];
+        clo[c] = iv->start;
+        chi[c] = iv->end;
+        cxc[c] = iv->crosses_call ? 1 : 0;
+      }
       #define UF_FIND(x) ({ int _r = (x); while (parent[_r] != _r) { parent[_r] = parent[parent[_r]]; _r = parent[_r]; } _r; })
 
       /* K for the Briggs degree test = number of allocatable int regs. */
@@ -2088,6 +2112,7 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
       if (K <= 0 || K > 13) K = 13;
 
       int merged = 0;
+      for (int sweep = 0; sweep < (nested ? 2 : 1); sweep++)
       for (int ei = 0; ei < ne; ei++) {
         int ca = cand_id[edge_d[ei]], cb = cand_id[edge_s[ei]];
         if (ca < 0 || cb < 0) continue;
@@ -2110,6 +2135,24 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
         if (ia->r1 >= 0 || ib->r1 >= 0) continue;
         if (ia->addrtaken || ib->addrtaken || ia->precolored >= 0 || ib->precolored >= 0) continue;
         if (ia->is_param || ib->is_param) continue;
+        /* Nested extents: a class inside the other's [lo, hi] (crossing a call
+         * only if the outer one does) merges without the pressure test below.
+         * The merged class occupies exactly the outer interval and the inner
+         * one's register is freed, so the linear scan never sees more live
+         * intervals at any point.  This is the loop IV's `t <- i+1; i' <- t`
+         * chain inside the IV's own interval: an IV inlined into a large
+         * function has 13+ significant neighbors (everything live across the
+         * loop) and kept `adds rT, rI, #1; mov rI, rT` per iteration
+         * (get_file_header's ComponentIterator scans).  A second sweep retries
+         * only these merges: the bump and its copy are not nested in each
+         * other, but both are in the IV's class once the copy has joined it. */
+        int nest = 0;
+        if (nested && ia->reg_type == LS_REG_TYPE_INT) {
+          int in_b = clo[rb] >= clo[ra] && chi[rb] <= chi[ra] && (!cxc[rb] || cxc[ra]);
+          int in_a = clo[ra] >= clo[rb] && chi[ra] <= chi[rb] && (!cxc[ra] || cxc[rb]);
+          nest = (in_b && chi[rb] - clo[rb] <= RA_CO_NEST_SPAN) || (in_a && chi[ra] - clo[ra] <= RA_CO_NEST_SPAN);
+        }
+        if (sweep && !nest) continue;
         /* non-interference: no member of class ra interferes with class rb */
         int interferes = 0;
         for (int m = ra; m >= 0 && !interferes; m = mnext[m]) {
@@ -2124,7 +2167,7 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
          * Counting all distinct neighbor classes (not just high-degree ones) is a
          * safe over-approximation of Briggs; the IV web has few neighbors so it
          * still coalesces, while high-pressure webs are correctly left alone. */
-        {
+        if (!nest) {
           /* Neighbor classes are weighted by register footprint (INT = 1,
            * LLONG pair = 2), and a pair-class merge needs a free adjacent
            * pair, so its headroom threshold drops by one.  DOUBLE_SOFT
@@ -2162,6 +2205,9 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
         parent[rb] = ra;
         if (briggs)
           cdeg[ra] += cdeg[rb];
+        if (clo[rb] < clo[ra]) clo[ra] = clo[rb];
+        if (chi[rb] > chi[ra]) chi[ra] = chi[rb];
+        cxc[ra] |= cxc[rb];
         if (rank[ra] == rank[rb]) rank[ra]++;
         int tail = ra; while (mnext[tail] >= 0) tail = mnext[tail];
         mnext[tail] = rb;
@@ -2238,6 +2284,7 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
       RA_DBG("coalesce: %d candidates, %d edges, %d unions (level=%d)", ncand, ne, merged, level);
 
       tcc_free(parent); tcc_free(rank); tcc_free(mnext); tcc_free(seen); if (cdeg) tcc_free(cdeg);
+      tcc_free(clo); tcc_free(chi); tcc_free(cxc);
       #undef UF_FIND
     }
     if (pass == 1) { tcc_free(adj_start); tcc_free(adj); tcc_free(imat); }

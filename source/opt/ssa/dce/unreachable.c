@@ -26,7 +26,7 @@ int dce_unreachable(IRSSAOptCtx *ctx)
   for (int i = 0; i < n; i++)
     if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
       return 0;
-  /* Likewise `asm goto`: its labels are edges the IR does not record. */
+  /* This instruction worklist does not enumerate the CFG's asm-goto edges. */
   if (ir->func_has_asm_goto)
     return 0;
 

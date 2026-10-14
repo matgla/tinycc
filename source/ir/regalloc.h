@@ -65,3 +65,5 @@ int ra_thread_known_branches(struct TCCIRState *ir);
 int ra_fold_phi_const_chain(struct TCCIRState *ir);
 int ra_fuse_umaal(struct TCCIRState *ir);
 int ra_exit_sink(struct TCCIRState *ir);
+int ra_load_sink(struct TCCIRState *ir);
+int ra_return_sink(struct TCCIRState *ir);

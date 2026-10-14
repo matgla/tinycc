@@ -188,8 +188,10 @@ int tcc_ir_opt_add_deref_fold(TCCIRState *ir)
 
     /* Skip 64-bit and struct loads: LOAD_INDEXED uses LDRD which requires
      * 4-byte alignment.  Packed structs can place 64-bit fields at
-     * unaligned offsets, causing a HardFault. */
-    if (load_btype == IROP_BTYPE_INT64 || load_btype == IROP_BTYPE_FLOAT64 || load_btype == IROP_BTYPE_STRUCT)
+     * unaligned offsets, causing a HardFault.  A _Complex value is two
+     * halves (btype + is_complex), which a single-register load drops. */
+    if (load_btype == IROP_BTYPE_INT64 || load_btype == IROP_BTYPE_FLOAT64 || load_btype == IROP_BTYPE_STRUCT ||
+        use_op.is_complex)
       continue;
 
     IROperand load_dest = dest;

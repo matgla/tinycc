@@ -438,6 +438,42 @@ static int cpt_try_fold_binop(CPTCtx *c, int i)
   return 1;
 }
 
+/* `#0 OR x`, `x ADD #0`, `x SHL #0`, ...: a 32-bit identity becomes a copy of
+ * the register operand.  The late loop unroller leaves these where an
+ * accumulator's #0 start value meets the first iteration (`x = 0 | a ^ b`). */
+static int cpt_try_fold_identity(CPTCtx *c, int i)
+{
+  TCCIRState *ir = c->ir;
+  IRQuadCompact *q = &ir->compact_instructions[i];
+  int op = q->op;
+  if (op != TCCIR_OP_OR && op != TCCIR_OP_XOR && op != TCCIR_OP_ADD && op != TCCIR_OP_SUB &&
+      op != TCCIR_OP_SHL && op != TCCIR_OP_SHR && op != TCCIR_OP_SAR)
+    return 0;
+  if (tcc_ir_barrel_shift_at(ir, q))
+    return 0;
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+  IROperand s1 = tcc_ir_op_get_src1(ir, q);
+  IROperand s2 = tcc_ir_op_get_src2(ir, q);
+  IROperand keep;
+  if (irop_is_immediate(s2) && !s2.is_sym && irop_get_imm64_ex(ir, s2) == 0)
+    keep = s1;
+  else if (irop_is_immediate(s1) && !s1.is_sym && irop_get_imm64_ex(ir, s1) == 0 &&
+           (op == TCCIR_OP_OR || op == TCCIR_OP_XOR || op == TCCIR_OP_ADD))
+    keep = s2;
+  else
+    return 0;
+  /* A plain register read of the result's own width: no memory operand, no
+   * extension or truncation hiding in the copy. */
+  if (irop_is_immediate(keep) || keep.is_lval || keep.is_sym || keep.is_local || keep.is_llocal ||
+      irop_get_vreg(keep) < 0 || dest.is_lval || irop_get_btype(keep) != IROP_BTYPE_INT32 ||
+      irop_get_btype(dest) != IROP_BTYPE_INT32)
+    return 0;
+  q->op = TCCIR_OP_ASSIGN;
+  tcc_ir_set_src1(ir, i, keep);
+  tcc_ir_set_src2_none(ir, i);
+  return 1;
+}
+
 static int cpt_try_cmp_setif_fold(CPTCtx *c, int i)
 {
   TCCIRState *ir = c->ir;
@@ -654,6 +690,7 @@ int tcc_ir_opt_const_prop_tmp_core(TCCIRState *ir)
     changes += cpt_propagate_src1(&ctx, i);
     changes += cpt_propagate_src2(&ctx, i);
     changes += cpt_try_fold_binop(&ctx, i);
+    changes += cpt_try_fold_identity(&ctx, i);
     changes += cpt_try_cmp_setif_fold(&ctx, i);
 
     int did_continue = 0;

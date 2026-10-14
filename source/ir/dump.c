@@ -595,7 +595,7 @@ void tcc_ir_dump_compact(TCCIRState *ir, IRQuadCompact *q, int pc, FILE *out)
     fprintf(out, "%s ", tcc_ir_get_op_name((TccIrOp)op));
     break;
   case TCCIR_OP_SET_CHAIN:
-    fprintf(out, "%s /* R10 <- FP */ ", tcc_ir_get_op_name((TccIrOp)op));
+    fprintf(out, "%s /* R10 <- chain level */ ", tcc_ir_get_op_name((TccIrOp)op));
     break;
   case TCCIR_OP_FUNCPARAMVAL:
     fprintf(out, "%s%d[call_%d] ", tcc_ir_get_op_name((TccIrOp)op), TCCIR_DECODE_PARAM_IDX(irop_get_imm64_ex(ir, src2)),

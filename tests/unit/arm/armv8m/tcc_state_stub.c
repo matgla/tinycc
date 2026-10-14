@@ -121,3 +121,23 @@ void tcc_state_free(TCCState *s)
   /* Do nothing. */
 }
 #endif /* UT_SSA_OPT_REAL */
+
+/* r0/r1 aggregate returns (arm-thumb-emit.c gfunc_regpair_ret, elfsym.c
+ * gfunc_regpair_address_sym and gfunc_regpair_asm_sym): weak, for the binaries that link either half
+ * without the other.  No function returns in r0/r1 in them. */
+__attribute__((weak)) int gfunc_regpair_ret(Sym *fsym)
+{
+  (void)fsym;
+  return 0;
+}
+
+__attribute__((weak)) Sym *gfunc_regpair_address_sym(Sym *sym)
+{
+  return sym;
+}
+
+__attribute__((weak)) Sym *gfunc_regpair_asm_sym(Sym *sym, int how)
+{
+  (void)how;
+  return sym;
+}

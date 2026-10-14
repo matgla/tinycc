@@ -124,6 +124,10 @@ static void patch_type(Sym *sym, CType *type)
 
   if (IS_ASM_SYM(sym))
   {
+    /* An asm label that C now declares a function: asm already names it,
+     * so its body keeps the AAPCS convention (gfunc_regpair_ret). */
+    if ((type->t & VT_BTYPE) == VT_FUNC)
+      sym->a.regpair_ret = REGPAIR_RET_NO;
     /* stay static if both are static */
     sym->type.t = type->t & (sym->type.t | ~VT_STATIC);
     sym->type.ref = type->ref;
@@ -154,6 +158,7 @@ static void patch_type(Sym *sym, CType *type)
         static_proto |= VT_INLINE;
     }
 
+    Sym *old_ref = sym->type.ref;
     if (0 == (type->t & VT_EXTERN))
     {
       struct FuncAttr f = sym->type.ref->f;
@@ -168,10 +173,26 @@ static void patch_type(Sym *sym, CType *type)
       sym->type.t &= ~VT_INLINE | static_proto;
     }
 
-    if (sym->type.ref->f.func_type == FUNC_OLD && type->ref->f.func_type != FUNC_OLD
-        && !local_scope)
+    /* An old-style definition met by a prototype, in either order: the
+     * symbol keeps the definition's parameters -- its body (and an inline
+     * replay of it) binds their names and declared types -- and calls take
+     * the prototype (knr_call_type). */
+    if (!local_scope && sym->type.ref->f.func_type == FUNC_OLD && sym->type.ref->next &&
+        old_ref->f.func_type != FUNC_OLD && sym->type.ref != old_ref)
     {
-      sym->type.ref = type->ref;
+      merge_funcattr(&old_ref->f, &sym->type.ref->f);
+      sym_facts(sym)->knr_proto = old_ref;
+    }
+    else if (sym->type.ref->f.func_type == FUNC_OLD && type->ref->f.func_type != FUNC_OLD && !local_scope)
+    {
+      if (sym->type.ref->next)
+      {
+        merge_funcattr(&sym->type.ref->f, &type->ref->f);
+        merge_funcattr(&type->ref->f, &sym->type.ref->f);
+        sym_facts(sym)->knr_proto = type->ref;
+      }
+      else
+        sym->type.ref = type->ref;
     }
   }
   else
@@ -200,6 +221,7 @@ void patch_storage(Sym *sym, AttributeDef *ad, CType *type)
     tcc_error("incompatible dll linkage for redefinition of '%s'", get_tok_str(sym->v, NULL));
 #endif
   merge_symattr(&sym->a, &ad->a);
+  gfunc_regpair_check_redecl(sym);
   /* Note: func_pure/func_const attributes are handled in external_sym
    * and in the function type symbol (type.ref->f), not in sym->f.
    * We don't merge ad->f into sym->f here to avoid corrupting function
@@ -349,6 +371,8 @@ static int resolve_alias_symbol(Sym *alias_sym, int target_tok, int report_error
   target_sym = find_global_alias_target_sym(target_tok);
   if (target_sym == alias_sym)
     tcc_error("'%s' is part of alias cycle", get_tok_str(alias_sym->v, NULL));
+  /* An alias reaches an r0/r1 function as a pointer would: by its adapter. */
+  target_sym = gfunc_regpair_address_sym(target_sym);
   if (!target_sym || target_sym->c <= 0)
     goto not_found;
 
@@ -377,6 +401,13 @@ static void queue_alias_symbol(Sym *alias_sym, int target_tok)
 
 void apply_alias_attribute(Sym *alias_sym, int target_tok)
 {
+  /* Its callers must use the convention of the body it names.  A function
+   * already r0/r1 has a body of its own: like gcc, defining it both normally
+   * and as an alias is an error. */
+  if (alias_sym->a.regpair_ret == REGPAIR_RET_YES)
+    tcc_error("'%s' defined both normally and as 'alias' attribute", get_tok_str(alias_sym->v, NULL));
+  if (alias_sym->a.regpair_ret == REGPAIR_RET_UNKNOWN)
+    alias_sym->a.regpair_ret = REGPAIR_RET_NO;
   if (!resolve_alias_symbol(alias_sym, target_tok, 0))
     queue_alias_symbol(alias_sym, target_tok);
 }
@@ -390,6 +421,20 @@ void mark_pending_alias_targets_used(void)
     Sym *target = find_global_alias_target_sym(pending_aliases[i].target_tok);
     if (target)
       target->a.used = 1;
+  }
+}
+
+/* The adapters the pending aliases of r0/r1 functions resolve to: made now,
+ * and kept, so gfunc_regpair_emit_adapters emits them before the aliases are
+ * resolved. */
+void regpair_adapt_pending_aliases(void)
+{
+  for (int i = 0; i < nb_pending_aliases; i++)
+  {
+    Sym *target = find_global_alias_target_sym(pending_aliases[i].target_tok);
+    Sym *adapter = gfunc_regpair_address_sym(target);
+    if (adapter && adapter != target)
+      adapter->a.used = 1;
   }
 }
 

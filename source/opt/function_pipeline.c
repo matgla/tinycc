@@ -133,13 +133,13 @@ static void run_store_load_fwd_passes(TCCIRState *ir)
   /* Redirect copied-local-field loads to their source global BEFORE store-load
    * forwarding collapses the copy field-stores; the redirected global loads then
    * CSE with the independent source loads and the self-comparisons fold. */
-  if (TCC_OPT(tcc_state, opt_store_load_fwd) && !ir->has_static_chain)
+  if (TCC_OPT(tcc_state, opt_store_load_fwd) && !tcc_ir_frame_shared_with_nested(ir))
   {
     if (tcc_ir_opt_copy_source_load_fwd(ir))
       tcc_ir_opt_cmp_expr_fold(ir);
     DUMP_IR_AFTER_PASS(ir, "ZZ_csfwd");
   }
-  if (TCC_OPT(tcc_state, opt_store_load_fwd) && !ir->has_static_chain)
+  if (TCC_OPT(tcc_state, opt_store_load_fwd) && !tcc_ir_frame_shared_with_nested(ir))
   {
     IROptCtx esp_ctx;
     tcc_ir_opt_ctx_init(&esp_ctx, ir);
@@ -153,7 +153,7 @@ static void run_store_load_fwd_passes(TCCIRState *ir)
     tcc_ir_opt_struct_copy_roundtrip_elim(ir);
   }
 
-  if (TCC_OPT(tcc_state, opt_store_load_fwd) && !ir->has_static_chain)
+  if (TCC_OPT(tcc_state, opt_store_load_fwd) && !tcc_ir_frame_shared_with_nested(ir))
   {
     IROptCtx sl_ctx;
     tcc_ir_opt_ctx_init(&sl_ctx, ir);
@@ -162,7 +162,7 @@ static void run_store_load_fwd_passes(TCCIRState *ir)
   }
   DUMP_IR_AFTER_PASS(ir, "memory_group");
 
-  if (TCC_OPT(tcc_state, opt_store_load_fwd) && !ir->has_static_chain)
+  if (TCC_OPT(tcc_state, opt_store_load_fwd) && !tcc_ir_frame_shared_with_nested(ir))
   {
     tcc_ir_opt_param_addrof_const_fold(ir);
     DUMP_IR_AFTER_PASS(ir, "ZZ_padrof");

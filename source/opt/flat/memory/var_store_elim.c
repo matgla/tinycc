@@ -302,8 +302,10 @@ static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
 
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_FUNCCALLVOID ||
         q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
-        q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_SWITCH_TABLE)
+        q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_IJUMP ||
+        (q->op == TCCIR_OP_INLINE_ASM && ir->func_has_asm_goto))
     {
+      /* An IJUMP or an asm goto leaves for a label no JUMP names. */
       cur_epoch++;
       continue;
     }
@@ -346,15 +348,19 @@ static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
         if (pos <= max_var)
         {
-          if (var_addr_taken[pos / 8] & (1 << (pos % 8)))
-          {
-            pending_epoch[pos] = 0;
-            continue;
-          }
           if (pending_epoch[pos] == cur_epoch)
           {
             ir->compact_instructions[pending[pos]].op = TCCIR_OP_NOP;
             changes++;
+          }
+          /* A def with a volatile access of its own is never deletable, and
+           * neither is a def of a volatile VAR: that is a store to its slot,
+           * which no lvalue operand of q records. */
+          if ((var_addr_taken[pos / 8] & (1 << (pos % 8))) || tcc_ir_instr_access_is_volatile(ir, q) ||
+              tcc_ir_operand_names_volatile_var(ir, tcc_ir_op_get_dest(ir, q)))
+          {
+            pending_epoch[pos] = 0;
+            continue;
           }
           pending[pos] = i;
           pending_epoch[pos] = cur_epoch;

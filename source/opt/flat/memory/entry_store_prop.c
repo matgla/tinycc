@@ -159,13 +159,23 @@ static int esp_is_derivation(TccIrOp op)
          op == TCCIR_OP_SELECT || op == TCCIR_OP_LOAD || op == TCCIR_OP_STORE;
 }
 
-/* Calls fn(ctx, addr, i) for every escaping use of a frame address.  Returns 0
- * when the vreg map could not be built (caller must assume everything escapes). */
-static int esp_for_each_escape(TCCIRState *ir, void (*fn)(void *, EspAddr, int), void *ctx)
+/* Fold a frame offset to the start of the object holding it, so pointers into
+ * one object at different offsets (`&s.a`, `&s.b`, `p++`) merge as ONE. */
+static int64_t esp_object_base(TCCIRState *ir, int64_t off)
+{
+  int lo, hi;
+  if (tcc_ir_frame_object_at(ir, (int)off, &lo, &hi))
+    return lo;
+  return off;
+}
+
+/* Builds M: for every vreg, which frame object (if any) its value may point
+ * into, flow-insensitively over all its definitions.  Returns 0 when the
+ * fixpoint was not reached (M is then incomplete).  esp_free_map releases it. */
+static int esp_build_map(TCCIRState *ir, EspAddrMap *m)
 {
   int n = ir->next_instruction_index;
-  EspAddrMap m;
-  memset(&m, 0, sizeof m);
+  memset(m, 0, sizeof *m);
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -181,12 +191,12 @@ static int esp_for_each_escape(TCCIRState *ir, void (*fn)(void *, EspAddr, int),
       if (vr < 0)
         continue;
       int t = TCCIR_DECODE_VREG_TYPE(vr), p = TCCIR_DECODE_VREG_POSITION(vr);
-      if (t >= 1 && t <= 3 && p > m.max[t])
-        m.max[t] = p;
+      if (t >= 1 && t <= 3 && p > m->max[t])
+        m->max[t] = p;
     }
   }
   for (int t = 1; t <= 3; t++)
-    m.v[t] = tcc_mallocz(sizeof(EspAddr) * (m.max[t] + 1));
+    m->v[t] = tcc_mallocz(sizeof(EspAddr) * (m->max[t] + 1));
 
   /* Propagate to a fixpoint: a VAR can be defined after a use (loops). The
      lattice NONE < ONE < MANY bounds the rounds. */
@@ -202,16 +212,37 @@ static int esp_for_each_escape(TCCIRState *ir, void (*fn)(void *, EspAddr, int),
       IROperand d = tcc_ir_op_get_dest(ir, q);
       if (!irop_dest_defines_vreg(d))
         continue;
-      EspAddr *ds = esp_slot(&m, irop_get_vreg(d));
+      EspAddr *ds = esp_slot(m, irop_get_vreg(d));
       if (!ds)
         continue;
-      if (irop_config[q->op].has_src1)
-        changed |= esp_merge(ds, esp_operand_addr(&m, tcc_ir_op_get_src1(ir, q)));
-      if (irop_config[q->op].has_src2)
-        changed |= esp_merge(ds, esp_operand_addr(&m, tcc_ir_op_get_src2(ir, q)));
+      for (int k = 1; k <= 2; k++)
+      {
+        if (!(k == 1 ? irop_config[q->op].has_src1 : irop_config[q->op].has_src2))
+          continue;
+        IROperand src = k == 1 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+        EspAddr a = esp_operand_addr(m, src);
+        if (a.state == ESP_ONE && irop_get_vreg(src) < 0)
+          a.off = esp_object_base(ir, a.off);
+        changed |= esp_merge(ds, a);
+      }
     }
   }
-  int ok = !changed;
+  return !changed;
+}
+
+static void esp_free_map(EspAddrMap *m)
+{
+  for (int t = 1; t <= 3; t++)
+    tcc_free(m->v[t]);
+}
+
+/* Calls fn(ctx, addr, i) for every escaping use of a frame address.  Returns 0
+ * when the vreg map could not be built (caller must assume everything escapes). */
+static int esp_for_each_escape(TCCIRState *ir, void (*fn)(void *, EspAddr, int), void *ctx)
+{
+  int n = ir->next_instruction_index;
+  EspAddrMap m;
+  int ok = esp_build_map(ir, &m);
 
   for (int i = 0; ok && i < n; i++)
   {
@@ -247,8 +278,7 @@ static int esp_for_each_escape(TCCIRState *ir, void (*fn)(void *, EspAddr, int),
     }
   }
 
-  for (int t = 1; t <= 3; t++)
-    tcc_free(m.v[t]);
+  esp_free_map(&m);
   return ok;
 }
 
@@ -923,75 +953,109 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
     }
   }
 
-  /* Phase 2.5: invalidate entries for later pointer stores through LEA-resolved TEMPs (idx-gated). */
+  /* Phase 2.5: invalidate entries for later stores through pointers (idx-gated).
+     A store whose target the LEA map pins (every vreg on the chain has one
+     definition) kills the entries it overlaps.  Any other store through a
+     pointer -- one the LEA map cannot follow (a VAR copied from another VAR, a
+     LOAD) or one it binds only as a may-alias -- kills every entry of each
+     frame object the escape map says that pointer may point into. */
   {
+    EspAddrMap pm;
+    int pm_ok = esp_build_map(ir, &pm);
     for (int j = 0; j < n; j++)
     {
       IRQuadCompact *eq = &ir->compact_instructions[j];
       if (eq->op != TCCIR_OP_STORE && eq->op != TCCIR_OP_STORE_INDEXED && eq->op != TCCIR_OP_STORE_POSTINC)
         continue;
       IROperand sd = tcc_ir_op_get_dest(ir, eq);
+      int32_t dv = irop_get_vreg(sd);
+      int64_t soff = 0x7FFFFFFFLL;
+      int exact = 0;
       if (eq->op == TCCIR_OP_STORE_INDEXED && sd.is_local && !sd.is_lval && !sd.is_llocal &&
           irop_get_tag(sd) == IROP_TAG_STACKOFF)
       {
         if (!tcc_ir_op_src2_is_imm(ir, eq) || tcc_ir_op_src2_is_sym(ir, eq))
-          continue;
+          continue; /* runtime index: Phase 2.6 */
         IROperand scale_op = ir->iroperand_pool[eq->operand_base + 3];
         int scale = (int)irop_get_imm64_ex(ir, scale_op);
-        int64_t soff = irop_get_stack_offset(sd) + (tcc_ir_op_src2_imm(ir, eq) << scale);
+        soff = irop_get_stack_offset(sd) + (tcc_ir_op_src2_imm(ir, eq) << scale);
+        exact = 1;
+      }
+      else if (dv < 0 || (eq->op == TCCIR_OP_STORE && irop_dest_defines_vreg(sd)))
+        continue; /* a direct slot (Phase 1.5) or a vreg definition, not a store through one */
+      else if (!sd.is_local)
+      {
+        SimpleLeaEntry *le = NULL;
+        int dp = TCCIR_DECODE_VREG_POSITION(dv);
+        if (TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP && dp <= max_tmp && lea_map[dp].valid)
+          le = &lea_map[dp];
+        else if (TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_VAR && dp <= max_var && var_lea_map[dp].valid)
+          le = &var_lea_map[dp];
+        if (le)
+        {
+          soff = le->offset;
+          exact = !le->maybe;
+          if (eq->op == TCCIR_OP_STORE_INDEXED)
+          {
+            if (tcc_ir_op_src2_is_imm(ir, eq) && !tcc_ir_op_src2_is_sym(ir, eq))
+            {
+              IROperand scale_op = ir->iroperand_pool[eq->operand_base + 3];
+              int scale = (int)irop_get_imm64_ex(ir, scale_op);
+              soff += (tcc_ir_op_src2_imm(ir, eq) << scale);
+            }
+            else
+            {
+              soff = 0x7FFFFFFFLL; /* runtime index off a known base: Phase 2.6, and the object below */
+              exact = 0;
+            }
+          }
+        }
+      }
+      if (soff != 0x7FFFFFFFLL)
+      {
+        /* Overlap, not exact offset: a byte store into a word entry kills it too. */
+        int ssz = ir_opt_store_btype_size_bytes(irop_get_btype(sd));
+        int64_t s_end = soff + (ssz > 0 ? ssz : 1);
         for (int k = 0; k < estore_count; k++)
         {
-          if (j > estores[k].idx && estores[k].offset == soff)
+          if (estores[k].offset == 0x7FFFFFFFLL || j <= estores[k].idx)
+            continue;
+          int esz = ir_opt_store_btype_size_bytes(estores[k].btype);
+          int64_t e_end = estores[k].offset + (esz > 0 ? esz : 1);
+          if (estores[k].offset < s_end && soff < e_end)
           {
-            LOG_IR_GEN("ENTRY_STORE_PROP: invalidated off=%lld (direct indexed store at i=%d)",
-                       (long long)soff, j);
+            LOG_IR_GEN("ENTRY_STORE_PROP: invalidated off=%lld (ptr store via LEA at i=%d)",
+                       (long long)estores[k].offset, j);
             estores[k].offset = 0x7FFFFFFFLL;
           }
         }
-        continue;
       }
-      if (sd.is_local)
+      if (exact || dv < 0)
         continue;
-      /* STORE_INDEXED / STORE_POSTINC always write through their base; disp_fusion clears is_lval, so don't skip on it. */
-      if (!sd.is_lval && eq->op == TCCIR_OP_STORE)
-        continue;
-      int32_t dv = irop_get_vreg(sd);
-      if (dv < 0)
-        continue;
-      int64_t soff;
-      if (TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP)
+      /* The pointer's target is not pinned: kill every object it may reach. */
+      EspAddr pa = {0, ESP_MANY};
+      if (pm_ok)
       {
-        int dp = TCCIR_DECODE_VREG_POSITION(dv);
-        if (dp > max_tmp || !lea_map[dp].valid)
-          continue;
-        soff = lea_map[dp].offset;
+        EspAddr *ps = esp_slot(&pm, dv);
+        pa = ps ? *ps : (EspAddr){0, ESP_NONE};
       }
-      else if (TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_VAR)
-      {
-        int dp = TCCIR_DECODE_VREG_POSITION(dv);
-        if (dp > max_var || !var_lea_map[dp].valid)
-          continue;
-        soff = var_lea_map[dp].offset;
-      }
-      else
-        continue;
-      if (eq->op == TCCIR_OP_STORE_INDEXED)
-      {
-        if (!tcc_ir_op_src2_is_imm(ir, eq))
-          continue;
-        IROperand scale_op = ir->iroperand_pool[eq->operand_base + 3];
-        int scale = (int)irop_get_imm64_ex(ir, scale_op);
-        soff += (tcc_ir_op_src2_imm(ir, eq) << scale);
-      }
+      if (pa.state == ESP_NONE)
+        continue; /* no frame address ever reaches this pointer */
+      int lo = 0, hi = 0;
+      int whole = pa.state == ESP_MANY || !tcc_ir_frame_object_at(ir, (int)pa.off, &lo, &hi);
       for (int k = 0; k < estore_count; k++)
       {
-        if (j > estores[k].idx && estores[k].offset == soff)
+        if (estores[k].offset == 0x7FFFFFFFLL || j <= estores[k].idx)
+          continue;
+        if (whole || (estores[k].offset >= lo && estores[k].offset < hi))
         {
-          LOG_IR_GEN("ENTRY_STORE_PROP: invalidated off=%lld (ptr store via LEA at i=%d)", (long long)soff, j);
+          LOG_IR_GEN("ENTRY_STORE_PROP: invalidated off=%lld (store at i=%d through a pointer into [%d,%d))",
+                     (long long)estores[k].offset, j, lo, hi);
           estores[k].offset = 0x7FFFFFFFLL;
         }
       }
     }
+    esp_free_map(&pm);
     ESTORE_COMPACT();
   }
   if (estore_count == 0)
@@ -1371,6 +1435,28 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
   return changes;
 }
 
+/* The entry-block LOAD before `before` that defines TEMP `vr` from a word of
+ * the incoming stack arguments (a split struct's stack word copied into its
+ * home, params.c), or -1. */
+static int phf_stack_word_load(TCCIRState *ir, int before, int32_t vr)
+{
+  for (int j = before - 1; j >= 0; j--)
+  {
+    IRQuadCompact *lq = &ir->compact_instructions[j];
+    if (lq->op == TCCIR_OP_NOP || !irop_config[lq->op].has_dest || tcc_ir_op_dest_vreg(ir, lq) != vr)
+      continue;
+    if (lq->op != TCCIR_OP_LOAD)
+      return -1;
+    IROperand a = tcc_ir_op_get_src1(ir, lq);
+    if (irop_get_tag(a) != IROP_TAG_STACKOFF || !a.is_param || !a.is_lval || a.is_llocal || irop_get_vreg(a) >= 0 ||
+        irop_get_btype(a) != IROP_BTYPE_INT32 || irop_is_64bit(a) || a.is_complex || irop_get_stack_offset(a) < 0 ||
+        tcc_ir_access_is_volatile(ir, a))
+      return -1;
+    return j;
+  }
+  return -1;
+}
+
 // Immutable, unescaped parameter homes can use their incoming word values.
 #define PHF_MAX 32
 int tcc_ir_opt_param_home_fwd(TCCIRState *ir)
@@ -1386,6 +1472,7 @@ int tcc_ir_opt_param_home_fwd(TCCIRState *ir)
   struct PhfHome
   {
     int off, idx, bad, keep;
+    int def; /* the defining stack-word LOAD of a TEMP value, else -1 */
     IROperand p;
   } h[PHF_MAX];
   int nh = 0;
@@ -1405,8 +1492,18 @@ int tcc_ir_opt_param_home_fwd(TCCIRState *ir)
         tcc_ir_access_is_volatile(ir, d))
       continue;
     int32_t pv = irop_get_vreg(s);
-    if (pv < 0 || TCCIR_DECODE_VREG_TYPE(pv) != TCCIR_VREG_TYPE_PARAM || s.is_lval || s.is_local || s.is_llocal ||
-        irop_get_btype(s) != IROP_BTYPE_INT32 || irop_is_64bit(s) || s.is_complex)
+    if (pv < 0 || s.is_lval || s.is_local || s.is_llocal || irop_get_btype(s) != IROP_BTYPE_INT32 ||
+        irop_is_64bit(s) || s.is_complex)
+      continue;
+    /* A PARAM vreg, or a TEMP holding an incoming stack word. */
+    int def = -1;
+    if (TCCIR_DECODE_VREG_TYPE(pv) == TCCIR_VREG_TYPE_TEMP)
+    {
+      def = phf_stack_word_load(ir, i, pv);
+      if (def < 0)
+        continue;
+    }
+    else if (TCCIR_DECODE_VREG_TYPE(pv) != TCCIR_VREG_TYPE_PARAM)
       continue;
     const int off = irop_get_stack_offset(d);
     if (off & 3)
@@ -1416,7 +1513,7 @@ int tcc_ir_opt_param_home_fwd(TCCIRState *ir)
       if (h[k].off == off)
         dup = h[k].bad = 1;
     if (!dup)
-      h[nh++] = (struct PhfHome){.off = off, .idx = i, .bad = 0, .p = s};
+      h[nh++] = (struct PhfHome){.off = off, .idx = i, .bad = 0, .def = def, .p = s};
   }
   if (!nh)
     return 0;
@@ -1449,12 +1546,14 @@ int tcc_ir_opt_param_home_fwd(TCCIRState *ir)
       else if (s == 1) { if (!irop_config[q->op].has_src1) continue; op = tcc_ir_op_get_src1(ir, q); }
       else if (s == 2) { if (!irop_config[q->op].has_src2) continue; op = tcc_ir_op_get_src2(ir, q); }
       else { if (!ir_op_has(q->op, IROP_A_SLOT3)) continue; op = ir->iroperand_pool[q->operand_base + 3]; }
-      /* A parameter vreg written anywhere is not the entry value. */
+      /* A parameter vreg (or stack-word TEMP) written anywhere else is not
+       * the entry value. */
       int32_t vr = irop_get_vreg(op);
-      if (s == 0 && vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_PARAM &&
+      if (s == 0 && vr >= 0 &&
+          (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_PARAM || TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP) &&
           q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCPARAMVOID)
         for (int k = 0; k < nh; k++)
-          if (irop_get_vreg(h[k].p) == vr)
+          if (irop_get_vreg(h[k].p) == vr && h[k].def != i)
             h[k].bad = 1;
       if (irop_get_tag(op) != IROP_TAG_STACKOFF || !op.is_local || op.is_llocal || vr >= 0)
         continue;

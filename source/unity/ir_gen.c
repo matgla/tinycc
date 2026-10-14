@@ -14,6 +14,7 @@
 #include "../ir/gen/live.c"
 #undef USING_GLOBALS
 #include "../ir/gen/params.c"
+#undef PARAM_SPLIT_HOME_MAX_STACK_WORDS
 #undef USING_GLOBALS
 #include "../ir/gen/put.c"
 #undef USING_GLOBALS

@@ -306,7 +306,7 @@ UT_TEST(test_dispatch_set_chain_routes_to_set_chain)
   SValue s_v = sv_var(v);
   SValue s_one = sv_const(1);
   tcc_ir_put(ir, TCCIR_OP_ASSIGN, &s_one, NULL, &s_v);
-  tcc_ir_put(ir, TCCIR_OP_SET_CHAIN, NULL, NULL, NULL);
+  tcc_ir_put(ir, TCCIR_OP_SET_CHAIN, &s_one, NULL, NULL); /* chain level 1 */
   tcc_ir_put(ir, TCCIR_OP_RETURNVALUE, &s_v, NULL, NULL);
 
   tcc_ir_ssa_regalloc(ir, arm_get_regalloc_target(), 0);
@@ -341,7 +341,8 @@ UT_TEST(test_dispatch_init_chain_slot_and_asm_noops)
   SValue s_one = sv_const(1);
   tcc_ir_put(ir, TCCIR_OP_ASSIGN, &s_one, NULL, &s_v);
 
-  tcc_ir_put(ir, TCCIR_OP_INIT_CHAIN_SLOT, &s_v, NULL, NULL);
+  SValue s_level = sv_const(0);
+  tcc_ir_put(ir, TCCIR_OP_INIT_CHAIN_SLOT, &s_v, &s_level, NULL);
   tcc_ir_put(ir, TCCIR_OP_ASM_INPUT, &s_v, NULL, NULL);
   tcc_ir_put(ir, TCCIR_OP_ASM_OUTPUT, NULL, NULL, &s_v);
 

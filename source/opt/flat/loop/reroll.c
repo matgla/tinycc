@@ -210,6 +210,8 @@ static int block_matches(TCCIRState *ir, int base, int P, int k,
     IRQuadCompact *qa = &ir->compact_instructions[base + i];
     IRQuadCompact *qb = &ir->compact_instructions[base + k * P + i];
     if (qa->op != qb->op) return 0;
+    /* barrel fusion runs before reroll: `add s, s, n lsl #2` and `lsl #3` differ only in the side table */
+    if (tcc_ir_barrel_shift_at(ir, qa) != tcc_ir_barrel_shift_at(ir, qb)) return 0;
     /* Reject every branch target in iterations k>=1, i==0 included: an edge landing on an iteration boundary cannot be represented by the single-entry rerolled loop. */
     if (qb->is_jump_target) return 0;
     if (!operand_equiv(ir, tcc_ir_op_get_dest(ir, qa), tcc_ir_op_get_dest(ir, qb), map, internal_defs)) return 0;

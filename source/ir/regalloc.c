@@ -122,7 +122,31 @@ static int *ra_build_real_call_prefix(TCCIRState *ir)
   return prefix;
 }
 
-static int ra_has_call_in_range(const int *prefix, int start, int end, int n)
+/* Prefix of the calls to noreturn callees (counted in both call prefixes
+ * above); NULL when there are none.  No value has to survive such a call:
+ * control never comes back to a use after it, so it must not force a value
+ * whose linear range merely spans the cold block into a callee-saved
+ * register (ra_has_call_in_range subtracts it). */
+static int *ra_build_noreturn_call_prefix(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int *prefix = NULL;
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    int nr = (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL) &&
+             !tcc_ir_call_clobbers_nothing(ir, q) && tcc_ir_cfg_instr_ends_flow(ir, q);
+    if (nr && !prefix) {
+      prefix = tcc_malloc(sizeof(int) * (n + 1));
+      for (int k = 0; k <= i; k++)
+        prefix[k] = 0;
+    }
+    if (prefix)
+      prefix[i + 1] = prefix[i] + nr;
+  }
+  return prefix;
+}
+
+static int ra_has_call_in_range(const int *prefix, const int *noret_prefix, int start, int end, int n)
 {
   if (!prefix || n <= 0)
     return 0;
@@ -130,7 +154,10 @@ static int ra_has_call_in_range(const int *prefix, int start, int end, int n)
   if (end > n) end = n;
   if (end <= start + 1) return 0;
   if (start + 1 >= n) return 0;
-  return (prefix[end] - prefix[start + 1]) != 0;
+  int calls = prefix[end] - prefix[start + 1];
+  if (noret_prefix)
+    calls -= noret_prefix[end] - noret_prefix[start + 1];
+  return calls != 0;
 }
 
 /* Prefix sum of SWITCH_TABLE / SWITCH_LOAD dispatches.  The Thumb lowering of
@@ -225,6 +252,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   int *switch_prefix = ra_build_switch_prefix(ir);
   int *asm_prefix = ra_build_asm_prefix(ir);
   int *real_call_prefix = ra_build_real_call_prefix(ir);
+  int *noret_prefix = ra_build_noreturn_call_prefix(ir);
 
   /* Allocate per-vreg start/end tracking indexed by encoded vreg, in the
    * dense VAR/TEMP/PARAM layout of RaVregIdx. */
@@ -660,6 +688,32 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
     int *taint_root = tcc_malloc(sizeof(int) * table_size);
     for (int i = 0; i < table_size; i++) taint_root[i] = -1;
 
+    /* Pass 0: a local or parameter captured by a nested function of this one
+     * is read and written through the static chain by whatever call runs a
+     * child, from any point of the body, and no instruction here names that
+     * access.  Its slot is the whole function's: with only its own
+     * references, -O0 gave `int p = 4, q = 5, r = 6;` (never read by the
+     * parent) ONE slot, and a captured narrow parameter's home went to the
+     * next local.  First, so that an address stored in a capture (`p = &v`)
+     * keeps its object live as long (pass 1). */
+    for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++) {
+      const NestedFunc *nf = tcc_state->nested_funcs[ni];
+      for (int j = 0; j < nf->nb_captured; j++) {
+        int32_t v_vr = nf->captured_vregs[j];
+        const int vt = v_vr < 0 ? -1 : TCCIR_DECODE_VREG_TYPE(v_vr);
+        if ((vt != TCCIR_VREG_TYPE_VAR && vt != TCCIR_VREG_TYPE_PARAM) ||
+            !tcc_ir_vreg_is_valid(ir, v_vr) ||
+            !nested_capture_owned_by(nf, j, tcc_state->current_nested_func))
+          continue;
+        int vidx = VREG_IDX(v_vr);
+        if (vidx >= table_size || starts[vidx] == INTERVAL_NOT_STARTED)
+          continue;
+        starts[vidx] = 0;
+        if (ends[vidx] < (uint32_t)(n - 1))
+          ends[vidx] = (uint32_t)(n - 1);
+      }
+    }
+
     /* Pass 1: seed taint from direct address-of patterns.
      * Iterate to a fixed point to propagate through chained ASSIGNs. */
     int changed;
@@ -762,28 +816,6 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
         root = taint_root[vidx];
       if (root >= 0 && ends[root] < (uint32_t)(n - 1))
         ends[root] = (uint32_t)(n - 1);
-    }
-
-    /* Pass 3: a local captured by a nested function of this one is read and
-     * written through the static chain by whatever call runs a child, from
-     * any point of the body, and no instruction here names that access.  Its
-     * slot is the whole function's: with only its own references, -O0 gave
-     * `int p = 4, q = 5, r = 6;` (never read by the parent) ONE slot. */
-    for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++) {
-      const NestedFunc *nf = tcc_state->nested_funcs[ni];
-      for (int j = 0; j < nf->nb_captured; j++) {
-        int32_t v_vr = nf->captured_vregs[j];
-        if (v_vr < 0 || TCCIR_DECODE_VREG_TYPE(v_vr) != TCCIR_VREG_TYPE_VAR ||
-            !tcc_ir_vreg_is_valid(ir, v_vr) ||
-            !nested_capture_owned_by(nf, j, tcc_state->current_nested_func))
-          continue;
-        int vidx = VREG_IDX(v_vr);
-        if (vidx >= table_size || starts[vidx] == INTERVAL_NOT_STARTED)
-          continue;
-        starts[vidx] = 0;
-        if (ends[vidx] < (uint32_t)(n - 1))
-          ends[vidx] = (uint32_t)(n - 1);
-      }
     }
 
     tcc_free(taint_root);
@@ -933,6 +965,10 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
       int target = (int)tcc_ir_op_dest_u_imm32(ir, q);
       if (target >= 0 && target < n && target < i)
         RA_EXTEND_BACKEDGE(i, target, 0);
+    } else if (q->op == TCCIR_OP_INLINE_ASM) {
+      for (int k = 0, target; (target = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+        if (target < n && target < i)
+          RA_EXTEND_BACKEDGE(i, target, 0);
     } else if (q->op == TCCIR_OP_IJUMP) {
       if (i > 0)
         RA_EXTEND_BACKEDGE(i, 0, 1);
@@ -1067,9 +1103,9 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
        * r0 across the copy. */
       const int xstart = type == TCCIR_VREG_TYPE_PARAM ? -1
                          : (int)iv->start - (live_in_at_start[idx] ? 1 : 0);
-      iv->crosses_real_call = ra_has_call_in_range(real_call_prefix, xstart, iv->end, n) ? 1 : 0;
+      iv->crosses_real_call = ra_has_call_in_range(real_call_prefix, noret_prefix, xstart, iv->end, n) ? 1 : 0;
       if (!iv->crosses_call) {
-        iv->crosses_call = ra_has_call_in_range(call_prefix, xstart, iv->end, n);
+        iv->crosses_call = ra_has_call_in_range(call_prefix, noret_prefix, xstart, iv->end, n);
         if (!iv->crosses_call && iv->end < (uint32_t)n) {
           TccIrOp eop = ir->compact_instructions[iv->end].op;
           if ((eop == TCCIR_OP_FUNCCALLVAL || eop == TCCIR_OP_FUNCCALLVOID) &&
@@ -1184,6 +1220,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   if (switch_prefix) tcc_free(switch_prefix);
   if (asm_prefix) tcc_free(asm_prefix);
   if (real_call_prefix) tcc_free(real_call_prefix);
+  tcc_free(noret_prefix);
   #undef VREG_IDX
 }
 

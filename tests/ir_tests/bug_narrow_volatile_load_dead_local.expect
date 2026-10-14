@@ -1,0 +1,10 @@
+armed 1
+w_short flag 0
+w_char flag 0
+w_schar flag 0
+w_assign flag 0
+w_array flag 0
+w_bool flag 0
+w_int flag 0
+v_value 22018
+timer ok

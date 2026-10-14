@@ -41,6 +41,8 @@
 
 static int unalias_ldbl(int btype);
 static int is_hgen_float_aggr(CType *type);
+/* The last instruction ot() emitted sat inside an IT block (set in dry and real passes). */
+static int th_ot_last_in_it;
 
 int ot(thumb_opcode op)
 {
@@ -291,6 +293,8 @@ int ot(thumb_opcode op)
       }
     }
   }
+  /* Both passes: frame_word_note must not pair across an IT block's end. */
+  th_ot_last_in_it = op_in_it_block;
 
   tcc_gen_machine_outline_capture(op.opcode, op.size, ind);
 
@@ -324,9 +328,18 @@ int ot(thumb_opcode op)
     }
   }
 
+  const int insn_pos = ind;
   if (op.size == 4)
     o(op.opcode >> 16);
   o(op.opcode & 0xffff);
+  if (thumb_gen_state.generating_function)
+  {
+    th_last_insn.pos = insn_pos;
+    th_last_insn.end = ind;
+    th_last_insn.opcode = op.opcode;
+    th_last_insn.size = op.size;
+    th_last_insn.conditional = op_in_it_block || mov_equiv_it_block_length(op) > 0;
+  }
   return op.size;
 }
 
@@ -453,6 +466,9 @@ int th_patch_call(int t, int a)
   int lt = t;
 
   TRACE("'th_patch_call' t: %.8x, a: %.8x\n", t, a);
+  if (th_widened_contains_mid(a))
+    tcc_ice("branch at 0x%x into the middle of an instruction widened over an alignment pad (0x%x) in %s", lt, a,
+            funcname ? funcname : "?");
 
   t = decbranch(t);
   TRACE("t: %.8x\n", t);
@@ -907,7 +923,12 @@ static int frame_word_base(int base)
 static void frame_word_note(int is_load, int start, thumb_opcode ins, int reg, int base, int fc, int sign)
 {
   frame_word_last.kind = 0;
-  if (!frame_word_base(base) || ins.size == 0 || ind - start != ins.size)
+  /* A conditional access -- the last one of an IT block, whose IT is no longer
+   * pending when the next word comes -- cannot pair with an unconditional
+   * one: `ite eq; ldreq r4,[sp,#40]; ldrne r4,[sp,#36]; ldr r1,[sp,#32]`
+   * became `ldrdne r1,r4,[sp,#32]`, so r1 was loaded on one path only
+   * (the native tcc's frame_objs_apart). */
+  if (th_ot_last_in_it || !frame_word_base(base) || ins.size == 0 || ind - start != ins.size)
     return;
   frame_word_last.kind = is_load ? 2 : 1;
   frame_word_last.start = start;
@@ -1411,6 +1432,116 @@ ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret, int *ret_align, int 
     return 1;
   }
   return 0;
+}
+
+int tcc_ir_params_sret_shift_moves(Sym *func_ref, uint8_t *src, uint8_t *dst, int max); /* ir/gen/params.c */
+
+/* Argument words an adapter moves down one register at most (r1-r3). */
+#define REGPAIR_MAX_MOVES 3
+
+/* An internal function returns an 8-byte, word-aligned aggregate in r0/r1
+ * instead of through a hidden pointer: AAPCS's sret costs the caller the
+ * buffer's address and two reloads and the callee two stores (Zig's ?usize,
+ * E!u32 and []u8 helpers).  Every direct call of a static function is in this
+ * TU and compiled with the body, so both sides agree; any other way to reach
+ * the function -- its address in code or data, an alias, its name in asm --
+ * names an AAPCS adapter instead (gfunc_regpair_address_sym), which needs
+ * the arguments to stay in registers when r0 is freed.  The decision is made
+ * once, at the first call, address or body, and kept -- so only once the
+ * whole TU is parsed (tu_parsed): every declaration, attribute, alias and
+ * top-level asm statement is then known.  Bodies generated while parsing --
+ * all of them at -O0, a few at -O1+ (the bodies saved for the end of the TU
+ * are generated after it) -- keep AAPCS for the functions they call or
+ * define.  The asm of the bodies generated after parsing runs after the
+ * decision, so a name it spells out stays AAPCS (gfunc_regpair_asm_named).  A
+ * GNU extern inline body is static only until the real, external definition
+ * replaces it.  What asm text or a later declaration does to a function
+ * already decided is checked by gfunc_regpair_asm_sym and
+ * gfunc_regpair_check_redecl. */
+static int regpair_ret_eligible(Sym *fsym)
+{
+  Sym *ref = fsym->type.ref;
+  if (!tcc_state->tu_parsed || !(fsym->type.t & VT_STATIC) || (fsym->type.t & VT_EXTERN) || fsym->a.weak ||
+      fsym->a.naked || fsym->a.nested_func || fsym->a.used || ref->f.func_type != FUNC_NEW ||
+      ref->f.func_rewritten_extern_inline || ref->f.func_ctor || ref->f.func_dtor || gfunc_regpair_asm_named(fsym) ||
+      tcc_ir_opt_pass_disabled("abi:regpair_ret"))
+    return 0;
+  CType *rt = &ref->type;
+  if ((rt->t & VT_BTYPE) != VT_STRUCT || (rt->t & (VT_COMPLEX | VT_VECTOR | VT_ARRAY)))
+    return 0;
+  int align, ret_align, regsize;
+  CType ret;
+  if (type_size(rt, &align) != 8 || align < 4 || gfunc_sret(rt, 0, &ret, &ret_align, &regsize) ||
+      gfunc_sret_vfp_words(rt, 0))
+    return 0;
+  uint8_t src[REGPAIR_MAX_MOVES], dst[REGPAIR_MAX_MOVES];
+  return tcc_ir_params_sret_shift_moves(ref, src, dst, REGPAIR_MAX_MOVES) >= 0;
+}
+
+ST_FUNC int gfunc_regpair_ret(Sym *fsym)
+{
+  if (!fsym || (fsym->type.t & VT_BTYPE) != VT_FUNC || !fsym->type.ref || (fsym->v & SYM_FIELD))
+    return 0;
+  if (fsym->a.regpair_ret == REGPAIR_RET_UNKNOWN)
+    fsym->a.regpair_ret = regpair_ret_eligible(fsym) ? REGPAIR_RET_YES : REGPAIR_RET_NO;
+  return fsym->a.regpair_ret == REGPAIR_RET_YES;
+}
+
+/* gfunc_sret for the function FSYM (a direct call of it, or its own body):
+ * an r0/r1 aggregate is one 64-bit register value. */
+ST_FUNC int gfunc_sret_fn(Sym *fsym, CType *vt, int variadic, CType *ret, int *ret_align, int *regsize)
+{
+  if (fsym && gfunc_regpair_ret(fsym))
+  {
+    *ret_align = 4;
+    *regsize = 8;
+    ret->ref = NULL;
+    ret->t = VT_LLONG;
+    return 1;
+  }
+  return gfunc_sret(vt, variadic, ret, ret_align, regsize);
+}
+
+static void regpair_put(thumb_opcode op)
+{
+  if (op.size == 4)
+    o(op.opcode >> 16);
+  o(op.opcode & 0xffff);
+}
+
+/* The AAPCS entry of the r0/r1 function FN, at ADAPTER:
+ *   push {r4, lr}; mov r4, r0; <arguments down one register>; bl FN;
+ *   str r0, [r4]; str r1, [r4, #4]; pop {r4, pc}
+ * Baseline Thumb only, so it runs on every ARMv8-M core. */
+ST_FUNC void gfunc_regpair_emit_adapter(TCCState *s1, Sym *fn, Sym *adapter, Section *sec)
+{
+  uint8_t src[REGPAIR_MAX_MOVES], dst[REGPAIR_MAX_MOVES];
+  const int nmoves = tcc_ir_params_sret_shift_moves(fn->type.ref, src, dst, REGPAIR_MAX_MOVES);
+  Section *saved_sec = cur_text_section;
+  const int saved_ind = ind, saved_nocode = nocode_wanted;
+  cur_text_section = sec;
+  nocode_wanted = 0;
+  ind = (sec->data_offset + 3) & ~3;
+  while ((int)sec->data_offset < ind)
+    *(uint8_t *)section_ptr_add(sec, 1) = 0;
+  const int start = ind;
+  map_sym_t();
+  regpair_put(th_push((1u << R4) | (1u << R_LR)));
+  regpair_put(th_mov_reg(R4, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                         ENFORCE_ENCODING_16BIT, false));
+  for (int i = 0; i < nmoves; i++)
+    regpair_put(th_mov_reg(dst[i], src[i], FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                           ENFORCE_ENCODING_16BIT, false));
+  greloc(cur_text_section, fn, ind, R_ARM_THM_JUMP24);
+  regpair_put(th_bl_t1((uint32_t)-4));
+  regpair_put(th_str_imm(R0, R4, 0, 6, ENFORCE_ENCODING_16BIT));
+  regpair_put(th_str_imm(R1, R4, 4, 6, ENFORCE_ENCODING_16BIT));
+  regpair_put(th_pop((1u << R4) | (1u << R_PC)));
+  sec->data_offset = ind;
+  put_extern_sym(adapter, sec, start + 1, ind - start);
+  cur_text_section = saved_sec;
+  ind = saved_ind;
+  nocode_wanted = saved_nocode;
 }
 
 // are those offsets to allow TREG_R0 start from other register than r0?

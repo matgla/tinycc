@@ -87,7 +87,17 @@ Sym *bci_image_sym(Section *sec, const uint8_t *bytes, int size, const BciReloc 
   addr_t off = section_add(sec, size, 4);
   memcpy(sec->data + off, bytes, size);
   for (int i = 0; i < nrel; i++)
+  {
+    /* A table image can be emitted while nocode_wanted still holds
+     * CODE_OFF_BIT (dead code after the function's last return), where
+     * put_extern_sym silently skips and the reloc sym stays unbound (c=0)
+     * for greloca to reject.  get_sym_ref has the same problem and bypasses
+     * the guard with put_extern_sym2; bind here the same way.  check_only
+     * (a dropped static's diagnostics parse) still emits nothing. */
+    if (rel[i].sym->c <= 0 && !tcc_state->check_only)
+      put_extern_sym2(rel[i].sym, SHN_UNDEF, 0, 0, 1);
     greloc(sec, rel[i].sym, off + rel[i].off, R_DATA_PTR);
+  }
   CType ctype;
   /* const-qualified: nothing ever writes an image, so loads from it fold
    * (global_init_prop). */

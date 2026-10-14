@@ -22,6 +22,19 @@
 #include "ir.h"
 #include "regalloc.h"
 
+/* Does the immediate's value fit an integer of btype bt as it is? */
+static int pcc_imm_fits(TCCIRState *ir, IROperand imm, int bt, int is_unsigned)
+{
+  int64_t k = (int32_t)irop_get_imm64_ex(ir, imm);
+  int bits = bt == IROP_BTYPE_INT8 ? 8 : bt == IROP_BTYPE_INT16 ? 16 : bt == IROP_BTYPE_INT32 ? 32 : 0;
+  if (!bits)
+    return 0;
+  if (bits == 32)
+    return 1;
+  return is_unsigned ? k >= 0 && k < ((int64_t)1 << bits)
+                     : k >= -((int64_t)1 << (bits - 1)) && k < ((int64_t)1 << (bits - 1));
+}
+
 /* Folds the post-ra_resolve_phis chain `T_case <- const_N` + `T_phi <- T_case` (switch-case body plus its phi copy) into a single `T_phi <- const_N`. */
 /* Precondition: T_case has exactly one use and the source is freely duplicable (IMM/SYMREF/STACKOFF/F32 inline payload, F64/I64/SYMREF via pool_idx). */
 /* Rewrites the original def's dest rather than the copy: that keeps the slot carrying the basic-block label and leaves the source operand's in-pool payload intact. */
@@ -145,7 +158,13 @@ int ra_fold_phi_const_chain(TCCIRState *ir)
     int u_dest_bt = irop_get_btype(u_dest);
     int def_dest_bt = tcc_ir_op_dest_btype(ir, def_q);
     int def_src_bt = irop_get_btype(def_src);
-    if (u_dest_bt != def_dest_bt || u_dest_bt != def_src_bt)
+    /* An integer immediate whose value every type on the chain holds as is
+     * moves the same register image whichever of them it is typed as (a
+     * promoted `uint8_t r = k;` arm: a byte-typed constant, a word phi). */
+    int narrow_imm = dtag == IROP_TAG_IMM32 && pcc_imm_fits(ir, def_src, def_src_bt, def_src.is_unsigned) &&
+                     pcc_imm_fits(ir, def_src, u_dest_bt, u_dest.is_unsigned) &&
+                     pcc_imm_fits(ir, def_src, def_dest_bt, tcc_ir_op_get_dest(ir, def_q).is_unsigned);
+    if (u_dest_bt != def_dest_bt || (u_dest_bt != def_src_bt && !narrow_imm))
       continue;
     /* Guards collapsing a narrowing read of a wider T_src. */
     if (irop_get_btype(u_src) != u_dest_bt)

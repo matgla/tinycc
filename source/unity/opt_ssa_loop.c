@@ -16,6 +16,8 @@
 #include "../opt/ssa/loop/iv_strength_reduction.c"
 #undef SSA_IVSR_MAX_PASSES
 #include "../opt/ssa/loop/loop_bottom_test.c"
+#undef LHD_MAX_HEADER
+#undef LHD_MAX_ONTO
 #undef LHD_MAX_PREFIX
 #undef LHD_MAX_REWRITES
 #undef SSA_LBT_MAX_REWRITES

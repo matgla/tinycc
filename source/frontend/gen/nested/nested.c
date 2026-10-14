@@ -22,6 +22,7 @@
  * Split out of tccgen.c; see docs/plan_tccgen_split.md. */
 
 #include "gen_priv.h"
+#include "memory/vector.h"
 
 /* gen_function lives in source/backend/generators/function.c */
 
@@ -36,9 +37,26 @@ static NestedFunc *find_nested_func_by_sym(Sym *sym)
   return NULL;
 }
 
+/* The static chain a reference from the function being compiled hands
+ * `callee`: 0 = this frame's top (the callee is our child, or we are not a
+ * nested function), k >= 1 = our incoming chain walked up k - 1 frames (1: a
+ * sibling, 2: a sibling of our parent, ...). */
+int nested_chain_level(const NestedFunc *callee)
+{
+  const NestedFunc *cur = tcc_state->current_nested_func;
+  if (!cur || !callee || callee->parent_nf == cur)
+    return 0;
+  int callee_level = 0, cur_level = 0;
+  for (const NestedFunc *p = callee; p; p = p->parent_nf)
+    callee_level++;
+  for (const NestedFunc *p = cur; p; p = p->parent_nf)
+    cur_level++;
+  return cur_level >= callee_level ? cur_level - callee_level + 1 : 0;
+}
+
 /* Set up trampoline for a nested function whose address is being taken.
  * Creates chain slot and trampoline symbols if not yet created,
- * emits INIT_CHAIN_SLOT IR to store parent FP into the chain slot,
+ * emits INIT_CHAIN_SLOT IR to store the callee's chain into the chain slot,
  * and replaces vtop->sym with the trampoline symbol. */
 void setup_nested_func_trampoline(Sym *s)
 {
@@ -113,7 +131,13 @@ void setup_nested_func_trampoline(Sym *s)
     dest.type.t = VT_INT;
     dest.r = 0;
     dest.vr = -1;
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_INIT_CHAIN_SLOT, &src, NULL, &dest);
+    SValue level;
+    svalue_init(&level);
+    level.type.t = VT_INT;
+    level.r = VT_CONST;
+    level.c.i = nested_chain_level(nf);
+    level.vr = -1;
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_INIT_CHAIN_SLOT, &src, &level, &dest);
   }
 
   /* Replace the function symbol with the trampoline symbol */
@@ -199,6 +223,335 @@ static void free_captured_sym_facts(void)
   captured_var_syms = NULL;
 }
 
+/* ---- the names of GNU nested functions ----
+ * A nested function's Sym lives on global_stack (it is a function of the TU)
+ * but its name binds like a block-scope declaration: nested_define links it
+ * at the head of its chain, and the end of the defining block unlinks it
+ * (nested_scope_end).  While linked it carries a nonzero sym_scope, so
+ * global_identifier_push and external_sym pass over it as over any other
+ * block-scope binding.  A body compiled after its parent binds the nested
+ * functions its definition saw (def_vis), linked again for that compile. */
+typedef struct NestedLink
+{
+  Sym *s;
+  int level; /* local_scope of the defining block; 0: linked for a compile */
+} NestedLink;
+static vector(NestedLink) nested_links;
+
+/* A block-scope function prototype: a nested function of that name defined
+ * later in the same block is its `auto` forward declaration (without `auto`
+ * GNU C rejects the definition), and the nested functions defined since the
+ * prototype bind to it. */
+typedef struct NestedProto
+{
+  int v;
+  int level;    /* local_scope of the block */
+  int first_nf; /* tcc_state->nb_nested_funcs at the prototype */
+} NestedProto;
+static vector(NestedProto) nested_protos;
+
+static void nested_link(Sym *s, int level)
+{
+  TokenSym *ts = tok_ensure(s->v);
+  TCC_PREDEF_PROTOS_FLUSH();
+  if (SYM_IS_PARKED(ts->sym_identifier))
+    sym_unpark(ts);
+  s->prev_tok = ts->sym_identifier;
+  ts->sym_identifier = s;
+  /* Bound for a compile: below every scope of the body (a parameter may
+   * take the name), yet not file scope. */
+  s->sym_scope = level > 0 ? level : -1;
+  vector_push_back(&nested_links, ((NestedLink){s, level}));
+}
+
+static void nested_unlink(Sym *s)
+{
+  Sym **pp = &table_ident[s->v - TOK_IDENT]->sym_identifier;
+  while (*pp && *pp != s && !SYM_IS_PARKED(*pp))
+    pp = &(*pp)->prev_tok;
+  if (*pp == s)
+    *pp = s->prev_tok;
+  s->prev_tok = NULL;
+  s->sym_scope = 0;
+}
+
+static void nested_unlink_to(size_t mark)
+{
+  while (nested_links.size > mark)
+    nested_unlink(nested_links.data[--nested_links.size].s);
+}
+
+static int nested_linked_since(size_t mark, Sym *s)
+{
+  for (size_t i = mark; i < nested_links.size; i++)
+    if (nested_links.data[i].s == s)
+      return 1;
+  return 0;
+}
+
+static NestedFunc *nested_func_index_of(Sym *s, int from)
+{
+  for (int i = from; i < tcc_state->nb_nested_funcs; i++)
+    if (tcc_state->nested_funcs[i]->sym == s)
+      return tcc_state->nested_funcs[i];
+  return NULL;
+}
+
+void nested_define(NestedFunc *nf)
+{
+  Sym *s = nf->sym;
+  nested_link(s, local_scope);
+  for (size_t i = 0; i < nested_protos.size; i++)
+  {
+    NestedProto p = nested_protos.data[i];
+    if (p.v != s->v || p.level != local_scope)
+      continue;
+    for (int j = p.first_nf; j < tcc_state->nb_nested_funcs; j++)
+    {
+      NestedFunc *o = tcc_state->nested_funcs[j];
+      int k;
+      if (o == nf || o->compiled)
+        continue;
+      for (k = 0; k < o->nb_def_vis; k++)
+        if (o->def_vis[k]->v == s->v)
+          break;
+      if (k == o->nb_def_vis)
+        dynarray_add(&o->def_vis, &o->nb_def_vis, s);
+      else if (!nested_func_index_of(o->def_vis[k], p.first_nf))
+        o->def_vis[k] = s; /* the prototype hid an outer one */
+    }
+  }
+  for (size_t i = 0; i < nested_links.size; i++)
+    dynarray_add(&nf->def_vis, &nf->nb_def_vis, nested_links.data[i].s);
+}
+
+void nested_note_block_proto(int v)
+{
+  vector_push_back(&nested_protos, ((NestedProto){v, local_scope, tcc_state->nb_nested_funcs}));
+}
+
+void nested_scope_end(int level)
+{
+  while (nested_links.size && nested_links.data[nested_links.size - 1].level >= level &&
+         nested_links.data[nested_links.size - 1].level > 0)
+    nested_unlink(nested_links.data[--nested_links.size].s);
+  while (nested_protos.size && nested_protos.data[nested_protos.size - 1].level >= level)
+    nested_protos.size--;
+}
+
+/* A function at file scope starts with no nested function bound. */
+void nested_names_reset(void)
+{
+  nested_unlink_to(0);
+  nested_protos.size = 0;
+}
+
+void nested_names_free(void)
+{
+  vector_cleanup(&nested_links);
+  vector_cleanup(&nested_protos);
+}
+
+void nested_func_release(NestedFunc *nf)
+{
+  tcc_free(nf->def_vis);
+  nf->def_vis = NULL;
+  nf->nb_def_vis = 0;
+}
+
+/* What compile_nested_functions binds for one body: the parent's labels,
+ * typedefs, enumeration constants, statics and tags, and the nested
+ * functions, as at the definition. */
+typedef struct NestedEnv
+{
+  NestedFunc *nf;
+  int live;
+  size_t link_mark;
+  Sym *storage; /* the typedef and enumeration constant copies */
+  Sym *idents[2 * MAX_CAPTURED_VARS];
+  int nb_idents;
+  Sym *static_prev[MAX_CAPTURED_VARS];
+  Sym *tag_prev[MAX_CAPTURED_VARS];
+} NestedEnv;
+static NestedEnv *nested_env; /* the body being compiled */
+
+static void nested_ident_link(Sym *s)
+{
+  TokenSym *ts = table_ident[s->v - TOK_IDENT];
+  if (SYM_IS_PARKED(ts->sym_identifier))
+    sym_unpark(ts);
+  s->prev_tok = ts->sym_identifier;
+  ts->sym_identifier = s;
+}
+
+static void nested_env_enter(NestedEnv *e, NestedFunc *nf)
+{
+  memset(e, 0, sizeof(*e));
+  e->nf = nf;
+  e->live = 1;
+
+  /* parent addr-taken labels, so &&label in the body finds them */
+  for (int j = 0; j < nf->nb_addr_labels; j++)
+  {
+    Sym *lbl = nf->addr_label_syms[j];
+    lbl->prev_tok = sym_label_head(lbl->v);
+    sym_set_label_head(lbl->v, lbl);
+  }
+
+  /* the nested functions the definition saw, below the parent's names */
+  e->link_mark = nested_links.size;
+  for (int j = 0; j < nf->nb_def_vis; j++)
+    if (!nested_linked_since(e->link_mark, nf->def_vis[j]))
+      nested_link(nf->def_vis[j], 0);
+
+  /* Typedefs and enumeration constants: copies on a stack of their own, so
+   * gen_function's pop_local_syms does not free them. */
+  for (int j = 0; j < nf->nb_parent_typedefs; j++)
+  {
+    int tv = nf->parent_typedef_tokens[j];
+    Sym *ts_sym = sym_push2(&e->storage, tv, nf->parent_typedef_types[j].t, 0);
+    ts_sym->type.ref = nf->parent_typedef_types[j].ref;
+    ts_sym->sym_scope = 0;
+    if ((unsigned)(tv - TOK_IDENT) < (unsigned)(tok_ident - TOK_IDENT))
+    {
+      nested_ident_link(ts_sym);
+      e->idents[e->nb_idents++] = ts_sym;
+    }
+  }
+  for (int j = 0; j < nf->nb_parent_enums; j++)
+  {
+    int ev = nf->parent_enum_tokens[j];
+    Sym *es = sym_push2(&e->storage, ev, nf->parent_enum_types[j].t, 0);
+    es->type.ref = nf->parent_enum_types[j].ref;
+    es->r = VT_CONST;
+    sym_set_enum_val(es, nf->parent_enum_vals[j]);
+    if ((unsigned)(ev - TOK_IDENT) < (unsigned)(tok_ident - TOK_IDENT))
+    {
+      nested_ident_link(es);
+      e->idents[e->nb_idents++] = es;
+    }
+  }
+
+  /* Statics: the original Syms, which outlive their scope. */
+  for (int j = 0; j < nf->nb_parent_statics; j++)
+  {
+    Sym *ss = nf->parent_static_syms[j];
+    e->static_prev[j] = ss->prev_tok;
+    nested_ident_link(ss);
+  }
+
+  /* Tags: the original Syms (completed tags have c != 0, so sym_pop does not
+   * free them). */
+  for (int j = 0; j < nf->nb_parent_struct_tags; j++)
+  {
+    Sym *tag = nf->parent_struct_tag_syms[j];
+    int tv = tag->v & ~SYM_STRUCT;
+    e->tag_prev[j] = NULL;
+    if ((unsigned)(tv - TOK_IDENT) < (unsigned)(tok_ident - TOK_IDENT))
+    {
+      e->tag_prev[j] = sym_tag_head(tv);
+      tag->prev_tok = e->tag_prev[j];
+      sym_set_tag_head(tv, tag);
+    }
+  }
+}
+
+/* The body is parsed: what enter bound stops binding (in reverse). */
+static void nested_env_unlink(NestedEnv *e)
+{
+  NestedFunc *nf = e->nf;
+  if (!e->live)
+    return;
+  e->live = 0;
+  for (int j = nf->nb_parent_struct_tags - 1; j >= 0; j--)
+  {
+    Sym *tag = nf->parent_struct_tag_syms[j];
+    int tv = tag->v & ~SYM_STRUCT;
+    if ((unsigned)(tv - TOK_IDENT) < (unsigned)(tok_ident - TOK_IDENT) && sym_tag_head(tv) == tag)
+      sym_set_tag_head(tv, e->tag_prev[j]);
+  }
+  for (int j = nf->nb_parent_statics - 1; j >= 0; j--)
+  {
+    Sym *ss = nf->parent_static_syms[j];
+    TokenSym *tsi = table_ident[ss->v - TOK_IDENT];
+    if (tsi->sym_identifier == ss)
+      tsi->sym_identifier = ss->prev_tok;
+    ss->prev_tok = e->static_prev[j];
+  }
+  for (int j = e->nb_idents - 1; j >= 0; j--)
+  {
+    Sym *ts_sym = e->idents[j];
+    TokenSym *tsi = table_ident[ts_sym->v - TOK_IDENT];
+    if (tsi->sym_identifier == ts_sym)
+      tsi->sym_identifier = ts_sym->prev_tok;
+  }
+  nested_unlink_to(e->link_mark);
+  for (int j = nf->nb_addr_labels - 1; j >= 0; j--)
+  {
+    Sym *lbl = nf->addr_label_syms[j];
+    if (sym_label_head(lbl->v) == lbl)
+      sym_set_label_head(lbl->v, lbl->prev_tok);
+  }
+}
+
+static void nested_env_leave(NestedEnv *e)
+{
+  nested_env_unlink(e);
+  for (Sym *s = e->storage; s;)
+  {
+    Sym *next = s->prev;
+    sym_free(s);
+    s = next;
+  }
+  e->storage = NULL;
+}
+
+/* A nested function defined in the body being compiled sees, besides the
+ * body's own scope (the local_stack walk in decl), what that body sees of its
+ * parent: the visible ones among the names nested_env_enter bound. */
+void nested_record_inherited(NestedFunc *nf)
+{
+  NestedEnv *e = nested_env;
+  if (!e || !e->live)
+    return;
+  for (int j = 0; j < e->nb_idents; j++)
+  {
+    Sym *s = e->idents[j];
+    if (sym_find(s->v) != s)
+      continue;
+    if (IS_ENUM_VAL(s->type.t))
+    {
+      if (nf->nb_parent_enums < MAX_CAPTURED_VARS)
+      {
+        nf->parent_enum_tokens[nf->nb_parent_enums] = s->v;
+        nf->parent_enum_types[nf->nb_parent_enums] = s->type;
+        nf->parent_enum_vals[nf->nb_parent_enums] = sym_enum_val(s);
+        nf->nb_parent_enums++;
+      }
+    }
+    else if (nf->nb_parent_typedefs < MAX_CAPTURED_VARS)
+    {
+      nf->parent_typedef_tokens[nf->nb_parent_typedefs] = s->v;
+      nf->parent_typedef_types[nf->nb_parent_typedefs] = s->type;
+      nf->nb_parent_typedefs++;
+    }
+  }
+  for (int j = 0; j < e->nf->nb_parent_statics; j++)
+  {
+    Sym *s = e->nf->parent_static_syms[j];
+    if (sym_find(s->v) == s && nf->nb_parent_statics < MAX_CAPTURED_VARS)
+      nf->parent_static_syms[nf->nb_parent_statics++] = s;
+  }
+  for (int j = 0; j < e->nf->nb_parent_struct_tags; j++)
+  {
+    Sym *tag = e->nf->parent_struct_tag_syms[j];
+    int tv = tag->v & ~SYM_STRUCT;
+    if ((unsigned)(tv - TOK_IDENT) < (unsigned)(tok_ident - TOK_IDENT) && sym_tag_head(tv) == tag &&
+        nf->nb_parent_struct_tags < MAX_CAPTURED_VARS)
+      nf->parent_struct_tag_syms[nf->nb_parent_struct_tags++] = tag;
+  }
+}
+
 /* Compile all nested functions defined inside a parent function */
 void compile_nested_functions(Sym *parent_sym)
 {
@@ -206,6 +559,12 @@ void compile_nested_functions(Sym *parent_sym)
   ParentSavedState saved;
 
   (void)parent_sym; /* currently unused */
+
+  /* Called at the end of a nested function's gen_function: that body is
+   * parsed, and each body compiled from here binds its own names. */
+  NestedEnv *saved_env = nested_env;
+  if (nested_env)
+    nested_env_unlink(nested_env);
 
   nb_nested = tcc_state->nb_nested_funcs;
   if (nb_nested == 0)
@@ -283,108 +642,16 @@ void compile_nested_functions(Sym *parent_sym)
      * the recursive call would try to compile it again (compile_idx is static). */
     nf->compiled = 1;
 
-    /* Temporarily add parent addr-taken labels to the hash table so that
-     * &&label references inside the nested function can find them. */
-    for (int j = 0; j < nf->nb_addr_labels; j++)
-    {
-      Sym *lbl = nf->addr_label_syms[j];
-      lbl->prev_tok = sym_label_head(lbl->v);
-      sym_set_label_head(lbl->v, lbl);
-    }
-
-    /* Temporarily push parent-scope typedefs into the symbol table so the
-     * nested function body can reference them.
-     * We allocate Sym entries on a separate stack (not local_stack)
-     * so gen_function's pop_local_syms does not free them.
-     * We manually link them into table_ident and remove them after. */
-    Sym *typedef_syms[MAX_CAPTURED_VARS];
-    Sym *typedef_sym_storage = NULL; /* separate linked list for our syms */
-    int nb_typedef_syms = 0;
-    for (int j = 0; j < nf->nb_parent_typedefs; j++)
-    {
-      int tv = nf->parent_typedef_tokens[j];
-      CType *ttype = &nf->parent_typedef_types[j];
-      Sym *ts_sym;
-      /* Allocate sym on a separate stack, not local_stack */
-      ts_sym = sym_push2(&typedef_sym_storage, tv, ttype->t, 0);
-      ts_sym->type.ref = ttype->ref;
-      ts_sym->sym_scope = 0;
-      /* Typedef — link into sym_identifier namespace */
-      int ident_idx = tv - TOK_IDENT;
-      if ((unsigned)ident_idx < (unsigned)(tok_ident - TOK_IDENT))
-      {
-        if (SYM_IS_PARKED(table_ident[ident_idx]->sym_identifier))
-          sym_unpark(table_ident[ident_idx]);
-        ts_sym->prev_tok = table_ident[ident_idx]->sym_identifier;
-        table_ident[ident_idx]->sym_identifier = ts_sym;
-      }
-      typedef_syms[nb_typedef_syms++] = ts_sym;
-    }
-
-    /* Temporarily re-link parent struct/union/enum tag syms into the
-     * sym_struct hash table.  These are the original Sym pointers which
-     * survive pop_local_syms (completed struct tags have c != 0). */
-    Sym *saved_struct_prev[MAX_CAPTURED_VARS]; /* save old hash entries */
-    for (int j = 0; j < nf->nb_parent_struct_tags; j++)
-    {
-      Sym *tag = nf->parent_struct_tag_syms[j];
-      int ident_idx = (tag->v & ~SYM_STRUCT) - TOK_IDENT;
-      if ((unsigned)ident_idx < (unsigned)(tok_ident - TOK_IDENT))
-      {
-        saved_struct_prev[j] = sym_tag_head(ident_idx + TOK_IDENT);
-        tag->prev_tok = saved_struct_prev[j];
-        sym_set_tag_head(ident_idx + TOK_IDENT, tag);
-      }
-      else
-      {
-        saved_struct_prev[j] = NULL;
-      }
-    }
+    /* Bind the parent's names the body sees, as at its definition. */
+    NestedEnv env;
+    nested_env_enter(&env, nf);
+    nested_env = &env;
 
     gen_function(nf->sym);
     free_captured_sym_facts();
 
-    /* Remove parent addr-taken labels from hash table after compilation. */
-    for (int j = 0; j < nf->nb_addr_labels; j++)
-    {
-      Sym *lbl = nf->addr_label_syms[j];
-      sym_set_label_head(lbl->v, lbl->prev_tok);
-    }
-
-    /* Remove parent struct tags from hash table */
-    for (int j = nf->nb_parent_struct_tags - 1; j >= 0; j--)
-    {
-      Sym *tag = nf->parent_struct_tag_syms[j];
-      int ident_idx = (tag->v & ~SYM_STRUCT) - TOK_IDENT;
-      if ((unsigned)ident_idx < (unsigned)(tok_ident - TOK_IDENT))
-      {
-        if (sym_tag_head(ident_idx + TOK_IDENT) == tag)
-          sym_set_tag_head(ident_idx + TOK_IDENT, saved_struct_prev[j]);
-      }
-    }
-
-    /* Remove parent typedefs that we injected and free them. */
-    for (int j = nb_typedef_syms - 1; j >= 0; j--)
-    {
-      Sym *ts_sym = typedef_syms[j];
-      int tv = ts_sym->v;
-      if (!(tv & SYM_FIELD) && (tv & ~SYM_STRUCT) < SYM_FIRST_ANOM)
-      {
-        TokenSym *tsi = table_ident[(tv & ~SYM_STRUCT) - TOK_IDENT];
-        if (tsi->sym_identifier == ts_sym)
-          tsi->sym_identifier = ts_sym->prev_tok;
-      }
-    }
-    /* Free the temporary typedef sym storage */
-    {
-      Sym *s = typedef_sym_storage;
-      while (s)
-      {
-        Sym *next = s->prev;
-        sym_free(s);
-        s = next;
-      }
-    }
+    nested_env_leave(&env);
+    nested_env = saved_env;
 
     /* gen_function() resets cur_text_section=NULL and ind=0 for safety.
      * Restore them so the next nested function starts at the right offset

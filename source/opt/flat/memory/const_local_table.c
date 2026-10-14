@@ -9,12 +9,17 @@
  */
 
 /* A frame object written only by one run of constant stores that covers every
- * byte of it, and whose address is only ever read through, holds the same
- * bytes at every read: reads through its address go to an image of those bytes
- * in .rodata instead.  The Zig C backend indexes an all-constant compound
+ * byte of it, and whose bytes are only ever read -- through its address, or
+ * directly at constant offsets -- holds the same bytes at every read: reads
+ * through its address go to an image of those bytes in .rodata instead.  The
+ * Zig C backend indexes an all-constant compound
  * literal with a loop counter -- `(struct arr_8_usize){{4,4,...,2}}.array[i]`,
  * in every MultiArrayList.slice -- which rebuilt the table on the stack on
- * every iteration.
+ * every iteration.  A store's source may also be a link-time address (a
+ * function or global symbol): the image then carries relocations, exactly as
+ * the block-copy initializer's does, and that is what a table of function
+ * pointers -- `(struct handler_table){{h0,...,h71}}.table[n]` in the CBE's
+ * syscall dispatcher -- needs.
  *
  * The object is the frontend's extent containing the address (before frame
  * relayout).  Its address goes into TEMPs -- by LEA, or folded into an
@@ -23,9 +28,14 @@
  * it (a deref source, or the base of LOAD_INDEXED) or a further derivation.
  * Any other reference to the object's bytes -- a store outside the run, its
  * address passed or stored, an asm -- keeps it.  A read before the run has
- * executed reads indeterminate memory, so the image serves it too.  Direct
- * frame loads of the object are left alone, and the run with them; with none,
- * the run is deleted. */
+ * executed reads indeterminate memory, so the image serves it too.
+ *
+ * A load of the object's own bytes at a constant offset is served the same way:
+ * when one constant store writes exactly those bytes, the load takes that
+ * store's value and the store is dead.  A table read only by constant indices
+ * has no address to send to an image at all, and a table read both ways keeps
+ * its constant loads off the frame; a load whose bytes no single store covers
+ * (a sub-word read, a slot written twice, a volatile) keeps the object. */
 
 #define USING_GLOBALS
 
@@ -34,6 +44,7 @@
 #include "opt_engine.h"
 #include "opt_alias.h"
 #include "opt_utils.h"
+#include "opt_xform.h"
 
 #define CLT_MAX_OBJ 512
 #define CLT_MAX_SIZE 65536
@@ -45,6 +56,7 @@ typedef struct
   int nstores;
   uint8_t bad;
   uint8_t direct_read;
+  uint8_t has_addr;     /* an instruction puts this object's address in a TEMP */
   int zcall;          /* memset(obj, 0, size) the run starts with; -1 when none */
   int zfirst;         /* its earliest PARAM */
 } CltObj;
@@ -57,12 +69,33 @@ static int clt_find(const CltObj *objs, int nobj, int off)
   return -1;
 }
 
+/* The object an ADDRESS at `off` points into.  A pointer one past an
+ * object's end can be indexed back into it (`int *e = t + 4; e[-1] = x`), so
+ * the object ending at `off` owns it too; when another object starts there,
+ * that one is returned and the one ending there can no longer be tracked. */
+static int clt_find_addr(CltObj *objs, int nobj, int off)
+{
+  int k = clt_find(objs, nobj, off);
+  for (int j = 0; j < nobj; j++)
+  {
+    if (j == k || objs[j].hi != off)
+      continue;
+    if (k < 0)
+      k = j;
+    else
+      objs[j].bad = 1;
+  }
+  return k;
+}
+
 static int clt_is_temp(int32_t vr)
 {
   return vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP;
 }
 
-/* Tracked address TEMPs: TEMP position -> object index, -1 untracked. */
+/* Tracked address TEMPs: TEMP position -> object index, -1 untracked.  The
+ * table is indexed by position alone, so a VAR or PARAM must never be looked
+ * up in it: V0 would read T0's entry. */
 typedef struct
 {
   int *obj;
@@ -71,16 +104,18 @@ typedef struct
 
 static int clt_temp_obj(const CltTemps *t, int32_t vr)
 {
+  if (!clt_is_temp(vr))
+    return -1;
   int pos = TCCIR_DECODE_VREG_POSITION(vr);
   return pos < t->n ? t->obj[pos] : -1;
 }
 
 /* 1 when newly tracked, 0 when already tracked for `obj`, -1 when tracked for
- * another object. */
+ * another object or not a TEMP. */
 static int clt_temp_add(CltTemps *t, int32_t vr, int obj)
 {
   int pos = TCCIR_DECODE_VREG_POSITION(vr);
-  if (pos >= t->n)
+  if (!clt_is_temp(vr) || pos >= t->n)
     return -1;
   if (t->obj[pos] >= 0)
     return t->obj[pos] == obj ? 0 : -1;
@@ -168,7 +203,10 @@ static int clt_addr_operand(TCCIRState *ir, IRQuadCompact *q, IROperand *addr)
   return 0;
 }
 
-/* A constant STORE into a frame object: returns the object, else -1. */
+/* A constant STORE into a frame object: returns the object, else -1.  A
+ * non-lval SYMREF source is a link-time constant (a function or object
+ * address) like the block-copy initializer's image: it contributes a
+ * relocation, so only a whole aligned word can carry one. */
 static int clt_const_store(TCCIRState *ir, IRQuadCompact *q, const CltObj *objs, int nobj)
 {
   if (q->op != TCCIR_OP_STORE)
@@ -186,19 +224,168 @@ static int clt_const_store(TCCIRState *ir, IRQuadCompact *q, const CltObj *objs,
   int tag = irop_get_tag(s);
   if (s.is_lval || s.is_local || s.is_llocal || irop_get_vreg(s) >= 0)
     return -1;
+  if (tag == IROP_TAG_SYMREF)
+  {
+    const IRPoolSymref *sr = irop_get_symref_ex(ir, s);
+    if (w != 4 || (off & 3) || !sr || !sr->sym)
+      return -1;
+    return k;
+  }
   if (tag != IROP_TAG_IMM32 && tag != IROP_TAG_I64 && tag != IROP_TAG_F32 && tag != IROP_TAG_F64)
     return -1;
   return k;
 }
 
+/* A reference to an object that does not go through its address: a LOAD of one
+ * of its frame slots.  Returns the operand slot (1), else 0. */
+static int clt_load_operand(TCCIRState *ir, IRQuadCompact *q, IROperand *slot)
+{
+  if (q->op != TCCIR_OP_LOAD || !irop_config[q->op].has_src1)
+    return 0;
+  IROperand s1 = tcc_ir_op_get_src1(ir, q);
+  if (!clt_direct_frame(s1) || !s1.is_lval)
+    return 0;
+  *slot = s1;
+  return 1;
+}
+
+/* The width of a direct load of a frame slot: a function pointer is a machine
+ * word, a type the stores of the same slot carry as INT32.  A struct or an
+ * unknown type is not a word, and loads no width. */
+static int clt_load_width(IROperand op)
+{
+  switch (irop_get_btype(op))
+  {
+  case IROP_BTYPE_FUNC:
+    return irop_is_64bit(op) ? 8 : 4;
+  default:
+    return clt_store_width(op);
+  }
+}
+
+/* A value operand copied from a store's source to a load keeps its meaning when
+ * both accesses have the same type, or are both whole machine words. */
+static int clt_copy_value_type(IROperand a, IROperand b)
+{
+  const int ba = irop_get_btype(a), bb = irop_get_btype(b);
+  if (ba == bb && irop_is_64bit(a) == irop_is_64bit(b))
+    return 1;
+  if (irop_is_64bit(a) || irop_is_64bit(b))
+    return 0;
+  const int wa = ba == IROP_BTYPE_INT32 || ba == IROP_BTYPE_FUNC;
+  const int wb = bb == IROP_BTYPE_INT32 || bb == IROP_BTYPE_FUNC;
+  return wa && wb;
+}
+
+/* The constant store that gives a direct LOAD of an object's bytes its value:
+ * the last store of the same offset, width and type, whose source can be copied
+ * to the load.  A later store overlapping the loaded bytes leaves their value
+ * mixed, and no store of that slot leaves it unknown.  The store must also
+ * reach the load: both in one basic block, the store first. */
+static int clt_store_for_load(TCCIRState *ir, const CltObj *objs, int nobj, int ob,
+                              IRQuadCompact *lq, IROperand *val)
+{
+  const CltObj *o = &objs[ob];
+  IROperand ls = tcc_ir_op_get_src1(ir, lq);
+  const int off = irop_get_stack_offset(ls), lw = clt_load_width(ls);
+  if (!lw)
+    return 0;
+  int found_j = -1;
+  IROperand found_v;
+  for (int j = o->first; j <= o->last; j++)
+  {
+    IRQuadCompact *sq = &ir->compact_instructions[j];
+    if (clt_const_store(ir, sq, objs, nobj) != ob)
+      continue;
+    IROperand sd = tcc_ir_op_get_dest(ir, sq);
+    if (irop_get_stack_offset(sd) != off || clt_store_width(sd) != lw ||
+        !clt_copy_value_type(sd, ls))
+      continue;
+    /* A narrower access extends what it loads: only a value both extensions
+     * agree on can be copied. */
+    if (lw < 4)
+    {
+      IROperand sv = tcc_ir_op_get_src1(ir, sq);
+      if (irop_get_tag(sv) != IROP_TAG_IMM32 ||
+          (uint64_t)irop_get_imm64_ex(ir, sv) >= (1ull << (8 * lw - 1)))
+        continue;
+    }
+    found_j = j;
+    found_v = tcc_ir_op_get_src1(ir, sq);
+  }
+  if (found_j < 0)
+    return 0;
+  for (int j = found_j + 1; j <= o->last; j++)
+  {
+    IRQuadCompact *sq = &ir->compact_instructions[j];
+    if (clt_const_store(ir, sq, objs, nobj) != ob)
+      continue;
+    IROperand sd = tcc_ir_op_get_dest(ir, sq);
+    int so = irop_get_stack_offset(sd), sw = clt_store_width(sd);
+    if (sw && so < off + lw && so + sw > off)
+      return 0;
+  }
+  /* The store must reach the load without a path around either of them. */
+  const int li = (int)(lq - ir->compact_instructions);
+  if (found_j >= li || !ir_xform_same_block(ir, found_j, li))
+    return 0;
+  *val = found_v;
+  return 1;
+}
+
+/* Every direct LOAD of this object's bytes folds to its constant store: with
+ * `apply` the loads take that store's value directly.  Returns -1 when a load
+ * has no single matching store or is not a plain load into a TEMP.  Otherwise
+ * the number of loads folded. */
+static int clt_fold_reads(TCCIRState *ir, int n, const CltObj *objs, int nobj, int ob, int apply)
+{
+  IROperand val;
+  if (apply)
+  {
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      IROperand s1;
+      if (!clt_load_operand(ir, q, &s1) || clt_find(objs, nobj, irop_get_stack_offset(s1)) != ob)
+        continue;
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      int32_t dv = irop_get_vreg(d);
+      if (d.is_lval || !clt_is_temp(dv) || !clt_store_for_load(ir, objs, nobj, ob, q, &val))
+        return -1;
+    }
+  }
+  int done = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    IROperand s1;
+    if (!clt_load_operand(ir, q, &s1) || clt_find(objs, nobj, irop_get_stack_offset(s1)) != ob)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    if (!clt_store_for_load(ir, objs, nobj, ob, q, &val))
+      return -1;
+    IROperand s2 = tcc_ir_op_get_src1(ir, q);
+    const int has_src2 = irop_config[q->op].has_src2;
+    int base = tcc_ir_iroperand_pool_add(ir, d);
+    tcc_ir_iroperand_pool_add(ir, val);
+    if (has_src2)
+      tcc_ir_iroperand_pool_add(ir, s2);
+    q->operand_base = base;
+    done++;
+  }
+  return done;
+}
+
 int tcc_ir_opt_const_local_table(TCCIRState *ir)
 {
   const int n = ir->next_instruction_index;
-  if (n == 0 || ir->frame_relaid || !ir->frame_obj_count || ir->inline_asm_count || tcc_ir_calls_returns_twice(ir))
+  if (n == 0 || ir->frame_relaid || !ir->frame_obj_count || ir->inline_asm_count || tcc_ir_calls_returns_twice(ir) ||
+      tcc_ir_frame_shared_with_nested(ir))
     return 0;
 
-  /* Candidate objects: those whose address goes into a TEMP.  The array grows
-   * on demand up to CLT_MAX_OBJ (nothing holds an element pointer while it is
+  /* Candidate objects: those whose address goes into a TEMP, or whose bytes are
+   * read straight off the frame.  The array grows on demand up to CLT_MAX_OBJ
+   * (nothing holds an element pointer while it is
    * filled): a fixed CLT_MAX_OBJ array was 16 KiB per -O2 function, nearly
    * always for a handful of objects. */
   int objs_cap = 16;
@@ -208,7 +395,7 @@ int tcc_ir_opt_const_local_table(TCCIRState *ir)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     IROperand s;
-    if (!clt_addr_operand(ir, q, &s))
+    if (!clt_addr_operand(ir, q, &s) && !clt_load_operand(ir, q, &s))
       continue;
     int off = irop_get_stack_offset(s), lo, hi;
     if (clt_find(objs, nobj, off) >= 0 || !tcc_ir_frame_object_at(ir, off, &lo, &hi))
@@ -308,10 +495,11 @@ int tcc_ir_opt_const_local_table(TCCIRState *ir)
     zmark[i] = 1;
   }
 
+  const int tn = ir->next_temporary_variable + 1;
   CltTemps temps;
-  temps.n = ir->next_temporary_variable + 1;
-  temps.obj = tcc_malloc(sizeof(int) * temps.n);
-  for (int k = 0; k < temps.n; k++)
+  temps.n = tn;
+  temps.obj = tcc_malloc(sizeof(int) * tn);
+  for (int k = 0; k < tn; k++)
     temps.obj[k] = -1;
   int changed = 1;
   for (int rounds = 0; changed && rounds < 8; rounds++)
@@ -328,7 +516,7 @@ int tcc_ir_opt_const_local_table(TCCIRState *ir)
       IROperand s1 = tcc_ir_op_get_src1(ir, q), a;
       int k = -1;
       if (clt_addr_operand(ir, q, &a))
-        k = clt_find(objs, nobj, irop_get_stack_offset(a));
+        k = clt_find_addr(objs, nobj, irop_get_stack_offset(a));
       else if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB)
       {
         if (!s1.is_lval && clt_is_temp(irop_get_vreg(s1)))
@@ -388,12 +576,19 @@ int tcc_ir_opt_const_local_table(TCCIRState *ir)
         continue;
       if (clt_direct_frame(op))
       {
-        int ob = clt_find(objs, nobj, irop_get_stack_offset(op));
+        int off = irop_get_stack_offset(op);
+        int ob = op.is_lval ? clt_find(objs, nobj, off) : clt_find_addr(objs, nobj, off);
         if (ob < 0)
           continue;
         IROperand a;
         if (k != 0 && clt_addr_operand(ir, q, &a) == k)
+        {
+          objs[ob].has_addr = 1;
           continue; /* the address TEMP's uses are checked below */
+        }
+        if (k == 1 && op.is_lval && q->op == TCCIR_OP_LOAD &&
+            !tcc_ir_access_is_volatile(ir, op))
+          continue; /* a load of the object's own bytes: folded, or it keeps the run */
         if (k != 0 && op.is_lval)
           objs[ob].direct_read = 1;
         else
@@ -418,6 +613,8 @@ int tcc_ir_opt_const_local_table(TCCIRState *ir)
         continue; /* read through the address */
       if (q->op == TCCIR_OP_LOAD_INDEXED && k == 1)
         continue;
+      /* A derivation into a TEMP tracked for the same object; a VAR or PARAM
+       * dest is never tracked, so the address escapes into it. */
       if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) &&
           clt_temp_obj(&temps, tcc_ir_op_dest_vreg(ir, q)) == ob &&
           !tcc_ir_op_dest_is_lval(ir, q) && !(q->op == TCCIR_OP_SUB && k == 2))
@@ -430,19 +627,51 @@ int tcc_ir_opt_const_local_table(TCCIRState *ir)
   /* Sized for the largest object that can still become a table rather than
    * CLT_MAX_SIZE: two fixed 64 KiB buffers were the largest allocation of a
    * typical -O2 compile, for objects of a few dozen bytes. */
-  int max_size = 1;
+  int max_size = 1, max_stores = 1;
   for (int ob = 0; ob < nobj; ob++)
-    if (!objs[ob].bad && objs[ob].first >= 0 && objs[ob].hi - objs[ob].lo > max_size)
+  {
+    if (objs[ob].bad || objs[ob].first < 0)
+      continue;
+    if (objs[ob].hi - objs[ob].lo > max_size)
       max_size = objs[ob].hi - objs[ob].lo;
+    if (objs[ob].nstores > max_stores)
+      max_stores = objs[ob].nstores;
+  }
   uint8_t *image = tcc_malloc(max_size), *written = tcc_malloc(max_size);
+  /* Which image words already carry a relocation: one is written whole, once. */
+  uint8_t *relocated = tcc_mallocz(max_size);
+  BciReloc *rels = tcc_malloc(sizeof(BciReloc) * max_stores);
   for (int ob = 0; ob < nobj; ob++)
   {
     CltObj *o = &objs[ob];
     if (o->bad || o->first < 0)
       continue;
+    /* Can every load of the object's own bytes take the value of the store
+     * that writes exactly those bytes?  If so the run is dead. */
+    int fold = !o->direct_read && clt_fold_reads(ir, n, objs, nobj, ob, 0) >= 0;
+    if (!o->has_addr)
+    {
+      /* Nothing holds the object's address, so there is no image to read from:
+       * the loads read the constants themselves and the stores are dead. */
+      if (!fold)
+        continue;
+      clt_fold_reads(ir, n, objs, nobj, ob, 1);
+      for (int i = o->first; i <= o->last; i++)
+        if (clt_const_store(ir, &ir->compact_instructions[i], objs, nobj) == ob)
+          ir->compact_instructions[i].op = TCCIR_OP_NOP;
+      if (o->zcall >= 0)
+      {
+        ir_opt_nop_call_params(ir, o->zcall);
+        ir->compact_instructions[o->zcall].op = TCCIR_OP_NOP;
+      }
+      changes++;
+      continue;
+    }
     const int size = o->hi - o->lo;
     memset(image, 0, size);
     memset(written, o->zcall >= 0, size);
+    memset(relocated, 0, size);
+    int nrel = 0;
     /* One contiguous run: nothing but this object's constant stores between
      * its first and last -- after its zero fill, when it has one. */
     int ok = o->zcall < 0 || o->zcall < o->first;
@@ -473,19 +702,46 @@ int tcc_ir_opt_const_local_table(TCCIRState *ir)
       }
       IROperand d = tcc_ir_op_get_dest(ir, q), s = tcc_ir_op_get_src1(ir, q);
       int rel = irop_get_stack_offset(d) - o->lo, w = clt_store_width(d);
-      uint64_t val = (uint64_t)irop_get_imm64_ex(ir, s);
-      for (int b = 0; b < w; b++)
+      for (int b = 0; b < w && ok; b++)
+        ok = !relocated[rel + b];
+      if (!ok)
+        break;
+      if (irop_get_tag(s) == IROP_TAG_SYMREF)
       {
-        image[rel + b] = (uint8_t)(val >> (8 * b));
-        written[rel + b] = 1;
+        const IRPoolSymref *sr = irop_get_symref_ex(ir, s);
+        write32le(image + rel, sr->addend);
+        memset(relocated + rel, 1, w);
+        rels[nrel].off = rel;
+        rels[nrel].sym = sr->sym;
+        rels[nrel].addend = sr->addend;
+        nrel++;
       }
+      else
+      {
+        uint64_t val = (uint64_t)irop_get_imm64_ex(ir, s);
+        for (int b = 0; b < w; b++)
+          image[rel + b] = (uint8_t)(val >> (8 * b));
+      }
+      for (int b = 0; b < w; b++)
+        written[rel + b] = 1;
     }
     for (int b = 0; b < size && ok; b++)
       ok = written[b];
     if (!ok)
       continue;
 
-    Sym *sym = bci_image_sym(rodata_section, image, size, NULL, 0);
+    /* A block holding a link-time constant needs a relocation, so it cannot
+     * go in a .rodata shared between the outputs: place it in writable data
+     * instead, as the block-copy initializer does.  The image and its
+     * relocations are data for code that is being emitted: this pass runs in
+     * the function pipeline, after the body's last statement, where the
+     * frontend has CODE_OFF_BIT set for the dead tail and would hold static
+     * data back -- so ask for it explicitly around the intern. */
+    Section *img_sec = (nrel && tcc_state->share_rodata) ? data_section : rodata_section;
+    int saved_ncw = nocode_wanted;
+    nocode_wanted = 0;
+    Sym *sym = bci_image_sym(img_sec, image, size, rels, nrel);
+    nocode_wanted = saved_ncw;
     for (int i = 0; i < n; i++)
     {
       IRQuadCompact *q = &ir->compact_instructions[i];
@@ -507,8 +763,9 @@ int tcc_ir_opt_const_local_table(TCCIRState *ir)
       q->operand_base = base;
       changes++;
     }
-    if (!o->direct_read)
+    if (fold)
     {
+      clt_fold_reads(ir, n, objs, nobj, ob, 1);
       for (int i = o->first; i <= o->last; i++)
         ir->compact_instructions[i].op = TCCIR_OP_NOP;
       if (o->zcall >= 0)
@@ -520,6 +777,8 @@ int tcc_ir_opt_const_local_table(TCCIRState *ir)
   }
   tcc_free(image);
   tcc_free(written);
+  tcc_free(relocated);
+  tcc_free(rels);
   tcc_free(zmark);
   tcc_free(temps.obj);
   tcc_free(objs);

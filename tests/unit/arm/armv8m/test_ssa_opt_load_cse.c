@@ -1822,9 +1822,10 @@ UT_TEST(test_cmp_load_exposure_preserves_entry_edges_and_operand_order)
   c.ir->switch_tables[0].targets = tcc_malloc(sizeof(int));
   c.ir->switch_tables[0].targets[0] = 1;
   c.ir->label_count = 1;
-  c.ir->label_pos = tcc_malloc(2 * sizeof(int));
+  c.ir->label_pos = tcc_malloc(IR_LABEL_WORDS * sizeof(int));
   c.ir->label_pos[0] = 99;
   c.ir->label_pos[1] = 1;
+  c.ir->label_pos[2] = 99; /* anchor gone: the index stands in */
 
   UT_ASSERT_EQ(ssa_opt_expose_cmp_loads(c.ir), 2);
   UT_ASSERT_EQ(utb_op(c.ir, 1), TCCIR_OP_LOAD);

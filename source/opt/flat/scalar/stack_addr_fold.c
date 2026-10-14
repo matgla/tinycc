@@ -294,6 +294,7 @@ int tcc_ir_opt_stack_addr_simplify(TCCIRState *ir)
         {
           IROperand direct = irop_make_stackoff(-1, addr.off, 1, 0, addr.is_param, irop_get_btype(dest));
           direct.is_unsigned = dest.is_unsigned;
+          direct.is_complex = dest.is_complex;
           irop_carry_access_marks(&direct, dest); /* same access: same volatility */
           tcc_ir_set_dest(ir, i, direct);
           changes++;
@@ -313,6 +314,7 @@ int tcc_ir_opt_stack_addr_simplify(TCCIRState *ir)
         {
           IROperand direct = irop_make_stackoff(-1, addr.off, 1, 0, addr.is_param, irop_get_btype(src));
           direct.is_unsigned = src.is_unsigned;
+          direct.is_complex = src.is_complex;
           irop_carry_access_marks(&direct, src); /* same access: same volatility */
           tcc_ir_set_src1(ir, i, direct);
           changes++;

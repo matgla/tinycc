@@ -129,3 +129,7 @@ typedef struct MachineOperand
  * fill ordering or double-fill issues.
  */
 MachineOperand machine_op_from_ir(struct TCCIRState *ir, const struct IROperand *op);
+
+/* A nested function's capture holding frame offset `off` (and the parent-frame
+ * offset it stands for), or -1. */
+int tcc_ir_capture_lookup(const struct TCCIRState *ir, int32_t off, int32_t *chain_off);

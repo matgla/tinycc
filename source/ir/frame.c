@@ -91,26 +91,30 @@ static int frame_record(int loc, int size, int mask, int flags)
   return off;
 }
 
-/* Mark the bytes of a `t` at byte `at` that some member of it occupies.  A
- * bit-field is charged its whole storage unit and every byte its bits reach;
- * anything nested too deep, or of unknown size, all of its bytes. */
-static void frame_cover(CType *t, int at, uint64_t *cov, int depth)
+/* Mark the bytes of a `t` at byte `at` that some member of it occupies, in
+ * the bit map `cov` of the object's first `n` bytes.  A bit-field is charged
+ * its whole storage unit and every byte its bits reach; anything nested too
+ * deep, or of unknown size, all of its bytes. */
+static void frame_cover_bytes(uint8_t *cov, int n, int lo, int hi)
+{
+  for (int b = lo; b < hi && b < n; b++)
+    cov[b >> 3] |= 1u << (b & 7);
+}
+
+static void frame_cover(CType *t, int at, uint8_t *cov, int n, int depth)
 {
   int align, size = type_size(t, &align);
-  if (size <= 0 || at >= 64)
+  if (size <= 0 || at >= n)
     return;
   const int bt = t->t & VT_BTYPE;
-  if (depth < 8 && bt == VT_STRUCT && t->ref && !(t->t & VT_BITFIELD))
+  /* A vector is a VT_STRUCT with no members: all of it is its elements. */
+  if (depth < 8 && bt == VT_STRUCT && t->ref && !(t->t & (VT_BITFIELD | VT_VECTOR)))
   {
     for (Sym *f = t->ref->next; f; f = f->next)
     {
-      frame_cover(&f->type, at + f->c, cov, depth + 1);
+      frame_cover(&f->type, at + f->c, cov, n, depth + 1);
       if (f->type.t & VT_BITFIELD)
-      {
-        int end = (BIT_POS(f->type.t) + BIT_SIZE(f->type.t) + 7) / 8;
-        for (int b = at + f->c; b < at + f->c + end && b < 64; b++)
-          *cov |= 1ull << b;
-      }
+        frame_cover_bytes(cov, n, at + f->c, at + f->c + (BIT_POS(f->type.t) + BIT_SIZE(f->type.t) + 7) / 8);
     }
     return;
   }
@@ -119,48 +123,68 @@ static void frame_cover(CType *t, int at, uint64_t *cov, int depth)
     int ea, es = type_size(&t->ref->type, &ea);
     if (es > 0)
     {
-      for (int e = 0; e < size / es && at + e * es < 64; e++)
-        frame_cover(&t->ref->type, at + e * es, cov, depth + 1);
+      for (int e = 0; e < size / es && at + e * es < n; e++)
+        frame_cover(&t->ref->type, at + e * es, cov, n, depth + 1);
       return;
     }
   }
-  for (int b = at; b < at + size && b < 64; b++)
-    *cov |= 1ull << b;
+  frame_cover_bytes(cov, n, at, at + size);
 }
+
+/* Padding is tracked over an object's first FRAME_PAD_MAX bytes; the bytes
+ * past them count as a member's. */
+#define FRAME_PAD_MAX 1024
 
 /* C leaves the padding bytes of a struct unspecified whenever a member is
  * stored (C11 6.2.6.1p6), so a store may write anything there: SRA uses it to
  * store a u16 into the low half of a word field without keeping the other
- * half (sra.c).  The bytes of the record above the object -- alignment, the
- * guard byte -- belong to no member either. */
+ * half (sra.c), copy_fwd to let member stores stand for a whole-struct write.
+ * The bytes of the record above the object -- alignment, the guard byte --
+ * belong to no member either. */
 void tcc_ir_frame_note_type(int off, CType *type)
 {
   TCCIRState *ir = tcc_state ? tcc_state->ir : NULL;
   if (!ir || !type || !ir->frame_obj_count || ir->frame_objs[FRAME_OBJ_WORDS * (ir->frame_obj_count - 1)] != off)
     return;
   const int32_t *o = &ir->frame_objs[FRAME_OBJ_WORDS * (ir->frame_obj_count - 1)];
-  uint64_t cov = 0;
-  frame_cover(type, 0, &cov, 0);
-  const int ext = o[1] < 64 ? o[1] : 64;
-  uint64_t pad = ~cov & (ext == 64 ? ~0ull : (1ull << ext) - 1);
-  if (!pad)
+  const int ext = o[1] < FRAME_PAD_MAX ? o[1] : FRAME_PAD_MAX, nbytes = (ext + 7) / 8;
+  if (ext <= 0)
+    return;
+  uint8_t cov[FRAME_PAD_MAX / 8];
+  memset(cov, 0, nbytes);
+  frame_cover(type, 0, cov, ext, 0);
+  int any = 0;
+  for (int b = 0; b < ext && !any; b++)
+    any = !(cov[b >> 3] & (1u << (b & 7)));
+  if (!any)
     return;
   if (ir->frame_pad_count == ir->frame_pad_cap)
   {
     ir->frame_pad_cap = ir->frame_pad_cap ? ir->frame_pad_cap * 2 : 16;
     ir->frame_pads = tcc_realloc(ir->frame_pads, sizeof(int32_t) * 3 * ir->frame_pad_cap);
   }
+  if (ir->frame_pad_bits_len + nbytes > ir->frame_pad_bits_cap)
+  {
+    ir->frame_pad_bits_cap = (ir->frame_pad_bits_len + nbytes) * 2;
+    ir->frame_pad_bits = tcc_realloc(ir->frame_pad_bits, ir->frame_pad_bits_cap);
+  }
   int32_t *p = &ir->frame_pads[3 * ir->frame_pad_count++];
   p[0] = off;
-  p[1] = (int32_t)(uint32_t)pad;
-  p[2] = (int32_t)(uint32_t)(pad >> 32);
+  p[1] = ext;
+  p[2] = ir->frame_pad_bits_len;
+  /* Stored as the padding map: a set bit is a byte no member covers. */
+  for (int k = 0; k < nbytes; k++)
+    ir->frame_pad_bits[ir->frame_pad_bits_len + k] = (uint8_t)~cov[k];
+  ir->frame_pad_bits_len += nbytes;
 }
 
-uint64_t tcc_ir_frame_padding(TCCIRState *ir, int lo, int hi)
+int tcc_ir_frame_padding_map(TCCIRState *ir, int lo, int hi, uint8_t *pad)
 {
-  if (!ir || ir->frame_relaid || !ir->frame_pad_count || hi - lo > 64 || hi <= lo)
+  if (hi <= lo)
     return 0;
-  uint64_t pad = ~0ull;
+  memset(pad, 0, hi - lo);
+  if (!ir || ir->frame_relaid || !ir->frame_pad_count)
+    return 0;
   int objs = 0;
   for (int k = 0; k < ir->frame_obj_count; k++)
   {
@@ -177,12 +201,37 @@ uint64_t tcc_ir_frame_padding(TCCIRState *ir, int lo, int hi)
     const int32_t *p = &ir->frame_pads[3 * k];
     if (p[0] != lo)
       continue;
-    pad &= (uint64_t)(uint32_t)p[1] | ((uint64_t)(uint32_t)p[2] << 32);
+    const uint8_t *bits = ir->frame_pad_bits + p[2];
+    for (int b = 0; b < hi - lo; b++)
+    {
+      const int is_pad = b < p[1] && (bits[b >> 3] & (1u << (b & 7)));
+      pad[b] = noted ? pad[b] & is_pad : is_pad;
+    }
     noted++;
   }
   /* Every object recorded here must have told its type: one with no padding
    * noted, or none known, keeps all of its bytes. */
-  return objs && noted == objs ? pad : 0;
+  if (!objs || noted != objs)
+  {
+    memset(pad, 0, hi - lo);
+    return 0;
+  }
+  for (int b = 0; b < hi - lo; b++)
+    if (pad[b])
+      return 1;
+  return 0;
+}
+
+uint64_t tcc_ir_frame_padding(TCCIRState *ir, int lo, int hi)
+{
+  uint8_t pad[64];
+  if (hi - lo > 64 || hi <= lo || !tcc_ir_frame_padding_map(ir, lo, hi, pad))
+    return 0;
+  uint64_t m = 0;
+  for (int b = 0; b < hi - lo; b++)
+    if (pad[b])
+      m |= 1ull << b;
+  return m;
 }
 
 int tcc_ir_frame_alloc(int loc, int size, int mask)
@@ -264,20 +313,80 @@ void tcc_ir_label_note(TCCIRState *ir, int jind)
   if (ir->label_count == ir->label_cap)
   {
     ir->label_cap = ir->label_cap ? 2 * ir->label_cap : 8;
-    ir->label_pos = tcc_realloc(ir->label_pos, sizeof(int32_t) * 2 * ir->label_cap);
+    ir->label_pos = tcc_realloc(ir->label_pos, sizeof(int32_t) * IR_LABEL_WORDS * ir->label_cap);
   }
-  ir->label_pos[2 * ir->label_count] = jind;
-  ir->label_pos[2 * ir->label_count + 1] = jind;
+  int32_t *l = &ir->label_pos[IR_LABEL_WORDS * ir->label_count];
+  l[0] = jind;
+  l[1] = jind;
+  l[2] = jind;
   ir->label_count++;
+}
+
+/* Where label record `l` is now: in front of its anchor instruction, or, that
+ * one gone, at the index carried through the renumberings. */
+static int label_resolve(TCCIRState *ir, int32_t *l)
+{
+  for (int i = 0; i < ir->next_instruction_index; i++)
+    if (ir->compact_instructions[i].orig_index == l[2])
+    {
+      l[1] = i;
+      return i;
+    }
+  return l[1];
 }
 
 /* Where the label defined at `jind` is now, or -1 if it was never noted. */
 int tcc_ir_label_insn(TCCIRState *ir, int jind)
 {
   for (int k = 0; ir && k < ir->label_count; k++)
-    if (ir->label_pos[2 * k] == jind)
-      return ir->label_pos[2 * k + 1];
+    if (ir->label_pos[IR_LABEL_WORDS * k] == jind)
+      return label_resolve(ir, &ir->label_pos[IR_LABEL_WORDS * k]);
   return -1;
+}
+
+/* Bring every label's index up to its anchor, before a pass renumbers the
+ * instructions (tcc_ir_frame_scope_remap then re-anchors from the index). */
+void tcc_ir_label_sync(TCCIRState *ir)
+{
+  for (int k = 0; ir && k < ir->label_count; k++)
+    label_resolve(ir, &ir->label_pos[IR_LABEL_WORDS * k]);
+}
+
+/* The instruction just inserted at `pos` belongs to the block that started
+ * at `pos + 1`: every way into that block -- a branch, a switch entry, a
+ * label, which an asm goto names -- now enters at `pos`. */
+void tcc_ir_keep_label_ahead(TCCIRState *ir, int pos)
+{
+  IRQuadCompact *moved = &ir->compact_instructions[pos + 1];
+  if (moved->is_jump_target)
+  {
+    moved->is_jump_target = 0;
+    ir->compact_instructions[pos].is_jump_target = 1;
+  }
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if ((q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) && (int)tcc_ir_op_dest_imm(ir, q) == pos + 1)
+      tcc_ir_op_set_dest_imm32(ir, q, pos, IROP_BTYPE_INT32);
+  }
+  for (int t = 0; t < ir->num_switch_tables; t++)
+  {
+    TCCIRSwitchTable *table = &ir->switch_tables[t];
+    if (table->default_target == pos + 1)
+      table->default_target = pos;
+    for (int j = 0; table->targets && j < table->num_entries; j++)
+      if (table->targets[j] == pos + 1)
+        table->targets[j] = pos;
+  }
+  for (int k = 0; k < ir->label_count; k++)
+  {
+    int32_t *l = &ir->label_pos[IR_LABEL_WORDS * k];
+    if (label_resolve(ir, l) == pos + 1)
+    {
+      l[1] = pos;
+      l[2] = ir->compact_instructions[pos].orig_index;
+    }
+  }
 }
 
 /* One instruction was inserted before `before_idx`: an end at or after it
@@ -286,8 +395,8 @@ int tcc_ir_label_insn(TCCIRState *ir, int jind)
 void tcc_ir_frame_scope_insert(TCCIRState *ir, int before_idx)
 {
   for (int k = 0; ir && k < ir->label_count; k++)
-    if (ir->label_pos[2 * k + 1] >= before_idx)
-      ir->label_pos[2 * k + 1]++;
+    if (ir->label_pos[IR_LABEL_WORDS * k + 1] >= before_idx)
+      ir->label_pos[IR_LABEL_WORDS * k + 1]++;
   for (int k = 0; ir && k < ir->frame_obj_count; k++)
   {
     int32_t *o = &ir->frame_objs[FRAME_OBJ_WORDS * k];
@@ -308,14 +417,18 @@ void tcc_ir_frame_scope_remap(TCCIRState *ir, const int *map, int old_n, int new
 {
   for (int k = 0; ir && k < ir->label_count; k++)
   {
-    int p = ir->label_pos[2 * k + 1], np = new_n;
+    int p = ir->label_pos[IR_LABEL_WORDS * k + 1], np = new_n;
     for (int i = p; i >= 0 && i < old_n; i++)
       if (map[i] >= 0)
       {
         np = map[i];
         break;
       }
-    ir->label_pos[2 * k + 1] = np;
+    ir->label_pos[IR_LABEL_WORDS * k + 1] = np;
+    /* Where the map sends the label -- the next survivor, or copies a branch
+     * to it now lands on -- is what it stands in front of from now on. */
+    if (np < new_n)
+      ir->label_pos[IR_LABEL_WORDS * k + 2] = ir->compact_instructions[np].orig_index;
   }
   for (int k = 0; ir && k < ir->frame_obj_count; k++)
   {

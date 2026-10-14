@@ -116,3 +116,23 @@ UT_TEST(test_cfg_cycle_unknown_successors_are_conservative)
   }
   return 0;
 }
+
+/* A TRAP ends its block with no successor: the guard block does not join the
+ * code after it (kernel-noreturn-call-cfg-fallthrough). */
+UT_TEST(test_cfg_trap_has_no_fallthrough)
+{
+  TCCIRState *ir = tcc_ir_alloc();
+  cfg_test_put(ir, TCCIR_OP_JUMPIF, 3);
+  cfg_test_put(ir, TCCIR_OP_NOP, 0);
+  cfg_test_put(ir, TCCIR_OP_TRAP, 0);
+  cfg_test_put(ir, TCCIR_OP_RETURNVOID, 0);
+  IRCFG *cfg = tcc_ir_cfg_build(ir);
+  UT_ASSERT(cfg != NULL);
+  UT_ASSERT_EQ(cfg->num_blocks, 3);
+  UT_ASSERT_EQ(cfg->blocks[1].num_succs, 0);
+  UT_ASSERT_EQ(cfg->blocks[2].num_preds, 1);
+  UT_ASSERT_EQ(cfg->blocks[2].preds[0], 0);
+  tcc_ir_cfg_free(cfg);
+  tcc_ir_free(ir);
+  return 0;
+}

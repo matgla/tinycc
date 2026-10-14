@@ -12,7 +12,13 @@
 #undef USING_GLOBALS
 #include "../opt/ra/incomplete_calls.c"
 #undef USING_GLOBALS
+#include "../opt/ra/load_sink.c"
+#undef RA_LOAD_SINK_HOPS
+#undef RA_LOAD_SINK_WINDOW
+#undef USING_GLOBALS
 #include "../opt/ra/phi_const_chain.c"
+#undef USING_GLOBALS
+#include "../opt/ra/return_sink.c"
 #undef USING_GLOBALS
 #include "../opt/ra/umaal_fusion.c"
 #undef USING_GLOBALS

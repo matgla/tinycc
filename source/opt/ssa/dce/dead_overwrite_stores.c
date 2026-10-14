@@ -199,12 +199,15 @@ int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
 
       /* Any is_lval source is a memory read; an unresolvable one may alias any store. */
       int saw_unresolved_deref = 0;
-      for (int side = 0; side < 2; side++) {
+      for (int side = 0; side < 3; side++) {
         if (side == 0 && !irop_config[q->op].has_src1)
           continue;
         if (side == 1 && !irop_config[q->op].has_src2)
           continue;
-        IROperand s = tcc_ir_op_get_src1_or_2(ir, q, side);
+        if (side == 2 && !tcc_ir_op_is_mac(q->op))
+          continue;
+        /* side 2: a MAC's accumulator is a read like its sources. */
+        IROperand s = side == 2 ? tcc_ir_op_get_accum(ir, q) : tcc_ir_op_get_src1_or_2(ir, q, side);
         if (!s.is_lval)
           continue;
         int eff = INT_MIN;
@@ -303,12 +306,15 @@ int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
       }
 
       /* Other ops may take a stack address as a value (BLOCK_COPY) — treat as a read. */
-      for (int side = 0; side < 2; side++) {
+      for (int side = 0; side < 3; side++) {
         if (side == 0 && !irop_config[q->op].has_src1)
           continue;
         if (side == 1 && !irop_config[q->op].has_src2)
           continue;
-        IROperand s = side ? tcc_ir_op_get_src2(ir, q) : tcc_ir_op_get_src1(ir, q);
+        if (side == 2 && !tcc_ir_op_is_mac(q->op))
+          continue;
+        IROperand s = side == 2 ? tcc_ir_op_get_accum(ir, q)
+                                : side ? tcc_ir_op_get_src2(ir, q) : tcc_ir_op_get_src1(ir, q);
         if (s.is_lval)
           continue;
         /* A direct frame address (`Addr[StackLoc[N]]`) handed to a memory reader. */

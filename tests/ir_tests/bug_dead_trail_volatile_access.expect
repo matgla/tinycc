@@ -1,0 +1,10 @@
+armed 1
+f_load 3 flag 0
+f_add 3 flag 0
+f_addr 3 flag 0
+f_ptr 3 flag 0
+f_ctrl 3 flag 0
+f_vlocal 3 4
+f_vcast 6 14
+f_plain 5
+timer ok

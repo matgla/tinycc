@@ -161,6 +161,9 @@ int tcc_ir_opt_switch_head(TCCIRState *ir)
       for (int j = 0; tbl->targets && j < tbl->num_entries; j++)
         tbl->targets[j] = sh_map(b, d, e, tbl->targets[j]);
     }
+    /* A label's fallback index, should its anchor instruction go. */
+    for (int l = 0; l < ir->label_count; l++)
+      ir->label_pos[IR_LABEL_WORDS * l + 1] = sh_map(b, d, e, ir->label_pos[IR_LABEL_WORDS * l + 1]);
     /* The jump at B becomes the dispatch's exit to E, or goes. */
     IRQuadCompact head = ir->compact_instructions[b];
     if (falls)

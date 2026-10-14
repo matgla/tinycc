@@ -1914,6 +1914,35 @@ static int bt_cbz_candidate(TCCIRState *ir, int i)
   return tcc_ir_op_src2_tag(ir, q) == IROP_TAG_IMM32 && !tcc_ir_op_src2_is_lval(ir, q) && !tcc_ir_op_src2_is_sym(ir, q) && tcc_ir_op_src2_imm32(ir, q) == 0;
 }
 
+/* An ASSIGN / LOAD copy the allocator gave one register at both ends: codegen
+ * emits nothing for it (codegen.c, ir_codegen_is_identity_move). */
+static int bt_identity_move(TCCIRState *ir, int i)
+{
+  IRQuadCompact *q = &ir->compact_instructions[i];
+  if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LOAD)
+    return 0;
+  IROperand s = tcc_ir_op_get_src1(ir, q), d = tcc_ir_op_get_dest(ir, q);
+  if (d.tag != IROP_TAG_VREG || d.is_lval || s.tag != IROP_TAG_VREG || s.is_lval || s.is_llocal || s.is_sym ||
+      irop_needs_pair(s) || irop_needs_pair(d))
+    return 0;
+  MachineOperand sm = machine_op_from_ir(ir, &s), dm = machine_op_from_ir(ir, &d);
+  return sm.kind == MACH_OP_REG && dm.kind == MACH_OP_REG && !sm.needs_deref && !dm.needs_deref &&
+         sm.u.reg.r0 >= 0 && sm.u.reg.r0 == dm.u.reg.r0;
+}
+
+/* Instructions (NOPs aside) from a to b, either direction, up to cap + 1. */
+static int bt_span(TCCIRState *ir, int a, int b, int cap)
+{
+  int lo = a < b ? a : b, hi = a < b ? b : a, c = 0;
+  for (int k = lo; k < hi && c <= cap; k++)
+    c += ir->compact_instructions[k].op != TCCIR_OP_NOP;
+  return c;
+}
+
+/* A short branch's reach, in instructions: a B<c>.N reaches 256 bytes, a
+ * B<c>.W 1 MB; 64 instructions stay inside a B.N's 2 KB with room. */
+#define BT_NEAR_SPAN 64
+
 /* Branch encodings decide what pays here.  A B reaches +-2 KB, so a jump
  * threaded past another jump keeps its size, and the other one goes when
  * nothing else enters it.  A conditional branch to a jump gives up its 16-bit
@@ -1921,7 +1950,14 @@ static int bt_cbz_candidate(TCCIRState *ir, int i)
  * it bypasses goes with it.  Inverting `B<c> L; B X; L:` into `B<!c> X` never
  * costs (B<c>.W is the size of B<c>.N + B.N).  A compare against zero is left
  * alone: its branch becomes a CBZ, forward-only within 126 bytes, which the
- * far target would lose. */
+ * far target would lose -- unless X is near.  Over a 16-bit B a CBZ cannot
+ * reach L (codegen's fusion needs 4 bytes more than `B<c> L` spans), so the
+ * pair is `CMP; B<c> L; B X` either way, and inverted the path to L costs the
+ * same and the path to X one branch less; X near also gives the inverted
+ * branch its own chance at a CBZ.  Copies between the B<c> and the B that
+ * the allocator made identity moves emit nothing, and are skipped: the
+ * scan's found-path `index <- i` in an inlined findScalarPos (ROMFS
+ * FileHeader.load) is just that. */
 int tcc_ir_branch_tidy(TCCIRState *ir)
 {
   const int n = ir->next_instruction_index;
@@ -1999,12 +2035,15 @@ int tcc_ir_branch_tidy(TCCIRState *ir)
     for (int i = 0; i < n; i++)
     {
       IRQuadCompact *q = &ir->compact_instructions[i];
-      if (q->op != TCCIR_OP_JUMPIF || bt_cbz_candidate(ir, i))
+      if (q->op != TCCIR_OP_JUMPIF)
         continue;
       int j = i + 1;
-      while (j < n && ir->compact_instructions[j].op == TCCIR_OP_NOP)
+      while (j < n && (ir->compact_instructions[j].op == TCCIR_OP_NOP ||
+                       (!refs[j] && !ir->compact_instructions[j].is_jump_target && bt_identity_move(ir, j))))
         j++;
       if (j >= n || ir->compact_instructions[j].op != TCCIR_OP_JUMP || refs[j])
+        continue;
+      if (bt_cbz_candidate(ir, i) && bt_span(ir, i, bt_target(ir, j), BT_NEAR_SPAN) > BT_NEAR_SPAN)
         continue;
       int after = j + 1;
       while (after < n && ir->compact_instructions[after].op == TCCIR_OP_NOP)

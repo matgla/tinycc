@@ -99,6 +99,8 @@ static void prev_scope(struct scope *o, int is_expr)
 
   /* pop locally defined symbols */
   pop_local_syms(o->lstk, is_expr);
+  /* and unbind the names of the nested functions the block defined */
+  nested_scope_end(local_scope);
 
   /* The block's objects live only while it runs (C11 6.2.4p6), whatever their
    * address did: frame colouring may then give another block's objects the
@@ -523,8 +525,7 @@ again:
       {
         /* no, regular for-loop init expr */
         gexpr();
-        gv_discarded_volatile();
-        vpop();
+        vpop_discarded();
       }
     }
     skip(';');
@@ -550,8 +551,7 @@ again:
       // d = gind();
       c = tcc_state->ir->next_instruction_index;
       gexpr();
-      gv_discarded_volatile();
-      vpop();
+      vpop_discarded();
       gjmp_addr(d);
       tcc_ir_backpatch_to_here(tcc_state->ir, e);
       // gsym(e);
@@ -822,6 +822,10 @@ again:
             /* This is a non-local goto - emit longjmp to parent's jmp_buf.
              * The jmp_buf is accessed as a captured variable via the static chain. */
             int buf_off = cur_nf->nlgoto_buf_offsets[ngi];
+            /* The buffer is a capture: address it by its range in this frame. */
+            for (int ci = 0; ci < cur_nf->nb_captured && ci < 32; ci++)
+              if (cur_nf->captured_tokens[ci] == -tok)
+                buf_off = tcc_state->ir->captured_vbase[ci];
 
             /* Create SValue for buffer address via chain-relative access.
              * vreg=-1 + VT_LOCAL + is_lval=false → MACH_OP_CHAIN_REL with no deref,
@@ -831,7 +835,7 @@ again:
             buf_sv.type.t = VT_INT;
             buf_sv.type.ref = NULL;
             buf_sv.r = VT_LOCAL;  /* FP-relative in parent, becomes chain-relative */
-            buf_sv.c.i = buf_off; /* parent's FP offset of the jmp_buf */
+            buf_sv.c.i = buf_off; /* the jmp_buf capture's offset range */
             buf_sv.vr = -1;       /* no vreg = pure stack offset → triggers CHAIN_REL */
 
             /* Emit NL_LONGJMP: restores callee-saved regs, SP from 40-byte buffer and jumps to resume addr */
@@ -920,6 +924,10 @@ again:
       }
       s->jind = gind();
       tcc_ir_label_note(tcc_state->ir, s->jind);
+      tcc_ir_asm_label_note(tcc_state->ir, s->c, s->jind);
+      tcc_state->ir->basic_block_start = 1;
+      if (s->c > 0)
+        tcc_state->ir->next_insn_is_jump_target = 1;
       const_init_forget_all();
       s->cleanupstate = cur_scope->cl.s;
 

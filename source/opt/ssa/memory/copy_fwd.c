@@ -114,6 +114,7 @@ typedef struct
   int at;     /* where the access happens (the CALL for an argument) */
   int insn;   /* the instruction holding the operand */
   int kind;
+  int inexact; /* CFA_WRITE of a width this could not tell (4 bytes assumed) */
 } CfwAcc;
 
 typedef struct
@@ -134,6 +135,8 @@ typedef struct
   int *copy_align;   /* copy-helper CALL -> the alignment its name promises */
   int *sret_param;   /* CALL -> its PARAM0 when that is the struct-return buffer, else -1 */
   int *copy_param;   /* 3 per instruction: PARAM0..2 of a copy-helper CALL */
+  uint8_t *param_redef; /* by position: a parameter some instruction defines (cfw_incoming_ptr) */
+  int nparam;
 } Cfw;
 
 static void cfw_add(Cfw *c, int lo, int hi, int at, int insn, int kind)
@@ -143,7 +146,7 @@ static void cfw_add(Cfw *c, int lo, int hi, int at, int insn, int kind)
     c->cap = c->cap ? 2 * c->cap : 64;
     c->acc = tcc_realloc(c->acc, sizeof(CfwAcc) * c->cap);
   }
-  c->acc[c->nacc++] = (CfwAcc){lo, hi, lo, at, insn, kind};
+  c->acc[c->nacc++] = (CfwAcc){lo, hi, lo, at, insn, kind, 0};
 }
 
 /* 0 if `call` is no copy helper, else the alignment of both pointers its
@@ -457,9 +460,11 @@ static void cfw_scan(Cfw *c, int i)
     if (r == 1)
     {
       w = cfw_width(o);
-      if (w <= 0 || o.is_llocal)
+      const int guessed = w <= 0 || o.is_llocal;
+      if (guessed)
         w = 4;
       cfw_add(c, off, off + w, i, i, is_dest && !o.is_llocal ? CFA_WRITE : CFA_READ);
+      c->acc[c->nacc - 1].inexact = guessed;
     }
     else if (r == 0 && !is_dest && !(traced && k == 1))
       cfw_escape_op(c, o, i);
@@ -814,6 +819,11 @@ static void cfw_build_cfg(Cfw *c)
           cfw_add_edge(cnt, &c->pred, b, c->block_of[t], pass);
         break;
       }
+      case TCCIR_OP_INLINE_ASM:
+        for (int k = 0, target; (target = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+          if (target < n)
+            cfw_add_edge(cnt, &c->pred, b, c->block_of[target], pass);
+        break;
       case TCCIR_OP_SWITCH_TABLE:
       {
         int id = (int)tcc_ir_op_src2_imm(ir, q);
@@ -932,6 +942,91 @@ static int cfw_block_clobbers(Cfw *c, int b, int d, int len, const CfwSrc *src)
   return 0;
 }
 
+typedef struct
+{
+  int at, a;
+} CfwAt;
+
+static int cfw_at_cmp(const void *x, const void *y)
+{
+  const CfwAt *p = x, *q = y;
+  if (p->at != q->at)
+    return p->at < q->at ? -1 : 1;
+  return (p->a > q->a) - (p->a < q->a);
+}
+
+/* The padding map of the frame object holding `off` (pad[b] for byte
+ * *olo + b), or NULL when it has none or it is unknown. */
+static uint8_t *cfw_padding(Cfw *c, int off, int *olo)
+{
+  int lo, hi;
+  if (!tcc_ir_frame_object_at(c->ir, off, &lo, &hi))
+    return NULL;
+  uint8_t *pad = tcc_malloc(hi - lo);
+  if (!tcc_ir_frame_padding_map(c->ir, lo, hi, pad))
+  {
+    tcc_free(pad);
+    return NULL;
+  }
+  *olo = lo;
+  return pad;
+}
+
+/* Mark in `cover` each instruction by which the writes of [lo, lo + len)
+ * since the start of its block (in the block of `ci`, since `ci` once past
+ * it) have stored every byte of it that is not padding of its frame object,
+ * and "clear" (rf = 0) the blocks where that happens after `ci`.  With a
+ * member stored, the padding bytes of a struct are unspecified (C11
+ * 6.2.6.1p6): `t16.is_null = false; t16.payload = t21` is a whole new
+ * value of t16, whatever bytes a copy put in its tail before. */
+static void cfw_mark_cover(Cfw *c, int ci, int lo, int len, uint8_t *cover, int8_t *rf)
+{
+  TCCIRState *ir = c->ir;
+  int olo = 0, nw = 0;
+  uint8_t *pad = cfw_padding(c, lo, &olo);
+  CfwAt *w = tcc_malloc(sizeof(CfwAt) * (c->nacc > 0 ? c->nacc : 1));
+  for (int a = 0; a < c->nacc; a++)
+  {
+    const CfwAcc *x = &c->acc[a];
+    if (x->kind == CFA_WRITE && x->at != ci && !x->inexact && cfw_overlaps(x, lo, lo + len) &&
+        ir->compact_instructions[x->at].op != TCCIR_OP_NOP)
+      w[nw++] = (CfwAt){x->at, a};
+  }
+  if (nw > 1)
+    tcc_qsort(w, nw, sizeof(CfwAt), cfw_at_cmp);
+  uint8_t *got = tcc_malloc(len);
+  const int cb = c->block_of[ci];
+  int blk = -1, seg = -1, left = 0;
+  for (int k = 0; k < nw; k++)
+  {
+    const CfwAcc *x = &c->acc[w[k].a];
+    const int at = x->at, b = c->block_of[at], sg = b == cb && at > ci;
+    if (b != blk || sg != seg)
+    {
+      blk = b, seg = sg, left = 0;
+      memset(got, 0, len);
+      for (int y = 0; y < len; y++)
+        left += !pad || !pad[lo + y - olo];
+    }
+    const int from = x->lo > lo ? x->lo : lo, to = x->hi < lo + len ? x->hi : lo + len;
+    for (int y = from; y < to; y++)
+      if (!got[y - lo])
+      {
+        got[y - lo] = 1;
+        left -= !pad || !pad[y - olo];
+      }
+    if (left == 0)
+    {
+      cover[at] = 1;
+      if (rf && (b != cb || at > ci))
+        rf[b] = 0;
+    }
+  }
+  tcc_free(got);
+  tcc_free(w);
+  tcc_free(pad);
+}
+
 /* Try the copy at CALL `ci`.  Returns the number of rewrites. */
 static int cfw_copy(Cfw *c, int ci)
 {
@@ -1004,16 +1099,9 @@ static int cfw_copy(Cfw *c, int ci)
   ain = tcc_mallocz(nb), aout = tcc_malloc(nb), rin = tcc_mallocz(nb), rout = tcc_mallocz(nb);
   memset(af, CFW_AF_UNKNOWN, nb);
   memset(rf, -1, nb);
-  /* "Cleared" for REACHES: a write covering all of D (in the copy's own
-   * block, only one after it). */
-  for (int a = 0; a < c->nacc; a++)
-    if (c->acc[a].kind == CFA_WRITE && c->acc[a].at != ci && c->acc[a].lo <= d && c->acc[a].hi >= d + len)
-    {
-      const int at = c->acc[a].at;
-      cover[at] = 1;
-      if (ir->compact_instructions[at].op != TCCIR_OP_NOP && (c->block_of[at] != cb || at > ci))
-        rf[c->block_of[at]] = 0;
-    }
+  /* "Cleared" for REACHES: writes covering all of D but its padding (in the
+   * copy's own block, ones after it). */
+  cfw_mark_cover(c, ci, d, len, cover, rf);
   if (rf[cb] < 0)
     rf[cb] = 1;
   /* The copy's own block sets AVAILABLE unless something after the copy
@@ -1303,6 +1391,398 @@ done:
   return changes;
 }
 
+/* An incoming pointer argument never redefined: the caller made it before
+ * this frame existed, so it points into none of this frame's objects. */
+static int cfw_incoming_ptr(Cfw *c, IROperand op)
+{
+  const int32_t vr = irop_get_vreg(op);
+  if (irop_get_tag(op) != IROP_TAG_VREG || op.is_llocal || op.is_local || vr < 0 ||
+      TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_PARAM)
+    return 0;
+  const int pos = TCCIR_DECODE_VREG_POSITION(vr);
+  if (!c->param_redef)
+  {
+    /* Which parameters an instruction (re)defines: computed on first use. */
+    TCCIRState *ir = c->ir;
+    c->nparam = ir->next_parameter;
+    c->param_redef = tcc_mallocz(c->nparam > 0 ? c->nparam : 1);
+    for (int i = 0; i < c->n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      int32_t dv[2] = {-1, -1};
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      if (q->op == TCCIR_OP_LOAD_POSTINC || q->op == TCCIR_OP_STORE_POSTINC)
+      {
+        dv[0] = tcc_ir_op_src1_vreg(ir, q);
+        dv[1] = tcc_ir_op_dest_vreg(ir, q);
+      }
+      else if (irop_config[q->op].has_dest && q->op != TCCIR_OP_STORE_INDEXED) /* that dest is the base */
+      {
+        IROperand dd = tcc_ir_op_get_dest(ir, q);
+        if (irop_dest_defines_vreg(dd))
+          dv[0] = irop_get_vreg(dd);
+      }
+      for (int k = 0; k < 2; k++)
+        if (dv[k] >= 0 && TCCIR_DECODE_VREG_TYPE(dv[k]) == TCCIR_VREG_TYPE_PARAM &&
+            TCCIR_DECODE_VREG_POSITION(dv[k]) < c->nparam)
+          c->param_redef[TCCIR_DECODE_VREG_POSITION(dv[k])] = 1;
+    }
+  }
+  IRLiveInterval *li = tcc_ir_get_live_interval(c->ir, vr);
+  return pos < c->nparam && !c->param_redef[pos] && li && !li->addrtaken;
+}
+
+/* An address operand naming the frame or no frame object at all. */
+static int cfw_addr_known(Cfw *c, IROperand op)
+{
+  int off;
+  return cfw_frame_addr(c, op, &off) || (!op.is_lval && cfw_incoming_ptr(c, op));
+}
+
+/* Could instruction i read or write a frame object other than through the
+ * accesses recorded for it -- through a pointer, in a call, in inline asm? */
+static int cfw_touches_unknown(Cfw *c, int i)
+{
+  TCCIRState *ir = c->ir;
+  IRQuadCompact *q = &ir->compact_instructions[i];
+  const int op = q->op;
+  int off, lo, hi, base;
+  switch (op)
+  {
+  case TCCIR_OP_FUNCCALLVOID:
+  case TCCIR_OP_FUNCCALLVAL:
+    /* A copy helper between frame bytes and incoming buffers touches no other frame bytes. */
+    return !(c->copy_len[i] > 0 && c->copy_param[3 * i] >= 0 && c->copy_param[3 * i + 1] >= 0 &&
+             cfw_addr_known(c, tcc_ir_op_get_src1(ir, &ir->compact_instructions[c->copy_param[3 * i]])) &&
+             cfw_addr_known(c, tcc_ir_op_get_src1(ir, &ir->compact_instructions[c->copy_param[3 * i + 1]])));
+  case TCCIR_OP_INLINE_ASM:
+  case TCCIR_OP_LOAD_POSTINC:
+  case TCCIR_OP_STORE_POSTINC:
+    return 1;
+  case TCCIR_OP_BLOCK_COPY:
+    return !cfw_block_copy_frame(c, i, &lo, &hi);
+  case TCCIR_OP_LOAD_INDEXED:
+  case TCCIR_OP_STORE_INDEXED:
+    return !cfw_indexed_frame(c, i, &base, &lo, &hi);
+  /* These reach memory only through their operands, checked below. */
+  case TCCIR_OP_NOP:
+  case TCCIR_OP_FUNCPARAMVOID:
+  case TCCIR_OP_FUNCPARAMVAL:
+  case TCCIR_OP_ADD:
+  case TCCIR_OP_ADC_USE:
+  case TCCIR_OP_ADC_GEN:
+  case TCCIR_OP_SUB:
+  case TCCIR_OP_SUBC_USE:
+  case TCCIR_OP_SUBC_GEN:
+  case TCCIR_OP_MUL:
+  case TCCIR_OP_MLA:
+  case TCCIR_OP_UMULL:
+  case TCCIR_OP_UMAAL:
+  case TCCIR_OP_SMULL:
+  case TCCIR_OP_DIV:
+  case TCCIR_OP_UDIV:
+  case TCCIR_OP_PDIV:
+  case TCCIR_OP_UMOD:
+  case TCCIR_OP_IMOD:
+  case TCCIR_OP_AND:
+  case TCCIR_OP_OR:
+  case TCCIR_OP_XOR:
+  case TCCIR_OP_SHL:
+  case TCCIR_OP_SAR:
+  case TCCIR_OP_SHR:
+  case TCCIR_OP_ROR:
+  case TCCIR_OP_CMP:
+  case TCCIR_OP_SETIF:
+  case TCCIR_OP_TEST_ZERO:
+  case TCCIR_OP_ASSIGN:
+  case TCCIR_OP_LEA:
+  case TCCIR_OP_UBFX:
+  case TCCIR_OP_SBFX:
+  case TCCIR_OP_BFI:
+  case TCCIR_OP_ZEXT:
+  case TCCIR_OP_PACK64:
+  case TCCIR_OP_BOOL_OR:
+  case TCCIR_OP_BOOL_AND:
+  case TCCIR_OP_SELECT:
+  case TCCIR_OP_CLZ:
+  case TCCIR_OP_RBIT:
+  case TCCIR_OP_REV:
+  case TCCIR_OP_REV16:
+  case TCCIR_OP_FADD:
+  case TCCIR_OP_FSUB:
+  case TCCIR_OP_FMUL:
+  case TCCIR_OP_FDIV:
+  case TCCIR_OP_FNEG:
+  case TCCIR_OP_FCMP:
+  case TCCIR_OP_CVT_FTOF:
+  case TCCIR_OP_CVT_ITOF:
+  case TCCIR_OP_CVT_FTOI:
+  case TCCIR_OP_LOAD:
+  case TCCIR_OP_STORE:
+  case TCCIR_OP_SWITCH_LOAD:
+  case TCCIR_OP_ASM_INPUT:
+  case TCCIR_OP_ASM_OUTPUT:
+  case TCCIR_OP_JUMP:
+  case TCCIR_OP_JUMPIF:
+  case TCCIR_OP_RETURNVOID:
+  case TCCIR_OP_RETURNVALUE:
+  case TCCIR_OP_SWITCH_TABLE:
+  case TCCIR_OP_TRAP:
+  case TCCIR_OP_PREFETCH:
+    break;
+  /* Anything else -- setjmp/longjmp, __builtin_apply and friends, VLA and
+   * chain-slot ops, an op added later -- may reach memory unseen. */
+  default:
+    return 1;
+  }
+  IROperand ops[4];
+  int nops = 0;
+  if (irop_config[op].has_dest)
+    ops[nops++] = tcc_ir_op_get_dest(ir, q);
+  if (irop_config[op].has_src1)
+    ops[nops++] = tcc_ir_op_get_src1(ir, q);
+  if (irop_config[op].has_src2)
+    ops[nops++] = tcc_ir_op_get_src2(ir, q);
+  if (tcc_ir_op_is_mac(op) || op == TCCIR_OP_SELECT)
+  {
+    ops[nops] = ir->iroperand_pool[q->operand_base + nops];
+    nops++;
+  }
+  for (int k = 0; k < nops; k++)
+  {
+    IROperand o = ops[k];
+    /* A variable's own home is no frame object. */
+    if (irop_get_tag(o) == IROP_TAG_STACKOFF && irop_get_vreg(o) >= 0)
+      continue;
+    if ((o.is_lval || o.is_llocal) && cfw_frame_mem(c, o, &off) != 1 && !(o.is_lval && cfw_incoming_ptr(c, o)))
+      return 1;
+  }
+  return 0;
+}
+
+/* A write of the frame bytes at `from` the window may move to `to`:
+ * the store, the block fill, or the copy or struct-return buffer
+ * PARAM0 that names them.  Returns the operand slot, -1 if none. */
+static int cfw_relay_slot(Cfw *c, const CfwAcc *x, int from, int to, IROperand *out)
+{
+  TCCIRState *ir = c->ir;
+  IRQuadCompact *q = &ir->compact_instructions[x->insn];
+  if (cfw_frame_align(to) < cfw_frame_align(from))
+    return -1;
+  if (q->op == TCCIR_OP_FUNCPARAMVAL && c->param_call[x->insn] == x->at)
+  {
+    const int call = x->at, pidx = TCCIR_DECODE_PARAM_IDX((uint32_t)tcc_ir_op_src2_imm(ir, q));
+    if (pidx != 0 || (c->copy_len[call] <= 0 && c->sret_param[call] != x->insn))
+      return -1;
+    if (c->copy_len[call] > 0 && cfw_frame_align(to) < c->copy_align[call])
+      return -1;
+    *out = irop_make_stackoff(-1, to, 0, 0, 0, IROP_BTYPE_INT32);
+    return irop_config[q->op].has_dest ? 1 : 0;
+  }
+  if ((q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_BLOCK_COPY) || x->at != x->insn)
+    return -1;
+  IROperand o = tcc_ir_op_get_dest(ir, q);
+  int off;
+  if (!cfw_direct_frame(o, &off) || off != from || o.is_llocal || tcc_ir_access_is_volatile(ir, o))
+    return -1;
+  if (irop_get_btype(o) == IROP_BTYPE_STRUCT)
+  {
+    if (to < -32768 || to > 32767)
+      return -1;
+    o.u.s.aux_data = (int16_t)to;
+  }
+  else
+    o.u.imm32 = to;
+  if (to & 3)
+    o.aux &= ~IROP_AUX_ALIGN4_OK;
+  *out = o;
+  return 0;
+}
+
+#define CFW_RELAY_MAX 16
+
+/* A relay: `D = S` where every byte of S the copy reads was stored just
+ * before it in its block, nothing reads S afterwards, and nothing touches D
+ * in between.  The Zig backend builds a value in one local and copies it
+ * into another: `t16.is_null = false; t16.payload = t21; t9 = t16`.  Those
+ * stores write D instead and the copy goes.  A byte of S the window does not
+ * store must be padding: with a member stored, it is unspecified (C11
+ * 6.2.6.1p6), so D may keep what it had.
+ *
+ * Soundness: S never escapes (only the recorded accesses name it); every
+ * moved write stores bytes of S that no later write in the window covers
+ * and that no read in the window may see; from the first moved write on,
+ * nothing names D's bytes, and where D's address may be out, nothing reads or
+ * writes memory through a pointer, a call or asm; no read of S that a moved
+ * write may reach is left (REACHES from the copy, as in cfw_copy). */
+static int cfw_relay(Cfw *c, int ci)
+{
+  TCCIRState *ir = c->ir;
+  const int len = c->copy_len[ci];
+  const int p0 = c->copy_param[3 * ci], p1 = c->copy_param[3 * ci + 1];
+  if (len <= 0 || p0 < 0 || p1 < 0 || c->copy_param[3 * ci + 2] < 0 || !cfw_result_unused(c, ci) ||
+      tcc_ir_opt_pass_disabled("copy_fwd:relay"))
+    return 0;
+  IROperand sop = tcc_ir_op_get_src1(ir, &ir->compact_instructions[p1]);
+  if (ir->func_has_volatile_access && !(sop.aux & IROP_AUX_NONVOLATILE))
+    return 0;
+  int d, dlo, dhi, s, slo, shi;
+  if (!cfw_frame_addr(c, tcc_ir_op_get_src1(ir, &ir->compact_instructions[p0]), &d) ||
+      !tcc_ir_frame_object_at(ir, d, &dlo, &dhi) || d + len > dhi || !cfw_frame_addr(c, sop, &s) ||
+      !tcc_ir_frame_object_at(ir, s, &slo, &shi) || s + len > shi || (s < d + len && d < s + len) ||
+      cfw_escaped(c, slo, shi))
+    return 0;
+
+  const int cb = c->block_of[ci], nb = c->nb;
+  int changes = 0, nw = 0, spad_lo = 0, moved[CFW_RELAY_MAX], slot[CFW_RELAY_MAX];
+  IROperand to[CFW_RELAY_MAX];
+  uint8_t *desc = cfw_esc_map(c, dlo, dhi), *spad = cfw_padding(c, s, &spad_lo), *need = tcc_malloc(len);
+  uint8_t *cover = NULL, *rin = NULL, *rout = NULL;
+  int8_t *rf = NULL;
+  int *blk = tcc_malloc(sizeof(int) * (c->nacc > 0 ? c->nacc : 1)), nblk = 0;
+  memset(need, 1, len);
+  for (int a = 0; a < c->nacc; a++)
+    if (c->acc[a].at < ci && c->block_of[c->acc[a].at] == cb)
+      blk[nblk++] = a;
+
+  /* Back from the copy: find the stores of every byte S hands to D. */
+  int left = len, done = 0;
+  for (int y = 0; y < len; y++)
+    if (spad && spad[s + y - spad_lo])
+      need[y] = 0, left--;
+  for (int i = ci - 1; i >= c->bstart[cb] && !done; i--)
+  {
+    if (ir->compact_instructions[i].op == TCCIR_OP_NOP)
+      continue;
+    /* Where D's address may be out, a pointer may reach it: nothing from
+     * the first moved write on may access memory unseen -- except a memmove
+     * that is itself a moved write, through its source: it reads before it
+     * writes, whichever object it writes. */
+    const int unk = desc && desc[i] && cfw_touches_unknown(c, i);
+    int stop = 0, found = 0, nw0 = nw, last = 0;
+    for (int k = 0; k < nblk && !stop; k++)
+    {
+      const CfwAcc *x = &c->acc[blk[k]];
+      if (x->at != i)
+        continue;
+      if (cfw_overlaps(x, d, d + len))
+        stop = 1;
+      else if (!cfw_overlaps(x, s, s + len))
+        continue;
+      else if (x->kind == CFA_WRITE)
+      {
+        int all = x->lo >= s && x->hi <= s + len && !x->inexact;
+        for (int y = x->lo; all && y < x->hi; y++)
+          all = need[y - s] || (spad && spad[y - spad_lo]);
+        IROperand v;
+        int sl = all && nw < CFW_RELAY_MAX ? cfw_relay_slot(c, x, x->lo, x->lo - s + d, &v) : -1;
+        if (sl < 0)
+        {
+          stop = 1;
+          continue;
+        }
+        moved[nw] = blk[k], slot[nw] = sl, to[nw] = v, nw++;
+        found = 1;
+      }
+      else
+      {
+        /* A read of bytes the window has not stored yet would see a moved one. */
+        for (int y = x->lo > s ? x->lo : s; !stop && y < x->hi && y < s + len; y++)
+          stop = need[y - s];
+      }
+    }
+    if (unk && !stop)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      Sym *callee = (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL) && c->copy_len[i] > 0
+                        ? tcc_ir_op_src1_sym(ir, q)
+                        : NULL;
+      int off;
+      stop = !found || !callee || !strstr(get_tok_str(callee->v, NULL), "memmove") ||
+             !cfw_frame_addr(c, tcc_ir_op_get_src1(ir, &ir->compact_instructions[c->copy_param[3 * i]]), &off);
+      last = 1; /* no write before it may move: it could read that */
+    }
+    if (stop)
+    {
+      nw = nw0;
+      break;
+    }
+    if (found)
+      for (int k = 0; k < nw; k++)
+        if (c->acc[moved[k]].at == i)
+          for (int y = c->acc[moved[k]].lo; y < c->acc[moved[k]].hi; y++)
+            if (need[y - s])
+              need[y - s] = 0, left--;
+    done = left == 0;
+    if (last)
+      break;
+  }
+  if (!done || !nw)
+    goto out;
+
+  /* S's stored bytes must die at the copy. */
+  cover = tcc_mallocz(c->n);
+  rf = tcc_malloc(nb), rin = tcc_mallocz(nb), rout = tcc_mallocz(nb);
+  memset(rf, -1, nb);
+  cfw_mark_cover(c, ci, s, len, cover, rf);
+  if (rf[cb] < 0)
+    rf[cb] = 1;
+  for (int changed = 1, guard = 0; changed && guard < 4 * nb + 8; guard++)
+  {
+    changed = 0;
+    for (int b = 0; b < nb; b++)
+    {
+      int r = 0;
+      for (int p = c->pred_at[b]; p < c->pred_at[b + 1]; p++)
+        r |= rout[c->pred[p]];
+      const int ro = rf[b] < 0 ? r : rf[b];
+      if (rin[b] != r || rout[b] != ro)
+        changed = 1;
+      rin[b] = r, rout[b] = ro;
+    }
+  }
+  for (int a = 0; a < c->nacc; a++)
+  {
+    const CfwAcc *x = &c->acc[a];
+    if (x->kind == CFA_WRITE || x->kind == CFA_ESCAPE || x->at == ci || !cfw_overlaps(x, s, s + len))
+      continue;
+    const int b = c->block_of[x->at];
+    int re = rin[b];
+    for (int i = c->bstart[b]; i < x->at; i++)
+      if (i == ci)
+        re = 1;
+      else if (cover[i])
+        re = 0;
+    if (re)
+      goto out;
+  }
+
+  CFW_DBG("%s: relay at %d len %d: %d stores of %d move to %d\n", funcname ? funcname : "?", ci, len, nw, s, d);
+  for (int k = 0; k < nw; k++)
+  {
+    CfwAcc *x = &c->acc[moved[k]];
+    cfw_set_operand(ir, x->insn, slot[k], to[k]);
+    x->lo += d - s, x->hi += d - s, x->base += d - s;
+  }
+  ir_opt_nop_call_params(ir, ci);
+  ir->compact_instructions[ci].op = TCCIR_OP_NOP;
+  for (int a = 0; a < c->nacc; a++)
+    if (c->acc[a].at == ci && (c->acc[a].kind == CFA_WRITE || c->acc[a].kind == CFA_COPY_SRC))
+      c->acc[a].kind = CFA_READ, c->acc[a].lo = c->acc[a].hi = 0;
+  changes = 1;
+out:
+  tcc_free(desc);
+  tcc_free(spad);
+  tcc_free(need);
+  tcc_free(blk);
+  tcc_free(cover);
+  tcc_free(rf);
+  tcc_free(rin);
+  tcc_free(rout);
+  return changes;
+}
+
 int ssa_opt_copy_fwd(IRSSAOptCtx *ctx)
 {
   TCCIRState *ir = ctx->ir;
@@ -1404,6 +1884,13 @@ int ssa_opt_copy_fwd(IRSSAOptCtx *ctx)
     case TCCIR_OP_TRAP:
       c.block_start[i + 1] = 1;
       break;
+    case TCCIR_OP_INLINE_ASM:
+      for (int k = 0, target; (target = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+        if (target < n)
+          c.block_start[target] = 1;
+      if (tcc_ir_asm_goto_target(ir, q, 0) >= 0)
+        c.block_start[i + 1] = 1;
+      break;
     default:
       break;
     }
@@ -1436,9 +1923,14 @@ int ssa_opt_copy_fwd(IRSSAOptCtx *ctx)
   int changes = 0;
   for (int i = 0; i < n; i++)
     if (c.copy_len[i] > 0 && ir->compact_instructions[i].op != TCCIR_OP_NOP)
+    {
       changes += cfw_copy(&c, i);
+      if (ir->compact_instructions[i].op != TCCIR_OP_NOP)
+        changes += cfw_relay(&c, i);
+    }
   if (changes)
     tcc_ir_ssa_opt_rebuild(ctx);
+  tcc_free(c.param_redef);
   tcc_free(c.acc);
   tcc_free(c.block_of);
   tcc_free(c.bstart);

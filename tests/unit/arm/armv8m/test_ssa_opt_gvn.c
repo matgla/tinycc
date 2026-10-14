@@ -223,4 +223,38 @@ UT_TEST(test_gvn_cmp_setif_single_pair_no_fold)
   return 0;
 }
 
+UT_TEST(test_gvn_umull_reuses_full_pair)
+{
+  ssa_ctx c = ssa_ctx_new(1, 5);
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(-1, I32));
+  ssa_add_instr3(&c, TCCIR_OP_UMULL, utb_temp(1, IROP_BTYPE_INT64), utb_temp(0, I32), utb_imm(7, I32));
+  int dup = ssa_add_instr3(&c, TCCIR_OP_UMULL, utb_temp(2, IROP_BTYPE_INT64), utb_temp(0, I32), utb_imm(7, I32));
+  int use = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(3, IROP_BTYPE_INT64),
+                         utb_temp(1, IROP_BTYPE_INT64), utb_temp(2, IROP_BTYPE_INT64));
+  gvn_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_gvn(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, dup), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_vreg(utb_src2(c.ir, use)), VR_TEMP(1));
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_gvn_zext_keys_source_width)
+{
+  ssa_ctx c = ssa_ctx_new(1, 6);
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(0x1234, I32));
+  ssa_add_instr(&c, TCCIR_OP_ZEXT, utb_temp(1, IROP_BTYPE_INT64), utb_temp(0, IROP_BTYPE_INT8));
+  int other = ssa_add_instr(&c, TCCIR_OP_ZEXT, utb_temp(2, IROP_BTYPE_INT64), utb_temp(0, I16));
+  int dup = ssa_add_instr(&c, TCCIR_OP_ZEXT, utb_temp(3, IROP_BTYPE_INT64), utb_temp(0, IROP_BTYPE_INT8));
+  int use = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(4, IROP_BTYPE_INT64),
+                         utb_temp(2, IROP_BTYPE_INT64), utb_temp(3, IROP_BTYPE_INT64));
+  gvn_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_gvn(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, other), TCCIR_OP_ZEXT);
+  UT_ASSERT_EQ(utb_op(c.ir, dup), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_vreg(utb_src2(c.ir, use)), VR_TEMP(1));
+  ssa_ctx_free(&c);
+  return 0;
+}
+
 UT_COVERS("gvn");

@@ -64,6 +64,12 @@ void tcc_ir_codegen_cmp_jmp_set(struct TCCIRState *ir);
  * Jump Handling
  * ============================================================================ */
 
+/* 1 when the real pass drops the JUMP (or a return's jump to the epilogue) at
+ * index i: every op it jumps over was laid out as zero bytes by the rehearsal
+ * (coalesced phi copies), so the branch would only land on the next
+ * instruction.  0 when no rehearsal ran. */
+int tcc_ir_codegen_jump_elidable(struct TCCIRState *ir, int i);
+
 /* Backpatch jump target */
 void tcc_ir_codegen_backpatch(struct TCCIRState *ir, int jump_idx, int target_address);
 
@@ -81,6 +87,7 @@ int tcc_ir_codegen_test_gen(struct TCCIRState *ir, int invert, int test);
 
 /* Drop unused return value from function call */
 void tcc_ir_codegen_drop_return(struct TCCIRState *ir);
+void tcc_ir_codegen_drop_return_of(struct TCCIRState *ir, int vr);
 
 /* ============================================================================
  * Basic Blocks

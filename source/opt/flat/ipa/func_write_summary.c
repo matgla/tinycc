@@ -249,6 +249,7 @@ void tcc_ir_compute_func_write_summary(TCCIRState *ir, Sym *func_sym)
   uint8_t must_write[FWS_MAX_PARAMS][FWS_MAX_BYTES / 8];
   memset(read_first, 0, sizeof(read_first));
   memset(must_write, 0, sizeof(must_write));
+  unsigned read_params = 0;
 
   for (int i = 0; i < n; i++)
   {
@@ -283,6 +284,7 @@ void tcc_ir_compute_func_write_summary(TCCIRState *ir, Sym *func_sym)
       if (sbit < 0 || sbit >= total || vp[sbit] < 0)
         continue;
       int pidx = vp[sbit];
+      read_params |= 1u << pidx;
       int off = vo[sbit];
       int size = fws_btype_bytes(sop.btype);
       if (size <= 0)
@@ -318,6 +320,9 @@ void tcc_ir_compute_func_write_summary(TCCIRState *ir, Sym *func_sym)
     if (off < 0 || off + size > FWS_MAX_BYTES)
       continue;
     if (pidx < 0 || pidx >= FWS_MAX_PARAMS)
+      continue;
+    /* Different pointer parameters can alias at any offset; only earlier writes remain proven. */
+    if (read_params & ~(1u << pidx))
       continue;
 
     for (int b = off; b < off + size; b++)

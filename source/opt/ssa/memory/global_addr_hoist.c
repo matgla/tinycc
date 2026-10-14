@@ -538,33 +538,6 @@ static int lac_slot_count(const TCCIRState *ir, IRQuadCompact *q, uint8_t *slots
   return n;
 }
 
-/* insert_instr_at retargets every branch to >= pos, so a label that sat on the
- * shifted instruction now points one past the new def; move it back or the
- * paths entering through it would use an undefined temp. */
-static void lac_keep_label_ahead(TCCIRState *ir, int pos)
-{
-  IRQuadCompact *moved = &ir->compact_instructions[pos + 1];
-  if (!moved->is_jump_target)
-    return;
-  moved->is_jump_target = 0;
-  ir->compact_instructions[pos].is_jump_target = 1;
-  for (int i = 0; i < ir->next_instruction_index; i++) {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
-      continue;
-    if ((int)tcc_ir_op_dest_imm(ir, q) == pos + 1)
-      tcc_ir_op_set_dest_imm32(ir, q, pos, IROP_BTYPE_INT32);
-  }
-  for (int ti = 0; ti < ir->num_switch_tables; ti++) {
-    TCCIRSwitchTable *table = &ir->switch_tables[ti];
-    if (table->default_target == pos + 1)
-      table->default_target = pos;
-    for (int tj = 0; tj < table->num_entries; tj++)
-      if (table->targets[tj] == pos + 1)
-        table->targets[tj] = pos;
-  }
-}
-
 int tcc_ir_ssa_opt_local_addr_cse(TCCIRState *ir)
 {
   int n_instrs = ir->next_instruction_index;
@@ -693,7 +666,7 @@ int tcc_ir_ssa_opt_local_addr_cse(TCCIRState *ir)
     if (insert_instr_at(ir, inserts[k].pos, TCCIR_OP_ASSIGN, dst, src,
                         irop_make_none()) < 0)
       continue;
-    lac_keep_label_ahead(ir, inserts[k].pos);
+    tcc_ir_keep_label_ahead(ir, inserts[k].pos);
     changes++;
   }
 

@@ -60,6 +60,8 @@ static void save_function_body(TokenString **str, int **pack, int compiled_now)
   int captures = pp_pack_captures;
   *pack = pp_pack_snapshot(tcc_state);
   skip_or_save_block(str);
+  /* Replayed after the TU is parsed, its asm must not name an r0/r1 function. */
+  gfunc_regpair_note_asm_names(*str);
   if (!compiled_now && pp_pack_captures != captures)
   {
     const int *buf = tok_str_buf(*str);
@@ -453,10 +455,11 @@ static void define_global_function(Sym *sym, Section *ad_section)
           next();
           gen_function(sym);
           end_macro();
-          if (sym->type.ref->f.func_small_leaf) {
+          if (sym->type.ref->f.func_small_leaf || sym->type.ref->f.func_inl_few_callers) {
             /* Promoted as a small straight-line leaf (see gen_function):
              * its optimized body is what gets duplicated, not its tokens,
-             * so it inlines at every call site. */
+             * so it inlines at every call site.  A few-callers leaf inlines
+             * at each of its few sites. */
           } else if (sym->type.ref->f.func_auto_inline) {
             /* Retroactively promoted: convert to eval-only so callsite
              * inlining only fires when ALL args are compile-time constants.
@@ -656,7 +659,8 @@ static int tok_ends_decl_specifiers(int t)
  * as of the definition, so such a body is generated here instead.  An
  * identifier that is a parameter, or that the body mentioned before (a local
  * function pointer), is not a file-scope reference; nor is a predefined token
- * (a builtin unary() expands itself, or a library name like memcpy). */
+ * (a builtin unary() expands itself, or a library name like memcpy), nor a
+ * struct/union/enum tag. */
 static int body_calls_unprototyped(Sym *sym, TokenString *body)
 {
   const int *start = tok_str_buf(body), *p = start, *end = start + body->len;
@@ -669,7 +673,9 @@ static int body_calls_unprototyped(Sym *sym, TokenString *body)
     tok_get(&t, &p, &cv);
     for (next_tok = p; next_tok < end && *next_tok == TOK_LINENUM;)
       next_tok += 2;
-    if (t >= TOK_UIDENT && prev != '.' && prev != TOK_ARROW && next_tok < end && *next_tok == '(')
+    /* A tag after struct/union/enum names a type: `struct T (*fp)(void)`. */
+    if (t >= TOK_UIDENT && prev != '.' && prev != TOK_ARROW && prev != TOK_STRUCT && prev != TOK_UNION &&
+        prev != TOK_ENUM && next_tok < end && *next_tok == '(')
     {
       Sym *s = sym_find(t);
       if (s && !IS_ASM_SYM(s))
@@ -733,6 +739,10 @@ void define_deferred_function(DeferredFunc *d)
   TokenString *body = d->body;
   int saved_pack[PACK_STACK_SIZE + 1];
   int saved_budget = called_once_budget_begin(body->len);
+  Sym *saved_sym = tcc_state->deferred_sym;
+  int saved_sites = tcc_state->deferred_call_sites;
+  tcc_state->deferred_sym = d->sym;
+  tcc_state->deferred_call_sites = d->call_sites;
   d->body = NULL;
   tccpp_setfile(d->filename);
   pp_pack_enter(tcc_state, d->pack, saved_pack);
@@ -741,6 +751,8 @@ void define_deferred_function(DeferredFunc *d)
   define_global_function(d->sym, d->section);
   end_macro();
   pp_pack_leave(tcc_state, saved_pack);
+  tcc_state->deferred_sym = saved_sym;
+  tcc_state->deferred_call_sites = saved_sites;
   called_once_budget_end(saved_budget);
 }
 
@@ -1115,19 +1127,20 @@ int decl(int l)
           /* Get pointer to new nested func slot (allocated once, reused by
            * later parents; the pointer never moves) */
           if (!tcc_state->nested_funcs[tcc_state->nb_nested_funcs])
-            tcc_state->nested_funcs[tcc_state->nb_nested_funcs] = tcc_malloc(sizeof(NestedFunc));
+            tcc_state->nested_funcs[tcc_state->nb_nested_funcs] = tcc_mallocz(sizeof(NestedFunc));
           NestedFunc *nf = tcc_state->nested_funcs[tcc_state->nb_nested_funcs];
+          nested_func_release(nf);
           memset(nf, 0, sizeof(*nf));
 
           /* Store filename for later */
           pstrncpy(nf->filename, file->filename, sizeof(nf->filename));
 
-          /* Push symbol into global scope, bypassing external_sym to avoid
-           * redefinition errors when multiple parent functions each define
-           * a nested function with the same name (e.g. "nested" in foo and bar). */
+          /* The function's Sym lives on global_stack, bypassing external_sym
+           * (each parent may define a nested function of the same name); its
+           * name binds in the defining block (nested_define, below). */
           type.t &= ~VT_EXTERN;
           type.t |= VT_STATIC; /* nested functions are always local */
-          nf->sym = global_identifier_push(v, type.t, 0);
+          nf->sym = sym_push2(&global_stack, v, type.t, 0);
           nf->sym->r = VT_CONST | VT_SYM;
           nf->sym->a = ad.a;
           nf->sym->type.ref = type.ref;
@@ -1153,6 +1166,7 @@ int decl(int l)
 
           /* Save the token stream (function body only, not parameters) */
           skip_or_save_block(&nf->func_str);
+          nested_define(nf);
 
           /* Pre-scan to identify captured parent variables.
            * If we're inside a nested function's gen_function, current_nested_func
@@ -1199,18 +1213,44 @@ int decl(int l)
                 fn->func_str->len = body_len;
               }
               dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
+              inline_record_def_bindings(fn, nf);
 
             }
           }
 
-          /* Capture parent-scope typedefs and struct/union/enum tags so the
-           * nested function body can reference them.  Walk the local_stack
-           * which is still live at this point (before pop_local_syms). */
+          /* Capture parent-scope typedefs, enumeration constants and
+           * struct/union/enum tags so the nested function body can reference
+           * them.  Walk the local_stack which is still live at this point
+           * (before pop_local_syms); only a name's innermost binding is
+           * visible here, so a shadowed one is not recorded. */
           nf->nb_parent_typedefs = 0;
+          nf->nb_parent_enums = 0;
+          nf->nb_parent_statics = 0;
           nf->nb_parent_struct_tags = 0;
           for (Sym *ts = local_stack; ts; ts = ts->prev)
           {
-            if (ts->type.t & VT_TYPEDEF)
+            int named = !(ts->v & SYM_FIELD) && (ts->v & ~SYM_STRUCT) < SYM_FIRST_ANOM;
+            if (named && !(ts->v & SYM_STRUCT) && sym_find(ts->v) != ts)
+              continue; /* hidden by an inner binding of the name */
+            if (named && (ts->v & SYM_STRUCT) && sym_tag_head(ts->v & ~SYM_STRUCT) != ts)
+              continue;
+            if (IS_ENUM_VAL(ts->type.t) && !(ts->v & SYM_STRUCT) && (ts->r & VT_VALMASK) == VT_CONST)
+            {
+              if (nf->nb_parent_enums >= MAX_CAPTURED_VARS)
+                continue;
+              nf->parent_enum_tokens[nf->nb_parent_enums] = ts->v;
+              nf->parent_enum_types[nf->nb_parent_enums] = ts->type;
+              nf->parent_enum_vals[nf->nb_parent_enums] = sym_enum_val(ts);
+              nf->nb_parent_enums++;
+            }
+            else if (named && !(ts->v & SYM_STRUCT) && (ts->r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM) &&
+                     !(ts->type.t & VT_TYPEDEF) && ts->c > 0)
+            {
+              /* a static local or block-scope extern variable */
+              if (nf->nb_parent_statics < MAX_CAPTURED_VARS)
+                nf->parent_static_syms[nf->nb_parent_statics++] = ts;
+            }
+            else if (ts->type.t & VT_TYPEDEF)
             {
               if (nf->nb_parent_typedefs >= MAX_CAPTURED_VARS)
                 continue;
@@ -1229,6 +1269,9 @@ int decl(int l)
               nf->nb_parent_struct_tags++;
             }
           }
+          /* ...and those an enclosing nested function's body sees from its
+           * own parent (not on local_stack). */
+          nested_record_inherited(nf);
 
           /* Pin struct field Syms reachable from captured typedefs/struct tags.
            * pop_local_syms frees Syms with c==0 (which includes struct fields
@@ -1385,14 +1428,10 @@ int decl(int l)
             tcc_error("storage class specified for '%s'", get_tok_str(v, NULL));
           if (sym->type.t != VT_VOID)
             tcc_error("redefinition of parameter '%s'", get_tok_str(v, NULL));
+          /* A float keeps its type: the double its caller passes is
+             converted on entry (knr_params_receive). */
+          sym->a.param_volatile = (type.t & VT_VOLATILE) != 0;
           convert_parameter_type(&type);
-          /* K&R default argument promotion: float parameters are received
-             as double because callers apply default argument promotions
-             (C89 6.5.4.2).  Without a prototype, float is promoted to
-             double at the call site, so the function must receive the
-             parameter as double. */
-          if ((type.t & VT_BTYPE) == VT_FLOAT)
-            type.t = (type.t & ~VT_BTYPE) | VT_DOUBLE;
           sym->type = type;
         }
         else if (type.t & VT_TYPEDEF)
@@ -1465,6 +1504,8 @@ int decl(int l)
                         !sym_find(v);
             type.t |= VT_EXTERN;
             sym = external_sym(v, &type, r, &ad);
+            if (l == VT_LOCAL && (type.t & VT_BTYPE) == VT_FUNC)
+              nested_note_block_proto(v); /* `auto`: a nested function defined later */
             /* a first prototype: kept compactly until something names it */
             if (fresh)
               sym_park_proto(sym, stack_before);

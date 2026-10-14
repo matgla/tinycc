@@ -76,6 +76,9 @@ int tcc_ir_asm_add(TCCIRState *ir, const char *asm_str, int asm_len, int must_su
   for (int i = nb_operands; i < nb_operands + nb_labels; ++i)
   {
     ia->operands[i].vt = NULL;
+    int target = tcc_ir_label_insn(ir, ia->operands[i].label_jind);
+    if (target >= 0 && target < ir->next_instruction_index)
+      ir->compact_instructions[target].is_jump_target = 1;
   }
 
   /* Conservative: inline asm is call-like for leaf analysis. */
@@ -108,3 +111,46 @@ void tcc_ir_put_inline_asm(TCCIRState *ir, int inline_asm_id)
 }
 
 #endif /* CONFIG_TCC_ASM */
+
+int tcc_ir_asm_goto_target(TCCIRState *ir, const IRQuadCompact *q, int label)
+{
+#ifdef CONFIG_TCC_ASM
+  if (q->op == TCCIR_OP_INLINE_ASM) {
+    int id = (int)tcc_ir_op_src1_imm(ir, q);
+    if (id >= 0 && id < ir->inline_asm_count) {
+      const TCCIRInlineAsm *ia = &ir->inline_asms[id];
+      if (label >= 0 && label < ia->nb_labels)
+        return tcc_ir_label_insn(ir, ia->operands[ia->nb_operands + label].label_jind);
+    }
+  }
+#else
+  (void)ir, (void)q, (void)label;
+#endif
+  return -1;
+}
+
+void tcc_ir_asm_label_note(TCCIRState *ir, int sym, int jind)
+{
+#ifdef CONFIG_TCC_ASM
+  for (int a = 0; ir && sym > 0 && a < ir->inline_asm_count; a++) {
+    TCCIRInlineAsm *ia = &ir->inline_asms[a];
+    for (int k = ia->nb_operands; k < ia->nb_operands + ia->nb_labels; k++)
+      if (ia->operands[k].label_sym == sym)
+        ia->operands[k].label_jind = jind;
+  }
+#else
+  (void)ir, (void)sym, (void)jind;
+#endif
+}
+
+void tcc_ir_asm_mark_targets(TCCIRState *ir)
+{
+  if (!ir || !ir->func_has_asm_goto)
+    return;
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    const IRQuadCompact *q = &ir->compact_instructions[i];
+    for (int k = 0, target; (target = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+      if (target < ir->next_instruction_index)
+        ir->compact_instructions[target].is_jump_target = 1;
+  }
+}

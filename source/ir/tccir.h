@@ -247,13 +247,7 @@ typedef enum TccIrOp
    * pointer.  No sources; its value depends on the call site, so a function
    * using it is never pure. */
   TCCIR_OP_RETURN_ADDRESS,
-  /* Unsigned multiply accumulate-accumulate (ARM UMAAL), 64-bit dest:
-   *   dest = (uint32)src1 * (uint32)src2 + lo32(accum) + hi32(accum)
-   * accum is pool[operand_base+3] like MLA's: a 64-bit value whose two words
-   * are the two 32-bit addends (the sum cannot overflow 64 bits).  Created
-   * only by the late umaal fusion right before register allocation, so only
-   * the allocator, the post-RA passes and codegen see it; everything that
-   * reads MLA's fourth operand reads this one via tcc_ir_op_is_mac(). */
+  /* UMAAL: u32(src1) * u32(src2) + lo32(accum) + hi32(accum); a word accumulator has high half zero. */
   TCCIR_OP_UMAAL,
   /* Number of opcodes -- not an op.  Sizes ir_op_props[] (op_props.h), whose
    * selftest fails for any op below it that the table does not classify. */
@@ -533,17 +527,24 @@ typedef struct IRParamForm
   int8_t reg_base; /* IR_PF_HOME: first argument register */
   int32_t vreg;    /* IR_PF_REG / IR_PF_MEM: the PARAM vreg */
   int32_t off;     /* IR_PF_MEM: parameter offset; IR_PF_HOME: home slot */
-  int32_t words;   /* IR_PF_HOME: words stored into the home slot */
+  int32_t words;   /* IR_PF_HOME: words stored into the home slot from registers */
+  int32_t stack_off;   /* IR_PF_HOME: parameter offset of the words copied from the stack */
+  int32_t stack_words; /* IR_PF_HOME: words copied from the stack, after the register words */
 } IRParamForm;
 #define IR_PF_NONE 0 /* unknown: never forwarded untouched */
 #define IR_PF_REG 1  /* a value in the PARAM vreg */
 #define IR_PF_MEM 2  /* memory at a parameter offset (stack scalar, in-place struct) */
-#define IR_PF_HOME 3 /* a register-passed struct the prologue stores into a home slot */
+#define IR_PF_HOME 3 /* a struct the prologue stores (and copies) into a home slot */
 
 /* Words per ir->frame_objs record: [0] frame offset, [1] size incl. padding,
  * [2] size, [3] FRAME_OBJ_* flags | (scope end + 1) << 4, [4] scope start + 1
  * (0 = none; tcc_ir_frame_scope_block). */
 #define FRAME_OBJ_WORDS 5
+
+/* Where a nested function's capture ranges start (gen_function): the bottom
+ * of the 16-bit frame offset space a struct operand can name.  They take no
+ * room in the frame; a frame reaching down to them is refused. */
+#define TCC_CAPTURE_SPACE (-32768 + 8)
 
 typedef struct TCCIRState
 {
@@ -555,9 +556,9 @@ typedef struct TCCIRState
   int named_arg_stack_bytes;
 
   uint8_t is_variadic : 1;
-  /* A parameter straddles r3 and the stack: the prologue pushes r0-r3 below
-   * the stack arguments, as for a variadic function, so it lies contiguous in
-   * memory and is used in place. */
+  /* A long parameter straddles r3 and the stack: the prologue pushes r0-r3
+   * below the stack arguments, as for a variadic function, so it lies
+   * contiguous in memory and is used in place. */
   uint8_t push_arg_regs : 1;
   /* The body only forwards its parameters, untouched, to one call of the same
    * signature: emitted as a branch to it (tcc_ir_backend_fold_pure_forward). */
@@ -589,6 +590,12 @@ typedef struct TCCIRState
   uint8_t vfp_ret_words;
   int32_t captured_offsets_list[32]; /* offsets of captured vars (for chain-relative access) */
   int32_t captured_chain_depths[32]; /* 1 = direct R10, 2+ = multi-hop */
+  /* A capture's operands address [vbase, vbase + size] of this frame's offset
+   * space, a range no local and no other capture uses (gen_function); that
+   * is what makes them chain-relative (tcc_ir_capture_lookup). */
+  int32_t captured_vbase[32];
+  int32_t captured_size[32];
+  int32_t captured_space_end; /* one past the highest capture range */
   int32_t captured_count;            /* number of captured variables */
   int32_t loc;
   int32_t parent_loc; /* parent's loc value (for nested function offset validation) */
@@ -597,16 +604,22 @@ typedef struct TCCIRState
    * start), for frame relayout (frame.c).  Filled while the body is parsed. */
   int32_t *frame_objs;
   int frame_obj_count, frame_obj_cap;
-  /* Labels as (Sym::jind, current instruction index) pairs.  The index moves
-   * with every renumbering like a frame scope end (frame.c), so `&&label` still
-   * finds its place once the labelled instruction itself is gone. */
+  /* Labels as IR_LABEL_WORDS-word records (Sym::jind, current instruction
+   * index, anchor): the label stands in front of the instruction whose
+   * orig_index is the anchor (first the one it was defined on), wherever a
+   * pass moved it.  The index moves with every renumbering like a frame scope
+   * end (frame.c), so `&&label` still finds its place once that instruction
+   * itself is gone. */
+#define IR_LABEL_WORDS 3
   int32_t *label_pos;
   int label_count, label_cap;
   /* Padding of the frame objects whose type the frontend knew, as (start,
-   * low word, high word) triples of a byte mask: bit b = byte b of the object
-   * is no member's (tcc_ir_frame_note_type). */
+   * bytes mapped, offset into frame_pad_bits) triples: bit b of the map =
+   * byte b of the object is no member's (tcc_ir_frame_note_type). */
   int32_t *frame_pads;
   int frame_pad_count, frame_pad_cap;
+  uint8_t *frame_pad_bits;
+  int frame_pad_bits_len, frame_pad_bits_cap;
   /* By call id: the size of the struct written through parameter 0, the
    * struct-return buffer, or 0 (frame.c). */
   int32_t *sret_calls;
@@ -740,9 +753,7 @@ typedef struct TCCIRState
    * state so the IR layer (regalloc) can consult it without referencing a tccgen
    * global (which the standalone unit-test link does not provide). */
   int func_has_label_addr;
-  /* The body has an `asm goto`: control can leave an INLINE_ASM for a label the
-   * IR records no edge to, so a block entered only through such a label looks
-   * unreachable.  Reachability sweeps (dce, SSA) skip the function, as for IJUMP. */
+  /* SSA promotion and transformations requiring edge-specific copies still exclude asm goto. */
   int func_has_asm_goto;
   /* The return class ra:known_ext proved for this body (FuncAttr.func_ret_zext),
    * published by gen_function once the body is final. */
@@ -816,6 +827,7 @@ typedef struct TCCIRState
   int *codegen_return_jump_addrs;
   int *codegen_dry_insn_scratch;
   uint16_t *codegen_dry_insn_saves;
+  uint32_t *codegen_dry_insn_save_info; /* per instruction: see IR_SAVE_INFO_* (codegen.c) */
   void *codegen_mop_cache;
   uint32_t *codegen_cbz_dry_mapping;
   /* Code address just past the last body instruction as laid out by the
@@ -823,6 +835,13 @@ typedef struct TCCIRState
    * epilogue, which is not an IR index, so this is what lets them be sized.
    * 0 when no rehearsal ran. */
   uint32_t codegen_rehearsal_end;
+  /* The rehearsal's running literal-pool entry total there. */
+  uint32_t codegen_rehearsal_end_pool_entries;
+  /* Per IR instruction, 1 when the rehearsal laid it out as zero bytes (after
+   * its alignment pad): a coalesced phi copy, a NOP.  A JUMP or a return whose
+   * span holds only such ops is dropped by the real pass
+   * (tcc_ir_codegen_jump_elidable).  NULL when no rehearsal ran. */
+  uint8_t *codegen_rehearsal_empty;
   /* Running literal-pool entry total per IR instruction, recorded by the
    * rehearsal pass; bounds the pool pressure over a forward branch's range so
    * can_narrow_forward_branch can prove no flush lands inside it. */
@@ -892,6 +911,9 @@ int tcc_ir_add_inline_asm(TCCIRState *ir, const char *asm_str, int asm_len, int 
                           int nb_operands, int nb_outputs, int nb_labels, const uint8_t *clobber_regs);
 void tcc_ir_put_inline_asm(TCCIRState *ir, int inline_asm_id);
 #endif
+int tcc_ir_asm_goto_target(TCCIRState *ir, const IRQuadCompact *q, int label);
+void tcc_ir_asm_label_note(TCCIRState *ir, int sym, int jind);
+void tcc_ir_asm_mark_targets(TCCIRState *ir);
 
 int tcc_ir_get_vreg_temp(TCCIRState *ir);
 int tcc_ir_get_vreg_var(TCCIRState *ir);
@@ -916,6 +938,8 @@ void tcc_ir_frame_scope_remap(struct TCCIRState *ir, const int *map, int old_n, 
 void tcc_ir_frame_scope_widen(struct TCCIRState *ir, int lo, int hi);
 void tcc_ir_label_note(struct TCCIRState *ir, int jind);
 int tcc_ir_label_insn(struct TCCIRState *ir, int jind);
+void tcc_ir_keep_label_ahead(struct TCCIRState *ir, int pos);
+void tcc_ir_label_sync(struct TCCIRState *ir);
 /* The same for the temporaries that carry a struct into or out of a call: its
  * address reaching the call does not let the callee keep it.  An argument's
  * copy is never visible to the program; a call's struct result is, through
@@ -937,6 +961,9 @@ void tcc_ir_frame_note_type(int off, CType *type);
  * byte lo + b; 0 when any object overlapping it has no noted type or starts
  * elsewhere (before frame relayout only). */
 uint64_t tcc_ir_frame_padding(TCCIRState *ir, int lo, int hi);
+/* The same for an object of any size: pad[b] = 1 for byte lo + b; returns
+ * whether any byte is padding (pad all 0 when unknown). */
+int tcc_ir_frame_padding_map(TCCIRState *ir, int lo, int hi, uint8_t *pad);
 int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc);
 /* The k-th concrete frame offset an inline asm operand names outside the IR
  * (the SValues the front end saved with the statement): 1 and *off, or 0 when
@@ -969,6 +996,15 @@ void tcc_ir_register_allocation_params(TCCIRState *ir);
 void tcc_ir_mark_return_value_incoming_regs(TCCIRState *ir);
 void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir);
 int tcc_ir_param_is_captured_by_nested(int vreg);
+/* This function's frame is reached by code outside its IR (it has, or is, a
+ * nested function), so a call may read or write any local. */
+int tcc_ir_frame_shared_with_nested(const TCCIRState *ir);
+/* Frame offset of a variadic function's r0 save (r0-r3 at +0..+12): -16, or
+ * -20 with a static chain, whose save slot is frame top - 4. */
+static inline int tcc_ir_variadic_reg_save_base(const TCCIRState *ir)
+{
+  return ir && ir->has_static_chain ? -20 : -16;
+}
 void tcc_ir_mark_nested_captured_params(TCCIRState *ir);
 void tcc_ir_build_stack_layout(TCCIRState *ir);
 /* Caller-saved registers to save around the call at call_idx (ra:caller_save) */
@@ -1287,6 +1323,15 @@ struct Sym *tcc_ir_op_src1_sym(const TCCIRState *ir, const IRQuadCompact *q);
  * memory; the register allocator and the frame do not treat it as one: no
  * value has to leave R0-R3 for it, and it makes no function a non-leaf. */
 int tcc_ir_call_clobbers_nothing(const TCCIRState *ir, const IRQuadCompact *q);
+
+/* A call to a noreturn callee, which leaves a function a leaf (-O1, -O2; not
+ * -Os, where the per-call push costs more bytes than the prologue's and a leaf
+ * loses the machine outliner):
+ * the call site pushes LR itself, in the cold block, right before its `bl`
+ * (tcc_gen_machine_func_call_mop), so the prologue need not.  ir/codegen.c
+ * makes the function non-leaf again when such a call passes stack arguments,
+ * or when the prologue pushes other registers anyway. */
+int tcc_ir_call_saves_lr_itself(const TCCIRState *ir, const IRQuadCompact *q);
 
 /* Get the 4th operand (scale) for indexed memory operations.
  * This is stored at operand_base + 3 for LOAD_INDEXED/STORE_INDEXED.

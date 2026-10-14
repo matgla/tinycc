@@ -359,10 +359,13 @@ UNITY_MEMBERS_opt_ra = \
 	source/opt/ra/const_branch_fold.c \
 	source/opt/ra/exit_sink.c \
 	source/opt/ra/incomplete_calls.c \
+	source/opt/ra/load_sink.c \
 	source/opt/ra/phi_const_chain.c \
+	source/opt/ra/return_sink.c \
 	source/opt/ra/umaal_fusion.c
 UNITY_MEMBERS_opt_ssa_cfg = \
 	source/opt/ssa/cfg/branch.c \
+	source/opt/ssa/cfg/dup_diamond.c \
 	source/opt/ssa/cfg/guard_collapse.c \
 	source/opt/ssa/cfg/phi.c \
 	source/opt/ssa/cfg/switch_fold.c \

@@ -26,6 +26,16 @@
 
 #include "regalloc_priv.h"
 
+/* Whether one of `q`'s asm goto labels lies inside [lo, hi] (`inside`), or
+ * outside it (!`inside`).  Any other instruction has no labels. */
+static int ra_asm_goto_label_in(TCCIRState *ir, const IRQuadCompact *q, int lo, int hi, int inside)
+{
+  for (int k = 0, t; (t = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+    if ((t >= lo && t <= hi) == !!inside)
+      return 1;
+  return 0;
+}
+
 /* ============================================================================
  * Post-Allocation Redundant Reload Elimination
  *
@@ -1328,6 +1338,8 @@ static int ra_retarget_producer(TCCIRState *ir)
       if ((qk->op == TCCIR_OP_JUMP || qk->op == TCCIR_OP_JUMPIF) &&
           (int)tcc_ir_op_dest_imm(ir, qk) == i)
       { ok = 0; break; }
+      if (ra_asm_goto_label_in(ir, qk, i, i, 1))
+      { ok = 0; break; }
       if (irop_config[qk->op].has_dest &&
           tcc_ir_op_dest_vreg(ir, qk) == sv)
       { ok = 0; break; }
@@ -1532,9 +1544,12 @@ static int ra_load_postinc_fuse(TCCIRState *ir)
         break;
       if (jq->op == TCCIR_OP_NOP)
         continue;
+      /* An inline asm may branch to an asm goto label that reads P, and its
+       * operands are not in the quad, so the window ends there too. */
       if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF ||
           jq->op == TCCIR_OP_IJUMP || jq->op == TCCIR_OP_SWITCH_TABLE ||
-          jq->op == TCCIR_OP_RETURNVALUE || jq->op == TCCIR_OP_RETURNVOID)
+          jq->op == TCCIR_OP_RETURNVALUE || jq->op == TCCIR_OP_RETURNVOID ||
+          ir_op_has(jq->op, IROP_A_MAY_BRANCH))
         break;
 
       if (jq->op == TCCIR_OP_ADD)
@@ -2023,6 +2038,7 @@ try_reverse:;
         int jt = (int)tcc_ir_op_dest_imm(ir, qk);
         if (jt < (int)src_iv->start || jt > i) { conflict = 1; break; }
       }
+      if (ra_asm_goto_label_in(ir, qk, (int)src_iv->start, i, 0)) { conflict = 1; break; }
     }
 rev_check_done:
     if (conflict) continue;

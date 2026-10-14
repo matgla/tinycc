@@ -27,7 +27,9 @@
  * compute `0 | 0` and `0 | x`.  make_double cost 17 instructions against GCC's
  * 8, and four of the four registers it had to push were holding zeros.
  *
- * The information needed to delete all of it is one bit per half:
+ * The information needed to delete all of it is one bit per half (derived from
+ * per-word may-be-set masks, so shifts that move only zeros across the word
+ * boundary keep a half known):
  *
  *   consumer side - an OR/XOR against a zero half is a copy of the other
  *                   operand, an AND against one is the constant zero, so the
@@ -60,12 +62,29 @@
 #define ZK_LO 1
 #define ZK_HI 2
 
+/* What the pass tracks per value: the bits each word may have set.  A word
+ * whose mask is 0 is the constant zero.  One bit per word was not enough:
+ * `(n & 0xff) << 16` and `(n >> 8) << 8` of a zero-extended n both keep a zero
+ * high word, but only the masks show that the bits shifted across the word
+ * boundary are zero (IntegerContext(u16).hash's key expansion). */
 typedef struct
 {
-  uint8_t *zk_t;  /* per TEMP position: ZK_LO | ZK_HI */
+  uint32_t lo, hi;
+} ZHMask;
+
+#define ZH_ALL ((ZHMask){0xFFFFFFFFu, 0xFFFFFFFFu})
+
+static int zh_mask_bits(ZHMask m)
+{
+  return (m.lo == 0 ? ZK_LO : 0) | (m.hi == 0 ? ZK_HI : 0);
+}
+
+typedef struct
+{
+  ZHMask *zk_t;   /* per TEMP position: may-be-set bits of each word */
   int *def_t;     /* per TEMP position: index of its single def, -1 / -2 */
   int max_t;
-  uint8_t *zk_v;  /* the same for named locals (VAR) */
+  ZHMask *zk_v;   /* the same for named locals (VAR) */
   int *def_v;
   uint8_t *ok_t;   /* per TEMP position: exactly one definition */
   uint8_t *ok_v;   /* per VAR position: one definition and no LEA */
@@ -95,16 +114,33 @@ static void zh_drop_addr_taken_vars(TCCIRState *ir, ZHState *st)
   }
 }
 
-/* The known-zero halves recorded for `vr`, or 0 when it has no entry. */
-static int zh_lookup(const ZHState *st, int32_t vr)
+/* A volatile local owes every byte of every store (C11 6.7.3p7: each access
+ * is a side effect), and a local the allocator keeps in memory (lvalue use) is
+ * read through its slot, not as a register pair.  Neither has halves this pass
+ * may call known or dead: `volatile uint64_t n = k; return n << 9;` lost the
+ * slot's high-word store while the shift still loaded it. */
+static void zh_drop_memory_vars(TCCIRState *ir, ZHState *st)
+{
+  for (int p = 0; p <= st->max_v; p++)
+  {
+    if (!st->ok_v[p])
+      continue;
+    IRLiveInterval *li = tcc_ir_try_get_live_interval(ir, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, p));
+    if (!li || li->is_volatile || li->is_lvalue || li->addrtaken)
+      st->ok_v[p] = 0;
+  }
+}
+
+/* The masks recorded for `vr`, or "anything" when it has no entry. */
+static ZHMask zh_lookup(const ZHState *st, int32_t vr)
 {
   int t = TCCIR_DECODE_VREG_TYPE(vr);
   int p = TCCIR_DECODE_VREG_POSITION(vr);
   if (t == TCCIR_VREG_TYPE_TEMP)
-    return (p >= 0 && p <= st->max_t && st->ok_t[p]) ? st->zk_t[p] : 0;
+    return (p >= 0 && p <= st->max_t && st->ok_t[p]) ? st->zk_t[p] : ZH_ALL;
   if (t == TCCIR_VREG_TYPE_VAR)
-    return (p >= 0 && p <= st->max_v && st->ok_v[p]) ? st->zk_v[p] : 0;
-  return 0;
+    return (p >= 0 && p <= st->max_v && st->ok_v[p]) ? st->zk_v[p] : ZH_ALL;
+  return ZH_ALL;
 }
 
 /* The halves of `op` that are provably zero.
@@ -115,86 +151,82 @@ static int zh_lookup(const ZHState *st, int32_t vr)
  * Signed narrow values reach a 64-bit op through an explicit sign-extending
  * ASSIGN, which is a pair by then, so this never mistakes a sign fill for a
  * zero. */
-static int zh_known(TCCIRState *ir, const ZHState *st, IROperand op)
+static ZHMask zh_mask(TCCIRState *ir, const ZHState *st, IROperand op)
 {
   if (irop_is_immediate(op))
   {
     uint64_t v = (uint64_t)irop_get_imm64_ex(ir, op);
-    int r = 0;
-    if ((uint32_t)v == 0)
-      r |= ZK_LO;
-    if ((uint32_t)(v >> 32) == 0)
-      r |= ZK_HI;
-    return r;
+    return (ZHMask){(uint32_t)v, (uint32_t)(v >> 32)};
   }
   if (!irop_needs_pair(op))
-    return ZK_HI;
+    return (ZHMask){0xFFFFFFFFu, 0};
+  /* A pair read through memory is whatever the memory holds; the vreg is
+   * only its address. */
+  if (op.is_lval)
+    return ZH_ALL;
   return zh_lookup(st, irop_get_vreg(op));
 }
 
-/* The halves of a 64-bit result that are provably zero, from its operands'.
- * Only the ops whose per-half behaviour is exact are listed; everything else
- * returns 0 ("nothing known"), which is always safe. */
-static int zh_result(TCCIRState *ir, const ZHState *st, IRQuadCompact *q)
+static int zh_known(TCCIRState *ir, const ZHState *st, IROperand op)
+{
+  return zh_mask_bits(zh_mask(ir, st, op));
+}
+
+/* The bits each word of a 64-bit result may have set, from its operands'.
+ * Only the ops whose per-word behaviour is exact are listed; everything else
+ * returns "anything", which is always safe. */
+static ZHMask zh_result(TCCIRState *ir, const ZHState *st, IRQuadCompact *q)
 {
   IROperand s1 = tcc_ir_op_get_src1(ir, q);
   IROperand s2 = tcc_ir_op_get_src2(ir, q);
-  int a = zh_known(ir, st, s1);
+  ZHMask a = zh_mask(ir, st, s1);
 
   switch (q->op)
   {
   case TCCIR_OP_ASSIGN:
   case TCCIR_OP_ZEXT:
     /* Widening or copying assign; a truncating one has a non-pair dest and is
-     * never asked about here.  A narrow source reports ZK_HI on its own (it is
-     * zero-extended), which is exactly what ZEXT guarantees. */
+     * never asked about here.  A narrow source reports a zero high word on its
+     * own (it is zero-extended), which is exactly what ZEXT guarantees. */
     return a;
 
   case TCCIR_OP_AND:
-    return a | zh_known(ir, st, s2);
+  {
+    ZHMask b = zh_mask(ir, st, s2);
+    return (ZHMask){a.lo & b.lo, a.hi & b.hi};
+  }
 
   case TCCIR_OP_OR:
   case TCCIR_OP_XOR:
-    return a & zh_known(ir, st, s2);
+  {
+    ZHMask b = zh_mask(ir, st, s2);
+    return (ZHMask){a.lo | b.lo, a.hi | b.hi};
+  }
 
   case TCCIR_OP_SHL:
   case TCCIR_OP_SHR:
   case TCCIR_OP_SAR:
   {
     if (!irop_is_immediate(s2))
-      return 0;
+      return ZH_ALL;
     int64_t k = irop_get_imm64_ex(ir, s2);
     if (k < 0)
-      return 0;
-    /* An arithmetic right shift fills from the sign bit, which is only known
-     * to be zero when the source's high word is. */
-    if (q->op == TCCIR_OP_SAR && !(a & ZK_HI))
-      return 0;
+      return ZH_ALL;
+    uint64_t m = ((uint64_t)a.hi << 32) | a.lo;
+    /* An arithmetic right shift fills from the sign bit: ones wherever the
+     * sign may be set. */
+    uint64_t fill = (q->op == TCCIR_OP_SAR && (a.hi & 0x80000000u)) ? ~0ull : 0;
     if (k >= 64)
-      return ZK_LO | ZK_HI; /* UB in C; the emitter produces zero */
-    if (k == 0)
-      return a;
-    if (q->op == TCCIR_OP_SHL)
-    {
-      /* The low word is fed only by src's low word, the high word by both. */
-      int r = (k >= 32) ? ZK_LO : ((a & ZK_LO) ? ZK_LO : 0);
-      int hi_src = (k >= 32) ? (a & ZK_LO) : ((a & ZK_LO) && (a & ZK_HI));
-      if (hi_src)
-        r |= ZK_HI;
-      return r;
-    }
-    /* SHR / SAR-with-zero-sign: mirror image. */
-    {
-      int r = (k >= 32) ? ZK_HI : ((a & ZK_HI) ? ZK_HI : 0);
-      int lo_src = (k >= 32) ? (a & ZK_HI) : ((a & ZK_LO) && (a & ZK_HI));
-      if (lo_src)
-        r |= ZK_LO;
-      return r;
-    }
+      m = (q->op == TCCIR_OP_SAR) ? fill : 0; /* UB in C; the emitter produces 0 / a sign fill */
+    else if (q->op == TCCIR_OP_SHL)
+      m <<= k;
+    else
+      m = (m >> k) | (k ? fill << (64 - k) : 0);
+    return (ZHMask){(uint32_t)m, (uint32_t)(m >> 32)};
   }
 
   default:
-    return 0;
+    return ZH_ALL;
   }
 }
 
@@ -209,12 +241,18 @@ static int zh_use_ignores_half(TCCIRState *ir, IRQuadCompact *u, int32_t vreg, i
 {
   IROperand s1 = tcc_ir_op_get_src1(ir, u);
   IROperand s2 = tcc_ir_op_get_src2(ir, u);
+  /* An lvalue operand naming the vreg reads memory: the VAR's own slot (a
+   * volatile or memory-resident local) or what the vreg points at.  zh_mask
+   * reports nothing known for it, so pass 2 tells the emitter nothing, and the
+   * emitter loads every word -- no half of it is ignored. */
+  if ((irop_get_vreg(s1) == vreg && s1.is_lval) || (irop_get_vreg(s2) == vreg && s2.is_lval))
+    return 0;
   int m1 = (irop_get_vreg(s1) == vreg) && irop_needs_pair(s1);
   int m2 = (irop_get_vreg(s2) == vreg) && irop_needs_pair(s2);
   /* A word-typed operand naming the pair reads its LOW register (machine
    * operands take their width from the operand, not the vreg). */
-  int n1 = (irop_get_vreg(s1) == vreg) && !irop_needs_pair(s1) && !s1.is_lval;
-  int n2 = (irop_get_vreg(s2) == vreg) && !irop_needs_pair(s2) && !s2.is_lval;
+  int n1 = (irop_get_vreg(s1) == vreg) && !irop_needs_pair(s1);
+  int n2 = (irop_get_vreg(s2) == vreg) && !irop_needs_pair(s2);
   if ((n1 || n2) && half == ZK_LO)
     return 0;
   if (!m1 && !m2)
@@ -233,13 +271,16 @@ static int zh_use_ignores_half(TCCIRState *ir, IRQuadCompact *u, int32_t vreg, i
   case TCCIR_OP_OR:
   case TCCIR_OP_XOR:
     /* The emitter's per-half plan turns the whole half into a copy of the
-     * other operand or a constant zero, naming neither source register --
-     * but ONLY on the register-register path.  Against a literal the emitter
-     * takes its own per-half peephole, and every arm of it but `AND #0` reads
-     * rn.  Claiming otherwise made codegen read a register nothing wrote:
-     * bug_ll_shift_ptr_clobber and 394_fuzz_barrel_shift_imm_remat_drop both
-     * miscompiled on it. */
-    return !irop_is_immediate(s2);
+     * other operand or a constant zero, naming neither source register.
+     * Against a literal it is src1's zero half that turns the result half into
+     * the literal's half (OR/XOR) or zero (AND) -- HALF_CONST / HALF_ZERO in
+     * the immediate arm of thumb_emit_data_processing_mop64.  A literal src1
+     * is not covered: the emitter keys that plan on src1's bits only, and
+     * claiming more made codegen read a register nothing wrote
+     * (bug_ll_shift_ptr_clobber, 394_fuzz_barrel_shift_imm_remat_drop). */
+    if (irop_is_immediate(s2))
+      return m1 && !m2;
+    return 1;
 
   case TCCIR_OP_ADD:
   case TCCIR_OP_SUB:
@@ -252,25 +293,43 @@ static int zh_use_ignores_half(TCCIRState *ir, IRQuadCompact *u, int32_t vreg, i
     return !irop_is_immediate(s2) && tcc_ir_op_dest_needs_pair(ir, u);
 
   case TCCIR_OP_SHL:
-    /* A left shift by >= 32 builds its high word out of the source's LOW word
-     * alone and forces its low word to zero, so `hi_needed` is 0 and the high
-     * word is never materialised.  src2 is the count and is never the pair. */
-    if (m2 || half != ZK_HI)
-      return 0;
-    return irop_is_immediate(s2) && irop_get_imm64_ex(ir, s2) >= 32;
-
   case TCCIR_OP_SHR:
-    /* Mirror image at the value level: a logical right shift by >= 32 derives
-     * both result words from the source's high word alone.  SAR is excluded --
-     * its tail fills both halves from the sign of the high word, so which
-     * words it reads is not the mirror of SHR. */
-    if (m2 || half != ZK_LO)
+  case TCCIR_OP_SAR:
+    /* A shift by a literal of a source whose high word is zero is built from
+     * the low word alone, whatever the count (thumb_emit_shift64_mop's
+     * `s1_hi_zero` arm; a SAR of it is a logical shift).  src2 is the count and
+     * is never the pair. */
+    if (m2 || !irop_is_immediate(s2))
       return 0;
-    return irop_is_immediate(s2) && irop_get_imm64_ex(ir, s2) >= 32;
+    if (half == ZK_HI)
+      return 1;
+    /* A logical right shift by >= 32 derives both result words from the
+     * source's high word alone.  SHL by >= 32 still reads the low word, and
+     * SAR's tail fills from the sign of the high word. */
+    return u->op == TCCIR_OP_SHR && irop_get_imm64_ex(ir, s2) >= 32;
 
   default:
     return 0;
   }
+}
+
+/* Does the use at `u` leave the high word of `vreg` unread whatever it holds?
+ * Only a read of the low word alone qualifies: a word-typed operand naming the
+ * pair (its low register), or a truncating ASSIGN, which
+ * tcc_gen_machine_assign_mop_ex lowers from the source's low half.  This is
+ * what lets a literal-derived high word nobody reads die (`(uint32_t)(k ^ C)`
+ * kept `ldr hi, =C.hi`); every other rule needs the half known zero. */
+static int zh_use_never_reads_hi(TCCIRState *ir, IRQuadCompact *u, int32_t vreg)
+{
+  IROperand s1 = tcc_ir_op_get_src1(ir, u);
+  IROperand s2 = tcc_ir_op_get_src2(ir, u);
+  if ((irop_get_vreg(s1) == vreg && s1.is_lval) || (irop_get_vreg(s2) == vreg && s2.is_lval))
+    return 0;
+  int m1 = (irop_get_vreg(s1) == vreg) && irop_needs_pair(s1);
+  int m2 = (irop_get_vreg(s2) == vreg) && irop_needs_pair(s2);
+  if (!m1 && !m2)
+    return 1;
+  return u->op == TCCIR_OP_ASSIGN && m1 && !tcc_ir_op_dest_needs_pair(ir, u) && !tcc_ir_op_dest_is_lval(ir, u);
 }
 
 /* Key of a TEMP or VAR in zh_build_uses' lists, or -1. */
@@ -358,16 +417,22 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
   ZHState st;
   st.max_t = max_t;
   st.max_v = max_v;
-  st.zk_t = tcc_mallocz((size_t)max_t + 2);
+  st.zk_t = tcc_malloc(((size_t)max_t + 2) * sizeof(ZHMask));
   st.def_t = tcc_malloc(((size_t)max_t + 2) * sizeof(int));
-  st.zk_v = tcc_mallocz((size_t)max_v + 2);
+  st.zk_v = tcc_malloc(((size_t)max_v + 2) * sizeof(ZHMask));
   st.def_v = tcc_malloc(((size_t)max_v + 2) * sizeof(int));
   st.ok_t = tcc_mallocz((size_t)max_t + 2);
   st.ok_v = tcc_mallocz((size_t)max_v + 2);
   for (int p = 0; p <= max_t; p++)
+  {
     st.def_t[p] = -1;
+    st.zk_t[p] = ZH_ALL;
+  }
   for (int p = 0; p <= max_v; p++)
+  {
     st.def_v[p] = -1;
+    st.zk_v[p] = ZH_ALL;
+  }
 
   /* Census FIRST: which positions have exactly one definition.
    *
@@ -424,7 +489,10 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
         st.ok_v[p] = 0;
     }
     if (max_v >= 0)
+    {
       zh_drop_addr_taken_vars(ir, &st);
+      zh_drop_memory_vars(ir, &st);
+    }
     tcc_free(cnt_t);
     tcc_free(cnt_v);
   }
@@ -442,7 +510,7 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
       continue;
     int dt = TCCIR_DECODE_VREG_TYPE(dv);
     int p = TCCIR_DECODE_VREG_POSITION(dv);
-    uint8_t *zk;
+    ZHMask *zk;
     int *def;
     if (dt == TCCIR_VREG_TYPE_TEMP && p >= 0 && p <= max_t && st.ok_t[p])
     {
@@ -459,7 +527,7 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
     def[p] = i;
     if (!tcc_ir_op_dest_needs_pair(ir, q) || tcc_ir_op_dest_is_lval(ir, q))
       continue;
-    zk[p] = (uint8_t)zh_result(ir, &st, q);
+    zk[p] = zh_result(ir, &st, q);
   }
 
   if (!ir->zero_half64)
@@ -507,7 +575,9 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
 
   /* Pass 3: a half that is provably zero AND that every use ignores need not be
    * written.  This is the half of the transform that actually removes
-   * instructions; without it the consumer rule only rewrites an ORR as a MOV. */
+   * instructions; without it the consumer rule only rewrites an ORR as a MOV.
+   * A high word that no use reads at all (zh_use_never_reads_hi) need not be
+   * written either, whatever it holds. */
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -524,21 +594,20 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
     int p = TCCIR_DECODE_VREG_POSITION(dv);
     int zk;
     if (dt == TCCIR_VREG_TYPE_TEMP && p >= 0 && p <= max_t && st.ok_t[p] && st.def_t[p] == i)
-      zk = st.zk_t[p];
+      zk = zh_mask_bits(st.zk_t[p]);
     else if (dt == TCCIR_VREG_TYPE_VAR && p >= 0 && p <= max_v && st.ok_v[p] && st.def_v[p] == i)
-      zk = st.zk_v[p];
+      zk = zh_mask_bits(st.zk_v[p]);
     else
       continue;
-    if (!zk)
-      continue;
-
     if (!use_start)
       zh_build_uses(ir, &st, &use_start, &uses);
     int key = zh_use_key(&st, dv);
     int dead = 0;
     for (int half = ZK_LO; half <= ZK_HI; half <<= 1)
     {
-      if (!(zk & half))
+      /* A half not known zero dies only when no use reads it at all. */
+      const int unread_only = !(zk & half);
+      if (unread_only && half != ZK_HI)
         continue;
       int all_ignore = 1;
       for (int x = use_start[key]; x < use_start[key + 1] && all_ignore; x++)
@@ -547,8 +616,8 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
         if (j == i)
           continue;
         IRQuadCompact *u = &ir->compact_instructions[j];
-        /* An accumulator (MLA's UMLAL form, UMAAL) is read whole: both words. */
-        if (tcc_ir_op_is_mac(u->op) && tcc_ir_op_accum_vreg(ir, u) == dv)
+        if (tcc_ir_op_is_mac(u->op) && tcc_ir_op_accum_vreg(ir, u) == dv &&
+            (half != ZK_HI || irop_needs_pair(tcc_ir_op_get_accum(ir, u))))
         {
           all_ignore = 0;
           break;
@@ -556,7 +625,7 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
         if (tcc_ir_op_src1_vreg(ir, u) != dv &&
             tcc_ir_op_src2_vreg(ir, u) != dv)
           continue;
-        all_ignore = zh_use_ignores_half(ir, u, dv, half);
+        all_ignore = unread_only ? zh_use_never_reads_hi(ir, u, dv) : zh_use_ignores_half(ir, u, dv, half);
       }
       if (all_ignore)
         dead |= (half == ZK_LO) ? ZH64_D_LO : ZH64_D_HI;

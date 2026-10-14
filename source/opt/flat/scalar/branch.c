@@ -1097,13 +1097,85 @@ static int setif_window_fuse(TCCIRState *ir)
   return changes;
 }
 
+static int ir_branch_zero_return(TCCIRState *ir)
+{
+  const int n = ir->next_instruction_index;
+  int changes = 0;
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE || ir_op_has(q->op, IROP_A_MAY_BRANCH))
+      return 0;
+  }
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *test = &ir->compact_instructions[i];
+    if (test->op != TCCIR_OP_CMP && test->op != TCCIR_OP_TEST_ZERO)
+      continue;
+    IROperand value = tcc_ir_op_get_src1(ir, test);
+    int bt = irop_get_btype(value);
+    if (!irop_is_vreg_value(value) || (bt != IROP_BTYPE_INT32 && bt != IROP_BTYPE_INT8 && bt != IROP_BTYPE_INT16))
+      continue;
+    int si = paired_prev(ir, i);
+    if (si < 0 || setif_window_condition(ir, &ir->compact_instructions[si]) < 0 ||
+        irop_get_vreg(tcc_ir_op_get_dest(ir, &ir->compact_instructions[si])) != irop_get_vreg(value))
+      continue;
+    IRLiveInterval *li = tcc_ir_try_get_live_interval(ir, irop_get_vreg(value));
+    if (!li || li->addrtaken || li->is_volatile)
+      continue;
+    if (test->op == TCCIR_OP_CMP) {
+      IROperand zero = tcc_ir_op_get_src2(ir, test);
+      if (!irop_is_plain_imm(zero) || irop_get_imm64_ex(ir, zero) != 0)
+        continue;
+    }
+    int ji = ir_skip_nops_forward(ir, i + 1, n);
+    if (ji >= n || paired_prev(ir, ji) != i || ir->compact_instructions[ji].op != TCCIR_OP_JUMPIF)
+      continue;
+    int cond = tcc_ir_op_src1_imm(ir, &ir->compact_instructions[ji]);
+    if (cond != TOK_EQ && cond != TOK_NE)
+      continue;
+    int entry = cond == TOK_EQ ? tcc_ir_op_dest_imm32(ir, &ir->compact_instructions[ji]) : ji + 1;
+    if (entry < 0 || entry >= n)
+      continue;
+    int ri = ir_skip_nops_forward(ir, entry, n);
+    if (ri >= n || ir->compact_instructions[ri].op != TCCIR_OP_RETURNVALUE)
+      continue;
+    IROperand ret = tcc_ir_op_get_src1(ir, &ir->compact_instructions[ri]);
+    if (!irop_is_vreg_value(ret) || irop_get_vreg(ret) != irop_get_vreg(value) ||
+        irop_get_btype(ret) != irop_get_btype(value))
+      continue;
+    int prev = ri - 1;
+    while (prev >= 0 && ir->compact_instructions[prev].op == TCCIR_OP_NOP)
+      prev--;
+    if (cond == TOK_EQ && (prev < 0 ||
+        (ir->compact_instructions[prev].op != TCCIR_OP_JUMP &&
+         ir->compact_instructions[prev].op != TCCIR_OP_RETURNVALUE &&
+         ir->compact_instructions[prev].op != TCCIR_OP_RETURNVOID)))
+      continue;
+    int exclusive = 1;
+    for (int k = 0; k < n && exclusive; k++) {
+      IRQuadCompact *q = &ir->compact_instructions[k];
+      if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+        continue;
+      int target = tcc_ir_op_dest_imm32(ir, q);
+      if (target >= 0 && target < n && ir_skip_nops_forward(ir, target, n) == ri &&
+          (cond != TOK_EQ || k != ji))
+        exclusive = 0;
+    }
+    if (!exclusive)
+      continue;
+    tcc_ir_set_src1(ir, ri, irop_make_imm32(-1, 0, irop_get_btype(ret)));
+    changes++;
+  }
+  return changes;
+}
+
 int tcc_ir_opt_setif_branch_fuse(TCCIRState *ir)
 {
   if (ir->next_instruction_index < 4)
     return 0;
   IROptCtx ctx;
   tcc_ir_opt_ctx_init(&ctx, ir);
-  int changes = tcc_ir_opt_run_gens(&ctx, branch_gens, branch_gens_count);
+  int changes = ir_branch_zero_return(ir);
+  changes += tcc_ir_opt_run_gens(&ctx, branch_gens, branch_gens_count);
   tcc_ir_opt_ctx_free(&ctx);
   changes += setif_paired_fuse(ir);
   changes += setif_window_fuse(ir);

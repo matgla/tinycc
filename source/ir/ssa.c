@@ -52,6 +52,7 @@ typedef struct {
   SSABitset *multi_block_def;
   SSABitset *global; /* upward-exposed somewhere: a read may observe a cross-block value */
   SSABitset *nonstore_def; /* has at least one def that is not a slot STORE */
+  SSABitset *nonconst_def; /* has a def that is not a covering slot STORE of a plain constant */
   SSABitset *value_def;    /* a def names it as a VALUE (is_lval 0): SRA's field definitions, which have
                             * no memory form -- codegen resolves such a dest as the slot's address -- so
                             * the VAR must be renamed whatever else the rules say */
@@ -62,6 +63,7 @@ typedef struct {
   int prom_sra;         /* promote SRA's field VARs past the STORE-only rule */
   int prom_single;      /* promote entry-block-only single-def VARs */
   int prom_domdef;      /* promote VARs whose one definition dominates every read (dom_def) */
+  int prom_const;       /* promote store-only VARs whose every def stores a constant */
   int *var_btype;
   const uint8_t *store_def_ok; /* per VAR: an INT32 slot STORE covers every read */
   int block_bitset_bytes;
@@ -153,7 +155,7 @@ static int ssa_mark_addrtaken(TCCIRState *ir, IRQuadCompact *q, SSABitset *addrt
  * modifications made between setjmp and longjmp if locals are in regs. */
 static int ssa_has_unsupported_ops(TCCIRState *ir)
 {
-  /* asm goto: the labels' edges are not in the CFG (see func_has_asm_goto) */
+  /* Phi resolution cannot yet place edge-specific copies before a branch inside inline asm. */
   if (ir->func_has_asm_goto)
     return 1;
   for (int i = 0; i < ir->next_instruction_index; i++) {
@@ -192,14 +194,24 @@ static int ssa_scan_var_defs(TCCIRState *ir, IRCFG *cfg, SSAVarInfo *info)
     if (!irop_config[q->op].has_dest)
       continue;
     if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC ||
-        q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID)
+        q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID) {
+      int32_t svr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+      if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_VAR &&
+          TCCIR_DECODE_VREG_POSITION(svr) < num_vars)
+        SSABitset_set(info->nonconst_def, TCCIR_DECODE_VREG_POSITION(svr));
       continue;
+    }
     /* A covering slot STORE is renamed to a fresh name (see
      * ssa_store_slot_def_pos); every other STORE updates the current name in
      * place and must not place a phi. */
     if (q->op == TCCIR_OP_STORE &&
-        ssa_store_slot_def_pos(ir, q, info->store_def_ok, num_vars) < 0)
+        ssa_store_slot_def_pos(ir, q, info->store_def_ok, num_vars) < 0) {
+      int32_t svr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+      if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_VAR &&
+          TCCIR_DECODE_VREG_POSITION(svr) < num_vars)
+        SSABitset_set(info->nonconst_def, TCCIR_DECODE_VREG_POSITION(svr));
       continue;
+    }
 
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     int32_t vr = irop_get_vreg(dest);
@@ -222,11 +234,18 @@ static int ssa_scan_var_defs(TCCIRState *ir, IRCFG *cfg, SSAVarInfo *info)
     raw_bitset_set(def_bits, blk);
     if (q->op != TCCIR_OP_STORE)
       SSABitset_set(info->nonstore_def, pos);
+    if (q->op != TCCIR_OP_STORE || !irop_is_plain_imm(tcc_ir_op_get_src1(ir, q)))
+      SSABitset_set(info->nonconst_def, pos);
     if (q->op != TCCIR_OP_STORE && !dest.is_lval)
       SSABitset_set(info->value_def, pos);
     if (dest.btype != IROP_BTYPE_INT32)
       info->var_btype[pos] = dest.btype;
   }
+
+  /* The constant-store rule needs a def to see: a VAR with none keeps memory. */
+  for (int v = 0; v < num_vars; v++)
+    if (!SSABitset_test(&has_def, v))
+      SSABitset_set(info->nonconst_def, v);
 
   /* Renaming clears an operand's offset (ssa_rename_use), so a VAR named
    * anywhere at an offset other than its own home (a _Complex double read at
@@ -700,12 +719,16 @@ static int ssa_var_promotable(const SSAVarInfo *info, IRCFG *cfg, int nb, int v,
    * destruction materializes costs a copy in every predecessor (gcc-torture
    * loop-15 +12 insns / +74 cycles, bug_switch_in_loop +122 cycles).  Vars that
    * mix ASSIGN and STORE defs — the shape this whole path exists for — keep
-   * being promoted. */
+   * being promoted.  So do vars whose every def stores a constant: a phi of
+   * constants costs the moves the stores were, and it is what lets the value
+   * passes thread an inlined `return true;` / `return false;` into the
+   * caller's test of the result (the return slot is written only that way). */
   /* SRA's field VARs are exempt: SRA saw every access to the object they
    * replace, so they are plain scalars whose slot STOREs are all their defs --
    * not the loop-carried source variables the rule's cycles cost is about.
    * Promoted, the value passes see through them (zig.c -33 KB). */
   if (!SSABitset_test(info->nonstore_def, v) &&
+      (SSABitset_test(info->nonconst_def, v) || SSABitset_test(info->off_mixed, v) || !info->prom_const) &&
       !(info->prom_sra && v >= info->sra_lo && v < info->sra_hi &&
         info->sra_hi - info->sra_lo <= ssa_prom_sra_max() && !SSABitset_test(info->off_mixed, v)))
     return 0;
@@ -851,6 +874,7 @@ IRSSAState *tcc_ir_ssa_construct(TCCIRState *ir, IRCFG *cfg)
   dynamic_bitset(SSABitset) multi_block_def = {0};
   dynamic_bitset(SSABitset) global = {0};
   dynamic_bitset(SSABitset) nonstore_def = {0};
+  dynamic_bitset(SSABitset) nonconst_def = {0};
   dynamic_bitset(SSABitset) value_def = {0};
   dynamic_bitset(SSABitset) off_mixed = {0};
   dynamic_bitset(SSABitset) def_outside_entry = {0};
@@ -862,6 +886,7 @@ IRSSAState *tcc_ir_ssa_construct(TCCIRState *ir, IRCFG *cfg)
       SSABitset_init(&multi_block_def, num_vars) != 0 ||
       SSABitset_init(&global, num_vars) != 0 ||
       SSABitset_init(&nonstore_def, num_vars) != 0 ||
+      SSABitset_init(&nonconst_def, num_vars) != 0 ||
       SSABitset_init(&value_def, num_vars) != 0 ||
       SSABitset_init(&off_mixed, num_vars) != 0 ||
       SSABitset_init(&def_outside_entry, num_vars) != 0 ||
@@ -874,6 +899,7 @@ IRSSAState *tcc_ir_ssa_construct(TCCIRState *ir, IRCFG *cfg)
     .multi_block_def = &multi_block_def,
     .global = &global,
     .nonstore_def = &nonstore_def,
+    .nonconst_def = &nonconst_def,
     .value_def = &value_def,
     .off_mixed = &off_mixed,
     .def_outside_entry = &def_outside_entry,
@@ -883,6 +909,7 @@ IRSSAState *tcc_ir_ssa_construct(TCCIRState *ir, IRCFG *cfg)
     .prom_sra = !tcc_ir_opt_pass_disabled("ssa_prom_sra"),
     .prom_single = !tcc_ir_opt_pass_disabled("ssa_prom_single"),
     .prom_domdef = !tcc_ir_opt_pass_disabled("ssa_prom_domdef"),
+    .prom_const = !tcc_ir_opt_pass_disabled("ssa_prom_const"),
     .var_btype = vector_data(&var_btype_owner),
     .block_bitset_bytes = bitset_bytes,
     .num_vars = num_vars,

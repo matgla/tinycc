@@ -64,7 +64,7 @@ OPT_GEN_FLAT(disp, TCCIR_OP_LOAD)
   {
     int access_btype = addr_op.btype;
     if (access_btype == IROP_BTYPE_INT64 || access_btype == IROP_BTYPE_FLOAT64 ||
-        access_btype == IROP_BTYPE_STRUCT)
+        access_btype == IROP_BTYPE_STRUCT || addr_op.is_complex)
       return 0;
   }
 

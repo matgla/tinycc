@@ -2,6 +2,7 @@
 #define TCC_IR_CFG_H
 
 struct TCCIRState;
+struct IRQuadCompact;
 
 /* The edge, dominance-frontier and dominator-child lists of all blocks live
  * in one array per kind, owned by the IRCFG (edge_store, df_store,
@@ -45,6 +46,8 @@ typedef struct IRCFG
 } IRCFG;
 
 IRCFG *tcc_ir_cfg_build(struct TCCIRState *ir);
+/* 1 for a TRAP or a call to a noreturn callee: ends its block, no fall-through. */
+int tcc_ir_cfg_instr_ends_flow(struct TCCIRState *ir, struct IRQuadCompact *q);
 void tcc_ir_cfg_free(IRCFG *cfg);
 /* Cheap flat pre-scan: false only when the function provably has no back-edge
  * (loop passes may then skip CFG+dominator construction entirely). */

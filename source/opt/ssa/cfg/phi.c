@@ -51,8 +51,94 @@ OPT_GEN_PHI(phi_trivial)
   REWRITE_PHI(.replacement = replacement_vreg);
 }
 
+/* Follow single-def, same-type (width and signedness) `T <- src [ASSIGN]` copies from vr to the value they carry. */
+static int32_t phi_copy_root(IRSSAOptCtx *ctx, int32_t vr, int *btype)
+{
+  TCCIRState *ir = ctx->ir;
+  for (int hops = 0; hops < 16; hops++) {
+    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
+    if (!vi || vi->def_instr < 0 || ssa_opt_def_total(vi) != 1)
+      return vr;
+    IRQuadCompact *q = &ir->compact_instructions[vi->def_instr];
+    if (q->op != TCCIR_OP_ASSIGN || tcc_ir_barrel_shift_at(ir, q))
+      return vr;
+    IROperand dest = tcc_ir_op_get_dest(ir, q), src = tcc_ir_op_get_src1(ir, q);
+    int32_t svr = irop_get_vreg(src);
+    if (src.tag != IROP_TAG_VREG || src.is_lval || src.is_llocal || src.is_local || src.is_sym ||
+        svr < 0 || irop_get_btype(dest) != irop_get_btype(src) || dest.is_unsigned != src.is_unsigned)
+      return vr;
+    int ty = TCCIR_DECODE_VREG_TYPE(svr);
+    if (ty != TCCIR_VREG_TYPE_PARAM && ty != TCCIR_VREG_TYPE_TEMP)
+      return vr;
+    if (*btype < 0)
+      *btype = irop_get_btype(dest);
+    vr = svr;
+    if (ty == TCCIR_VREG_TYPE_PARAM)
+      return vr;
+  }
+  return vr;
+}
+
+/* A PARAM that no instruction writes and whose address is never taken holds its entry value
+ * everywhere, so it can stand in for a copy of it (the rule VRP's param_stable uses). */
+static int phi_param_is_stable(IRSSAOptCtx *ctx, int32_t pvr)
+{
+  TCCIRState *ir = ctx->ir;
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (q->op == TCCIR_OP_LEA && tcc_ir_op_src1_vreg(ir, q) == pvr)
+      return 0;
+    if (irop_config[q->op].has_dest && tcc_ir_op_dest_vreg(ir, q) == pvr)
+      return 0;
+  }
+  return 1;
+}
+
+/* Every incoming value is a copy of the same value R (the two arms of a select whose arms
+ * both fold to x, e.g. zig.h's full-width signed truncate): the phi is R.  R dominates the
+ * phi's block because it dominates every copy, and each copy dominates its predecessor.
+ * A PARAM root replaces only instruction uses: phi operands stay TEMPs. */
+OPT_GEN_PHI(phi_copies)
+{
+  int32_t root = -1;
+  int any_copy = 0;
+  for (int i = 0; i < phi->num_operands; i++) {
+    int32_t v = phi->operands[i].vreg;
+    if (v < 0 || v == phi->dest_vreg)
+      continue;
+    int btype = -1;
+    int32_t r = phi_copy_root(ctx, v, &btype);
+    if (r == phi->dest_vreg)
+      continue;
+    if (btype >= 0 && btype != phi->btype)
+      return 0;
+    any_copy |= (r != v);
+    if (root < 0)
+      root = r;
+    else if (root != r)
+      return 0;
+  }
+  if (root < 0 || !any_copy || !phi_dest_is_sole_def(ctx, phi))
+    return 0;
+  if (TCCIR_DECODE_VREG_TYPE(root) == TCCIR_VREG_TYPE_TEMP) {
+    if (!phi_replacement_value_stable(ctx, root))
+      return 0;
+  } else {
+    IRSSAVregInfo *dvi = ssa_opt_vinfo(ctx, phi->dest_vreg);
+    for (int u = 0; dvi && u < dvi->use_count; u++)
+      if (dvi->uses[u].kind == SSA_USE_PHI)
+        return 0;
+    if (!phi_param_is_stable(ctx, root))
+      return 0;
+  }
+  REWRITE_PHI(.replacement = root);
+}
+
 static const OptDslPhiRule phi_rules[] = {
   OPT_PHI_ENTRY(phi_trivial),
+  OPT_PHI_ENTRY(phi_copies),
 };
 
 typedef struct PhiSCCNode {

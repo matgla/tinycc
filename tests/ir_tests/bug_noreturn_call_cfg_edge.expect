@@ -1,0 +1,16 @@
+g1 1 depth 1
+g2 0 depth 0
+g3 -42 depth 0
+d1 1 flags 9 sunk 0
+d2 0 flags 0 sunk 10
+r2 13
+r3 -2
+r4 -1
+r5 -8
+r6 -3
+r7 30
+r8 63
+r9 -4
+r10 24
+r11 -5
+panics 57

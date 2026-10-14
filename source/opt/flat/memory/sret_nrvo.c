@@ -51,7 +51,7 @@
 #include "opt_alias.h"
 #include "memory/vector.h"
 
-#define NRVO_MAX_OBJ 8
+#define NRVO_MAX_OBJ 24
 #define NRVO_MAX_SITES 16
 #define NRVO_MAX_REFS 512
 #define NRVO_MAX_CANDIDATES 64 /* merge candidates looked at per function */
@@ -399,28 +399,8 @@ static void nrvo_insert_landing(TCCIRState *ir, int at, IRQuadCompact *q)
 {
   const int target = ir->compact_instructions[at].is_jump_target;
   nrvo_insert(ir, at, q);
-  if (target)
-  {
-    ir->compact_instructions[at].is_jump_target = 1;
-    ir->compact_instructions[at + 1].is_jump_target = 0;
-  }
-  for (int i = 0; i < ir->next_instruction_index; i++)
-  {
-    IRQuadCompact *jq = &ir->compact_instructions[i];
-    if (jq->op != TCCIR_OP_JUMP && jq->op != TCCIR_OP_JUMPIF)
-      continue;
-    if ((int)tcc_ir_op_dest_imm(ir, jq) == at + 1)
-      tcc_ir_op_set_dest_imm32(ir, jq, at, IROP_BTYPE_INT32);
-  }
-  for (int t = 0; t < ir->num_switch_tables; t++)
-  {
-    TCCIRSwitchTable *tb = &ir->switch_tables[t];
-    if (tb->default_target == at + 1)
-      tb->default_target = at;
-    for (int j = 0; tb->targets && j < tb->num_entries; j++)
-      if (tb->targets[j] == at + 1)
-        tb->targets[j] = at;
-  }
+  ir->compact_instructions[at + 1].is_jump_target = target;
+  tcc_ir_keep_label_ahead(ir, at);
 }
 
 /* `t <- P0 ADD #k` (or `t <- P0` for k == 0), inserted before `at` so that
@@ -1579,36 +1559,134 @@ static int nrvo_access_width(IROperand o)
   return irop_is_64bit(o) ? 8 : ir_opt_store_btype_size_bytes(irop_get_btype(o));
 }
 
-#define NRVO_RD 1 /* reads some of the bytes */
-#define NRVO_WR 2 /* writes some of them */
-#define NRVO_KILL 4 /* writes all of them, reading none first */
+/* The *P0 bytes [B, E) a merge is checked over, in granules of g bytes --
+ * 1, or more for a range over NRVO_SPAN_MAX bytes: bit i of a mask is bytes
+ * [B + i*g, B + (i+1)*g).  Single bytes, because a member store kills only
+ * the bytes it writes (an error code's u16, an optional's bool). */
+#define NRVO_SPAN_WORDS 4
+#define NRVO_SPAN_MAX (64 * NRVO_SPAN_WORDS)
+typedef struct
+{
+  int B, E, g, ng, nw;
+} NrvoSpan;
 
-/* What frame bytes [off, off + w) of the objects in `ov` (w <= 0: to the end
- * of the object) are to *P0 bytes [B, E): 0 apart, 1 overlapping, 2 covering. */
-static int nrvo_frame_cover(const NrvoObj *obj, int nobj, uint64_t ov, int off, int w, int B, int E)
+typedef uint64_t NrvoMask[NRVO_SPAN_WORDS];
+
+static NrvoSpan nrvo_span(int B, int E)
+{
+  const int g = (E - B + NRVO_SPAN_MAX - 1) / NRVO_SPAN_MAX > 1 ? (E - B + NRVO_SPAN_MAX - 1) / NRVO_SPAN_MAX : 1;
+  const int ng = (E - B + g - 1) / g;
+  return (NrvoSpan){B, E, g, ng, (ng + 63) / 64};
+}
+
+/* bits [a, b) of m */
+static void nrvo_mask_set(uint64_t *m, int a, int b)
+{
+  for (int i = a; i < b;)
+  {
+    const int w = i / 64, lo = i % 64, hi = b - w * 64 < 64 ? b - w * 64 : 64;
+    m[w] |= (hi == 64 ? ~0ull : (1ull << hi) - 1) & ~((1ull << lo) - 1);
+    i = w * 64 + hi;
+  }
+}
+
+/* What one instruction does to the bytes: granules it reads some byte of,
+ * writes some byte of, and writes whole (a read coming first counts as read). */
+typedef struct
+{
+  NrvoMask rd, wr, kill;
+} NrvoAcc;
+
+/* *P0 bytes [p, p + w) as granules touched (any) and covered (kill). */
+static void nrvo_span_cover(const NrvoSpan *sp, int p, int w, uint64_t *any, uint64_t *kill)
+{
+  const int lo = p > sp->B ? p : sp->B, hi = p + w < sp->E ? p + w : sp->E;
+  if (lo >= hi)
+    return;
+  nrvo_mask_set(any, (lo - sp->B) / sp->g, (hi - sp->B - 1) / sp->g + 1);
+  /* (the last granule may be short: reaching E covers it) */
+  if (kill)
+    nrvo_mask_set(kill, (lo - sp->B + sp->g - 1) / sp->g, hi == sp->E ? sp->ng : (hi - sp->B) / sp->g);
+}
+
+/* Frame bytes [off, off + w) of the objects in `ov` (w <= 0: to the end of the
+ * object, and nothing is known written whole) as granules of the span. */
+static void nrvo_frame_cover(const NrvoObj *obj, int nobj, uint64_t ov, int off, int w, const NrvoSpan *sp,
+                             uint64_t *any, uint64_t *kill)
 {
   const int ob = nrvo_obj_of(obj, nobj, off);
   if (ob < 0 || !((ov >> ob) & 1))
-    return 0;
+    return;
+  const int whole = w > 0;
   if (w <= 0)
     w = obj[ob].lo + obj[ob].size - off;
-  const int p = obj[ob].base + off - obj[ob].lo;
-  if (p >= E || p + w <= B)
-    return 0;
-  return p <= B && p + w >= E ? 2 : 1;
+  nrvo_span_cover(sp, obj[ob].base + off - obj[ob].lo, w, any, whole ? kill : NULL);
 }
 
-/* How instruction j accesses *P0 bytes [B, E) through the objects in `ov`:
- * NRVO_RD | NRVO_WR | NRVO_KILL.  Computing an address is no access; a frame
- * slot, a load or store through a TEMP holding `&obj + k`, a copy helper's or
- * a call's result buffer at such an address are placed byte by byte; any
- * other access through an address of the objects reads and writes them all. */
-static int nrvo_access(TCCIRState *ir, const NrvoObj *obj, int nobj, const NrvoUses *u, uint64_t ov, int j, int B,
-                       int E, int32_t p0)
+/* The bytes of the returned type some member occupies (1), by byte: the
+ * others are padding, which the caller cannot read (C11 6.2.6.1p6).  Set for
+ * the merge analysis by tcc_ir_opt_sret_nrvo. */
+static struct
 {
+  uint8_t *member;
+  int size;
+} nrvo_ret;
+
+static void nrvo_type_cover(CType *t, int at, uint8_t *cov, int lim, int depth)
+{
+  int align, size = type_size(t, &align);
+  if (size <= 0 || at >= lim)
+    return;
+  const int bt = t->t & VT_BTYPE;
+  if (depth < 8 && bt == VT_STRUCT && t->ref && !(t->t & VT_BITFIELD))
+  {
+    for (Sym *f = t->ref->next; f; f = f->next)
+    {
+      if (f->type.t & VT_BITFIELD)
+      {
+        const int end = (BIT_POS(f->type.t) + BIT_SIZE(f->type.t) + 7) / 8;
+        for (int b = at + f->c; b < at + f->c + end && b < lim; b++)
+          cov[b] = 1;
+      }
+      else
+        nrvo_type_cover(&f->type, at + f->c, cov, lim, depth + 1);
+    }
+    return;
+  }
+  if (depth < 8 && bt == VT_PTR && (t->t & VT_ARRAY) && t->ref)
+  {
+    int ea, es = type_size(&t->ref->type, &ea);
+    if (es > 0)
+    {
+      for (int e = 0; e < size / es && at + e * es < lim; e++)
+        nrvo_type_cover(&t->ref->type, at + e * es, cov, lim, depth + 1);
+      return;
+    }
+  }
+  for (int b = at; b < at + size && b < lim; b++)
+    cov[b] = 1;
+}
+
+/* How instruction j accesses the span's *P0 bytes through the objects in
+ * `ov`, added to *acc.  Computing an address is no access; a frame slot, a
+ * load or store through a TEMP holding `&obj + k`, a copy helper's or a call's
+ * result buffer at such an address are placed byte by byte; any other access
+ * through an address of the objects reads and writes them all.  A copy out to
+ * P0 reads only the bytes the caller can see. */
+static void nrvo_access(TCCIRState *ir, const NrvoObj *obj, int nobj, const NrvoUses *u, uint64_t ov, int j,
+                        const NrvoSpan *sp, int32_t p0, NrvoAcc *acc)
+{
+  memset(acc, 0, sizeof *acc);
   if (!(u->ref[j] & ov))
-    return 0;
-  const int unknown = (u->ind[j] & ov) ? NRVO_RD | NRVO_WR : 0;
+    return;
+  const int unknown = (u->ind[j] & ov) != 0;
+#define NRVO_ACC_ALL(rdwr)                                                                                             \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    nrvo_mask_set(acc->rd, 0, sp->ng);                                                                                 \
+    if (rdwr)                                                                                                          \
+      nrvo_mask_set(acc->wr, 0, sp->ng);                                                                               \
+  } while (0)
   IRQuadCompact *q = &ir->compact_instructions[j];
   const int op = q->op;
   if (nrvo_is_call(op))
@@ -1620,31 +1698,48 @@ static int nrvo_access(TCCIRState *ir, const NrvoObj *obj, int nobj, const NrvoU
       const int fill = !ir_opt_is_memcpy_or_memmove_name(nm);
       const int aeabi_fill = fill && strcmp(nm, "memset");
       if (!nrvo_call_args(ir, j, a))
-        return NRVO_RD | NRVO_WR;
+      {
+        NRVO_ACC_ALL(1);
+        return;
+      }
       /* the size: memcpy/memmove/memset (d, s|c, n); __aeabi_memset (d, n, c) */
       IROperand sz = aeabi_fill ? a[1] : a[2];
       if (irop_get_tag(sz) != IROP_TAG_IMM32)
-        return unknown;
+      {
+        if (unknown)
+          NRVO_ACC_ALL(1);
+        return;
+      }
       const int cnt = (int)irop_get_imm64_ex(ir, sz);
-      int acc = 0, rd = 0;
+      int doff = 0;
+      const int dkind = nrvo_arg_kind(ir, a[0], j, p0, &doff);
       for (int k = (fill ? 0 : 1); k >= 0; k--) /* the source first */
       {
         int off = 0;
         const int kind = nrvo_arg_kind(ir, a[k], j, p0, &off);
         if (kind == 1)
         {
-          const int c = nrvo_frame_cover(obj, nobj, ov, off, cnt, B, E);
-          if (!c)
-            continue;
-          if (k == 1)
-            acc |= NRVO_RD, rd = 1;
+          if (k == 1 && dkind == 3 && nrvo_ret.member && cnt <= nrvo_ret.size)
+          {
+            /* a copy out: the bytes of members of the returned value */
+            for (int b = 0; b < cnt; b++)
+              if (nrvo_ret.member[b])
+                nrvo_frame_cover(obj, nobj, ov, off + b, 1, sp, acc->rd, NULL);
+          }
+          else if (k == 1)
+            nrvo_frame_cover(obj, nobj, ov, off, cnt, sp, acc->rd, NULL);
           else
-            acc |= NRVO_WR | (c == 2 && !rd ? NRVO_KILL : 0);
+            nrvo_frame_cover(obj, nobj, ov, off, cnt, sp, acc->wr, acc->kill);
         }
         else if (kind != 2 && kind != 3)
-          return unknown;
+        {
+          memset(acc, 0, sizeof *acc);
+          if (unknown)
+            NRVO_ACC_ALL(1);
+          return;
+        }
       }
-      return acc;
+      return;
     }
     const int c = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q));
     IROperand r0;
@@ -1655,10 +1750,12 @@ static int nrvo_access(TCCIRState *ir, const NrvoObj *obj, int nobj, const NrvoU
       /* the result buffer is the only address of the objects a call may get
        * (any other is an escape, and then nothing is merged), and a callee
        * only writes it -- what was there before is not its business */
-      const int cv = nrvo_frame_cover(obj, nobj, ov, off, ir->sret_calls[c], B, E);
-      return cv == 2 ? NRVO_WR | NRVO_KILL : cv ? NRVO_WR : 0;
+      nrvo_frame_cover(obj, nobj, ov, off, ir->sret_calls[c], sp, acc->wr, acc->kill);
+      return;
     }
-    return unknown;
+    if (unknown)
+      NRVO_ACC_ALL(1);
+    return;
   }
   if (op == TCCIR_OP_FUNCPARAMVAL || op == TCCIR_OP_FUNCPARAMVOID)
   {
@@ -1666,17 +1763,15 @@ static int nrvo_access(TCCIRState *ir, const NrvoObj *obj, int nobj, const NrvoU
      * here; an address passed is accessed at the call */
     IROperand o = tcc_ir_op_get_src1(ir, q);
     if (irop_get_tag(o) == IROP_TAG_STACKOFF && irop_get_vreg(o) < 0 && (o.is_lval || o.is_llocal))
-      return nrvo_frame_cover(obj, nobj, ov, irop_get_stack_offset(o), o.is_llocal ? 4 : nrvo_access_width(o), B, E)
-                 ? NRVO_RD
-                 : 0;
-    if (irop_get_tag(o) == IROP_TAG_VREG && irop_get_vreg(o) >= 0 &&
-        (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(o)) == TCCIR_VREG_TYPE_VAR ? o.is_llocal : o.is_lval))
-      return unknown ? NRVO_RD : 0;
-    return 0;
+      nrvo_frame_cover(obj, nobj, ov, irop_get_stack_offset(o), o.is_llocal ? 4 : nrvo_access_width(o), sp, acc->rd,
+                       NULL);
+    else if (irop_get_tag(o) == IROP_TAG_VREG && irop_get_vreg(o) >= 0 &&
+             (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(o)) == TCCIR_VREG_TYPE_VAR ? o.is_llocal : o.is_lval) && unknown)
+      NRVO_ACC_ALL(0);
+    return;
   }
   const int indexed = op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED;
   const int postinc = op == TCCIR_OP_LOAD_POSTINC || op == TCCIR_OP_STORE_POSTINC;
-  int acc = 0;
   for (int k = 0; k < 4; k++)
   {
     IROperand o;
@@ -1690,10 +1785,11 @@ static int nrvo_access(TCCIRState *ir, const NrvoObj *obj, int nobj, const NrvoU
     {
       if (!(o.is_lval || o.is_llocal))
         continue;
-      const int c =
-          nrvo_frame_cover(obj, nobj, ov, irop_get_stack_offset(o), o.is_llocal ? 4 : nrvo_access_width(o), B, E);
-      if (c)
-        acc |= o.is_llocal || !wr ? NRVO_RD : NRVO_WR;
+      const int off = irop_get_stack_offset(o), w = o.is_llocal ? 4 : nrvo_access_width(o);
+      if (o.is_llocal || !wr)
+        nrvo_frame_cover(obj, nobj, ov, off, w, sp, acc->rd, NULL);
+      else
+        nrvo_frame_cover(obj, nobj, ov, off, w, sp, acc->wr, acc->kill);
       continue;
     }
     if (tag != IROP_TAG_VREG || v < 0)
@@ -1731,66 +1827,99 @@ static int nrvo_access(TCCIRState *ir, const NrvoObj *obj, int nobj, const NrvoU
                       (op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_STORE_POSTINC);
     if (!ok)
     {
-      acc |= unknown;
+      if (unknown)
+        NRVO_ACC_ALL(1);
       continue;
     }
-    if (nrvo_frame_cover(obj, nobj, ov, off, w, B, E))
-      acc |= is_wr ? NRVO_WR : NRVO_RD;
+    if (is_wr)
+      nrvo_frame_cover(obj, nobj, ov, off, w, sp, acc->wr, acc->kill);
+    else
+      nrvo_frame_cover(obj, nobj, ov, off, w, sp, acc->rd, NULL);
   }
-  return acc;
+#undef NRVO_ACC_ALL
 }
 
-/* Is any `hit` instruction reached from a successor of a `start` one, along
- * paths that end at a `stop` (checked after `hit`)? */
-static int nrvo_live_after(TCCIRState *ir, const uint8_t *start, const uint8_t *hit, const uint8_t *stop)
+/* Per instruction, what it does to one side of a merge (S or the family's
+ * bytes R): rd, wr and kill masks of nw words each, kept only for the
+ * instructions that touch the side (at[j] >= 0 indexes `acc`). */
+typedef struct
+{
+  int *at;
+  NrvoAcc *acc;
+  int n, cap;
+} NrvoSide;
+
+static void nrvo_side_put(NrvoSide *sd, int j, const NrvoAcc *a, int nw)
+{
+  int any = 0;
+  for (int w = 0; w < nw; w++)
+    any |= (a->rd[w] | a->wr[w] | a->kill[w]) != 0;
+  if (!any)
+    return;
+  if (sd->n == sd->cap)
+  {
+    sd->cap = sd->cap ? sd->cap * 2 : 16;
+    sd->acc = tcc_realloc(sd->acc, sizeof(NrvoAcc) * sd->cap);
+  }
+  sd->acc[sd->n] = *a;
+  sd->at[j] = sd->n++;
+}
+
+/* Does an instruction write (W side) a granule still to be read (R side)
+ * after it: read on some path from a successor before an instruction writes
+ * it whole?  Backward liveness of the R side's granules to a fixpoint. */
+static int nrvo_clobbers_live(TCCIRState *ir, const NrvoSide *wside, const NrvoSide *rside, int nw)
 {
   const int n = ir->next_instruction_index;
-  uint8_t *seen = tcc_mallocz(n + 1);
-  int *stack = tcc_malloc(sizeof(int) * (n + 1));
-  int cap = 64, sp = 0, found = 0;
+  uint64_t *in = tcc_mallocz(sizeof(uint64_t) * nw * (n + 1));
+  int cap = 64;
   for (int t = 0; t < ir->num_switch_tables; t++)
     if (ir->switch_tables[t].num_entries + 2 > cap)
       cap = ir->switch_tables[t].num_entries + 2;
   int *succ = tcc_malloc(sizeof(int) * cap);
+  int found = 0;
+  uint64_t out[NRVO_SPAN_WORDS];
+  /* the granules live after instruction j: those live into a successor */
+#define NRVO_LIVE_OUT(j)                                                                                               \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    const int ns_ = nrvo_succ(ir, (j), succ, cap);                                                                     \
+    for (int w_ = 0; w_ < nw; w_++)                                                                                    \
+      out[w_] = ns_ < 0 ? ~0ull : 0;                                                                                   \
+    for (int k_ = 0; k_ < ns_; k_++)                                                                                   \
+      if (succ[k_] >= 0 && succ[k_] < n)                                                                               \
+        for (int w_ = 0; w_ < nw; w_++)                                                                                \
+          out[w_] |= in[succ[k_] * nw + w_];                                                                           \
+  } while (0)
+  for (int changed = 1; changed;)
+  {
+    changed = 0;
+    for (int j = n - 1; j >= 0; j--)
+    {
+      NRVO_LIVE_OUT(j);
+      const NrvoAcc *a = rside->at[j] >= 0 ? &rside->acc[rside->at[j]] : NULL;
+      for (int w = 0; w < nw; w++)
+      {
+        const uint64_t ni = a ? (out[w] & ~a->kill[w]) | a->rd[w] : out[w];
+        if (ni != in[j * nw + w])
+        {
+          in[j * nw + w] = ni;
+          changed = 1;
+        }
+      }
+    }
+  }
   for (int j = 0; j < n && !found; j++)
   {
-    if (!start[j])
+    if (wside->at[j] < 0)
       continue;
-    const int ns = nrvo_succ(ir, j, succ, cap);
-    if (ns < 0)
-      found = 1;
-    for (int k = 0; k < ns; k++)
-      if (succ[k] >= 0 && succ[k] < n && !seen[succ[k]])
-      {
-        seen[succ[k]] = 1;
-        stack[sp++] = succ[k];
-      }
+    const NrvoAcc *a = &wside->acc[wside->at[j]];
+    NRVO_LIVE_OUT(j);
+    for (int w = 0; w < nw; w++)
+      found |= (a->wr[w] & out[w]) != 0;
   }
-  while (sp && !found)
-  {
-    const int j = stack[--sp];
-    if (hit[j])
-    {
-      found = 1;
-      break;
-    }
-    if (stop[j])
-      continue;
-    const int ns = nrvo_succ(ir, j, succ, cap);
-    if (ns < 0)
-    {
-      found = 1;
-      break;
-    }
-    for (int k = 0; k < ns; k++)
-      if (succ[k] >= 0 && succ[k] < n && !seen[succ[k]])
-      {
-        seen[succ[k]] = 1;
-        stack[sp++] = succ[k];
-      }
-  }
-  tcc_free(seen);
-  tcc_free(stack);
+#undef NRVO_LIVE_OUT
+  tcc_free(in);
   tcc_free(succ);
   return found;
 }
@@ -1843,24 +1972,31 @@ static int nrvo_merge_ok(TCCIRState *ir, const NrvoObj *obj, int nobj, const Nrv
     /* the copies between S and R: 1 from S, 2 from R; they, their PARAMs and
      * the argument TEMPs those pass are not references */
     uint8_t *idc = tcc_mallocz(n), *own = tcc_mallocz(n);
+    NrvoRange *span = tcc_malloc(sizeof(NrvoRange) * (n + 1));
     for (int j = 0; j < n; j++)
     {
       IRQuadCompact *q = &ir->compact_instructions[j];
       if (!nrvo_is_call(q->op) || !ir_opt_is_memcpy_or_memmove_name(nrvo_callee(ir, q)))
         continue;
       IROperand a[3];
-      if (!nrvo_call_args(ir, j, a) || (int)irop_get_imm64_ex(ir, a[2]) != s->size)
+      if (!nrvo_call_args(ir, j, a))
         continue;
+      const int cn = (int)irop_get_imm64_ex(ir, a[2]);
       const int pd = nrvo_arg_pos(ir, a[0], j, p0, all, nobj + 1), ps = nrvo_arg_pos(ir, a[1], j, p0, all, nobj + 1);
-      if (pd != B || ps != B)
+      /* (the same bytes at both ends, all of them inside S) */
+      if (cn <= 0 || pd != ps || pd < B || pd + cn > E)
         continue;
       int od = 0, os = 0;
       const int dk = nrvo_arg_kind(ir, a[0], j, p0, &od), sk = nrvo_arg_kind(ir, a[1], j, p0, &os);
       const int src_s = sk == 1 && os >= s->lo && os < s->lo + s->size;
       const int dst_s = dk == 1 && od >= s->lo && od < s->lo + s->size;
-      if (src_s == dst_s)
+      /* ... and inside one object of the family at the other end */
+      const int ro = src_s ? od : os, rkind = src_s ? dk : sk;
+      if (src_s == dst_s || (rkind == 1 && (nrvo_obj_of(obj, nobj, ro) < 0 ||
+                                            nrvo_obj_of(obj, nobj, ro) != nrvo_obj_of(obj, nobj, ro + cn - 1))))
         continue;
       idc[j] = src_s ? 1 : 2;
+      span[j] = (NrvoRange){pd, pd + cn};
       own[j] = 1;
       for (int k = 0; k < 3; k++)
       {
@@ -1877,45 +2013,56 @@ static int nrvo_merge_ok(TCCIRState *ir, const NrvoObj *obj, int nobj, const Nrv
      * is written while the other's value is still to be read (live).  A copy
      * between them at matching bytes writes one with the other's value: no
      * conflict, and it ends the life of the old value of what it writes. */
-    uint8_t *sw = tcc_mallocz(n), *sr = tcc_mallocz(n), *sk = tcc_mallocz(n);
-    uint8_t *rw = tcc_mallocz(n), *rr = tcc_mallocz(n), *rk = tcc_mallocz(n);
-    const uint64_t sbit = 1ull << nobj;
-    for (int j = 0; j < n; j++)
+    const NrvoSpan sp = nrvo_span(B, E);
+    NrvoSide side[2] = {{0}}; /* 0: S, 1: R */
+    for (int k = 0; k < 2; k++)
     {
+      side[k].at = tcc_malloc(sizeof(int) * (n + 1));
+      for (int j = 0; j <= n; j++)
+        side[k].at[j] = -1;
+    }
+    const uint64_t sbit = 1ull << nobj;
+    for (int j = 0; j < n && ok; j++)
+    {
+      NrvoAcc as, ar;
       if (idc[j])
       {
         /* 1: S -> R, 2: R -> S */
-        (idc[j] == 1 ? sr : rr)[j] = 1;
-        (idc[j] == 1 ? rk : sk)[j] = 1;
+        NrvoAcc *from = idc[j] == 1 ? &as : &ar, *to = idc[j] == 1 ? &ar : &as;
+        memset(&as, 0, sizeof as);
+        memset(&ar, 0, sizeof ar);
+        nrvo_span_cover(&sp, span[j].lo, span[j].hi - span[j].lo, from->rd, to->kill);
+        nrvo_side_put(&side[0], j, &as, sp.nw);
+        nrvo_side_put(&side[1], j, &ar, sp.nw);
         continue;
       }
       if (own[j])
         continue;
-      const int as = nrvo_access(ir, all, nobj + 1, &u, sbit, j, B, E, p0);
-      const int ar = nrvo_access(ir, all, nobj + 1, &u, ov, j, B, E, p0);
-      sw[j] = (as & NRVO_WR) != 0;
-      sr[j] = (as & NRVO_RD) != 0;
-      sk[j] = (as & NRVO_KILL) != 0;
-      rw[j] = (ar & NRVO_WR) != 0;
-      rr[j] = (ar & NRVO_RD) != 0;
-      rk[j] = (ar & NRVO_KILL) != 0;
+      nrvo_access(ir, all, nobj + 1, &u, sbit, j, &sp, p0, &as);
+      nrvo_access(ir, all, nobj + 1, &u, ov, j, &sp, p0, &ar);
+      const int sn = side[0].n, rn = side[1].n;
+      nrvo_side_put(&side[0], j, &as, sp.nw);
+      nrvo_side_put(&side[1], j, &ar, sp.nw);
       /* one instruction touching both: only a copy between them is known */
-      if (as && ar)
+      if (side[0].n != sn && side[1].n != rn)
+      {
+        if (nrvo_dbg())
+          fprintf(stderr, "[NRVO]   merge of %d at %d: instruction %d touches both\n", s->lo, copy, j);
         ok = 0;
+      }
     }
-    if (ok)
-      ok = !nrvo_live_after(ir, sw, rr, rk) && !nrvo_live_after(ir, rw, sr, sk);
+    const int s_meets = ok && nrvo_clobbers_live(ir, &side[0], &side[1], sp.nw);
+    const int r_meets = ok && !s_meets && nrvo_clobbers_live(ir, &side[1], &side[0], sp.nw);
+    if (s_meets || r_meets)
+      ok = 0;
     if (!ok && nrvo_dbg())
+      fprintf(stderr, "[NRVO]   merge of %d at %d: lifetimes meet (%d/%d)\n", s->lo, copy, s_meets, r_meets);
+    for (int k = 0; k < 2; k++)
     {
-      fprintf(stderr, "[NRVO]   merge of %d at %d: lifetimes meet (%d/%d)\n", s->lo, copy,
-              nrvo_live_after(ir, sw, rr, rk), nrvo_live_after(ir, rw, sr, sk));
+      tcc_free(side[k].at);
+      tcc_free(side[k].acc);
     }
-    tcc_free(sw);
-    tcc_free(sr);
-    tcc_free(sk);
-    tcc_free(rw);
-    tcc_free(rr);
-    tcc_free(rk);
+    tcc_free(span);
     tcc_free(idc);
     tcc_free(own);
   }
@@ -1947,17 +2094,27 @@ static void nrvo_merge(TCCIRState *ir, NrvoObj *obj, int *pnobj, int32_t p0, int
         continue;
       const int cn = (int)irop_get_imm64_ex(ir, a[2]);
       const int od = nrvo_obj_of(obj, nobj, d);
-      if (od < 0 || nrvo_obj_of(obj, nobj, s) >= 0 || cn <= 0 || (s & 3) || d + cn > obj[od].lo + obj[od].size ||
-          tcc_ir_frame_object_size_at(ir, s) != cn)
+      if (od < 0 || nrvo_obj_of(obj, nobj, s) >= 0 || cn <= 0 || (s & 3) || d + cn > obj[od].lo + obj[od].size)
         continue;
+      /* S: the frame object the copy reads, whole or a part of it (an error
+       * union whose payload alone is copied); all of it goes into *P0 */
+      int slo = s, shi = s + cn;
+      if (tcc_ir_frame_object_size_at(ir, s) != cn)
+      {
+        if (!tcc_ir_frame_object_at(ir, s, &slo, &shi))
+          continue;
+        shi = slo + tcc_ir_frame_object_size_at(ir, slo); /* (the extent holds its padding too) */
+        if (shi <= slo || shi < s + cn)
+          continue;
+      }
       /* S must not overlap the family's frame bytes */
       int clash = 0;
       for (int k = 0; k < nobj; k++)
-        clash |= s < obj[k].lo + obj[k].size && s + cn > obj[k].lo;
-      const int B = obj[od].base + d - obj[od].lo;
-      if (clash || (B & 3) || buf_align < 4)
+        clash |= slo < obj[k].lo + obj[k].size && shi > obj[k].lo;
+      const int B = obj[od].base + d - obj[od].lo - (s - slo);
+      if (clash || (slo & 3) || B < 0 || B + (shi - slo) > obj[0].base + obj[0].size || (B & 3) || buf_align < 4)
         continue;
-      NrvoObj cand = {.lo = s, .size = cn, .base = B};
+      NrvoObj cand = {.lo = slo, .size = shi - slo, .base = B};
       budget--;
       if (!nrvo_merge_ok(ir, obj, nobj, &cand, i, p0))
         continue;
@@ -2065,7 +2222,16 @@ int tcc_ir_opt_sret_nrvo(TCCIRState *ir)
   if (!nrvo_p0_only_copies(ir, sites, nsites, p0))
     NRVO_FAIL();
 
-  nrvo_merge(ir, obj, &nobj, p0, buf_align);
+  {
+    int al;
+    nrvo_ret.size = type_size(&func_vt, &al);
+    nrvo_ret.member = nrvo_ret.size > 0 ? tcc_mallocz(nrvo_ret.size) : NULL;
+    if (nrvo_ret.member)
+      nrvo_type_cover(&func_vt, 0, nrvo_ret.member, nrvo_ret.size, 0);
+    nrvo_merge(ir, obj, &nobj, p0, buf_align);
+    tcc_free(nrvo_ret.member);
+    memset(&nrvo_ret, 0, sizeof nrvo_ret);
+  }
 
   /* Where the family's addresses go. */
   {

@@ -1094,23 +1094,21 @@ ST_FUNC void label_pop(Sym **ptop, Sym *slast, int keep)
           s->c = 0; /* Reset marker so put_extern_sym creates new symbol */
 
         TCCIRState *lir = tcc_state->ir;
-        int label_at = -1; /* current index of the labelled position, its own instruction gone */
+        int label_at = -1; /* current index of the labelled position */
         if (lir && lir->ir_to_code_mapping && s->jind >= 0)
         {
-          int survived = 0;
-          for (int k = 0; k < lir->next_instruction_index && !survived; k++)
-            survived = lir->compact_instructions[k].orig_index == s->jind;
-          if (!survived)
-            label_at = tcc_ir_label_insn(lir, s->jind);
+          label_at = tcc_ir_label_insn(lir, s->jind);
           if (label_at >= lir->ir_to_code_mapping_size)
             label_at = -1;
         }
         if (label_at >= 0)
         {
-          /* The instruction the label stood on was deleted.  The next original
-           * index need not be the next instruction any more (an unrolled loop's
-           * copies carry fresh ones, so it skipped the whole body): use where
-           * the label itself was carried through the renumberings. */
+          /* Where the label was carried through the passes, which is also
+           * where the CFG puts an asm goto's edge: not the instruction it was
+           * defined on, which a pass may have put a def in front of (the def
+           * belongs to the label's block), or deleted -- and the next original
+           * index need not be the next instruction any more (an unrolled
+           * loop's copies carry fresh ones, so it skipped the whole body). */
           put_extern_sym(s, cur_text_section, lir->ir_to_code_mapping[label_at] + 1, 1);
         }
         else if (tcc_state->ir && tcc_state->ir->orig_ir_to_code_mapping && s->jind >= 0 &&

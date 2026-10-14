@@ -700,6 +700,12 @@ static void ra_widen_intervals_by_loops(TCCIRState *ir, const RaVregIdx *vx, uin
       int lo = n, nt = 0, t[2] = {0, 0};
       if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
         t[nt++] = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      else if (q->op == TCCIR_OP_INLINE_ASM)
+      {
+        for (int k = 0, target; (target = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+          if (target <= i && target < lo)
+            lo = target;
+      }
       else if (q->op == TCCIR_OP_SWITCH_TABLE)
       {
         int table_id = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
@@ -755,6 +761,12 @@ void ra_widen_intervals_by_liveness(TCCIRState *ir, const RaVregIdx *vx, uint32_
       int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
       if (t >= 0 && t <= i)
         has_back = 1;
+    }
+    else if (q->op == TCCIR_OP_INLINE_ASM)
+    {
+      for (int k = 0, target; (target = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+        if (target <= i)
+          has_back = 1;
     }
     else if (q->op == TCCIR_OP_SWITCH_TABLE)
     {
@@ -1258,6 +1270,7 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
    * two are interlocked: whichever fires first in a function locks the other
    * out for the rest of it. */
   int share_ok = (alive && alive->valid);
+  const int co_hint_on = !tcc_ir_opt_pass_disabled("ra:co_hint");
   int alive_shared_used = 0;
   int reg_shared_used = 0;
   const int evict_density = TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("ra:evict_density");
@@ -1305,10 +1318,10 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
    * pointer through an ABI-compliant helper) and would see any value the
    * allocator parked in R10 corrupted across that call (nestfunc-2: the
    * i/j/k loop counters lived in R10 and the inner foo() call clobbered it →
-   * infinite loop).  Reserve R10 in such parents.  Nested functions
-   * themselves (has_static_chain) hold the live chain in R10 and are handled
-   * separately, so leave their allocation untouched. */
-  if (tcc_state->nb_nested_funcs > 0 && !ir->has_static_chain)
+   * infinite loop).  Reserve R10 in such parents.  A nested function itself
+   * (has_static_chain) reads every capture as [R10, #off] off the live
+   * register for the whole body, so R10 is never free there either. */
+  if (tcc_state->nb_nested_funcs > 0 || ir->has_static_chain)
     int_allowed &= ~(1ull << (uint64_t)architecture_config.static_chain_reg);
 
   /* The frame-pointer register (R7 on Thumb) is held out of the target's
@@ -1658,8 +1671,11 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
           int32_t av = tcc_ir_op_accum_vreg(ir, dq);
           int ai = av >= 0 ? HINT_IDX(av) : -1;
           SSAInterval *p = (ai >= 0 && ai < hint_tbl_size) ? vreg_to_iv[ai] : NULL;
-          if (p && p->r1 >= 0)
-            don[0] = don[1] = p;
+          if (p) {
+            don[0] = p;
+            if (irop_needs_pair(tcc_ir_op_get_accum(ir, dq)) && p->r1 >= 0)
+              don[1] = p;
+          }
         } else if (dq->op == TCCIR_OP_ZEXT || dq->op == TCCIR_OP_PACK64) {
           for (int w = 0; w < (dq->op == TCCIR_OP_PACK64 ? 2 : 1); w++) {
             IROperand so = tcc_ir_op_get_src1_or_2(ir, dq, w);
@@ -1987,6 +2003,44 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
 
     /* Integer: single register */
     int reg = -1;
+    if (cur->reg_type == LS_REG_TYPE_INT && !cur->co_member &&
+        TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("ra:pair_extract") &&
+        (int)cur->start < ir->next_instruction_index) {
+      IRQuadCompact *q = &ir->compact_instructions[cur->start];
+      int high = q->op == TCCIR_OP_SHR && tcc_ir_op_src2_is_imm(ir, q) &&
+                 tcc_ir_op_src2_imm(ir, q) == 32;
+      if ((q->op == TCCIR_OP_ASSIGN || high) && !tcc_ir_barrel_shift_at(ir, q) &&
+          !tcc_ir_op_dest_is_lval(ir, q) && tcc_ir_op_dest_vreg(ir, q) == cur->vreg) {
+        IROperand src = tcc_ir_op_get_src1(ir, q);
+        int32_t sv = irop_is_vreg_value(src) ? irop_get_vreg(src) : -1;
+        int si = sv >= 0 ? HINT_IDX(sv) : -1;
+        SSAInterval *p = si >= 0 && si < hint_tbl_size ? vreg_to_iv[si] : NULL;
+        if (p && p->reg_type == LS_REG_TYPE_LLONG && p->end == cur->start &&
+            p->r0 >= 0 && p->r1 >= 0 && p->stack_location == 0 &&
+            !p->co_member && !p->loop_phi_locked && !p->alive_shared &&
+            !ra_reg_has_other_holder(active, active_count, p, p->r0) &&
+            !ra_reg_has_other_holder(active, active_count, p, p->r1)) {
+          int hr = high ? p->r1 : p->r0;
+          int ok = (int_allowed & (1ull << hr)) != 0;
+          if (cur->crosses_call) {
+            int callee_saved = 0;
+            for (int ci = 0; ci < target->int_class.num_callee_saved; ci++)
+              if (target->int_class.callee_saved[ci] == hr) callee_saved = 1;
+            ok &= callee_saved;
+          }
+          if (ok) {
+            for (int k = 0; k < active_count; k++) {
+              if (active[k] == p) {
+                int_free |= (1ull << p->r0) | (1ull << p->r1);
+                active[k] = active[--active_count];
+                reg = hr;
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
     RA_DBG("  alloc T%d [%u,%u] uses=%u xcall=%d co=%d co_to=%d lp=%d hint=%d narrow=%u int_free=0x%llx active=%d",
            TCCIR_DECODE_VREG_POSITION(cur->vreg), cur->start, cur->end,
            cur->use_count, cur->crosses_call, cur->co_member, ra_coalesce_pos(cur),
@@ -2009,7 +2063,7 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
      * free. Restricted to single-register INT to avoid corrupting register
      * pairs (umull, ll-shift, etc.) where the architecture forbids dest/
      * source overlap. */
-    if (cur->hint_vreg >= 0 && max_vreg_pos > 0 && !cur->co_member) {
+    if (reg < 0 && cur->hint_vreg >= 0 && max_vreg_pos > 0 && (!cur->co_member || co_hint_on)) {
       int hint_idx = HINT_IDX(cur->hint_vreg);
       if (hint_idx >= 0 && hint_idx < hint_tbl_size) {
         SSAInterval *partner = vreg_to_iv[hint_idx];

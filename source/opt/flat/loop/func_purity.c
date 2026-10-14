@@ -310,7 +310,7 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
           if (callee_purity == TCC_FUNC_PURITY_UNKNOWN && !callee->a.weak &&
               !tcc_ir_opt_pass_disabled("purity:transitive"))
           {
-            int cached = tcc_ir_lookup_func_purity(tcc_state, callee->v);
+            int cached = tcc_ir_lookup_func_purity(tcc_state, func_cache_token(callee));
             if (cached >= TCC_FUNC_PURITY_PURE)
               callee_purity = cached;
           }
@@ -437,7 +437,7 @@ int tcc_ir_get_func_purity(TCCIRState *ir, Sym *sym)
   extern TCCState *tcc_state;
   if (tcc_state)
   {
-    int cached = tcc_ir_lookup_func_purity(tcc_state, sym->v);
+    int cached = tcc_ir_lookup_func_purity(tcc_state, func_cache_token(sym));
     if (cached >= 0)
     {
       LOG_LICM("Found cached purity for '%s': %d", func_name, cached);

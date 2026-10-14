@@ -118,7 +118,8 @@ def _traces(level):
     # and a shared path let one disassemble another's half-written object.
     obj = BUILD_DIR / f"volatile_trace{level}.{os.getpid()}.o"
     cmd = [str(TCC), level, "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb",
-           "-mfloat-abi=soft", "-ffunction-sections", "-c", str(CASES), "-o", str(obj)]
+           "-mfloat-abi=soft", "-ffunction-sections", "-fno-pic", "-mno-sb-relative-got",
+           "-fno-module-local-calls", "-c", str(CASES), "-o", str(obj)]
     r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     assert r.returncode == 0, f"compile failed: {' '.join(cmd)}\n{r.stderr}"
     r = subprocess.run([OBJDUMP, "-dr", "--no-show-raw-insn", str(obj)], capture_output=True, text=True,

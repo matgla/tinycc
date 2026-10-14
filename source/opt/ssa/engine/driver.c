@@ -29,6 +29,7 @@
 #include "opt/ssa/gvn.h"
 #include "opt/ssa/var_imm_prop.h"
 #include "opt/ssa/cprop.h"
+#include "opt/ssa/dup_diamond.h"
 
 
 static const IRSSAOptGen *target_gens;
@@ -106,6 +107,7 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
     SSA_RUN("ssa:const_string_fold", tcc_ir_ssa_opt_const_string_fold(ctx));
     SSA_RUN("ssa:bitop_const_fold", tcc_ir_ssa_opt_bitop_const_fold(ctx));
     SSA_RUN("ssa:ptr_store_dse", tcc_ir_ssa_opt_ptr_store_dse(ctx));
+    SSA_RUN("ssa:ptr_silent_store", tcc_ir_ssa_opt_ptr_silent_store(ctx));
     SSA_RUN("ssa:branch", ssa_opt_branch(ctx));
     SSA_RUN("ssa:switch_fold", ssa_opt_switch_fold(ctx));
     SSA_RUN("ssa:cmp_eq_prop", ssa_opt_cmp_eq_prop(ctx));
@@ -120,6 +122,7 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
     SSA_RUN("ssa:strength", ssa_opt_strength(ctx));
     SSA_RUN("ssa:narrow", ssa_opt_narrow(ctx));
     SSA_RUN("ssa:gvn", ssa_opt_gvn(ctx));
+    SSA_RUN("ssa:dup_diamond", ssa_opt_dup_diamond(ctx));
     SSA_RUN("ssa:pure_call_cse", ssa_opt_pure_call_cse(ctx));
     SSA_RUN("ssa:phi_simplify", ssa_opt_phi_simplify(ctx));
     /* -O2, not -O1: gcc deletes a pure counting loop only at -O2 -- its -O1

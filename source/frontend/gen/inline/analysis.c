@@ -22,6 +22,8 @@
  * Split out of tccgen.c; see docs/plan_tccgen_split.md. */
 
 #include "gen_priv.h"
+#include "memory/unique_ptr.h"
+#include "memory/vector.h"
 
 /* Returns 1 if `type` is a struct/union with at least one pointer member
  * (searched recursively through nested aggregates).  Such structs, when passed
@@ -469,9 +471,11 @@ static int inline_body_shadowed_ident(TokenString *func_str, int enum_only)
         Sym *s = ts->sym_identifier;
         /* If the identifier resolves to a local and there's also a global
          * with the same name, the local shadows the global. */
-        /* Anonymous enums record no scope: a chained constant is a local one. */
+        /* Anonymous enums record no scope: a chained constant is a local one.
+         * A GNU nested function's name is block-scoped (nested_define) but
+         * is not a caller local this check is about. */
         if (enum_only ? IS_ENUM_VAL(s->type.t) && s->prev_tok
-                      : (sym_scope(s) > 0 || IS_ENUM_VAL(s->type.t)) && s->prev_tok)
+                      : (sym_scope(s) > 0 || IS_ENUM_VAL(s->type.t)) && s->prev_tok && !s->a.nested_func)
           return 1;
       }
     }
@@ -510,39 +514,444 @@ static int inline_body_has_shadowed_tag(TokenString *func_str)
   return 0;
 }
 
-/* Smarter variant for nested inlining.  At the top level (not inside another
- * inline expansion), defer to the strict check — it catches the genuine bug
- * of a caller's local shadowing a global that the callee references.
- *
- * When called from inside a nested inline expansion, the outer-inlined
- * function's parameter/local symbols are already in scope and shadow their
- * file-scope counterparts.  The strict check would always trip on those,
- * blocking nested expansion for any non-trivial body — even when the inner
- * callee's identifiers are purely self-bound (its own params/locals, re-
- * resolved during its own replay).  In that case the shadowing is harmless,
- * so we relax the check to allow nested expansion.
- *
- * The residual risk is: callee references a free global identifier whose
- * name happens to match one of the outer-inlined function's locals.  This
- * is rare in practice and the gain (full collapse of helper-chain calls in
- * the c5p/CPOW/CCID style) is substantial.  If a real regression surfaces,
- * the check can be tightened by exempting only the outer expansion's
- * known-pushed symbols. */
+/* A name bound here to something the callee, defined at file scope, cannot
+ * mean: a block-scope object, typedef or enum constant, a GNU nested
+ * function, or a parent local or typedef an out-of-line nested function
+ * captures (those sit at scope 0, or on no chain at all). */
+static int inline_name_binds_local(int t)
+{
+  NestedFunc *cnf = tcc_state->current_nested_func;
+  TokenSym *ts = table_ident[t - TOK_IDENT];
+  Sym *s = ts ? ts->sym_identifier : NULL;
+  if (s && !SYM_IS_PARKED(s))
+  {
+    if (IS_ENUM_VAL(s->type.t))
+    {
+      if (sym_scope(s) > 0 || s->prev_tok)
+        return 1;
+    }
+    else if ((s->type.t & (VT_BTYPE | VT_TYPEDEF)) == VT_FUNC)
+    {
+      if (s->a.nested_func || (s->sym_scope > 0 && s->prev_tok))
+        return 1;
+    }
+    else if (s->sym_scope > 0)
+      return 1;
+  }
+  if (cnf)
+  {
+    for (int i = 0; i < cnf->nb_captured; i++)
+      if (cnf->captured_tokens[i] == t)
+        return 1;
+    for (int i = 0; i < cnf->nb_parent_typedefs; i++)
+      if (cnf->parent_typedef_tokens[i] == t)
+        return 1;
+  }
+  return 0;
+}
+
+/* The binding of a nested function's name compared across its definition and
+ * a call: NULL for one at file scope, else the Sym itself. */
+static Sym *inline_def_binding(Sym *s)
+{
+  if (!s || SYM_IS_PARKED(s))
+    return NULL;
+  if (IS_ENUM_VAL(s->type.t) || s->sym_scope > 0 ||
+      ((s->type.t & (VT_BTYPE | VT_TYPEDEF)) == VT_FUNC && s->a.nested_func))
+    return s;
+  return NULL;
+}
+
+typedef struct InlineNameState
+{
+  int tok;
+  int depth;  /* brace depth of the declaration while open */
+  int for_bd; /* declared in a for header at this brace depth: ends with that statement; else -1 */
+  uint8_t state;
+} InlineNameState;
+
+enum
+{
+  INL_NAME_UNSEEN,
+  INL_NAME_OPEN,   /* the callee's own declaration binds it here */
+  INL_NAME_CLOSED, /* its block ended; a later use is free */
+  INL_NAME_FREE    /* some use binds outside the callee */
+};
+
+static InlineNameState *inline_name_find(InlineNameState *names, int n, int t)
+{
+  for (int i = 0; i < n; i++)
+    if (names[i].tok == t)
+      return &names[i];
+  return NULL;
+}
+
+static int inline_tok_in(const int *v, size_t n, size_t stride, int t)
+{
+  for (size_t i = 0; i < n; i += stride)
+    if (v[i] == t)
+      return 1;
+  return 0;
+}
+
+/* Keywords that begin or continue the specifiers of a declaration. */
+static int inline_tok_is_decl_spec(int t)
+{
+  return (t >= TOK_EXTERN && t <= TOK_THREAD_LOCAL && t != TOK_EXTENSION) || (t >= TOK_VOID && t <= TOK_ENUM) ||
+         t == TOK_ATTRIBUTE1 || t == TOK_ATTRIBUTE2 || t == TOK_ALIGNAS || t == TOK_TYPEOF1 || t == TOK_TYPEOF2 ||
+         t == TOK_TYPEOF3;
+}
+
+static int inline_tok_is_declarator_qual(int t)
+{
+  return (t >= TOK_CONST1 && t <= TOK_VOLATILE3) || (t >= TOK_RESTRICT1 && t <= TOK_RODATA_REL) || t == TOK__Atomic ||
+         t == TOK_ATTRIBUTE1 || t == TOK_ATTRIBUTE2;
+}
+
+/* Walks a callee body as its replay will parse it and settles, for each name
+ * in NAMES, whether every use binds to a declaration of the callee itself
+ * (its parameters, or a declarator before the use in an enclosing block).
+ * Anything it cannot read as a declaration counts as a use, so it errs
+ * towards FREE.  Returns 1 if the body defines a nested function. */
+static int inline_spliced(const int *spliced, int ord)
+{
+  if (spliced)
+    for (int i = 0; i < spliced[0]; i++)
+      if (ord >= spliced[1 + 2 * i] && ord < spliced[2 + 2 * i])
+        return 1;
+  return 0;
+}
+
+static int inline_body_scan_names(TokenString *func_str, Sym *callee, const int *spliced, InlineNameState *names,
+                                  int nnames)
+{
+  scoped_vector(int) toks = {0};
+  scoped_vector(int) opener_prev = {0}; /* the token before each open '(' / '[' */
+  scoped_vector(int) decl_names = {0};
+  scoped_vector(int) decl_typedefs = {0}; /* pairs: the callee's own typedef name, its brace depth */
+  const int *tp = tok_str_buf(func_str);
+  enum { M_NONE, M_SPEC, M_DECLR, M_AFTER } mode = M_NONE;
+  int bd = 0, pd = 0, stmt_start = 0, decl_bd = 0, decl_pd = 0, is_td = 0, type_seen = 0, in_init = 0;
+  int noname_pd = -1; /* inside __attribute__/typeof/_Alignas parens: names are uses */
+  int closed_prev = 0, ident_ord = 0, in_for = 0, defines_nested = 0;
+  while (*tp)
+  {
+    int tv;
+    CValue tcv;
+    tok_get(&tv, &tp, &tcv);
+    if (tv == TOK_EOF || tv == 0)
+      break;
+    if (tv != TOK_LINENUM)
+      vector_push_back(&toks, tv);
+  }
+  if (callee && callee->type.ref)
+    for (Sym *p = callee->type.ref->next; p; p = p->next)
+    {
+      InlineNameState *ns = inline_name_find(names, nnames, p->v & ~SYM_FIELD);
+      vector_push_back(&decl_names, p->v & ~SYM_FIELD); /* a parameter is no typedef name */
+      if (ns)
+        ns->state = INL_NAME_OPEN, ns->depth = 0, ns->for_bd = -1;
+    }
+  for (size_t i = 0; i < toks.size; i++)
+  {
+    int tv = toks.data[i];
+    int prev = i ? toks.data[i - 1] : 0;
+    int next = i + 1 < toks.size ? toks.data[i + 1] : 0;
+    int at_decl_level = mode != M_NONE && bd == decl_bd && pd == decl_pd;
+    int was_stmt_start = stmt_start;
+    int ord = tv >= TOK_UIDENT ? ident_ord++ : -1;
+    int for_header_start = mode == M_NONE && prev == '(' && i >= 2 && toks.data[i - 2] == TOK_FOR;
+    stmt_start = 0;
+    if (tv == '{')
+    {
+      /* `) {` after a call-shaped `name(...)`, or a declarator's body. */
+      if ((mode == M_AFTER && at_decl_level && !in_init) ||
+          (mode == M_NONE && prev == ')' && closed_prev >= TOK_UIDENT))
+      {
+        defines_nested = 1;
+        mode = M_NONE; /* its body: statements; its parameters counted as uses */
+      }
+      bd++;
+      if (mode == M_NONE && pd == 0)
+        stmt_start = 1;
+      continue;
+    }
+    if (tv == '}')
+    {
+      for (int k = 0; k < nnames; k++)
+        if (names[k].state == INL_NAME_OPEN && names[k].depth >= bd)
+          names[k].state = INL_NAME_CLOSED;
+      while (decl_typedefs.size && decl_typedefs.data[decl_typedefs.size - 1] >= bd)
+        decl_typedefs.size -= 2;
+      bd--;
+      if (mode != M_NONE && bd < decl_bd)
+        mode = M_NONE;
+      if (mode == M_NONE && pd == 0)
+        stmt_start = 1;
+      continue;
+    }
+    if (tv == '(' || tv == '[')
+    {
+      int spec_paren = prev == TOK_TYPEOF1 || prev == TOK_TYPEOF2 || prev == TOK_TYPEOF3 || prev == TOK_ATTRIBUTE1 ||
+                       prev == TOK_ATTRIBUTE2 || prev == TOK_ALIGNAS || prev == TOK__Atomic;
+      vector_push_back(&opener_prev, prev);
+      if ((mode == M_SPEC || mode == M_DECLR) && spec_paren && noname_pd < 0)
+        noname_pd = pd;
+      else if (mode == M_SPEC && at_decl_level && tv == '(')
+        mode = M_DECLR; /* int (*fp)(...) */
+      pd++;
+      continue;
+    }
+    if (tv == ')' || tv == ']')
+    {
+      if (opener_prev.size)
+        closed_prev = opener_prev.data[--opener_prev.size];
+      pd--;
+      if (pd == noname_pd)
+        noname_pd = -1;
+      continue;
+    }
+    if (tv == ';')
+    {
+      /* a for statement without braces ends at its first ';' at its own level (or later: then this errs FREE) */
+      if (pd == 0)
+        for (int k = 0; k < nnames; k++)
+          if (names[k].state == INL_NAME_OPEN && names[k].for_bd == bd)
+            names[k].state = INL_NAME_CLOSED;
+      if (mode == M_NONE ? pd == 0 : at_decl_level)
+        mode = M_NONE, stmt_start = 1;
+      continue;
+    }
+    if (at_decl_level && mode == M_AFTER && tv == ',')
+    {
+      mode = M_DECLR, in_init = 0;
+      continue;
+    }
+    if (at_decl_level && mode == M_AFTER && tv == '=')
+    {
+      in_init = 1;
+      continue;
+    }
+    if (tv < TOK_IDENT)
+    {
+      if (at_decl_level && mode == M_SPEC && tv == '*')
+        mode = M_DECLR;
+      else if (at_decl_level && (mode == M_SPEC || mode == M_DECLR) && tv != '*')
+        mode = M_NONE; /* not a declaration this walk can read */
+      continue;
+    }
+    if (tv < TOK_UIDENT)
+    {
+      if (((was_stmt_start && pd == 0) || for_header_start) && inline_tok_is_decl_spec(tv))
+      {
+        mode = M_SPEC, decl_bd = bd, decl_pd = pd, is_td = 0, type_seen = 0, in_init = 0, in_for = for_header_start;
+        at_decl_level = 1;
+      }
+      if (!at_decl_level)
+        continue;
+      if (mode == M_SPEC && inline_tok_is_decl_spec(tv))
+      {
+        if (tv == TOK_TYPEDEF)
+          is_td = 1;
+        else if (!inline_tok_is_declarator_qual(tv) && tv != TOK_EXTERN && tv != TOK_STATIC && tv != TOK_AUTO &&
+                 tv != TOK_REGISTER && !(tv >= TOK_INLINE1 && tv <= TOK_INLINE3) && tv != TOK_THREAD_LOCAL)
+          type_seen = 1;
+      }
+      else if (!(mode == M_DECLR && inline_tok_is_declarator_qual(tv)) && mode != M_AFTER)
+        mode = M_NONE;
+      continue;
+    }
+    /* A user identifier: a caller's spliced argument, a member, a label or a
+     * tag binds in no ordinary scope of the callee. */
+    if (inline_spliced(spliced, ord))
+      continue;
+    if (prev == '.' || prev == TOK_ARROW || prev == TOK_GOTO || (was_stmt_start && next == ':'))
+    {
+      if (was_stmt_start)
+        stmt_start = 1;
+      continue;
+    }
+    if (mode == M_SPEC && at_decl_level && (prev == TOK_STRUCT || prev == TOK_UNION || prev == TOK_ENUM))
+      continue; /* a tag */
+    if ((was_stmt_start && pd == 0) || for_header_start)
+    {
+      int is_type = inline_tok_in(decl_typedefs.data, decl_typedefs.size, 2, tv);
+      if (!is_type && !inline_tok_in(decl_names.data, decl_names.size, 1, tv))
+      {
+        TokenSym *ts = table_ident[tv - TOK_IDENT];
+        Sym *s = ts ? ts->sym_identifier : NULL;
+        is_type = s && !SYM_IS_PARKED(s) && (s->type.t & VT_TYPEDEF);
+      }
+      if (is_type)
+      {
+        mode = M_SPEC, decl_bd = bd, decl_pd = pd, is_td = 0, type_seen = 0, in_init = 0, in_for = for_header_start;
+        at_decl_level = 1;
+      }
+    }
+    if (mode == M_SPEC && at_decl_level && !type_seen && noname_pd < 0)
+    {
+      int is_type = inline_tok_in(decl_typedefs.data, decl_typedefs.size, 2, tv);
+      if (!is_type && !inline_tok_in(decl_names.data, decl_names.size, 1, tv))
+      {
+        TokenSym *ts = table_ident[tv - TOK_IDENT];
+        Sym *s = ts ? ts->sym_identifier : NULL;
+        is_type = s && !SYM_IS_PARKED(s) && (s->type.t & VT_TYPEDEF);
+      }
+      if (is_type)
+      {
+        type_seen = 1;
+        InlineNameState *ns = inline_name_find(names, nnames, tv);
+        if (ns && ns->state != INL_NAME_OPEN)
+          ns->state = INL_NAME_FREE;
+        continue;
+      }
+    }
+    if ((mode == M_SPEC || mode == M_DECLR) && bd == decl_bd && pd >= decl_pd && noname_pd < 0)
+    {
+      /* the declarator's name: in scope from here to the end of its block */
+      InlineNameState *ns = inline_name_find(names, nnames, tv);
+      vector_push_back(&decl_names, tv);
+      if (is_td)
+      {
+        vector_push_back(&decl_typedefs, tv);
+        vector_push_back(&decl_typedefs, bd);
+      }
+      if (ns && ns->state != INL_NAME_FREE)
+        ns->state = INL_NAME_OPEN, ns->depth = in_for ? bd + 1 : bd, ns->for_bd = in_for ? bd : -1;
+      mode = M_AFTER;
+      continue;
+    }
+    {
+      InlineNameState *ns = inline_name_find(names, nnames, tv);
+      if (ns && ns->state != INL_NAME_OPEN)
+        ns->state = INL_NAME_FREE;
+    }
+  }
+  return defines_nested;
+}
+
+/* 1 if a name of the body that the callee does not declare itself binds here
+ * otherwise than the callee means it (DEF_BINDS: as recorded at a nested
+ * function's definition; NULL: at file scope, so not to a caller local), or
+ * if a file-scope callee's body defines a nested function. */
+static int inline_body_free_names_unsafe(TokenString *func_str, Sym *callee, Sym **def_binds, const int *spliced)
+{
+  scoped_vector(InlineNameState) names = {0};
+  const int *tp = tok_str_buf(func_str);
+  int k = 0, unsafe, prev = 0, paren_brace = 0;
+  while (*tp)
+  {
+    int tv;
+    CValue tcv;
+    tok_get(&tv, &tp, &tcv);
+    if (tv == TOK_EOF || tv == 0)
+      break;
+    if (tv == TOK_LINENUM)
+      continue;
+    paren_brace |= prev == ')' && tv == '{';
+    prev = tv;
+    if (tv < TOK_UIDENT || tv >= tok_ident)
+      continue;
+    int need;
+    if (inline_spliced(spliced, k))
+      need = 0;
+    else if (def_binds)
+    {
+      TokenSym *ts = table_ident[tv - TOK_IDENT];
+      need = inline_def_binding(ts ? ts->sym_identifier : NULL) != def_binds[k];
+    }
+    else
+      need = inline_name_binds_local(tv);
+    k++;
+    if (need && !inline_name_find(names.data, names.size, tv))
+      vector_push_back(&names, ((InlineNameState){tv, 0, -1, INL_NAME_UNSEEN}));
+  }
+  if (!names.size && !paren_brace)
+    return 0; /* no shadowed name, and no `) {` a nested function definition needs */
+  /* A file-scope callee's nested function would stay bound in the caller
+   * past the replay (and compile there out of line); a nested callee's
+   * children are its parent's family already. */
+  unsafe = inline_body_scan_names(func_str, callee, spliced, names.data, names.size) &&
+           !(callee && callee->a.nested_func);
+  for (size_t i = 0; i < names.size && !unsafe; i++)
+    unsafe = names.data[i].state == INL_NAME_FREE;
+  return unsafe;
+}
+
+/* Records, for a nested function's inline copy, what each name of its body
+ * binds to at the definition: its replay at a call must bind them alike. */
+void inline_record_def_bindings(InlineFunc *fn, NestedFunc *nf)
+{
+  const int *tp = tok_str_buf(fn->func_str);
+  int n = 0;
+  while (*tp)
+  {
+    int tv;
+    CValue tcv;
+    tok_get(&tv, &tp, &tcv);
+    if (tv == TOK_EOF || tv == 0)
+      break;
+    if (tv >= TOK_UIDENT && tv < tok_ident)
+      n++;
+  }
+  fn->def_binds = tcc_malloc((n ? n : 1) * sizeof(Sym *));
+  tp = tok_str_buf(fn->func_str);
+  n = 0;
+  while (*tp)
+  {
+    int tv;
+    CValue tcv;
+    tok_get(&tv, &tp, &tcv);
+    if (tv == TOK_EOF || tv == 0)
+      break;
+    if (tv >= TOK_UIDENT && tv < tok_ident)
+    {
+      TokenSym *ts = table_ident[tv - TOK_IDENT];
+      fn->def_binds[n++] = inline_def_binding(ts ? ts->sym_identifier : NULL);
+    }
+  }
+  fn->def_func = tcc_state->cur_func_sym;
+  fn->def_nf = tcc_state->current_nested_func;
+  fn->def_scope_top = local_stack;
+  fn->def_has_capture = nested_has_genuine_capture(nf);
+}
+
+/* Is the scope a nested function was defined in still the one being parsed? */
+static int inline_def_scope_live(InlineFunc *fn)
+{
+  if (!fn->def_binds || fn->def_func != tcc_state->cur_func_sym || fn->def_nf != tcc_state->current_nested_func)
+    return 0;
+  if (!fn->def_scope_top)
+    return 1;
+  for (Sym *s = local_stack; s; s = s->prev)
+    if (s == fn->def_scope_top)
+      return 1;
+  return 0;
+}
+
+/* Token replay parses the callee's body at the call site.  A file-scope
+ * callee's free names must bind as at file scope; a nested function's as at
+ * its definition.  The check of the callee's own names first: at the top
+ * level any shadowing local refuses (an expansion's params and locals would
+ * trip it below that, so nested expansions check enum constants only). */
 int inline_body_has_unsafe_shadowed_ident(TokenString *func_str, Sym *call_func_sym)
 {
-  (void)call_func_sym;
   if (!func_str)
     return 0;
-  /* In nested inline expansion: the outer expansion's locals are in scope
-   * and would always shadow globals matching the callee's params/locals.
-   * Skip the strict check in that case. */
   if (inline_body_has_shadowed_tag(func_str))
     return 1;
-  /* Nested: the outer body's params and locals are expected to shadow, but a
-   * constant of an enum it declares must not replace the callee's. */
-  if (tcc_state->in_inline_expansion)
-    return inline_body_shadowed_ident(func_str, 1);
-  return inline_body_has_shadowed_ident(func_str);
+  if (inline_body_shadowed_ident(func_str, tcc_state->in_inline_expansion != 0))
+    return 1;
+  InlineFunc *fn = call_func_sym ? inline_fn_lookup(tcc_state, call_func_sym) : NULL;
+  const int *spliced = fn && fn->func_str == func_str ? fn->spliced : NULL;
+  if (call_func_sym && call_func_sym->a.nested_func)
+  {
+    if (fn && inline_def_scope_live(fn))
+      return inline_body_free_names_unsafe(func_str, call_func_sym, fn->def_binds, NULL);
+    if (!fn || !fn->def_binds || fn->def_has_capture)
+      return 1;
+  }
+  return inline_body_free_names_unsafe(func_str, call_func_sym, NULL, spliced);
 }
 
 /* Return 1 if the function body contains tokens that are unsafe for
@@ -1258,4 +1667,404 @@ void inline_restore_label_bindings(int *tokens, Sym **saved_labels, int count)
   }
   tcc_free(saved_labels);
   tcc_free(tokens);
+}
+
+/* Guard heads (partial inlining of a void body's test): see docs/inline_guard_heads.md. */
+
+#define GUARD_HEAD_MAX_TOKENS 512
+#define GUARD_HEAD_MAX_STMTS 8
+#define GUARD_HEAD_MAX_LOCALS 32
+#define GUARD_HEAD_MAX_LABELS 8
+#define GUARD_HEAD_MAX_FREE 48
+
+typedef struct GuardTok
+{
+  int t;
+  const int *at;
+} GuardTok;
+
+static int guard_type_keyword(int t)
+{
+  switch (t)
+  {
+  case TOK_STRUCT:
+  case TOK_UNION:
+  case TOK_ENUM:
+  case TOK_VOID:
+  case TOK_CHAR:
+  case TOK_INT:
+  case TOK_SHORT:
+  case TOK_LONG:
+  case TOK_SIGNED1:
+  case TOK_SIGNED2:
+  case TOK_SIGNED3:
+  case TOK_UNSIGNED:
+  case TOK_BOOL:
+  case TOK_FLOAT:
+  case TOK_DOUBLE:
+  case TOK_CONST1:
+  case TOK_CONST2:
+  case TOK_CONST3:
+  case TOK_RESTRICT1:
+  case TOK_RESTRICT2:
+  case TOK_RESTRICT3:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static int guard_is_name(int t)
+{
+  return t >= TOK_UIDENT;
+}
+
+static int guard_find(const int *names, int n, int t)
+{
+  for (int i = 0; i < n; i++)
+    if (names[i] == t)
+      return 1;
+  return 0;
+}
+
+/* The names the head binds itself (parameters, its locals declared so far) and
+ * the free ones it reads: those are resolved in the caller when it is replayed
+ * and must still mean the file-scope ones there (guard_head_captures_local). */
+typedef struct GuardNames
+{
+  const int *params;
+  int nparams;
+  const int *locals;
+  const int *nlocals;
+  int free[GUARD_HEAD_MAX_FREE];
+  int nfree;
+} GuardNames;
+
+/* Name tk[k] as the head reads it; 0 when it cannot be replayed. */
+static int guard_note_name(GuardNames *gn, const GuardTok *tk, int k, int b)
+{
+  int t = tk[k].t;
+  int prev = k > b ? tk[k - 1].t : 0;
+  /* __func__ names the function it appears in: the caller, once replayed. */
+  if (t == TOK___FUNC__ || t == TOK___FUNCTION__)
+    return 0;
+  /* a member, or a struct/union/enum tag (tags: inline_body_has_shadowed_tag) */
+  if (prev == '.' || prev == TOK_ARROW || prev == TOK_STRUCT || prev == TOK_UNION || prev == TOK_ENUM)
+    return 1;
+  if (guard_find(gn->params, gn->nparams, t) || guard_find(gn->locals, *gn->nlocals, t) ||
+      guard_find(gn->free, gn->nfree, t))
+    return 1;
+  if (gn->nfree >= GUARD_HEAD_MAX_FREE)
+    return 0;
+  gn->free[gn->nfree++] = t;
+  return 1;
+}
+
+/* Tokens [b, e) read but write and call nothing. */
+static int guard_expr_ok(const GuardTok *tk, int b, int e, GuardNames *gn)
+{
+  if (b >= e)
+    return 0;
+  for (int k = b; k < e; k++)
+  {
+    int t = tk[k].t;
+    int prev = k > b ? tk[k - 1].t : 0;
+    if (guard_is_name(t))
+    {
+      if (!guard_note_name(gn, tk, k, b))
+        return 0;
+      continue;
+    }
+    if (guard_type_keyword(t) || (t >= TOK_CCHAR && t <= TOK_CULONG))
+      continue;
+    if (TOK_ISCOND(t))
+      continue;
+    switch (t)
+    {
+    case '(':
+      /* a call */
+      if (guard_is_name(prev) || prev == ')' || prev == ']')
+        return 0;
+      continue;
+    case ')':
+    case '[':
+    case ']':
+    case '.':
+    case TOK_ARROW:
+    case '*':
+    case '&':
+    case '+':
+    case '-':
+    case '~':
+    case '!':
+    case '/':
+    case '%':
+    case '<':
+    case '>':
+    case TOK_SHR:
+    case '|':
+    case '^':
+    case '?':
+    case ':':
+      continue;
+    default:
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int guard_match(const GuardTok *tk, int n, int open)
+{
+  int depth = 0;
+  for (int k = open; k < n; k++)
+  {
+    int t = tk[k].t;
+    if (t == '(' || t == '[' || t == '{')
+      depth++;
+    else if ((t == ')' || t == ']' || t == '}') && --depth == 0)
+      return k;
+  }
+  return -1;
+}
+
+/* Declaration [b, e] of plain locals with effect-free initializers; adds them to locals[]. */
+static int guard_decl_ok(const GuardTok *tk, int b, int e, int *locals, int *nlocals, const int *params, int nparams,
+                         int self, int *inits, GuardNames *gn)
+{
+  int last = 0, last_k = 0;
+  for (int k = b; k <= e; k++)
+  {
+    int t = tk[k].t;
+    if (t == ',' || t == ';' || t == '=')
+    {
+      if (!last || last == self || guard_find(params, nparams, last) || *nlocals >= GUARD_HEAD_MAX_LOCALS)
+        return 0;
+      locals[(*nlocals)++] = last;
+      last = 0;
+      if (t == '=')
+      {
+        int s = k + 1, end = s;
+        while (end < e && tk[end].t != ',')
+        {
+          if (tk[end].t == '(' || tk[end].t == '[')
+          {
+            end = guard_match(tk, e, end);
+            if (end < 0)
+              return 0;
+          }
+          end++;
+        }
+        if (!guard_expr_ok(tk, s, end, gn))
+          return 0;
+        ++*inits;
+        k = end;
+      }
+      continue;
+    }
+    if (guard_is_name(t))
+    {
+      /* a name followed by another one is a typedef name (or a tag) */
+      if (last && !guard_note_name(gn, tk, last_k, b))
+        return 0;
+      last = t;
+      last_k = k;
+    }
+    else if (t != '*' && !guard_type_keyword(t))
+      return 0;
+  }
+  return 1;
+}
+
+/* Does a statement starting with t declare?  The body's own scope is gone
+ * when this runs, so a name is a type only when the head does not bind it
+ * itself (a parameter or one of its locals named like a file-scope typedef
+ * makes `T * x;` a multiplication) and its binding here is a file-scope
+ * typedef. */
+static int guard_decl_start(int t, const GuardNames *gn)
+{
+  if (guard_type_keyword(t))
+    return 1;
+  if (!guard_is_name(t) || guard_find(gn->params, gn->nparams, t) || guard_find(gn->locals, *gn->nlocals, t))
+    return 0;
+  Sym *s = sym_find(t);
+  return s && (s->type.t & VT_TYPEDEF) && sym_scope(s) == 0;
+}
+
+static TokenString *guard_head_scan(TokenString *func_str, Sym *sym, GuardTok *tk, int **free_names)
+{
+  Sym *ref = sym->type.ref;
+  const int self = sym->v & ~SYM_FIELD;
+  int params[16], nparams = 0;
+  for (Sym *p = ref->next; p; p = p->next)
+  {
+    int bt = p->type.t & VT_BTYPE;
+    if (nparams >= 16 || !p->v || (p->v & ~SYM_FIELD) == self || (p->type.t & (VT_VLA | VT_ARRAY | VT_VOLATILE)) ||
+        !(bt == VT_PTR || bt == VT_INT || bt == VT_SHORT || bt == VT_BYTE || bt == VT_BOOL))
+      return NULL;
+    params[nparams++] = p->v & ~SYM_FIELD;
+  }
+
+  int n = 0;
+  const int *p = tok_str_buf(func_str), *end = p + func_str->len;
+  while (p < end)
+  {
+    const int *at = p;
+    int t;
+    CValue cv;
+    tok_get(&t, &p, &cv);
+    if (t == TOK_EOF || t == 0)
+      break;
+    if (t == TOK_LINENUM)
+      continue;
+    if (t == TOK_PACK_REPLAY || t == self || n >= GUARD_HEAD_MAX_TOKENS)
+      return NULL;
+    tk[n].t = t;
+    tk[n].at = at;
+    n++;
+  }
+  if (n < 2 || tk[0].t != '{' || guard_match(tk, n, 0) != n - 1)
+    return NULL;
+
+  int locals[GUARD_HEAD_MAX_LOCALS], nlocals = 0, stmts = 0;
+  GuardNames gn = {params, nparams, locals, &nlocals};
+  gn.nfree = 0;
+  int i = 1;
+  while (i < n - 1 && tk[i].t != TOK_IF)
+  {
+    int semi = i;
+    while (semi < n - 1 && tk[semi].t != ';')
+    {
+      if (tk[semi].t == '{' || tk[semi].t == '}')
+        return NULL;
+      semi++;
+    }
+    if (semi >= n - 1)
+      return NULL;
+    if (semi == i)
+      ;
+    else if (guard_is_name(tk[i].t) && tk[i + 1].t == '=')
+    {
+      if (!guard_find(locals, nlocals, tk[i].t) || !guard_expr_ok(tk, i + 2, semi, &gn))
+        return NULL;
+      stmts++;
+    }
+    else if (guard_decl_start(tk[i].t, &gn))
+    {
+      if (!guard_decl_ok(tk, i, semi, locals, &nlocals, params, nparams, self, &stmts, &gn))
+        return NULL;
+    }
+    else
+      return NULL;
+    if (stmts > GUARD_HEAD_MAX_STMTS)
+      return NULL;
+    i = semi + 1;
+  }
+
+  if (i >= n - 1 || tk[i + 1].t != '(')
+    return NULL;
+  const int cond_close = guard_match(tk, n, i + 1);
+  if (cond_close < 0 || !guard_expr_ok(tk, i + 2, cond_close, &gn) || tk[cond_close + 1].t != '{')
+    return NULL;
+  const int work_close = guard_match(tk, n, cond_close + 1);
+  if (work_close < 0 || work_close >= n - 1 || tk[work_close + 1].t == TOK_ELSE)
+    return NULL;
+
+  int pending[GUARD_HEAD_MAX_LABELS], npending = 0, seen[GUARD_HEAD_MAX_LABELS], nseen = 0;
+  for (int k = work_close + 1; k < n - 1;)
+  {
+    int t = tk[k].t;
+    if (t == ';')
+      k++;
+    else if (t == TOK_RETURN && tk[k + 1].t == ';')
+      k += 2;
+    else if (t == TOK_GOTO && k + 2 < n && guard_is_name(tk[k + 1].t) && tk[k + 2].t == ';')
+    {
+      if (guard_find(seen, nseen, tk[k + 1].t) || npending >= GUARD_HEAD_MAX_LABELS)
+        return NULL;
+      pending[npending++] = tk[k + 1].t;
+      k += 3;
+    }
+    else if (guard_is_name(t) && tk[k + 1].t == ':')
+    {
+      if (nseen >= GUARD_HEAD_MAX_LABELS)
+        return NULL;
+      seen[nseen++] = t;
+      for (int j = 0; j < npending; j++)
+        if (pending[j] == t)
+          pending[j--] = pending[--npending];
+      k += 2;
+    }
+    else
+      return NULL;
+  }
+  if (npending)
+    return NULL;
+
+  /* The call it ends with is one more free name: a caller's local of that
+   * name must not take it. */
+  int *names = tcc_malloc(sizeof(int) * (gn.nfree + 2));
+  names[0] = gn.nfree + 1;
+  memcpy(names + 1, gn.free, sizeof(int) * gn.nfree);
+  names[gn.nfree + 1] = self;
+  *free_names = names;
+
+  TokenString *head = tok_str_alloc();
+  const int *q = tok_str_buf(func_str);
+  const int *stop = tk[cond_close + 1].at;
+  while (q < stop)
+  {
+    int t;
+    CValue cv;
+    tok_get(&t, &q, &cv);
+    tok_str_add2(head, t, &cv);
+  }
+  tok_str_add(head, self);
+  tok_str_add(head, '(');
+  for (int k = 0; k < nparams; k++)
+  {
+    if (k)
+      tok_str_add(head, ',');
+    tok_str_add(head, params[k]);
+  }
+  tok_str_add(head, ')');
+  tok_str_add(head, ';');
+  tok_str_add(head, '}');
+  tok_str_add(head, TOK_EOF);
+  return head;
+}
+
+/* The head, and in *free_names ([0] = count) the names it reads that it
+ * does not bind itself. */
+TokenString *inline_body_guard_head(TokenString *func_str, Sym *sym, int **free_names)
+{
+  Sym *ref = sym->type.ref;
+  if (!func_str || !ref || (ref->type.t & VT_BTYPE) != VT_VOID || ref->f.func_type == FUNC_ELLIPSIS ||
+      func_str->len > GUARD_HEAD_MAX_TOKENS)
+    return NULL;
+  /* the native compiler runs on a small stack */
+  unique_ptr(GuardTok) tk = tcc_malloc(sizeof(GuardTok) * GUARD_HEAD_MAX_TOKENS);
+  *free_names = NULL;
+  return guard_head_scan(func_str, sym, tk, free_names);
+}
+
+/* Replayed here, would a free name of the head bind to something other than
+ * what it meant at file scope?  The general check (inline_body_has_unsafe_shadowed_ident)
+ * lets the locals of an outer expansion shadow globals, trusting the replayed
+ * body to rebind its own names; a guard head's free names are known exactly,
+ * so any local binding of one -- the caller's or an outer expansion's, a
+ * variable, a typedef or an enum constant -- keeps the plain call. */
+int guard_head_captures_local(const int *free_names)
+{
+  if (!free_names)
+    return 1;
+  for (int i = 1; i <= free_names[0]; i++)
+  {
+    int t = free_names[i];
+    TokenSym *ts = table_ident[t - TOK_IDENT];
+    Sym *s = ts ? ts->sym_identifier : NULL;
+    if (s && !SYM_IS_PARKED(s) && (sym_scope(s) > 0 || (IS_ENUM_VAL(s->type.t) && s->prev_tok)))
+      return 1;
+  }
+  return 0;
 }

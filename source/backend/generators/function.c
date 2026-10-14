@@ -38,6 +38,7 @@ extern void block(int is_entry);
 extern void tcc_bench_log_phase(TCCState *s1, const char *operation, const char *name,
                                 unsigned *total_time, unsigned *count, unsigned elapsed);
 extern void check_vstack(void);
+extern void nested_names_reset(void); /* nested/nested.c */
 
 /* Cross-TU globals referenced by gen_function.  Defined in tccgen.c.
  * Note: cur_scope/root_scope are declared in tcc_scope.h. */
@@ -105,6 +106,17 @@ static int ir_body_is_register_only(TCCIRState *ir)
 
 /* Count live operations; see docs/inline_control_flow.md for the cycle check. */
 #define SMALL_LEAF_INLINE_OPS 24
+#define SRET_LOOP_INLINE_OPS 32
+#define SRET_LOOP_INLINE_TOKENS 2048
+
+/* A static leaf whose only references are a few direct calls inlines at each
+ * of them while (sites - 1) * its ops stays within this: the out-of-line copy
+ * goes with the last call, so that is what the TU grows by.  96 takes the
+ * kernel's bit_set setRangeValue (74 ops, 2 sites, `value` constant at both).
+ * A TU may expand it twice per site: a caller is generated standalone and
+ * expanded again where it is itself inlined. */
+#define FEW_CALLERS_GROWTH_OPS 96
+#define FEW_CALLERS_INLINE_TOKENS 512
 
 /* Static acyclic wrappers use a local caller budget; see docs/inline_readonly_wrappers.md. */
 #define WRAPPER_INLINE_OPS 12
@@ -166,28 +178,502 @@ static int ir_body_is_acyclic_leaf(TCCIRState *ir)
   return ir_body_is_leaf(ir) && !tcc_ir_cfg_has_cycle(ir);
 }
 
-int inline_body_has_unsafe_loops(TokenString *func_str); /* inline/analysis.c */
+/* A register value: a vreg read as is, or a VAR read through its spill encoding. */
+static int ir_operand_is_reg_value(IROperand op)
+{
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0 || op.is_sym || op.is_llocal)
+    return 0;
+  if (irop_get_tag(op) == IROP_TAG_VREG)
+    return !op.is_lval;
+  return irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_lval && op.is_local &&
+         TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR;
+}
 
-/* Small loop class (inline:small_loop): a static leaf of at most
- * SMALL_LEAF_INLINE_OPS live ops, loop included -- the kernel's
- * SpinLock.lock is an LDREX/STREX attempt and a WFE in a loop, called on
- * every lock_irqsave, which LLVM inlines into each of them.  Its body is
- * replayed from tokens, so a loop the token replay could misbind (one in
- * expression context, a `for`: inline_body_has_unsafe_loops) keeps it out
- * of line.  Not at -Os. */
+/* The vreg an lvalue operand reads or writes through, or -1. */
+static int32_t ir_operand_deref_vreg(IROperand op)
+{
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0 || op.is_sym || op.is_llocal || !op.is_lval || irop_get_tag(op) != IROP_TAG_VREG)
+    return -1;
+  return vr;
+}
+
+/* An incoming argument read from where the caller put it: a parameter's own
+ * storage (stack-passed, or the home of an address-taken one). */
+static int ir_operand_is_arg_read(IROperand op)
+{
+  int32_t vr = irop_get_vreg(op);
+  return irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_lval && op.is_local && !op.is_llocal &&
+         (vr < 0 || op.vreg_type == 0 ? op.is_param : TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_PARAM);
+}
+
+/* The address of an incoming parameter's storage (`&P1`). */
+static int ir_operand_is_arg_addr(IROperand op)
+{
+  int32_t vr = irop_get_vreg(op);
+  return irop_get_tag(op) == IROP_TAG_STACKOFF && !op.is_lval && op.is_local && !op.is_llocal &&
+         (vr < 0 || op.vreg_type == 0 ? op.is_param : TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_PARAM);
+}
+
+static int ir_operand_is_frame_slot(IROperand op, int lval)
+{
+  return irop_get_tag(op) == IROP_TAG_STACKOFF && op.vreg_type == 0 && op.is_local && op.is_lval == lval &&
+         !op.is_llocal;
+}
+
+/* Zig's `undefined`: the payload of a null optional or an error union, never read. */
+static int ir_operand_is_undefined_fill(TCCIRState *ir, IROperand op)
+{
+  return irop_is_immediate(op) && !op.is_sym && op.btype == IROP_BTYPE_INT32 &&
+         (uint32_t)irop_get_imm64_ex(ir, op) == 0xaaaaaaaau;
+}
+
+#define IR_MARSHAL_SRET 1 /* the hidden result pointer, or an offset from it */
+#define IR_MARSHAL_ARG 2  /* the address of an incoming parameter's storage */
+
+static int ir_marshal_index(TCCIRState *ir, int32_t vr, int n)
+{
+  int p = TCCIR_DECODE_VREG_POSITION(vr), b = -1;
+  switch (TCCIR_DECODE_VREG_TYPE(vr))
+  {
+  case TCCIR_VREG_TYPE_TEMP:
+    b = p;
+    break;
+  case TCCIR_VREG_TYPE_VAR:
+    b = ir->next_temporary_variable + p;
+    break;
+  case TCCIR_VREG_TYPE_PARAM:
+    b = ir->next_temporary_variable + ir->next_local_variable + p;
+    break;
+  }
+  return b >= 0 && b < n ? b : -1;
+}
+
+/* The marshalling class a defining op gives its destination: a copy or a
+ * constant offset of a marshalling pointer, the address of a parameter, or
+ * the sret pointer reloaded from its home slot. */
+static int ir_marshal_def(TCCIRState *ir, IRQuadCompact *q, const uint8_t *m, int n, int sret)
+{
+  if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LOAD && q->op != TCCIR_OP_LEA && q->op != TCCIR_OP_ADD)
+    return 0;
+  IROperand s = tcc_ir_op_get_src1(ir, q);
+  int32_t vr = irop_get_vreg(s);
+  if (q->op == TCCIR_OP_ADD)
+  {
+    IROperand k = tcc_ir_op_get_src2(ir, q);
+    int b = ir_operand_is_reg_value(s) ? ir_marshal_index(ir, vr, n) : -1;
+    return b >= 0 && irop_is_immediate(k) && !k.is_sym ? m[b] : 0;
+  }
+  if (ir_operand_is_arg_addr(s))
+    return IR_MARSHAL_ARG;
+  if (sret && q->op == TCCIR_OP_LOAD && ir_operand_is_frame_slot(s, 1) && irop_get_stack_offset(s) == func_vc)
+    return IR_MARSHAL_SRET;
+  int b = ir_operand_is_reg_value(s) ? ir_marshal_index(ir, vr, n) : -1;
+  return b >= 0 ? m[b] : 0;
+}
+
+/* Live prologue operations copying a struct parameter split between r0-r3
+ * and the stack into its home (params.c): stores of its register words, and
+ * loads of its stack words stored into the home.  An expanded call binds the
+ * argument instead, so the inline size classes leave them out -- as they did
+ * when such a parameter was used in place, without them.  *stack_stores gets
+ * the stores of loaded stack words alone. */
+static int ir_split_param_copy_ops(TCCIRState *ir, int *stack_stores)
+{
+  if (stack_stores)
+    *stack_stores = 0;
+  if (!ir || !ir->param_forms || ir->parameters_count <= 0)
+    return 0;
+  int32_t loaded[64];
+  int nloaded = 0, n = 0;
+  for (int pass = 0; pass < 2; pass++)
+    for (int i = 0; i < ir->next_instruction_index; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op != (pass ? TCCIR_OP_STORE : TCCIR_OP_LOAD))
+        continue;
+      IROperand a = pass ? tcc_ir_op_get_dest(ir, q) : tcc_ir_op_get_src1(ir, q);
+      if (irop_get_tag(a) != IROP_TAG_STACKOFF || irop_get_vreg(a) >= 0 || !a.is_lval || a.is_param != !pass)
+        continue;
+      const int32_t off = irop_get_stack_offset(a);
+      IROperand v = pass ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_dest(ir, q);
+      const int32_t vr = irop_get_tag(v) == IROP_TAG_VREG && !v.is_lval ? irop_get_vreg(v) : -1;
+      for (int k = 0; k < ir->parameters_count; k++)
+      {
+        const IRParamForm *f = &ir->param_forms[k];
+        if (f->kind != IR_PF_HOME || f->stack_words <= 0)
+          continue;
+        if (!pass)
+        {
+          if (off >= f->stack_off && off < f->stack_off + f->stack_words * 4 && vr >= 0 && nloaded < 64)
+          {
+            loaded[nloaded++] = vr;
+            n++;
+          }
+          continue;
+        }
+        if (off < f->off || off >= f->off + (f->words + f->stack_words) * 4 || vr < 0)
+          continue;
+        int from_copy = TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_PARAM;
+        for (int j = 0; j < nloaded && !from_copy; j++)
+          from_copy = loaded[j] == vr;
+        n += from_copy;
+        if (stack_stores && from_copy && TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_PARAM)
+          ++*stack_stores;
+        break;
+      }
+    }
+  return n;
+}
+
+/* An optimized body's size the way it survives expansion at a call site.  A
+ * body written over by-value aggregates (Zig's `fn (self: Self) ?T`) is mostly
+ * marshalling the expansion removes: register copies, reads of the incoming
+ * aggregate through its address, stores through the hidden result pointer
+ * (its undefined 0xaa fills too, also when they reach it as register
+ * values), and the address arithmetic for both.  Those cost the caller as
+ * much out of line, so only the remaining ops are counted.
+ * -Os keeps the raw count: its classes are tuned to it. */
+static int ir_body_inline_ops(TCCIRState *ir)
+{
+  const int nops = ir->next_instruction_index;
+  /* A split struct parameter's home copy (ir_split_param_copy_ops): left out
+   * of the raw count whole; the marshalling count below already drops its
+   * register-word stores and stack-word loads, so only the stores of the
+   * loaded stack words are left to discount there. */
+  int pstack;
+  const int pcopy = ir_split_param_copy_ops(ir, &pstack);
+  int raw = -pcopy;
+  for (int i = 0; i < nops; i++)
+    raw += ir->compact_instructions[i].op != TCCIR_OP_NOP;
+  if (TCC_OPT(tcc_state, optimize_size) || tcc_ir_opt_pass_disabled("inline:marshal_cost"))
+    return raw;
+
+  const int sret = func_vc != 0 && !ir->vfp_ret_words;
+  const int n = ir->next_temporary_variable + ir->next_local_variable + ir->next_parameter + 1;
+  uint8_t *m = tcc_mallocz(n);
+  if (sret)
+  {
+    int b = ir_marshal_index(ir, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_PARAM, 0), n);
+    if (b >= 0)
+      m[b] = IR_MARSHAL_SRET;
+  }
+  for (int changed = 1; changed;)
+  {
+    changed = 0;
+    for (int i = 0; i < nops; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+        continue;
+      int cls = ir_marshal_def(ir, q, m, n, sret);
+      int b = cls ? ir_marshal_index(ir, tcc_ir_op_dest_vreg(ir, q), n) : -1;
+      if (b >= 0 && (m[b] | cls) != m[b])
+      {
+        m[b] |= cls;
+        changed = 1;
+      }
+    }
+  }
+
+  int ops = 0;
+  for (int i = 0; i < nops; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    int free_op = 0;
+    switch (q->op)
+    {
+    case TCCIR_OP_NOP:
+      free_op = 1;
+      break;
+    case TCCIR_OP_ASSIGN:
+    case TCCIR_OP_LOAD:
+    case TCCIR_OP_LEA:
+    case TCCIR_OP_ADD:
+    case TCCIR_OP_LOAD_INDEXED:
+    {
+      IROperand s = tcc_ir_op_get_src1(ir, q);
+      int32_t through = q->op == TCCIR_OP_LOAD ? ir_operand_deref_vreg(s)
+                        : q->op == TCCIR_OP_LOAD_INDEXED && ir_operand_is_reg_value(s) ? irop_get_vreg(s)
+                                                                                        : -1;
+      int b = through >= 0 ? ir_marshal_index(ir, through, n) : -1;
+      free_op = ir_marshal_def(ir, q, m, n, sret) != 0 ||
+                ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD) && ir_operand_is_reg_value(s)) ||
+                (q->op == TCCIR_OP_ASSIGN && ir_operand_is_undefined_fill(ir, s)) ||
+                (q->op == TCCIR_OP_LOAD && ir_operand_is_arg_read(s)) || (b >= 0 && (m[b] & IR_MARSHAL_ARG));
+      break;
+    }
+    case TCCIR_OP_STORE:
+    case TCCIR_OP_STORE_INDEXED:
+    {
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      IROperand s = tcc_ir_op_get_src1(ir, q);
+      int32_t through = q->op == TCCIR_OP_STORE ? ir_operand_deref_vreg(d)
+                        : ir_operand_is_reg_value(d) ? irop_get_vreg(d)
+                                                     : -1;
+      int b = through >= 0 ? ir_marshal_index(ir, through, n) : -1;
+      int32_t svr = irop_get_vreg(s);
+      free_op = (b >= 0 && (m[b] & IR_MARSHAL_SRET)) ||
+                (q->op == TCCIR_OP_STORE && ir_operand_is_frame_slot(d, 1) &&
+                 ((sret && irop_get_stack_offset(d) == func_vc) ||
+                  (ir_operand_is_reg_value(s) && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_PARAM)));
+      break;
+    }
+    default:
+      break;
+    }
+    ops += !free_op;
+  }
+  tcc_free(m);
+  return ops - pstack;
+}
+
+int inline_body_has_unsafe_loops(TokenString *func_str); /* inline/analysis.c */
+InlineFunc *inline_fn_lookup(TCCState *s, Sym *sym); /* inline/emit.c */
+TokenString *inline_body_guard_head(TokenString *func_str, Sym *sym, int **free_names); /* inline/analysis.c */
+void guard_head_register(TCCState *s, Sym *sym, TokenString *head, const int *pack, int *free_names); /* inline/emit.c */
+
+/* A copy between two vregs the allocator gave one register emits nothing. */
+static int ir_copy_is_free(TCCIRState *ir, IRQuadCompact *q)
+{
+  if (q->op != TCCIR_OP_ASSIGN)
+    return 0;
+  IROperand d = tcc_ir_op_get_dest(ir, q), s = tcc_ir_op_get_src1(ir, q);
+  int32_t dv = irop_get_vreg(d), sv = irop_get_vreg(s);
+  if (dv < 0 || sv < 0 || irop_get_tag(d) != IROP_TAG_VREG || irop_get_tag(s) != IROP_TAG_VREG || d.is_lval ||
+      s.is_lval || d.is_llocal || s.is_llocal || d.is_local || s.is_local ||
+      irop_get_btype(d) != irop_get_btype(s) || d.is_unsigned != s.is_unsigned)
+    return 0;
+  IRLiveInterval *di = tcc_ir_get_live_interval(ir, dv), *si = tcc_ir_get_live_interval(ir, sv);
+  if (!di || !si || (di->allocation.r0 & PREG_SPILLED) || (si->allocation.r0 & PREG_SPILLED) ||
+      (di->allocation.r0 & PREG_REG_NONE) == PREG_REG_NONE)
+    return 0;
+  return di->allocation.r0 == si->allocation.r0 && (!irop_needs_pair(d) || di->allocation.r1 == si->allocation.r1);
+}
+
+/* Does TEMP vr hold 0 or 1 wherever it is read: every definition a copy of
+ * either constant or of another such TEMP?  (A phi of `return true;` /
+ * `return false;` edges, after phi resolution.) */
+static int ir_temp_is_bool_const(TCCIRState *ir, int32_t vr, int depth)
+{
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP || depth > 4)
+    return 0;
+  int defs = 0;
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest || tcc_ir_op_dest_vreg(ir, q) != vr)
+      continue;
+    if (q->op != TCCIR_OP_ASSIGN || tcc_ir_op_dest_is_lval(ir, q))
+      return 0;
+    IROperand s = tcc_ir_op_get_src1(ir, q);
+    if (irop_is_plain_imm(s))
+    {
+      if (irop_get_imm64_ex(ir, s) != 0 && irop_get_imm64_ex(ir, s) != 1)
+        return 0;
+    }
+    else if (s.is_lval || irop_get_tag(s) != IROP_TAG_VREG || irop_get_vreg(s) == vr ||
+             !ir_temp_is_bool_const(ir, irop_get_vreg(s), depth + 1))
+      return 0;
+    defs++;
+  }
+  return defs > 0;
+}
+
+/* Zig C represents bool as an unsigned byte; require constant boolean
+ * returns.  Counted are the ops that emit code: a predicate whose loop exits
+ * through `return true;` / `return false;` keeps the copies phi resolution
+ * left for them, which the allocator coalesced away. */
+static int ir_body_is_small_predicate(TCCIRState *ir, Sym *sym)
+{
+  int type = sym->type.ref->type.t;
+  int bt = type & VT_BTYPE;
+  if (TCC_OPT(tcc_state, optimize) < 2 || TCC_OPT(tcc_state, optimize_size) ||
+      tcc_ir_opt_pass_disabled("inline:small_predicate") || !(sym->type.t & VT_STATIC) ||
+      (bt != VT_BOOL && (bt != VT_BYTE || !(type & VT_UNSIGNED))) ||
+      tcc_ir_lookup_func_purity(tcc_state, func_cache_token(sym)) < TCC_FUNC_PURITY_PURE)
+    return 0;
+  int returns = 0, ops = 0;
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    ops += q->op != TCCIR_OP_NOP && !ir_copy_is_free(ir, q);
+    if (q->op != TCCIR_OP_RETURNVALUE)
+      continue;
+    IROperand value = tcc_ir_op_get_src1(ir, q);
+    if (irop_is_plain_imm(value))
+    {
+      if (irop_get_imm64_ex(ir, value) != 0 && irop_get_imm64_ex(ir, value) != 1)
+        return 0;
+    }
+    else if (value.is_lval || irop_get_tag(value) != IROP_TAG_VREG ||
+             !ir_temp_is_bool_const(ir, irop_get_vreg(value), 0))
+      return 0;
+    returns++;
+  }
+  return returns > 0 && ops - ir_split_param_copy_ops(ir, NULL) <= 32;
+}
+
+static int ir_body_backedges(TCCIRState *ir)
+{
+  int n = 0;
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+    {
+      int target = (int)tcc_ir_op_dest_imm(ir, q);
+      n += target >= 0 && target <= i;
+    }
+  }
+  return n;
+}
+
+/* A wrapper measured after its one small-leaf callee expanded into it
+ * (Zig's ComponentIterator.next over peekNext): before the expansion it was
+ * a wrapper, expanded with the leaf nested in it, so the composite keeps that
+ * class when its own ops (all but the leaf's cost) are wrapper-sized and it
+ * adds no loop, and the leaf's per-caller bound (ir_body_is_small_loop_leaf).
+ * The SMALL_LEAF + WRAPPER bound stops wrappers of wrappers. */
+static int ir_body_wraps_small_leaf(TCCIRState *ir, int inline_ops)
+{
+  if (TCC_OPT(tcc_state, optimize_size) || tcc_ir_opt_pass_disabled("inline:wrappers") ||
+      tcc_ir_opt_pass_disabled("inline:leaf_wrapper") || tcc_state->inline_leaf_sites != 1 ||
+      inline_ops > SMALL_LEAF_INLINE_OPS + WRAPPER_INLINE_OPS ||
+      inline_ops - tcc_state->inline_leaf_ops > WRAPPER_INLINE_OPS)
+    return 0;
+  return ir_body_backedges(ir) <= tcc_state->inline_leaf_backedges;
+}
+
+/* Token replay must still reject loops in expression context. */
 static int ir_body_is_small_loop_leaf(TCCIRState *ir, Sym *sym, int real_ops)
 {
+  int wrapper = 0;
   if (TCC_OPT(tcc_state, optimize_size) || tcc_ir_opt_pass_disabled("inline:small_loop") ||
-      !(sym->type.t & VT_STATIC) || real_ops > SMALL_LEAF_INLINE_OPS || !ir_body_is_leaf(ir) ||
-      !tcc_ir_cfg_has_cycle(ir))
+      !(sym->type.t & VT_STATIC) ||
+      (real_ops > SMALL_LEAF_INLINE_OPS && !ir_body_is_small_predicate(ir, sym) &&
+       !(wrapper = ir_body_wraps_small_leaf(ir, real_ops))) ||
+      !ir_body_is_leaf(ir) || !tcc_ir_cfg_has_cycle(ir))
     return 0;
   for (int fi = 0; fi < tcc_state->nb_inline_fns; fi++)
     if (tcc_state->inline_fns[fi]->sym == sym)
-      return tcc_state->inline_fns[fi]->func_str && !inline_body_has_unsafe_loops(tcc_state->inline_fns[fi]->func_str);
+    {
+      if (!tcc_state->inline_fns[fi]->func_str || inline_body_has_unsafe_loops(tcc_state->inline_fns[fi]->func_str))
+        return 0;
+      if (wrapper && tcc_state->inline_leaf_bounded)
+        sym->type.ref->f.func_inl_sret_loop = 1;
+      return 1;
+    }
   return 0;
 }
 
 TCC_DBG_ENV_STR(dbg_dump_func, "TCC_DUMP_FUNC")
+
+/* An old-style definition receives each argument as its caller passed it:
+ * promoted (int for a narrow integer or _Bool, double for a float), or as
+ * the prototype in scope says.  Its body converts each one to the declared
+ * parameter type on entry (C11 6.9.1p10).  The parameter the ABI delivers
+ * binds under an anonymous name in its arrival type, and the declared name
+ * binds a local initialised from it. */
+typedef struct KnrConv
+{
+  Sym *param; /* in the definition's parameter list */
+  int v;      /* its name, restored after tcc_ir_params_add */
+  CType type; /* its declared type */
+  int anon;   /* the arrival's name */
+} KnrConv;
+
+/* The type an old-style parameter of type DECL arrives in (PROTO_PARAM: the
+ * prototype's, if one is in scope), into ARRIVAL; 0 when it is DECL. */
+static int knr_arrival_type(const CType *decl, const Sym *proto_param, CType *arrival)
+{
+  const int arith = VT_BTYPE | VT_UNSIGNED;
+  int bt = decl->t & VT_BTYPE;
+  if (decl->t & (VT_ARRAY | VT_VLA | VT_VECTOR | VT_COMPLEX))
+    return 0;
+  if (proto_param)
+  {
+    int pbt = proto_param->type.t & VT_BTYPE;
+    if (!(bt == VT_BOOL || bt == VT_BYTE || bt == VT_SHORT || bt == VT_INT || bt == VT_LLONG || is_float(bt)) ||
+        !(pbt == VT_BOOL || pbt == VT_BYTE || pbt == VT_SHORT || pbt == VT_INT || pbt == VT_LLONG || is_float(pbt)) ||
+        (proto_param->type.t & (VT_ARRAY | VT_VLA | VT_VECTOR | VT_COMPLEX)) ||
+        (proto_param->type.t & arith) == (decl->t & arith))
+      return 0;
+    arrival->t = proto_param->type.t & arith;
+    arrival->ref = NULL;
+    return 1;
+  }
+  if (bt == VT_BOOL || bt == VT_BYTE || bt == VT_SHORT)
+    arrival->t = VT_INT;
+  else if (bt == VT_FLOAT)
+    arrival->t = VT_DOUBLE;
+  else
+    return 0;
+  arrival->ref = NULL;
+  return 1;
+}
+
+/* Before tcc_ir_params_add: give each parameter of SYM's old-style definition
+ * that arrives converted its arrival type and an anonymous name.  Returns
+ * them (tcc_malloc'd, freed by knr_params_receive), their count in *N. */
+static KnrConv *knr_params_arrive(Sym *sym, int *pn)
+{
+  Sym *ref = sym->type.ref;
+  KnrConv *conv = NULL;
+  int n = 0, nb_params = 0;
+  *pn = 0;
+  if (ref->f.func_type != FUNC_OLD || !ref->next)
+    return NULL;
+  const SymLocalFacts *facts = sym_facts_peek(sym);
+  Sym *pp = facts && facts->knr_proto ? facts->knr_proto->next : NULL;
+  for (Sym *p = ref->next; p; p = p->next)
+    nb_params++;
+  for (Sym *p = ref->next; p; p = p->next, pp = pp ? pp->next : NULL)
+  {
+    CType arrival;
+    if (!knr_arrival_type(&p->type, pp, &arrival))
+      continue;
+    if (!conv)
+      conv = tcc_malloc(sizeof *conv * nb_params);
+    conv[n] = (KnrConv){.param = p, .v = p->v, .type = p->type, .anon = anon_sym++};
+    p->type = arrival;
+    p->v = conv[n].anon | SYM_FIELD;
+    n++;
+  }
+  *pn = n;
+  return conv;
+}
+
+/* After tcc_ir_params_add: restore the definition's parameters and bind each
+ * declared name to its converted value. */
+static void knr_params_receive(KnrConv *conv, int n)
+{
+  for (int i = 0; i < n; i++)
+  {
+    Sym *p = conv[i].param;
+    Sym *arrived = sym_find2(local_stack, conv[i].anon);
+    p->type = conv[i].type;
+    p->v = conv[i].v;
+    if (!arrived)
+      continue;
+    CType type = conv[i].type;
+    int align, size = type_size(&type, &align);
+    if (p->a.param_volatile)
+      type.t |= VT_VOLATILE;
+    loc = tcc_ir_frame_alloc(loc, size, -align);
+    tcc_ir_frame_note_type(loc, &type);
+    Sym *local = sym_push(conv[i].v & ~SYM_FIELD, &type, VT_LOCAL | VT_LVAL, loc);
+    vset(&type, VT_LOCAL | VT_LVAL, loc);
+    vtop->sym = local;
+    vtop->vr = local->vreg;
+    vset(&arrived->type, arrived->r, arrived->c);
+    vtop->sym = arrived;
+    vtop->vr = arrived->vreg;
+    vstore();
+    vpop();
+  }
+  tcc_free(conv);
+}
 
 void gen_function(Sym *sym)
 {
@@ -237,9 +723,13 @@ void gen_function(Sym *sym)
   func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
   func_has_label_addr = 0;
   tcc_state->cur_func_sym = sym;
+  if (!tcc_state->current_nested_func)
+    nested_names_reset(); /* a file-scope function binds no nested function yet */
   /* Per-caller budget: see CONST_LOOP_INLINE_BUDGET in gen/builtin/call.c. */
   tcc_state->const_loop_inline_used = 0;
   tcc_state->nested_inline_budget = NESTED_INLINE_BUDGET;
+  tcc_state->inline_leaf_sites = tcc_state->inline_leaf_ops = tcc_state->inline_leaf_backedges = 0;
+  tcc_state->inline_leaf_bounded = 0;
 
   /* NOTE: we patch the symbol size later */
   put_extern_sym(sym, cur_text_section, ind + 1, 0);
@@ -260,7 +750,10 @@ void gen_function(Sym *sym)
   ir->naked = sym->a.naked;
   ir->is_variadic = func_var;
 
-  if (tcc_state->current_nested_func && tcc_state->current_nested_func->nb_captured > 0)
+  /* Every nested function keeps its incoming chain (saved at frame top - 4,
+   * reloaded after each call), captures or not: a call of a sibling or an
+   * ancestor passes it on, and a descendant walks through it. */
+  if (tcc_state->current_nested_func)
   {
     NestedFunc *nf = tcc_state->current_nested_func;
     ir->has_static_chain = 1;
@@ -278,10 +771,33 @@ void gen_function(Sym *sym)
     tcc_ir_opt_fp_cache_init(ir);
 
   local_scope = 1;
+  int nb_knr_conv;
+  KnrConv *knr_conv = knr_params_arrive(sym, &nb_knr_conv);
   tcc_ir_params_add(ir, &sym->type);
 
-  if (ir->has_static_chain)
-    loc -= 4;
+  /* Captures are addressed by offsets of their own: each gets a range at
+   * the bottom of the frame offset space (TCC_CAPTURE_SPACE, where no local
+   * of a frame under 32 KiB reaches, and which takes no room in the frame),
+   * so an interior offset (a member, an element, one past the end) still
+   * names the capture and its depth, and none of our own locals can be
+   * mistaken for one.  The 8-byte gaps keep one-past-the-end addresses out of
+   * the neighbouring range; vbase has the parent offset's alignment mod 8. */
+  {
+    int cursor = TCC_CAPTURE_SPACE;
+    for (int j = 0; j < ir->captured_count && j < 32; j++)
+    {
+      int align;
+      int size = type_size(&tcc_state->current_nested_func->captured_types[j], &align);
+      if (size < 4)
+        size = 4;
+      cursor += (ir->captured_offsets_list[j] - cursor) & 7;
+      ir->captured_vbase[j] = cursor;
+      ir->captured_size[j] = size;
+      cursor += size + 8;
+    }
+    ir->captured_space_end = cursor;
+  }
+  knr_params_receive(knr_conv, nb_knr_conv);
   nb_temp_local_vars = 0;
 
   local_scope = 0;
@@ -489,26 +1005,11 @@ void gen_function(Sym *sym)
 
   tcc_ir_codegen_generate(ir);
 
-  if (ir->barrel_shifts) {
-    tcc_free(ir->barrel_shifts);
-    ir->barrel_shifts = NULL;
-    ir->barrel_shifts_len = 0;
-  }
-  if (ir->zero_half64) {
-    tcc_free(ir->zero_half64);
-    ir->zero_half64 = NULL;
-    ir->zero_half64_len = 0;
-  }
-  if (ir->shift64_dead_half) {
-    tcc_free(ir->shift64_dead_half);
-    ir->shift64_dead_half = NULL;
-    ir->shift64_dead_half_len = 0;
-  }
-  if (ir->bfi_params) {
-    tcc_free(ir->bfi_params);
-    ir->bfi_params = NULL;
-    ir->bfi_params_len = 0;
-  }
+  /* The orig_index side tables (barrel_shifts, zero_half64, shift64_dead_half,
+   * bfi_params) stay until tcc_ir_free: they are part of what the final IR
+   * means, and the IPC snapshot below (tcc_ir_detect_switch_func) evaluates
+   * that IR -- without barrel_shifts a fused `cmp i, n, lsr #4` reads as
+   * `cmp i, n`. */
 
   if (!sym->a.naked)
   {
@@ -541,6 +1042,9 @@ void gen_function(Sym *sym)
    * not its purity, not a constant result, not a trivial body to inline. */
   const int body_is_final = sym && !sym->a.weak;
   const int wrappers_on = !TCC_OPT(tcc_state, optimize_size) && !tcc_ir_opt_pass_disabled("inline:wrappers");
+  /* Inline size classes count the body without a split struct's home copy. */
+  const int pcopy = ir_split_param_copy_ops(ir, NULL);
+  const int slots = ir ? ir->next_instruction_index - pcopy : 0;
 
   if (TCC_OPT(tcc_state, opt_licm) && ir && body_is_final)
   {
@@ -549,7 +1053,7 @@ void gen_function(Sym *sym)
     extern void tcc_ir_cache_func_purity(TCCState * s, int func_token, TCCFuncPurity purity);
 
     TCCFuncPurity purity = tcc_ir_infer_func_purity(ir, sym);
-    tcc_ir_cache_func_purity(tcc_state, sym->v, purity);
+    tcc_ir_cache_func_purity(tcc_state, func_cache_token(sym), purity);
   }
 
   if (TCC_OPT(tcc_state, opt_ipc) && ir && body_is_final)
@@ -559,7 +1063,7 @@ void gen_function(Sym *sym)
     int const_cached = 0;
     if (tcc_ir_detect_const_result(ir, &const_val, &const_btype))
     {
-      tcc_ir_cache_const_result(tcc_state, sym->v, const_val, const_btype);
+      tcc_ir_cache_const_result(tcc_state, func_cache_token(sym), const_val, const_btype);
       const_cached = 1;
     }
     /* If the function isn't a plain const-returning function but is a pure
@@ -569,30 +1073,36 @@ void gen_function(Sym *sym)
     {
       TCCFuncSwitchSnapshot *snap = NULL;
       if (tcc_ir_detect_switch_func(ir, &snap))
-        tcc_ir_cache_switch_func(tcc_state, sym->v, snap);
+        tcc_ir_cache_switch_func(tcc_state, func_cache_token(sym), snap);
     }
   }
 
   /* Read-only wrappers share the small-leaf limit; caller caps still apply. */
   const int wrapper_inline_ops =
       wrappers_on && !tcc_ir_opt_pass_disabled("inline:readonly_wrappers") &&
-              tcc_ir_lookup_func_purity(tcc_state, sym->v) >= TCC_FUNC_PURITY_PURE
+              tcc_ir_lookup_func_purity(tcc_state, func_cache_token(sym)) >= TCC_FUNC_PURITY_PURE
           ? SMALL_LEAF_INLINE_OPS
           : WRAPPER_INLINE_OPS;
+  /* What the body costs a caller once expanded; the class limits below are in these ops. */
+  const int inline_ops = ir ? ir_body_inline_ops(ir) : 0;
 
+  /* Linkage does not gate the classes below: a non-static function's
+   * standalone definition is always emitted (decl.c sets VT_INLINE — deferring
+   * emission — only for static ones), so expanding its body at intra-TU call
+   * sites is as safe as the static case; external callers keep the symbol.
+   * The nonstatic_global_copier and nested-function guards still apply. */
   if (ir && body_is_final && sym->type.ref->f.func_auto_inline &&
-      !sym->type.ref->f.func_inl_wrapper && wrappers_on &&
-      (sym->type.t & VT_STATIC) && !sym->a.nested_func && !nonstatic_global_copier)
+      !sym->type.ref->f.func_inl_wrapper && wrappers_on && !sym->a.nested_func &&
+      !nonstatic_global_copier)
   {
-    int real_ops = 0, calls = 0;
+    int calls = 0;
     for (int ii = 0; ii < ir->next_instruction_index; ii++)
     {
       int op = ir->compact_instructions[ii].op;
-      real_ops += op != TCCIR_OP_NOP;
       calls += (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID) &&
                !ir_call_is_barrier(ir, &ir->compact_instructions[ii]);
     }
-    if (calls == 1 && real_ops <= wrapper_inline_ops && ir_body_is_acyclic_wrapper(ir, 1))
+    if (calls == 1 && inline_ops <= wrapper_inline_ops && ir_body_is_acyclic_wrapper(ir, 1))
     {
       sym->type.ref->f.func_small_leaf = 1;
       sym->type.ref->f.func_inl_wrapper = 1;
@@ -611,15 +1121,11 @@ void gen_function(Sym *sym)
    * straight leaves such as math.rotr (+165M instructions on zig.c at 200),
    * and every registered leaf over 12 IR slots was judged as call-heavy. */
   if (ir && body_is_final && sym->type.ref->f.func_auto_inline && !sym->type.ref->f.func_small_leaf &&
-      !sym->a.nested_func && !nonstatic_global_copier && (sym->type.t & VT_STATIC) &&
+      !sym->a.nested_func && !nonstatic_global_copier &&
       !tcc_ir_opt_pass_disabled("inline:leaf_rescue"))
   {
-    int real_ops = 0;
-    for (int ii = 0; ii < ir->next_instruction_index; ii++)
-      if (ir->compact_instructions[ii].op != TCCIR_OP_NOP)
-        real_ops++;
-    if ((real_ops <= SMALL_LEAF_INLINE_OPS && ir_body_is_acyclic_leaf(ir)) ||
-        ir_body_is_small_loop_leaf(ir, sym, real_ops))
+    if ((inline_ops <= SMALL_LEAF_INLINE_OPS && ir_body_is_acyclic_leaf(ir)) ||
+        ir_body_is_small_loop_leaf(ir, sym, inline_ops))
       sym->type.ref->f.func_small_leaf = 1;
   }
   if (ir && body_is_final && !sym->type.ref->f.func_auto_inline &&
@@ -630,36 +1136,54 @@ void gen_function(Sym *sym)
      * can leave a NOP-only body uncompacted, which the slot count would miss.
      * Wider real-op counting newly inlines bodies the slot heuristic was
      * tuned to keep out of line (nestfunc-7). */
-    int real_ops = 0;
+    int real_ops = -pcopy;
     for (int ii = 0; ii < ir->next_instruction_index; ii++)
       if (ir->compact_instructions[ii].op != TCCIR_OP_NOP)
         real_ops++;
-    if (ir->next_instruction_index <= 8 || real_ops == 0)
+    if (slots <= 8 || real_ops == 0)
     {
       sym->type.ref->f.func_auto_inline = 1;
-      /* A trivial static leaf is a small_leaf too: inlined at every site
-       * whatever its token length, where decl.c's registration would have
-       * left it eval-only (constant arguments). */
-      if ((sym->type.t & VT_STATIC) && ir_body_is_acyclic_leaf(ir) &&
-          !tcc_ir_opt_pass_disabled("inline:trivial_leaf"))
+      /* A trivial leaf is a small_leaf too: inlined at every site whatever
+       * its token length, where decl.c's registration would have left it
+       * eval-only (constant arguments). */
+      if (ir_body_is_acyclic_leaf(ir) && !tcc_ir_opt_pass_disabled("inline:trivial_leaf"))
         sym->type.ref->f.func_small_leaf = 1;
     }
-    else if ((sym->type.t & VT_STATIC) && real_ops <= SMALL_LEAF_INLINE_OPS && ir_body_is_acyclic_leaf(ir))
+    else if (inline_ops <= SMALL_LEAF_INLINE_OPS && ir_body_is_acyclic_leaf(ir))
     {
       sym->type.ref->f.func_auto_inline = 1;
       sym->type.ref->f.func_small_leaf = 1;
     }
-    else if (wrappers_on && (sym->type.t & VT_STATIC) && real_ops <= wrapper_inline_ops &&
-             ir_body_is_acyclic_wrapper(ir, 1))
+    else if (wrappers_on && inline_ops <= wrapper_inline_ops && ir_body_is_acyclic_wrapper(ir, 1))
     {
       sym->type.ref->f.func_auto_inline = 1;
       sym->type.ref->f.func_small_leaf = 1;
       sym->type.ref->f.func_inl_wrapper = 1;
     }
-    else if (ir_body_is_small_loop_leaf(ir, sym, real_ops))
+    else if (ir_body_is_small_loop_leaf(ir, sym, inline_ops))
     {
       sym->type.ref->f.func_auto_inline = 1;
       sym->type.ref->f.func_small_leaf = 1;
+    }
+  }
+
+  /* Inlining aggregate-return scans exposes the result buffer to scalar replacement. */
+  if (ir && body_is_final && TCC_OPT(tcc_state, optimize) >= 2 &&
+      !TCC_OPT(tcc_state, optimize_size) && !sym->a.nested_func &&
+      (sym->type.t & VT_STATIC) && sym->a.pure_via_sret &&
+      !tcc_ir_opt_pass_disabled("inline:sret_loop") && ir_body_is_leaf(ir) && tcc_ir_cfg_has_cycle(ir))
+  {
+    for (int fi = 0; inline_ops <= SRET_LOOP_INLINE_OPS && fi < tcc_state->nb_inline_fns; fi++)
+    {
+      InlineFunc *fn = tcc_state->inline_fns[fi];
+      if (fn->sym == sym && fn->func_str && fn->func_str->len <= SRET_LOOP_INLINE_TOKENS &&
+          !inline_body_has_unsafe_loops(fn->func_str))
+      {
+        sym->type.ref->f.func_auto_inline = 1;
+        sym->type.ref->f.func_small_leaf = 1;
+        sym->type.ref->f.func_inl_sret_loop = 1;
+        break;
+      }
     }
   }
 
@@ -684,11 +1208,11 @@ void gen_function(Sym *sym)
   if (ir && sym && sym->type.ref->f.func_auto_inline &&
       !sym->a.nested_func &&
       !sym->type.ref->f.func_alwinl &&
-      ir->next_instruction_index > 12)
+      slots > 12)
   {
     int call_ops = 0;
     int has_aggr_copy = 0;
-    int real_ops = 0;
+    int real_ops = -pcopy;
     for (int ii = 0; ii < ir->next_instruction_index; ii++)
     {
       int op = ir->compact_instructions[ii].op;
@@ -730,14 +1254,14 @@ void gen_function(Sym *sym)
      * function; demote anything larger here.  (Static functions can still be
      * inlined and have their standalone copy dropped by --gc-sections.) */
     int nonstatic_bloat =
-        !(sym->type.t & VT_STATIC) && has_aggr_copy && ir->next_instruction_index > 8;
+        !(sym->type.t & VT_STATIC) && has_aggr_copy && slots > 8;
     /* Tail sharing can introduce backward jumps without introducing a loop. */
     int loop_body = !sym->type.ref->f.func_small_leaf && real_ops > 12 && tcc_ir_cfg_has_cycle(ir);
     if (!sym->type.ref->f.func_small_leaf &&
-        (call_ops >= 3 || (!naturally_small && ir->next_instruction_index > 24) || nonstatic_bloat || loop_body))
+        (call_ops >= 3 || (!naturally_small && slots > 24) || nonstatic_bloat || loop_body))
     {
       /* Wrappers keep expansion with the per-caller budget. */
-      if (wrappers_on && (sym->type.t & VT_STATIC) && !nonstatic_global_copier && real_ops <= wrapper_inline_ops &&
+      if (wrappers_on && !nonstatic_global_copier && inline_ops <= wrapper_inline_ops &&
           ir_body_is_acyclic_wrapper(ir, 1))
       {
         sym->type.ref->f.func_small_leaf = 1;
@@ -754,18 +1278,40 @@ void gen_function(Sym *sym)
       sym->type.ref->f.func_const_arg_loop = 1;
   }
 
+  /* Few call sites (FEW_CALLERS_GROWTH_OPS): what the expansion buys is the
+   * call, an sret round trip, and whatever a constant argument folds there. */
+  const int few_sites = sym && sym == tcc_state->deferred_sym ? tcc_state->deferred_call_sites : 0;
+  if (ir && body_is_final && few_sites >= 2 && !sym->type.ref->f.func_auto_inline &&
+      TCC_OPT(tcc_state, optimize) >= 2 && !TCC_OPT(tcc_state, optimize_size) && (sym->type.t & VT_STATIC) &&
+      !sym->a.nested_func && !nonstatic_global_copier && ir_body_is_leaf(ir) &&
+      (few_sites - 1) * (inline_ops > 0 ? inline_ops : 1) <= FEW_CALLERS_GROWTH_OPS &&
+      !tcc_ir_opt_pass_disabled("inline:few_callers"))
+  {
+    InlineFunc *fn = inline_fn_lookup(tcc_state, sym);
+    if (fn && fn->func_str && fn->func_str->len <= FEW_CALLERS_INLINE_TOKENS &&
+        !inline_body_has_unsafe_loops(fn->func_str))
+    {
+      sym->type.ref->f.func_auto_inline = 1;
+      sym->type.ref->f.func_inl_few_callers = 1;
+      fn->few_callers_left = 2 * few_sites;
+    }
+  }
+
   /* Keep read-only loops visible to call-result reuse; see docs/inline_readonly_wrappers.md. */
   if (ir && body_is_final && sym->type.ref->f.func_auto_inline &&
-      !sym->type.ref->f.func_alwinl && !tcc_ir_opt_pass_disabled("inline:readonly_loops"))
+      !sym->type.ref->f.func_alwinl && !sym->type.ref->f.func_inl_sret_loop &&
+      !tcc_ir_opt_pass_disabled("inline:readonly_loops"))
   {
-    TCCFuncPurity purity = tcc_ir_lookup_func_purity(tcc_state, sym->v);
+    TCCFuncPurity purity = tcc_ir_lookup_func_purity(tcc_state, func_cache_token(sym));
     if (purity == TCC_FUNC_PURITY_UNKNOWN)
       purity = tcc_ir_infer_func_purity(ir, sym);
-    if (purity >= TCC_FUNC_PURITY_PURE && !ir_body_is_register_only(ir) && tcc_ir_cfg_has_cycle(ir))
+    if (purity >= TCC_FUNC_PURITY_PURE && !ir_body_is_register_only(ir) && tcc_ir_cfg_has_cycle(ir) &&
+        !ir_body_is_small_predicate(ir, sym))
     {
       sym->type.ref->f.func_auto_inline = 0;
       sym->type.ref->f.func_small_leaf = 0;
       sym->type.ref->f.func_inl_wrapper = 0;
+      sym->type.ref->f.func_inl_few_callers = 0;
     }
   }
 
@@ -777,7 +1323,7 @@ void gen_function(Sym *sym)
    * compiler's memory.  The call-site logic budget-limits how many times a
    * call-heavy callee is expanded before falling back to a normal call. */
   if (ir && sym && sym->type.ref->f.func_auto_inline &&
-      ir->next_instruction_index > 8)
+      slots > 8)
   {
     for (int ii = 0; ii < ir->next_instruction_index; ii++)
     {
@@ -790,6 +1336,40 @@ void gen_function(Sym *sym)
       }
     }
   }
+
+  if (ir && body_is_final)
+    for (int fi = 0; fi < tcc_state->nb_inline_fns; fi++)
+    {
+      InlineFunc *fn = tcc_state->inline_fns[fi];
+      if (fn->sym != sym)
+        continue;
+      const int leaf = sym->type.ref->f.func_auto_inline && sym->type.ref->f.func_small_leaf &&
+                       !sym->type.ref->f.func_inl_wrapper;
+      fn->leaf_ops = leaf ? (inline_ops > 0 ? inline_ops : 1) : 0;
+      fn->leaf_backedges = leaf ? ir_body_backedges(ir) : 0;
+      fn->leaf_bounded = leaf && sym->type.ref->f.func_inl_sret_loop;
+      break;
+    }
+
+  /* Guard head (docs/inline_guard_heads.md); the call repeats the test, so no volatile access.  A recompiled
+   * body without one drops its earlier head. */
+  TokenString *guard_head = NULL;
+  int *guard_free = NULL;
+  const int *guard_pack = NULL;
+  if (ir && body_is_final && !sym->type.ref->f.func_auto_inline && !sym->type.ref->f.func_noinline &&
+      (sym->type.t & VT_STATIC) && !sym->a.nested_func && !ir->func_has_volatile_access &&
+      TCC_OPT(tcc_state, optimize) >= 2 && !TCC_OPT(tcc_state, optimize_size) &&
+      !tcc_ir_opt_pass_disabled("inline:guard_head"))
+  {
+    InlineFunc *fn = inline_fn_lookup(tcc_state, sym);
+    if (fn && fn->func_str)
+    {
+      guard_head = inline_body_guard_head(fn->func_str, sym, &guard_free);
+      guard_pack = fn->pack;
+    }
+  }
+  if (guard_head || sym->a.guard_head)
+    guard_head_register(tcc_state, sym, guard_head, guard_pack, guard_free);
 
   /* TCC_INL_DBG: the post-optimization inline classification of every function (with [INLSITE] lines from
    * the call sites that expand one). */
@@ -806,10 +1386,10 @@ void gen_function(Sym *sym)
         ro += op != TCCIR_OP_NOP;
         calls += op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID;
       }
-      fprintf(stderr, "[INL] %s slots=%d ops=%d calls=%d auto=%d leaf=%d evalonly=%d heavy=%d bytes=%d\n",
-              get_tok_str(sym->v, NULL), ir->next_instruction_index, ro, calls, sym->type.ref->f.func_auto_inline,
+      fprintf(stderr, "[INL] %s slots=%d ops=%d cost=%d calls=%d auto=%d leaf=%d evalonly=%d heavy=%d guard=%d bytes=%d\n",
+              get_tok_str(sym->v, NULL), ir->next_instruction_index, ro, inline_ops, calls, sym->type.ref->f.func_auto_inline,
               sym->type.ref->f.func_small_leaf, sym->type.ref->f.func_eval_only_inline,
-              sym->type.ref->f.func_inline_call_heavy, ind - func_ind);
+              sym->type.ref->f.func_inline_call_heavy, sym->a.guard_head, ind - func_ind);
     }
   }
   tcc_debug_funcend(tcc_state, ind - func_ind);
@@ -912,6 +1492,7 @@ void gen_function_check_only(Sym *sym)
   Section *saved_text = cur_text_section;
 
   tcc_state->check_only++;
+  nested_names_reset();
   cur_scope = root_scope = &f;
   nocode_wanted = 0;
   cur_text_section = tcc_state->check_scratch;
@@ -930,7 +1511,10 @@ void gen_function_check_only(Sym *sym)
   gen_op_vector_reset();
   ir->is_variadic = func_var;
   local_scope = 1;
+  int nb_knr_conv;
+  KnrConv *knr_conv = knr_params_arrive(sym, &nb_knr_conv);
   tcc_ir_params_add(ir, &sym->type);
+  knr_params_receive(knr_conv, nb_knr_conv);
   nb_temp_local_vars = 0;
   local_scope = 0;
   rsym = -1;

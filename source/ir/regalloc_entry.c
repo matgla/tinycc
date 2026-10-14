@@ -512,6 +512,7 @@ static void ra_split_rename_def(TCCIRState *ir, IRQuadCompact *q, int32_t to)
  * instruction stream, remapping branch and switch targets. */
 static void ra_split_insert(TCCIRState *ir, RaSplitCopy *cp, int ncp)
 {
+  tcc_ir_label_sync(ir);
   int old_n = ir->next_instruction_index;
   int new_cap = old_n + ncp + 16;
   IRQuadCompact *ni = tcc_mallocz(new_cap * sizeof(IRQuadCompact));
@@ -635,9 +636,44 @@ static int ra_split_def_kind(TCCIRState *ir, IRQuadCompact *q, int32_t v)
   return 1;
 }
 
+/* Where a copy can go at the end of the block [start, term], term its JUMP or
+ * JUMPIF: before the terminator, or before the flag setter that feeds a
+ * conditional one (a 16-bit MOVS would clobber the flags).  *land is set when
+ * that point is the block's jump-target start, so every entry runs the copy.
+ * -1: no such point. */
+static int ra_split_lt_point(TCCIRState *ir, int start, int term, int *land)
+{
+  int at = term;
+  if (ra_split_flags_live_before(ir, at)) {
+    at = -1;
+    for (int k = term - 1; k >= start; k--) {
+      TccIrOp op = ir->compact_instructions[k].op;
+      if (ra_split_flag_setter(op)) {
+        at = k;
+        break;
+      }
+      if (op != TCCIR_OP_NOP && ra_split_flag_reader(op))
+        return -1;
+    }
+    if (at < 0 || ra_split_flags_live_before(ir, at) || ra_split_flag_reader(ir->compact_instructions[at].op))
+      return -1;
+  }
+  if (ir->compact_instructions[at].is_jump_target) {
+    if (at != start)
+      return -1;
+    *land = 1;
+  }
+  return at;
+}
+
+/* Most uses a live-through split may rename: with the store at the split
+ * point they cost one block execution each, against at least one reload per
+ * iteration of the loop (4x weight, see ra_build_intervals). */
+#define RA_LIVE_THROUGH_MAX_RELOADS 3
+
 /* Returns the number of IR edits (0: IR untouched). */
 static int ra_split_spilled(TCCIRState *ir, IRCFG *cfg, SSAInterval *intervals, int count, int max_vreg_pos,
-                            const int *call_prefix)
+                            const int *call_prefix, int loop_only)
 {
   int n = ir->next_instruction_index;
   (void)cfg; /* may predate the flat edits after phi resolution; built fresh below */
@@ -657,7 +693,7 @@ static int ra_split_spilled(TCCIRState *ir, IRCFG *cfg, SSAInterval *intervals, 
   for (int i = 0; i < count; i++) {
     SSAInterval *iv = &intervals[i];
     if (iv->stack_location == 0 || iv->r0 >= 0 || iv->addrtaken || iv->is_volatile ||
-        iv->reg_type != LS_REG_TYPE_INT || iv->precolored >= 0 || iv->coalesce_to >= 0 || iv->co_member)
+        iv->reg_type != LS_REG_TYPE_INT || iv->precolored >= 0)
       continue;
     int t = TCCIR_DECODE_VREG_TYPE(iv->vreg);
     /* PARAMs carry no def instruction (their value arrives at entry), so the
@@ -681,10 +717,74 @@ static int ra_split_spilled(TCCIRState *ir, IRCFG *cfg, SSAInterval *intervals, 
   uint8_t *cparam = tcc_mallocz((size_t)ncand);
   for (int c = 0; c < ncand; c++)
     cparam[c] = (TCCIR_DECODE_VREG_TYPE(cvreg[c]) == TCCIR_VREG_TYPE_PARAM);
+  /* Members of a graph-coalesced class share their class's slot, so only the
+   * loop group may split them: an entry copy reads the slot where the member
+   * is live, which the coalescer already guarantees holds the member's value
+   * (members never interfere), and nothing else is renamed.  The def/reload
+   * groups rename defs and place write-backs, which a shared slot cannot take.
+   * A previous round's loop-split temp is never loop-split again: it spilled
+   * because the loop itself is over pressure, and another entry copy only
+   * moves the same reload.  cloop[c]: loop group only; cnoloop[c]: never. */
+  uint8_t *cloop = tcc_mallocz((size_t)ncand);
+  uint8_t *cnoloop = tcc_mallocz((size_t)ncand);
+  for (int i = 0; i < count; i++) {
+    int c = SPLIT_CAND(intervals[i].vreg);
+    if (c < 0 || cvreg[c] != intervals[i].vreg)
+      continue;
+    if (intervals[i].coalesce_to >= 0 || intervals[i].co_member)
+      cloop[c] = 1;
+    IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, intervals[i].vreg);
+    if (li && li->loop_split)
+      cnoloop[c] = 1;
+  }
   if (ncand == 0) {
     tcc_free(cand);
     tcc_free(cvreg);
+    tcc_free(cparam);
+    tcc_free(cloop);
+    tcc_free(cnoloop);
     return 0;
+  }
+  /* Live-through candidates (see the live-through group below): values that
+   * kept a register, appended after the spilled ones -- c >= nspilled.  Only
+   * that group reads them; a coalesced class is out (its slot or register
+   * carries several vregs), as is anything the scan pinned. */
+  const int nspilled = ncand;
+  const int lt_on = TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("ra:loop_split") &&
+                    !tcc_ir_opt_pass_disabled("ra:live_through");
+  uint32_t *cstart = NULL, *cend = NULL;
+  if (lt_on) {
+    cstart = tcc_malloc(sizeof(uint32_t) * (count > 0 ? count : 1));
+    cend = tcc_malloc(sizeof(uint32_t) * (count > 0 ? count : 1));
+    for (int i = 0; i < count; i++) {
+      SSAInterval *iv = &intervals[i];
+      if (iv->stack_location != 0 || iv->r0 < 0 || iv->r1 >= 0 || iv->addrtaken || iv->is_volatile ||
+          iv->reg_type != LS_REG_TYPE_INT || iv->precolored >= 0 || iv->coalesce_to >= 0 || iv->co_member ||
+          iv->loop_phi_locked || iv->reg_shared)
+        continue;
+      int t = TCCIR_DECODE_VREG_TYPE(iv->vreg);
+      if (t != TCCIR_VREG_TYPE_TEMP && t != TCCIR_VREG_TYPE_VAR)
+        continue;
+      IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, iv->vreg);
+      if (!li || li->addrtaken || li->is_volatile || li->is_lvalue || li->is_struct ||
+          tcc_ir_vreg_is_ignored(ir, iv->vreg))
+        continue;
+      int idx = SPLIT_IDX(iv->vreg);
+      if (idx < 0 || idx >= tbl || cand[idx] >= 0)
+        continue;
+      cand[idx] = ncand;
+      cstart[ncand] = iv->start;
+      cend[ncand] = iv->end;
+      cvreg[ncand++] = iv->vreg;
+    }
+    if (ncand > nspilled) {
+      cparam = tcc_realloc(cparam, (size_t)ncand);
+      cloop = tcc_realloc(cloop, (size_t)ncand);
+      cnoloop = tcc_realloc(cnoloop, (size_t)ncand);
+      memset(cparam + nspilled, 0, (size_t)(ncand - nspilled));
+      memset(cloop + nspilled, 0, (size_t)(ncand - nspilled));
+      memset(cnoloop + nspilled, 0, (size_t)(ncand - nspilled));
+    }
   }
   cfg = tcc_ir_cfg_build(ir);
   if (!cfg || !cfg->instr_to_block || cfg->num_instrs < n) {
@@ -692,6 +792,11 @@ static int ra_split_spilled(TCCIRState *ir, IRCFG *cfg, SSAInterval *intervals, 
       tcc_ir_cfg_free(cfg);
     tcc_free(cand);
     tcc_free(cvreg);
+    tcc_free(cparam);
+    tcc_free(cloop);
+    tcc_free(cnoloop);
+    tcc_free(cstart);
+    tcc_free(cend);
     return 0;
   }
   tcc_ir_cfg_compute_dominators(cfg);
@@ -902,9 +1007,11 @@ static int ra_split_spilled(TCCIRState *ir, IRCFG *cfg, SSAInterval *intervals, 
    * before a use INSIDE the loop (a reload per iteration), and both need a
    * call-free region while a loop group only needs dominance.
    *
-   * Safety: V has exactly one def whose block dominates the loop header (so
-   * it also dominates every entry pred: extending the entry edge to the
-   * header yields a path the def is on), every entry into the loop goes
+   * Safety: V has no def inside the loop (one def whose block dominates the
+   * header, or several all outside the loop), so V holds one value across
+   * the loop and an entry copy reads what each in-loop use would; members of
+   * a coalesced class qualify too, since the class slot holds a member's own
+   * value wherever it is live.  Every entry into the loop goes
    * through the header (checked over all member blocks' preds -- no side
    * entry can reach a renamed use without passing a copy), and every entry
    * edge can host the copy: before the pred's terminator when it is a
@@ -926,6 +1033,10 @@ static int ra_split_spilled(TCCIRState *ir, IRCFG *cfg, SSAInterval *intervals, 
     RaLoopEntry *loops = tcc_malloc(sizeof(RaLoopEntry) * (nb > 0 ? nb : 1));
     uint8_t *member = tcc_mallocz((size_t)nb);
     int *walk = tcc_malloc(sizeof(int) * (nb > 0 ? nb : 1));
+    uint8_t *lt_reached = tcc_mallocz((size_t)(nb > 0 ? nb : 1));
+    uint8_t *ltdone = tcc_mallocz((size_t)ncand);
+    typedef struct { int c, cost, ncd, at, land; uint32_t span; } RaLtPick;
+    RaLtPick *picks = tcc_malloc(sizeof(RaLtPick) * (ncand > nspilled ? ncand - nspilled : 1));
     int nloops = 0;
     for (int b = 0; b < nb && nloops < nb; b++) {
       for (int si = 0; si < cfg->blocks[b].num_succs; si++) {
@@ -967,6 +1078,36 @@ static int ra_split_spilled(TCCIRState *ir, IRCFG *cfg, SSAInterval *intervals, 
       }
       loops[j + 1] = key;
     }
+    /* lt_inner[b]: the innermost loop holding block b (-1: none), for the
+     * live-through group's cost check */
+    int *lt_inner = NULL;
+    if (lt_on && ncand > nspilled) {
+      lt_inner = tcc_malloc(sizeof(int) * (nb > 0 ? nb : 1));
+      for (int b = 0; b < nb; b++)
+        lt_inner[b] = -1;
+      for (int li = 0; li < nloops; li++) {
+        int sp = 0;
+        memset(member, 0, (size_t)nb);
+        member[loops[li].header] = 1;
+        if (loops[li].latch != loops[li].header) {
+          member[loops[li].latch] = 1;
+          walk[sp++] = loops[li].latch;
+        }
+        while (sp > 0) {
+          IRBasicBlock *pb = &cfg->blocks[walk[--sp]];
+          for (int pi = 0; pi < pb->num_preds; pi++) {
+            int p = pb->preds[pi];
+            if (p >= 0 && p < nb && !member[p]) {
+              member[p] = 1;
+              walk[sp++] = p;
+            }
+          }
+        }
+        for (int b = 0; b < nb; b++)
+          if (member[b] && lt_inner[b] < 0)
+            lt_inner[b] = li;
+      }
+    }
     for (int li = 0; li < nloops; li++) {
       int hb = loops[li].header;
       int sp = 0;
@@ -1001,23 +1142,281 @@ static int ra_split_spilled(TCCIRState *ir, IRCFG *cfg, SSAInterval *intervals, 
       if (!reducible)
         continue;
       IRBasicBlock *hbb = &cfg->blocks[hb];
-      for (int c = 0; c < ncand; c++) {
+      int lmin = n, lmax = -1;
+      for (int bi = 0; bi < nb; bi++) {
+        if (!member[bi])
+          continue;
+        if (cfg->blocks[bi].start_idx < lmin)
+          lmin = cfg->blocks[bi].start_idx;
+        if (cfg->blocks[bi].end_idx - 1 > lmax)
+          lmax = cfg->blocks[bi].end_idx - 1;
+      }
+      /* loop_free: some register the scan hands out is free across the whole
+       * loop.  Without one the loop itself is over pressure: after the rescan
+       * (loop_only) a carrier split alone only makes an entry-copy temp that
+       * spills again while the rescan reshuffles which values reload inside
+       * the loop (Wyhash.hash's block loop went from 10 to 50 SP accesses),
+       * so the loop group waits for the live-through group to free one. */
+      int loop_free = 1;
+      {
+        uint32_t used = 0, busy = 0;
+        for (int i = 0; i < count; i++) {
+          SSAInterval *iv = &intervals[i];
+          if (iv->reg_type != LS_REG_TYPE_INT)
+            continue;
+          uint32_t m = (iv->r0 >= 0 && iv->r0 < 32 ? 1u << iv->r0 : 0) | (iv->r1 >= 0 && iv->r1 < 32 ? 1u << iv->r1 : 0);
+          used |= m;
+          if (iv->start <= (uint32_t)lmax && iv->end >= (uint32_t)lmin)
+            busy |= m;
+        }
+        loop_free = (used & ~busy) != 0;
+        /* An enclosing loop's linear range covers its inner loops' too, so
+         * no register is ever free across it; its carriers often live in an
+         * inner loop that has one.  Only an innermost loop is judged. */
+        for (int lj = 0; lj < nloops && !loop_free; lj++)
+          if (loops[lj].header != hb && member[loops[lj].header])
+            loop_free = 1;
+      }
+      int lt_splits = 0;
+      /* Live-through group (ra:live_through): the loop has no free register
+       * and reads spilled values (need: how many), while a value that is
+       * live through the loop but never touched in it keeps a register for
+       * the whole loop.  The scan spills whole intervals, so it cannot give
+       * that register up: the value's uses elsewhere (another loop) make it
+       * the expensive victim.  Split it instead: one copy
+       * `M <- V` at a point P before the loop that dominates the loop and
+       * every use of V the loop can reach, and those uses read M.  V now ends
+       * before the loop; M crosses it carrying only the uses after it -- the
+       * cheapest interval at the loop's pressure point, so the rescan spills
+       * it (a store at P, a reload after the loop) and the carrier gets the
+       * register.
+       *
+       * P is the nearest common dominator of the header and those uses: the
+       * end of that block (before its flag setter when a branch reads the
+       * flags), or the loop's entry edges when it is the header itself.
+       * Every renamed use is dominated by P, V has one def, which dominates
+       * P, and no path from the def reaches a renamed use around P, so M
+       * always holds V's value where it is read.  The uses V keeps, and P,
+       * lie before the loop in layout order, and M has a use after it --
+       * otherwise the linear ranges would still overlap the loop.  The loop
+       * group below then splits the carriers, which the freed register can
+       * take (the yasld GOT-replay loop kept `entries.len` in a
+       * register and reloaded its own bound every iteration). */
+      if (lt_inner && !loop_free) {
+        int need = 0;
+        for (int c = 0; c < nspilled; c++) {
+          for (int k = nuse[c]; k < nuse[c + 1]; k++) {
+            int ub = cfg->instr_to_block[uses[k].instr];
+            if (ub >= 0 && member[ub]) {
+              need++;
+              break;
+            }
+          }
+        }
+        /* entry edges, as for the loop group (computed once per loop) */
+        int lt_nentry = 0, lt_entries_ok = 1;
+        int lt_ebefore[16], lt_eland[16], lt_eblock[16];
+        for (int pi = 0; pi < hbb->num_preds && lt_entries_ok; pi++) {
+          int p = hbb->preds[pi];
+          if (p < 0 || p >= nb || member[p] || tcc_ir_cfg_dominates(cfg, hb, p))
+            continue;
+          IRBasicBlock *pb = &cfg->blocks[p];
+          int term = pb->end_idx - 1;
+          if (term < pb->start_idx || lt_nentry >= 16) {
+            lt_entries_ok = 0;
+            break;
+          }
+          TccIrOp top = ir->compact_instructions[term].op;
+          int at = -1, land = 0;
+          if (top == TCCIR_OP_JUMP || top == TCCIR_OP_JUMPIF)
+            at = ra_split_lt_point(ir, pb->start_idx, term, &land);
+          else if (pb->end_idx == hbb->start_idx)
+            at = hbb->start_idx; /* fall-through; backedge skips (land=0) */
+          if (at < 0)
+            lt_entries_ok = 0;
+          else {
+            lt_eblock[lt_nentry] = p;
+            lt_ebefore[lt_nentry] = at;
+            lt_eland[lt_nentry++] = land;
+          }
+        }
+        int npick = 0;
+        for (int c = nspilled; c < ncand && need > 0; c++) {
+          int lo = nuse[c], hi = nuse[c + 1];
+          if (ltdone[c] || bad[c] || ndef[c + 1] - ndef[c] != 1 || hi - lo < 1)
+            continue;
+          if (!(cstart[c] < (uint32_t)lmin && cend[c] > (uint32_t)lmax))
+            continue;
+          int d = defs[ndef[c]], db = cfg->instr_to_block[d];
+          if (db < 0 || member[db] || !tcc_ir_cfg_dominates(cfg, db, hb) ||
+              (ir->compact_instructions[d].op != TCCIR_OP_STORE &&
+               irop_get_btype(tcc_ir_op_get_dest(ir, &ir->compact_instructions[d])) != IROP_BTYPE_INT32))
+            continue;
+          int inloop = 0;
+          for (int k = lo; k < hi && !inloop; k++) {
+            int ub = cfg->instr_to_block[uses[k].instr];
+            inloop = ub < 0 || member[ub] || grouped[k];
+          }
+          if (inloop)
+            continue;
+          /* blocks the loop reaches before V is defined again */
+          memset(lt_reached, 0, (size_t)nb);
+          int sp = 0;
+          for (int bi = 0; bi < nb; bi++)
+            if (member[bi]) {
+              lt_reached[bi] = 1;
+              walk[sp++] = bi;
+            }
+          while (sp > 0) {
+            int b = walk[--sp];
+            if (b == db)
+              continue;
+            for (int si = 0; si < cfg->blocks[b].num_succs; si++) {
+              int sb = cfg->blocks[b].succs[si];
+              if (sb >= 0 && sb < nb && !lt_reached[sb]) {
+                lt_reached[sb] = 1;
+                walk[sp++] = sb;
+              }
+            }
+          }
+          /* NCD of the header and the uses the loop reaches */
+          int ncd = hb, ok = 1, nreach = 0;
+          for (int k = lo; k < hi && ok; k++) {
+            int ui = uses[k].instr, ub = cfg->instr_to_block[ui];
+            if (!lt_reached[ub] || (ub == db && ui > d))
+              continue;
+            if (ub == db) {
+              ok = 0; /* read before its def on a path round the loop */
+              break;
+            }
+            nreach++;
+            while (ncd >= 0 && !tcc_ir_cfg_dominates(cfg, ncd, ub))
+              ncd = cfg->blocks[ncd].idom == ncd ? -1 : cfg->blocks[ncd].idom;
+            if (ncd < 0)
+              ok = 0;
+          }
+          if (!ok || nreach == 0 || !tcc_ir_cfg_dominates(cfg, db, ncd))
+            continue;
+          int at = -1, land = 0;
+          if (ncd != hb) {
+            IRBasicBlock *nbb = &cfg->blocks[ncd];
+            int term = nbb->end_idx - 1;
+            TccIrOp top = term >= nbb->start_idx ? ir->compact_instructions[term].op : TCCIR_OP_NOP;
+            if (top == TCCIR_OP_JUMP || top == TCCIR_OP_JUMPIF)
+              at = ra_split_lt_point(ir, nbb->start_idx, term, &land);
+            else if (nbb->end_idx < n && !ra_split_flags_live_before(ir, nbb->end_idx) &&
+                     top != TCCIR_OP_SWITCH_TABLE && top != TCCIR_OP_IJUMP && top != TCCIR_OP_RETURNVALUE &&
+                     top != TCCIR_OP_RETURNVOID)
+              at = nbb->end_idx; /* falls through: before the next block, jumps there skip it */
+            if (at < 0 || (ncd == db && at <= d) || at > lmin)
+              continue;
+          } else {
+            if (!lt_entries_ok || lt_nentry == 0)
+              continue;
+            int late = 0;
+            for (int e = 0; e < lt_nentry; e++)
+              if (lt_ebefore[e] > lmin || lt_ebefore[e] <= d || lt_inner[lt_eblock[e]] != lt_inner[lt_eblock[0]])
+                late = 1;
+            if (late)
+              continue;
+          }
+          /* renamed: the uses P dominates; kept: the rest, all before the loop */
+          int cost = 0, last = -1, after = 0;
+          for (int k = lo; k < hi && ok; k++) {
+            int ui = uses[k].instr, ub = cfg->instr_to_block[ui];
+            int ren = ncd != hb ? (ub != ncd ? tcc_ir_cfg_dominates(cfg, ncd, ub) : ui >= at)
+                                : tcc_ir_cfg_dominates(cfg, hb, ub);
+            if (lt_reached[ub] && !(ub == db && ui > d) && !ren)
+              ok = 0; /* the loop reaches a use P does not dominate */
+            else if (!ren && ui >= lmin)
+              ok = 0; /* V would still span the loop */
+            else if (ren) {
+              if (ui > lmax)
+                after = 1;
+              if (ui != last)
+                cost++;
+              last = ui;
+              /* M is meant to spill and each renamed use reloads it: none
+               * may sit in a loop P is not in (a reload per iteration) */
+              if (lt_inner[ub] != lt_inner[ncd != hb ? ncd : lt_eblock[0]])
+                ok = 0;
+            }
+          }
+          if (ok && cost > RA_LIVE_THROUGH_MAX_RELOADS)
+            ok = 0;
+          if (!ok || !after)
+            continue;
+          picks[npick].c = c;
+          picks[npick].cost = cost;
+          picks[npick].span = cend[c] - cstart[c];
+          picks[npick].ncd = ncd;
+          picks[npick].at = at;
+          picks[npick++].land = land;
+        }
+        /* cheapest first: fewest renamed uses, then the longest range */
+        while (need > 0 && npick > 0) {
+          int bi = 0;
+          for (int i = 1; i < npick; i++)
+            if (picks[i].cost < picks[bi].cost || (picks[i].cost == picks[bi].cost && picks[i].span > picks[bi].span))
+              bi = i;
+          RaLtPick pk = picks[bi];
+          picks[bi] = picks[--npick];
+          int32_t M = tcc_ir_vreg_alloc_temp(ir);
+          if (M < 0)
+            break;
+          {
+            IRLiveInterval *mli = tcc_ir_vreg_live_interval(ir, M);
+            if (mli)
+              mli->loop_split = 1; /* the split is the point: never coalesce M back into V */
+          }
+          int last = -1;
+          for (int k = nuse[pk.c]; k < nuse[pk.c + 1]; k++) {
+            int ui = uses[k].instr, ub = cfg->instr_to_block[ui];
+            int ren = pk.ncd != hb ? (ub != pk.ncd ? tcc_ir_cfg_dominates(cfg, pk.ncd, ub) : ui >= pk.at)
+                                   : tcc_ir_cfg_dominates(cfg, hb, ub);
+            if (!ren)
+              continue;
+            grouped[k] = 1;
+            if (ui != last) {
+              ra_split_rename_uses(ir, &ir->compact_instructions[ui], cvreg[pk.c], M);
+              last = ui;
+            }
+          }
+          if (pk.ncd != hb) {
+            SPLIT_PUSH(pk.at, pk.land, M, cvreg[pk.c], IROP_BTYPE_INT32, 0);
+            cps[ncp - 1].entry = 1;
+          } else {
+            for (int e = 0; e < lt_nentry; e++) {
+              SPLIT_PUSH(lt_ebefore[e], lt_eland[e], M, cvreg[pk.c], IROP_BTYPE_INT32, 0);
+              cps[ncp - 1].entry = 1;
+            }
+          }
+          ltdone[pk.c] = 1;
+          need--;
+          lt_splits++;
+        }
+      }
+      for (int c = 0; c < ncand && (!loop_only || loop_free || lt_splits > 0); c++) {
         int lo = nuse[c], hi = nuse[c + 1], dlo = ndef[c], dhi = ndef[c + 1];
         int nd = dhi - dlo;
-        /* one def (a PARAM instead has its value from entry: block 0), and
+        /* a def (a PARAM instead has its value from entry: block 0), and
          * at least one use */
-        if (bad[c] || hi - lo < 1 || (nd != 1 && !(nd == 0 && cparam[c])))
+        if (c >= nspilled || bad[c] || cnoloop[c] || hi - lo < 1 || (nd == 0 && !cparam[c]))
           continue;
-        int d = nd == 1 ? defs[dlo] : -1;
-        int db = nd == 1 ? cfg->instr_to_block[d] : 0;
-        if (db < 0 || member[db] || !tcc_ir_cfg_dominates(cfg, db, hb))
-          continue;
-        int dbt = IROP_BTYPE_INT32;
-        if (nd == 1 && ir->compact_instructions[d].op != TCCIR_OP_STORE) {
-          IROperand dop = tcc_ir_op_get_dest(ir, &ir->compact_instructions[d]);
-          dbt = irop_get_btype(dop);
+        /* One def must dominate the header; several (a merge, a coalesced
+         * class) need only all lie outside the loop: V then cannot change
+         * inside it, so the value an entry copy reads is the one every
+         * in-loop use would have read. */
+        int dok = 1;
+        for (int x = dlo; x < dhi && dok; x++) {
+          int d = defs[x], db = cfg->instr_to_block[d];
+          if (db < 0 || member[db] || (nd == 1 && !tcc_ir_cfg_dominates(cfg, db, hb)))
+            dok = 0;
+          else if (ir->compact_instructions[d].op != TCCIR_OP_STORE &&
+                   irop_get_btype(tcc_ir_op_get_dest(ir, &ir->compact_instructions[d])) != IROP_BTYPE_INT32)
+            dok = 0;
         }
-        if (dbt != IROP_BTYPE_INT32)
+        if (!dok)
           continue;
         int any = 0;
         for (int k = lo; k < hi; k++) {
@@ -1097,12 +1496,16 @@ static int ra_split_spilled(TCCIRState *ir, IRCFG *cfg, SSAInterval *intervals, 
     tcc_free(loops);
     tcc_free(member);
     tcc_free(walk);
+    tcc_free(lt_reached);
+    tcc_free(ltdone);
+    tcc_free(picks);
+    tcc_free(lt_inner);
   }
 
   for (int c = 0; c < ncand; c++) {
     int lo = nuse[c], hi = nuse[c + 1], dlo = ndef[c], dhi = ndef[c + 1];
     int nd = dhi - dlo;
-    if (bad[c] || cparam[c] || nd == 0 || hi - lo < 1)
+    if (loop_only || c >= nspilled || bad[c] || cparam[c] || cloop[c] || nd == 0 || hi - lo < 1)
       continue;
     int32_t V = cvreg[c];
     int single = nd == 1;
@@ -1250,6 +1653,10 @@ static int ra_split_spilled(TCCIRState *ir, IRCFG *cfg, SSAInterval *intervals, 
   tcc_free(cand);
   tcc_free(cvreg);
   tcc_free(cparam);
+  tcc_free(cloop);
+  tcc_free(cnoloop);
+  tcc_free(cstart);
+  tcc_free(cend);
   tcc_ir_cfg_free(cfg);
   return changed;
 }
@@ -1930,6 +2337,7 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
           RUN_SSA("ssa:const_string_fold", tcc_ir_ssa_opt_const_string_fold(&ssa_opt_ctx));
           RUN_SSA("ssa:bitop_const_fold", tcc_ir_ssa_opt_bitop_const_fold(&ssa_opt_ctx));
           RUN_SSA("ssa:ptr_store_dse", tcc_ir_ssa_opt_ptr_store_dse(&ssa_opt_ctx));
+          RUN_SSA("ssa:ptr_silent_store", tcc_ir_ssa_opt_ptr_silent_store(&ssa_opt_ctx));
           RUN_SSA("ssa:cprop", ssa_opt_cprop(&ssa_opt_ctx));
           RUN_SSA("ssa:fold", ssa_opt_fold(&ssa_opt_ctx));
           RUN_SSA("ssa:var_imm_prop", ssa_opt_var_imm_prop(&ssa_opt_ctx));
@@ -1946,6 +2354,7 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
           RUN_SSA("ssa:strength", ssa_opt_strength(&ssa_opt_ctx));
           RUN_SSA("ssa:narrow", ssa_opt_narrow(&ssa_opt_ctx));
           RUN_SSA("ssa:gvn", ssa_opt_gvn(&ssa_opt_ctx));
+          RUN_SSA("ssa:dup_diamond", ssa_opt_dup_diamond(&ssa_opt_ctx));
           RUN_SSA("ssa:phi_simplify", ssa_opt_phi_simplify(&ssa_opt_ctx));
           RUN_SSA("ssa:copy_fwd",
                   TCC_OPT(tcc_state, opt_store_load_fwd) ? ssa_opt_copy_fwd(&ssa_opt_ctx) : 0);
@@ -2274,6 +2683,20 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
       tcc_ir_opt_compact_nops(ir);
       branch_changes += c;
     }
+    /* The last redirect's arm dies in the round's own dce, but the JUMP it
+     * left behind only becomes a jump-to-next afterwards -- one more cleanup
+     * round, or the fuse passes below still see it between a SETIF and its
+     * test and decline (the && diamonds of the Zig C backend).  Only when a
+     * redirect happened: a diamond-free function must not run these passes
+     * here at all (shl32_or codegen reads state the extra compaction
+     * invalidates). */
+    if (branch_changes > 0) {
+      tcc_ir_opt_eliminate_fallthrough(ir);
+      tcc_ir_opt_jump_threading(ir);
+      if (TCC_OPT(tcc_state, opt_dce))
+        tcc_ir_opt_dce(ir);
+      tcc_ir_opt_compact_nops(ir);
+    }
     /* What SSA's dead-store elimination emptied: a branch over nothing, and
      * between a SETIF and its test the copies of a scalarized struct. */
     if (branch_changes || (!tcc_ir_opt_pass_disabled("ra:jumpif_to_next") && tcc_ir_drop_jumpif_to_next(ir) > 0))
@@ -2304,6 +2727,31 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
     memset(ssa->block_phis, 0, cfg->num_blocks * sizeof(IRPhiNode *));
   }
 
+  /* SSA folding exposes small constant-trip memory loops after the early unroller. */
+  RA_FLAT_PASS(ra_ch, "ra:loop_unroll", TCC_OPT(tcc_state, opt_loop_unroll),
+               ssa_opt_loop_unroll_late(ir));
+  if (ra_ch > 0) {
+    if (TCC_OPT(tcc_state, opt_const_prop))
+      tcc_ir_opt_const_prop_tmp(ir);
+    /* Forwarding the unrolled offset-table reads leaves `T <- #k` feeding an
+     * index: propagate those too. */
+    if (TCC_OPT(tcc_state, opt_store_load_fwd) && tcc_ir_opt_sl_forward(ir) > 0 &&
+        TCC_OPT(tcc_state, opt_const_prop))
+      tcc_ir_opt_const_prop_tmp(ir);
+    if (TCC_OPT(tcc_state, opt_dead_store)) {
+      tcc_ir_opt_dse(ir);
+      tcc_ir_opt_dead_local_slot_elim(ir);
+    }
+    tcc_ir_opt_compact_nops(ir);
+    tcc_ir_cfg_free(cfg);
+    cfg = tcc_ir_cfg_build(ir);
+    tcc_ir_cfg_compute_dominators(cfg);
+    ssa->cfg = cfg;
+    ssa->block_phis = tcc_realloc(ssa->block_phis, cfg->num_blocks * sizeof(IRPhiNode *));
+    memset(ssa->block_phis, 0, cfg->num_blocks * sizeof(IRPhiNode *));
+    tcc_ir_dump_after_pass(ir, "ra:unroll_cleanup");
+  }
+
   /* Product + zero-extended words -> UMAAL.  Last of the IR rewrites: every
    * pass before this point is unaware of TCCIR_OP_UMAAL; the allocator and
    * everything after it read its accumulator via tcc_ir_op_is_mac. */
@@ -2313,6 +2761,11 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
 
   if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("ra:bump_sink") && ra_bump_sink(ir))
     tcc_ir_dump_after_pass(ir, "ra:bump_sink");
+
+  /* A copied word's load moves down to its store (opt/ra/load_sink.c): SRA
+   * leaves a struct copy as all its loads, then all its stores. */
+  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("ra:load_sink") && ra_load_sink(ir))
+    tcc_ir_dump_after_pass(ir, "ra:load_sink");
 
   /* A pure value computed in a loop but read only in a single-predecessor exit
    * block sinks there (opt/ra/exit_sink.c): one instruction per iteration and a
@@ -2344,23 +2797,32 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
     tcc_ir_dump_after_pass(ir, "ra:branch_thread");
   }
 
-  /* TEMP definitions nothing reads, or overwritten before a read -- the SSA
-   * passes above leave them (an entry-block VAR renamed to one TEMP keeps its
-   * zero fill).  Here, before the intervals: graph coalescing below erases
-   * the copies between vregs that share a register, after which a value can
-   * be read under another vreg's name (dead_def.c). */
-  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("dead_def") && tcc_ir_dead_def(ir))
+  /* `C <- x; JMP L` into a block that only returns C becomes `RETURNVALUE x`
+   * (opt/ra/return_sink.c): no carrier register held from the first arm to
+   * the shared return. */
+  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("ra:return_sink") && ra_return_sink(ir))
+  {
+    tcc_ir_cfg_free(cfg);
+    cfg = tcc_ir_cfg_build(ir);
+    tcc_ir_cfg_compute_dominators(cfg);
+    ssa->cfg = cfg;
+    ssa->block_phis = tcc_realloc(ssa->block_phis, cfg->num_blocks * sizeof(IRPhiNode *));
+    memset(ssa->block_phis, 0, cfg->num_blocks * sizeof(IRPhiNode *));
+    tcc_ir_dump_after_pass(ir, "ra:return_sink");
+  }
+
+  /* Dead definitions must be removed before coalescing erases copies between vregs sharing a register. */
+  int cleanup_changes = 0;
+  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("dead_def") &&
+      (cleanup_changes = tcc_ir_dead_def(ir)))
     tcc_ir_dump_after_pass(ir, "dead_def");
 
-  /* Writes into frame bytes no instruction reads, and the frame records cut
-   * to the bytes still named (frame_dfe.c): after the last pass that adds or
-   * drops a frame reference, before the call prefix (a BLOCK_COPY can shrink
-   * under the memcpy threshold) and the intervals.  The stores it drops leave
-   * their values dead: dead_def again. */
+  /* Remove dead frame bytes before computing call crossings and live intervals. */
   {
     int dfe_inserted = 0;
     if (TCC_OPT(tcc_state, optimize) >= 1 && tcc_ir_frame_dead_bytes(ir, &dfe_inserted))
     {
+      cleanup_changes++;
       if (dfe_inserted)
       {
         /* as after the address hoists above */
@@ -2375,6 +2837,21 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
       if (!tcc_ir_opt_pass_disabled("dead_def"))
         tcc_ir_dead_def(ir);
     }
+  }
+
+  /* Dead result-buffer stores and copies can hide error-tag joins from the earlier threading pass. */
+  if (cleanup_changes && TCC_OPT(tcc_state, opt_jump_threading) &&
+      !tcc_ir_opt_pass_disabled("ra:branch_thread") && !tcc_ir_opt_pass_disabled("ra:branch_thread_post_frame") &&
+      ra_thread_known_branches(ir)) {
+    tcc_ir_cfg_free(cfg);
+    cfg = tcc_ir_cfg_build(ir);
+    tcc_ir_cfg_compute_dominators(cfg);
+    ssa->cfg = cfg;
+    ssa->block_phis = tcc_realloc(ssa->block_phis, cfg->num_blocks * sizeof(IRPhiNode *));
+    memset(ssa->block_phis, 0, cfg->num_blocks * sizeof(IRPhiNode *));
+    tcc_ir_dump_after_pass(ir, "ra:branch_thread_post_frame");
+    if (!tcc_ir_opt_pass_disabled("dead_def"))
+      tcc_ir_dead_def(ir);
   }
 
   int *call_prefix = NULL;
@@ -2473,9 +2950,13 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
     }
 
     /* Spill-driven splitting: rewrite the spilled values' uses, then allocate
-     * again from scratch (see ra_split_spilled). */
-    if (round == 0 && TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("ra:spill_split") &&
-        ra_split_spilled(ir, cfg, intervals, interval_count, max_vreg_pos, call_prefix) > 0) {
+     * again from scratch (see ra_split_spilled).  The rescan after the first
+     * split evicts new loop carriers (the temps it made take registers), which
+     * reload every iteration unless split in turn: a second round, loop groups
+     * only -- def/reload groups again just reshuffle pressure (Wyhash.update
+     * +4% with them). */
+    if (round < 2 && TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("ra:spill_split") &&
+        ra_split_spilled(ir, cfg, intervals, interval_count, max_vreg_pos, call_prefix, round > 0) > 0) {
       tcc_free(intervals);
       intervals = NULL;
       tcc_free(call_prefix);

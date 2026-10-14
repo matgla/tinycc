@@ -121,6 +121,8 @@ int try_eliminate_loop(struct TCCIRState *ir, struct IRLoop *loop);
 int try_eliminate_loop_symbolic(struct TCCIRState *ir, struct IRLoop *loop);
 int try_unroll_loop_ex(struct TCCIRState *ir, struct IRLoop *loop,
                        struct IRLoops *loops, int loop_idx);
+int try_unroll_loop_ivs(struct TCCIRState *ir, struct IRLoop *loop,
+                        struct IRLoops *loops, int loop_idx, InductionVar *ivs, int num_ivs);
 int try_rotate_loop(struct TCCIRState *ir, struct IRLoop *loop);
 /* Placement-only sibling of rotation: moves a `for` body ahead of its
  * increment so the two bridging jumps become fall-throughs. */

@@ -399,6 +399,13 @@ size_t section_add(Section *sec, addr_t size, int align)
   return 0;
 }
 
+/* arm-thumb-emit.c: no function returns its aggregate in r0/r1 here. */
+int gfunc_regpair_ret(Sym *fsym)
+{
+  (void)fsym;
+  return 0;
+}
+
 /* ---------------------------------------------------------------------------
  * Minimal host-side runtime for the subset of tccgen.c exercised below.
  *

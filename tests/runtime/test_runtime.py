@@ -204,7 +204,7 @@ def test_cross_aeabi_divmod(runtime_compiler):
 
     # On Cortex-M33 the compiler uses SDIV/UDIV instructions for 32-bit
     # division, so no __aeabi_idiv/__aeabi_uidiv references are emitted.
-    # 64-bit division/modulo uses the combined EABI helpers from
+    # Variable 64-bit division/modulo uses the combined EABI helpers from
     # lib/armeabi_divmod.S.
     expected = {
         "__aeabi_ldivmod",

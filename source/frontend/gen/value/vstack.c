@@ -112,6 +112,12 @@ ST_FUNC void vpop(void)
     if (vtop->jfalse >= 0)
       tcc_ir_backpatch_to_here(tcc_state->ir, vtop->jfalse);
   }
+  else if ((v == VT_JMP || v == VT_JMPI) && tcc_state->ir && vtop->c.i >= 0)
+  {
+    /* A discarded `c && (x, 1)` is a bare jump chain (expr_landor): both
+     * outcomes continue here. */
+    tcc_ir_backpatch_to_here(tcc_state->ir, (int)vtop->c.i);
+  }
   vtop--;
   print_vstack("vpop");
 }
@@ -135,6 +141,17 @@ ST_FUNC void gv_discarded_volatile(void)
         (vtop->sym && (vtop->sym->type.t & VT_VOLATILE))))
     return;
   gv(RC_TYPE(vtop->type.t));
+}
+
+/* Pop a value whose result is discarded (a comma operator's left operand, a
+ * for-loop init or increment): read it if volatile, and drop the return
+ * value of the call that produced it, when it is the last instruction. */
+ST_FUNC void vpop_discarded(void)
+{
+  gv_discarded_volatile();
+  if (!(vtop->r & VT_LVAL) && (vtop->r & VT_VALMASK) != VT_CONST)
+    tcc_ir_codegen_drop_return_of(tcc_state->ir, vtop->vr);
+  vpop();
 }
 
 /* push constant of type "type" with useless value */

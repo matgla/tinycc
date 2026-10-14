@@ -25,31 +25,25 @@
 
 #define __ATOMIC_SEQ_CST_VALUE 5 /* the memory orders as <stdatomic.h> numbers them */
 
-/* A memory barrier: a call to __tcc_dmb, which the ARM backend emits as one
- * DMB instead (tcc_gen_machine_func_call_mop).  Every pass already treats a
- * call as reading and writing any memory, so nothing moves across it. */
-static void gen_atomic_barrier(void)
-{
-  const int call_id = tcc_state->ir->next_call_id++;
-  SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 0);
-  vpush_helper_func(tok_alloc_const("__tcc_dmb"));
-  tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, vtop, &call_id_sv, NULL);
-  vpop();
-}
-
 /* __atomic_load/__atomic_store of a 1-, 2- or 4-byte object, inline: a plain
  * LDR/STR of those sizes is single-copy atomic on ARMv7-M/ARMv8-M, and the
  * ordering is the standard C11 mapping for the architecture --
- *   load:  relaxed: ldr;  acquire/consume: ldr; dmb;  seq_cst: ldr; dmb
- *   store: relaxed: str;  release: dmb; str;  seq_cst: dmb; str; dmb
+ *   load:  relaxed: ldr;  acquire/consume/seq_cst: lda    (v7-M: ldr; dmb)
+ *   store: relaxed: str;  release/seq_cst: stl     (v7-M: dmb; str [; dmb])
  * with an order that is not a constant, or not valid for the access, taken
- * as seq_cst.  A store, and a relaxed load, is a volatile access, so it is
- * neither dropped, merged nor moved out of a loop.  An ordered load needs no
- * such mark: the barrier call after it already reads and writes all memory,
- * so no pass merges it with another load or hoists it, and a volatile access
- * would make every pass treat each unmarked access of the whole function (of
- * any caller it is inlined into) as possibly volatile -- Zig's InternPool
- * accessors do an acquire load on every lookup.
+ * as seq_cst.  A relaxed access is a volatile one, so it is neither dropped,
+ * merged nor moved out of a loop.  An ordered one is a call the backend
+ * emits as that instruction where its operands are
+ * (thumb_inline_atomic_call), which writes no register but the loaded value
+ * and to every pass reads and writes memory: no pass merges it with another
+ * access or hoists it.  Seq_cst as LDA/STL is the ARMv8 mapping gcc and
+ * LLVM use; it is sound only because everything else agrees -- a seq_cst
+ * read-modify-write is LDAEX/STLEX with no DMB (atomic_order_flags), an STL
+ * followed by an LDA is never reordered, and the runtime's helpers fence on
+ * both sides.  A volatile access would also make every pass treat each
+ * unmarked access of the whole function (of any caller it is inlined into)
+ * as possibly volatile -- Zig's InternPool accessors do an acquire load on
+ * every lookup.
  * Read-modify-write stays a call unless -minline-atomics: an LDREX/STREX
  * loop never completes on the RP2350's PSRAM, so how to make it atomic is the
  * runtime's to decide (inline_atomic_rmw).
@@ -65,47 +59,39 @@ static int inline_atomic_access(int atok, int size, CType *atom)
   if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
     order = (int)vtop->c.i;
   vpop();
-  CType vol = *atom;
-  vol.t |= VT_VOLATILE;
-  /* An acquire load and a release store are one LDA / STL on ARMv8-M: a
-   * call the backend emits as that instruction where its operands are
-   * (thumb_inline_atomic_call), which writes no register but the loaded
-   * value, and to every pass reads and writes memory as the barrier did.
-   * Seq_cst keeps the DMB mapping it shares with code built before. */
-  if ((atok == TOK___atomic_load || atok == TOK___atomic_load_n) && (order == 1 || order == 2))
+  const int load = atok == TOK___atomic_load || atok == TOK___atomic_load_n;
+  if (load ? order != 0 && order != 1 && order != 2 : order != 0 && order != 3)
+    order = __ATOMIC_SEQ_CST_VALUE;
+  if (order != 0)
   {
+    /* __tcc_ax_lda<size>_<flags> / __tcc_ax_stl<size>_<flags>, the flags as
+     * a read-modify-write's (atomic_order_flags): 1 acquire, 2 release, and
+     * 4 seq_cst, which only the ARMv7-M DMB mapping needs (a store's
+     * trailing DMB). */
     char name[32];
-    snprintf(name, sizeof(name), "__tcc_ax_lda%d_1", size);
-    gen_internal_call(name, 1, atom);
-    return 1;
-  }
-  if (atok == TOK___atomic_store && order == 3)
-  {
-    char name[32];
+    const int flags = (load ? 1 : 2) | (order == __ATOMIC_SEQ_CST_VALUE ? 4 : 0);
+    if (load)
+    {
+      snprintf(name, sizeof(name), "__tcc_ax_lda%d_%d", size, flags);
+      gen_internal_call(name, 1, atom);
+      return 1;
+    }
     CType void_type = {.t = VT_VOID};
-    snprintf(name, sizeof(name), "__tcc_ax_stl%d_2", size);
+    snprintf(name, sizeof(name), "__tcc_ax_stl%d_%d", size, flags);
     gen_internal_call(name, 2, &void_type);
     vpop();
     return 1;
   }
-  if (atok == TOK___atomic_load || atok == TOK___atomic_load_n)
+  CType vol = *atom;
+  vol.t |= VT_VOLATILE;
+  if (load)
   {
-    if (order != 0 && order != 1 && order != 2)
-      order = __ATOMIC_SEQ_CST_VALUE;
-    if (order != 0 && !(atom->t & VT_VOLATILE))
-      vol.t &= ~VT_VOLATILE;
     mk_pointer(&vol);
     vtop->type = vol;
     indir();
     gv(RC_INT);
-    if (order != 0)
-      gen_atomic_barrier();
     return 1;
   }
-  if (order != 0 && order != 3)
-    order = __ATOMIC_SEQ_CST_VALUE;
-  if (order != 0)
-    gen_atomic_barrier();
   vswap();
   mk_pointer(&vol);
   vtop->type = vol;
@@ -113,8 +99,6 @@ static int inline_atomic_access(int atok, int size, CType *atom)
   vswap();
   vstore();
   vpop();
-  if (order == __ATOMIC_SEQ_CST_VALUE)
-    gen_atomic_barrier();
   return 1;
 #else
   (void)atok;
@@ -138,8 +122,9 @@ static int atomic_pop_order(void)
  * helper's name (tcc_gen_machine_func_call_mop reads them back):
  *   1 acquire: LDAEX (consume, acquire, acq_rel, seq_cst)
  *   2 release: STLEX (release, acq_rel, seq_cst)
- *   4 seq_cst: and a DMB after -- STLEX does not order a later plain LDR,
- *     and a seq_cst load here is `ldr; dmb` (inline_atomic_access). */
+ *   4 seq_cst: nothing more on ARMv8-M, where a seq_cst load is LDA and a
+ *     store STL (inline_atomic_access), and STLEX is never reordered with a
+ *     later LDA; ARMv7-M's DMB mapping already fences both sides. */
 static int atomic_order_flags(int order)
 {
   static const unsigned char flags[] = {0, 1, 1, 2, 3, 7};
@@ -245,7 +230,9 @@ static int inline_atomic_rmw(int atok, int size, CType *atom, CType *ct)
     gen_internal_call(name, 3, atom);
     gen_cast(atom); /* the helper's zero extension, to compare with expected */
     SValue old = atomic_pop_reg();
-    /* Success is old == expected; a failure writes old back to *expected. */
+    /* Success is old == expected; a failure closes the reservation the
+     * loop's LDREX left open (thumb_inline_atomic_call: a successful STREX
+     * already closed it) and writes old back to *expected. */
     vpushv(&old);
     vpushv(&expected);
     gen_op(TOK_EQ);
@@ -254,6 +241,9 @@ static int inline_atomic_rmw(int atok, int size, CType *atom, CType *ct)
     vpushv(&expected);
     gen_op(TOK_NE);
     int skip = tcc_ir_codegen_test_gen(tcc_state->ir, 1, -1);
+    CType void_type = {.t = VT_VOID};
+    gen_internal_call("__tcc_mc_clrex", 0, &void_type);
+    vpop();
     vpushv(&expected_ptr);
     indir();
     vtop->type.t &= ~VT_VOLATILE;

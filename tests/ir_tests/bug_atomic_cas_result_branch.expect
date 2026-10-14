@@ -1,0 +1,22 @@
+lock: 5
+trylock busy: -5 word=5
+trylock free: 1 word=6
+reg hit: 100 word=41
+reg miss: 41 word=41
+big hit: 7 word=3
+big miss: 3 word=3
+max: 10 word=20 tries=1
+max stale: 20 word=20 tries=2
+max stale up: 20 word=25 tries=2
+far hit: 1 word=51 sink=0
+far miss: 53 word=51 sink=1528798784
+far fail hit: 9 word=60 sink=1372397120
+far fail miss: 63 word=60 sink=1372397120
+take free: 1 word=7 sink=7
+take busy: 0 word=7 sink=7
+take5: 1 word=6 2 word=6
+take big: 4 word=1 3 word=1
+take reg: 10 word=9 11 word=9
+spin: 12
+take far: 1 word=13 sink=4156202560 0 word=13 sink=4156202560
+take far fail: 0 word=13 sink=1290280512 1 word=16 sink=1290280512

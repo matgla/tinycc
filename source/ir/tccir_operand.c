@@ -22,6 +22,7 @@
 #define USING_GLOBALS
 #include "tcc.h"
 #include "tccir.h"
+#include "opt.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -353,6 +354,17 @@ static int svalue_access_is_aggregate_volatile(const SValue *sv)
   return ctype_has_volatile_member(&sv->sym->type, 0);
 }
 
+/* The symbol an operand names: an internal function returning in r0/r1 is
+ * reached through its AAPCS adapter, except as the target of the direct call
+ * being put (gfunc_regpair_ret). */
+static Sym *irop_sym_as_address(const SValue *sv)
+{
+  Sym *sym = sv->sym;
+  if (sym && sym == tcc_state->regpair_direct_call && !(sv->r & VT_LVAL) && sv->c.i == 0)
+    return sym;
+  return gfunc_regpair_address_sym(sym);
+}
+
 IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
 {
   if (!sv)
@@ -421,7 +433,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
       pool_flags |= IRPOOL_SYMREF_LVAL;
     if (is_local)
       pool_flags |= IRPOOL_SYMREF_LOCAL;
-    uint32_t idx = tcc_ir_pool_add_symref(ir, sv->sym, (int32_t)sv->c.i, pool_flags);
+    uint32_t idx = tcc_ir_pool_add_symref(ir, irop_sym_as_address(sv), (int32_t)sv->c.i, pool_flags);
     result = irop_make_symref(vr, idx, is_lval, is_local, is_const, irop_bt);
     irop_copy_svalue_info(&result, sv);
     goto done;
@@ -569,7 +581,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
     /* Only store sv->sym if VT_SYM is actually set; otherwise the pointer may be stale garbage.
      * SValues that reach this fallback (e.g. VT_CMP results) may have an uninitialized
      * sym field from a previous vstack operation. */
-    Sym *fallback_sym = has_sym ? sv->sym : NULL;
+    Sym *fallback_sym = has_sym ? irop_sym_as_address(sv) : NULL;
     uint32_t idx = tcc_ir_pool_add_symref(ir, fallback_sym, (int32_t)sv->c.i, pool_flags);
     result = irop_make_symref(vr, idx, is_lval, is_local, is_const, irop_bt);
     result.is_sym = has_sym; /* Only set if original had VT_SYM */
@@ -1383,6 +1395,12 @@ int tcc_ir_call_clobbers_nothing(const TCCIRState *ir, const IRQuadCompact *q)
     return 0;
   const char *name = get_tok_str(s->v, NULL);
   return !strcmp(name, "__tcc_dmb") || tcc_is_inline_machine_call(name);
+}
+
+int tcc_ir_call_saves_lr_itself(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID) && TCC_OPT(tcc_state, optimize) >= 1 &&
+         !TCC_OPT(tcc_state, optimize_size) && !tcc_ir_opt_pass_disabled("codegen:noreturn_lr_push") && tcc_ir_callee_is_noreturn(tcc_ir_op_src1_sym(ir, q));
 }
 
 IROperand tcc_ir_get_src2(const TCCIRState *ir, int index)

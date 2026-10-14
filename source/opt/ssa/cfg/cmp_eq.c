@@ -17,12 +17,27 @@
 #define TOK_EQ 0x94
 #define TOK_NE 0x95
 
+/* b_vr == CMP_EQ_IMM: the fact compares a_vr with the constant imm, a value
+ * of btype `btype` (a 32-bit compare against a constant). */
+#define CMP_EQ_IMM (-2)
+
 typedef struct CmpFact
 {
   int32_t a_vr;
   int32_t b_vr;
+  int32_t imm;
+  uint8_t btype;
   uint8_t equal;    /* 1 = A==B known, 0 = A!=B known */
 } CmpFact;
+
+/* One side of an equality compare: a TEMP vreg, or (b only) a constant. */
+typedef struct CmpEqOperands
+{
+  int32_t a_vr;
+  int32_t b_vr; /* CMP_EQ_IMM: compared with imm */
+  int32_t imm;
+  uint8_t btype;
+} CmpEqOperands;
 
 /* Dominator-scoped fact stack, threaded through the domwalk engine's `state`. */
 typedef struct CmpEqState
@@ -32,25 +47,41 @@ typedef struct CmpEqState
   int cap;
 } CmpEqState;
 
-static void fact_push(CmpEqState *st, int32_t a, int32_t b, int eq)
+static void fact_push(CmpEqState *st, const CmpEqOperands *o, int eq)
 {
   if (st->count >= st->cap) {
     int nc = st->cap ? st->cap * 2 : 32;
     st->stack = tcc_realloc(st->stack, nc * sizeof(CmpFact));
     st->cap = nc;
   }
-  st->stack[st->count].a_vr = a;
-  st->stack[st->count].b_vr = b;
+  st->stack[st->count].a_vr = o->a_vr;
+  st->stack[st->count].b_vr = o->b_vr;
+  st->stack[st->count].imm = o->imm;
+  st->stack[st->count].btype = o->btype;
   st->stack[st->count].equal = (uint8_t)eq;
   st->count++;
 }
 
-static int fact_lookup(CmpEqState *st, int32_t a, int32_t b)
+/* 1 / 0: the dominating facts prove A==B / A!=B; -1: they say nothing.
+ * Against constants: x==c answers x==c and (32-bit) every x==k, x!=c only
+ * x==c. */
+static int fact_lookup(CmpEqState *st, const CmpEqOperands *o)
 {
   for (int i = st->count - 1; i >= 0; i--) {
     CmpFact *f = &st->stack[i];
-    if ((f->a_vr == a && f->b_vr == b) ||
-        (f->a_vr == b && f->b_vr == a))
+    if (o->b_vr == CMP_EQ_IMM) {
+      if (f->b_vr != CMP_EQ_IMM || f->a_vr != o->a_vr || f->btype != o->btype)
+        continue;
+      if (f->imm == o->imm)
+        return f->equal ? 1 : 0;
+      /* Distinct constants differ only at full width: a narrow compare may
+       * look at the low bits alone (255 and -1 as a byte). */
+      if (f->equal && f->btype == IROP_BTYPE_INT32)
+        return 0;
+      continue;
+    }
+    if ((f->a_vr == o->a_vr && f->b_vr == o->b_vr) ||
+        (f->a_vr == o->b_vr && f->b_vr == o->a_vr))
       return f->equal ? 1 : 0;
   }
   return -1;
@@ -66,6 +97,37 @@ static int extract_eq_operand(IROperand op, int32_t *out_vr)
   if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
     return 0;
   *out_vr = vr;
+  return 1;
+}
+
+static int extract_eq_imm(IROperand op, int32_t *out)
+{
+  if (irop_get_tag(op) != IROP_TAG_IMM32 || !irop_is_plain_imm(op) || op.is_local || op.is_llocal)
+    return 0;
+  *out = op.u.imm32;
+  return 1;
+}
+
+/* The operands of an equality compare: two TEMPs, or a TEMP and a constant
+ * on either side (32-bit only: an I64 constant names a register pair). */
+static int extract_eq_operands(TCCIRState *ir, IRQuadCompact *cq, CmpEqOperands *o)
+{
+  IROperand cs1 = tcc_ir_op_get_src1(ir, cq);
+  IROperand cs2 = tcc_ir_op_get_src2(ir, cq);
+  if (extract_eq_operand(cs1, &o->a_vr)) {
+    if (extract_eq_operand(cs2, &o->b_vr))
+      return 1;
+    if (irop_is_64bit(cs1) || !extract_eq_imm(cs2, &o->imm))
+      return 0;
+    o->btype = (uint8_t)cs1.btype;
+  } else if (extract_eq_operand(cs2, &o->a_vr)) {
+    if (irop_is_64bit(cs2) || !extract_eq_imm(cs1, &o->imm))
+      return 0;
+    o->btype = (uint8_t)cs2.btype;
+  } else {
+    return 0;
+  }
+  o->b_vr = CMP_EQ_IMM;
   return 1;
 }
 
@@ -99,10 +161,8 @@ static int try_push_edge_fact(IRSSAOptCtx *ctx, CmpEqState *st,
   if (cq->op != TCCIR_OP_CMP)
     return 0;
 
-  IROperand cs1 = tcc_ir_op_get_src1(ir, cq);
-  IROperand cs2 = tcc_ir_op_get_src2(ir, cq);
-  int32_t a_vr, b_vr;
-  if (!extract_eq_operand(cs1, &a_vr) || !extract_eq_operand(cs2, &b_vr))
+  CmpEqOperands o = {0};
+  if (!extract_eq_operands(ir, cq, &o))
     return 0;
 
   int tok = (int)tcc_ir_op_src1_imm(ir, jq);
@@ -128,7 +188,7 @@ static int try_push_edge_fact(IRSSAOptCtx *ctx, CmpEqState *st,
     return 0;
 
   int branch_taken_eq = (tok == TOK_EQ) ? is_target : is_ft;
-  fact_push(st, a_vr, b_vr, branch_taken_eq);
+  fact_push(st, &o, branch_taken_eq);
   return 1;
 }
 
@@ -141,17 +201,15 @@ static int try_fold_cmp(IRSSAOptCtx *ctx, CmpEqState *st,
   if (cq->op != TCCIR_OP_CMP || jq->op != TCCIR_OP_JUMPIF)
     return 0;
 
-  IROperand cs1 = tcc_ir_op_get_src1(ir, cq);
-  IROperand cs2 = tcc_ir_op_get_src2(ir, cq);
-  int32_t a_vr, b_vr;
-  if (!extract_eq_operand(cs1, &a_vr) || !extract_eq_operand(cs2, &b_vr))
+  CmpEqOperands o = {0};
+  if (!extract_eq_operands(ir, cq, &o))
     return 0;
 
   int tok = (int)tcc_ir_op_src1_imm(ir, jq);
   if (tok != TOK_EQ && tok != TOK_NE)
     return 0;
 
-  int known = fact_lookup(st, a_vr, b_vr);
+  int known = fact_lookup(st, &o);
   if (known < 0)
     return 0;
 
@@ -195,10 +253,10 @@ static int try_fold_cmp(IRSSAOptCtx *ctx, CmpEqState *st,
   }
 
   /* Decrement use counts. */
-  IRSSAVregInfo *avi = ssa_opt_vinfo(ctx, a_vr);
+  IRSSAVregInfo *avi = ssa_opt_vinfo(ctx, o.a_vr);
   if (avi)
     ssa_opt_remove_use_instr(avi, cmp_idx);
-  IRSSAVregInfo *bvi = ssa_opt_vinfo(ctx, b_vr);
+  IRSSAVregInfo *bvi = o.b_vr != CMP_EQ_IMM ? ssa_opt_vinfo(ctx, o.b_vr) : NULL;
   if (bvi)
     ssa_opt_remove_use_instr(bvi, cmp_idx);
   return 1;
@@ -217,7 +275,9 @@ static void cmp_eq_reset(void *state, int watermark)
 static int cmp_eq_enter(IRSSAOptCtx *ctx, int block, void *state)
 {
   IRBasicBlock *bb = &ctx->cfg->blocks[block];
-  if (bb->num_preds == 1 && bb->preds[0] == bb->idom)
+  /* The entry block is its own idom: a lone backedge into it (a one-block
+   * loop at function entry) is not the only way in. */
+  if (bb->num_preds == 1 && bb->preds[0] == bb->idom && bb->idom != block)
     try_push_edge_fact(ctx, state, bb->preds[0], block);
   return 0;
 }

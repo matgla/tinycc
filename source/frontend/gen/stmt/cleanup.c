@@ -112,7 +112,8 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
     TCC_DBG_TRACE(dbg_clinl, (stderr, "[CLINL] %s: apply_args\n", clinl_name(fs)));
     return 0;
   }
-  if (inline_body_has_shadowed_ident(inline_fn->func_str)) {
+  if (inline_body_has_shadowed_ident(inline_fn->func_str) ||
+      inline_body_has_unsafe_shadowed_ident(inline_fn->func_str, fs)) {
     TCC_DBG_TRACE(dbg_clinl, (stderr, "[CLINL] %s: shadowed_ident\n", clinl_name(fs)));
     return 0;
   }

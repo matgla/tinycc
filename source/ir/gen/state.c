@@ -170,6 +170,8 @@ void tcc_ir_free(TCCIRState *ir)
   }
   tcc_free(ir->frame_pads);
   ir->frame_pads = NULL;
+  tcc_free(ir->frame_pad_bits);
+  ir->frame_pad_bits = NULL;
   tcc_free(ir->label_pos);
   ir->label_pos = NULL;
   ir->label_count = ir->label_cap = 0;
@@ -286,11 +288,16 @@ void tcc_ir_free(TCCIRState *ir)
   ir->codegen_dry_insn_scratch = NULL;
   tcc_free(ir->codegen_dry_insn_saves);
   ir->codegen_dry_insn_saves = NULL;
+  tcc_free(ir->codegen_dry_insn_save_info);
+  ir->codegen_dry_insn_save_info = NULL;
   tcc_ir_mop_cache_free(ir->codegen_mop_cache);
   ir->codegen_mop_cache = NULL;
   tcc_free(ir->codegen_cbz_dry_mapping);
   ir->codegen_cbz_dry_mapping = NULL;
   ir->codegen_rehearsal_end = 0;
+  ir->codegen_rehearsal_end_pool_entries = 0;
+  tcc_free(ir->codegen_rehearsal_empty);
+  ir->codegen_rehearsal_empty = NULL;
   tcc_free(ir->codegen_dry_pool_entries);
   ir->codegen_dry_pool_entries = NULL;
   tcc_free(ir->codegen_branch_target_reset);

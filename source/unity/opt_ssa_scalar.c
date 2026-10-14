@@ -7,6 +7,7 @@
 #include "../opt/ssa/scalar/cmp_offset_fold.c"
 #undef USING_GLOBALS
 #include "../opt/ssa/scalar/fold.c"
+#undef FOLD_KB64_NONE
 #undef USING_GLOBALS
 #include "../opt/ssa/scalar/gvn.c"
 #undef GVN_HASH_SIZE

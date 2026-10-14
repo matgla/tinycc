@@ -37,6 +37,156 @@ static void gfunc_return_keep_zext_promise(void)
   gen_op('&');
 }
 
+/* The scalar pieces of an aggregate returned in r0/r1, as (offset, size):
+ * members, array elements and nested members, an 8-byte one as two words.
+ * -1 for what is not read member by member (a union, a bit-field, a piece
+ * not naturally aligned).  Padding is no piece. */
+typedef struct RegpairPiece
+{
+  int off, size;
+} RegpairPiece;
+
+static int regpair_pieces(CType *type, int base, RegpairPiece *out, int n)
+{
+  if (n < 0)
+    return n;
+  if (type->t & VT_ARRAY)
+  {
+    int align, esize = type_size(&type->ref->type, &align);
+    if (type->ref->c < 0 || esize <= 0)
+      return -1;
+    for (int i = 0; i < type->ref->c && n >= 0; i++)
+      n = regpair_pieces(&type->ref->type, base + i * esize, out, n);
+    return n;
+  }
+  if ((type->t & VT_BTYPE) == VT_STRUCT)
+  {
+    if (IS_UNION(type->t))
+      return -1;
+    for (Sym *f = type->ref->next; f && n >= 0; f = f->next)
+      n = (f->type.t & VT_BITFIELD) ? -1 : regpair_pieces(&f->type, base + f->c, out, n);
+    return n;
+  }
+  int align, size = type_size(type, &align);
+  if ((type->t & (VT_COMPLEX | VT_VECTOR)) || (size != 1 && size != 2 && size != 4 && size != 8) || base % size ||
+      base + size > 8 || n + (size == 8 ? 2 : 1) > 8)
+    return -1;
+  for (int k = 0; k < (size == 8 ? 2 : 1); k++)
+  {
+    out[n].off = base + 4 * k;
+    out[n].size = size == 8 ? 4 : size;
+    n++;
+  }
+  return n;
+}
+
+/* Push the unsigned SIZE-byte value at byte OFF of the aggregate lvalue AGG,
+ * widened to 32 bits: the same IR a member access emits. */
+static void regpair_push_piece(const SValue *agg, int off, int size)
+{
+  CType piece;
+  piece.ref = NULL;
+  piece.t = (size == 1 ? VT_BYTE : size == 2 ? VT_SHORT : VT_INT) | VT_UNSIGNED;
+  vpushv((SValue *)agg);
+  gaddrof();
+  vtop->type = char_pointer_type;
+  if (off)
+  {
+    vpushi(off);
+    gen_op('+');
+  }
+  CType ptr = piece;
+  mk_pointer(&ptr);
+  vtop->type = ptr;
+  indir();
+  CType u32 = {VT_INT | VT_UNSIGNED, NULL};
+  gen_cast(&u32);
+}
+
+/* Replace the aggregate lvalue on vtop by the 64-bit r0/r1 value of an
+ * internal function's return (gfunc_regpair_ret), built from its members
+ * at their own widths: the stores that filled them then forward, where one
+ * 64-bit load of the slot kept them in memory.  0 when the aggregate is not
+ * read that way (a union, a bit-field). */
+static int regpair_compose_return(CType *type)
+{
+  RegpairPiece pieces[8];
+  const int n = regpair_pieces(type, 0, pieces, 0);
+  if (n < 0 || !(vtop->r & VT_LVAL) || tcc_ir_opt_pass_disabled("abi:regpair_compose"))
+    return 0;
+  SValue agg = *vtop;
+  vpop();
+  CType u64 = {VT_LLONG | VT_UNSIGNED, NULL};
+  for (int word = 0; word < 2; word++)
+  {
+    int any = 0;
+    for (int i = 0; i < n; i++)
+    {
+      if (pieces[i].off / 4 != word)
+        continue;
+      regpair_push_piece(&agg, pieces[i].off, pieces[i].size);
+      if (pieces[i].off % 4)
+      {
+        vpushi((pieces[i].off % 4) * 8);
+        gen_op(TOK_SHL);
+      }
+      if (any)
+        gen_op('|');
+      any = 1;
+    }
+    if (!any)
+      vpushi(0);
+    gen_cast(&u64);
+    if (word)
+    {
+      vpushi(32);
+      gen_op(TOK_SHL);
+      gen_op('|');
+    }
+  }
+  return 1;
+}
+
+/* The other side of regpair_compose_return: vtop is the 64-bit r0/r1 value
+ * a call of an internal function returned; store it, member by member, into
+ * the frame slot ADDR that holds the aggregate of TYPE, so the member reads
+ * that follow forward from the stores.  Two words when the aggregate is not
+ * read that way.  Pops vtop. */
+void regpair_store_call_result(CType *type, int addr)
+{
+  RegpairPiece pieces[8];
+  int n = regpair_pieces(type, 0, pieces, 0);
+  if (n < 0 || tcc_ir_opt_pass_disabled("abi:regpair_compose"))
+  {
+    pieces[0].off = 0;
+    pieces[1].off = pieces[0].size = pieces[1].size = 4;
+    n = 2;
+  }
+  CType u32 = {VT_INT | VT_UNSIGNED, NULL}, u64 = {VT_LLONG | VT_UNSIGNED, NULL};
+  vtop->type = u64;
+  for (int i = 0; i < n; i++)
+  {
+    CType piece = {(pieces[i].size == 1 ? VT_BYTE : pieces[i].size == 2 ? VT_SHORT : VT_INT) | VT_UNSIGNED, NULL};
+    vdup();
+    if (pieces[i].off >= 4)
+    {
+      vpushi(32);
+      gen_op(TOK_SHR);
+    }
+    gen_cast(&u32);
+    if (pieces[i].off % 4)
+    {
+      vpushi((pieces[i].off % 4) * 8);
+      gen_op(TOK_SHR);
+    }
+    vset(&piece, VT_LOCAL | VT_LVAL, addr + pieces[i].off);
+    vswap();
+    vstore();
+    vpop();
+  }
+  vpop();
+}
+
 /* ------------------------------------------------------------------------- */
 /* return from function */
 #ifndef TCC_TARGET_ARM64
@@ -50,7 +200,12 @@ void gfunc_return(CType *func_type)
   {
     CType type, ret_type;
     int ret_align, ret_nregs, regsize;
-    ret_nregs = gfunc_sret(func_type, func_var, &ret_type, &ret_align, &regsize);
+    /* The body's own convention: an internal function's 8-byte aggregate
+     * leaves in r0/r1 (gfunc_regpair_ret). */
+    Sym *fs = tcc_state->cur_func_sym;
+    if (!fs || !fs->type.ref || (func_type->t & VT_BTYPE) != VT_STRUCT || func_type->ref != fs->type.ref->type.ref)
+      fs = NULL;
+    ret_nregs = gfunc_sret_fn(fs, func_type, func_var, &ret_type, &ret_align, &regsize);
     if (ret_nregs < 0)
     {
 #ifdef TCC_TARGET_RISCV64
@@ -521,7 +676,11 @@ void gfunc_return(CType *func_type)
         vtop->type.ref = NULL;
       }
       else
+      {
+        if (fs && gfunc_regpair_ret(fs))
+          regpair_compose_return(func_type);
         vtop->type = ret_type;
+      }
       rc = RC_RET(ret_type.t);
       // printf("struct return: n:%d t:%02x rc:%02x\n", ret_nregs, ret_type.t,
       // rc);

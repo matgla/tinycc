@@ -141,6 +141,7 @@ IRLoops *tcc_ir_detect_loops(TCCIRState *ir)
         if (!loops->ramp)
         {
           loops->ramp = tcc_malloc(sizeof(int) * ir->next_instruction_index);
+          loops->ramp_len = ir->next_instruction_index;
           for (int k = 0; k < ir->next_instruction_index; k++)
             loops->ramp[k] = k;
         }
@@ -278,6 +279,35 @@ void tcc_ir_free_loops(IRLoops *loops)
   tcc_free(loops->ramp);
 
   tcc_free(loops);
+}
+
+void tcc_ir_loops_shift_bodies(IRLoops *loops, int first, int skip, int pos, int delta)
+{
+  if (!loops || !delta)
+    return;
+  uint8_t *done = loops->ramp && loops->ramp_len > 0 ? tcc_mallocz(loops->ramp_len) : NULL;
+  for (int li = first < 0 ? 0 : first; li < loops->num_loops; li++)
+  {
+    if (li == skip)
+      continue;
+    IRLoop *o = &loops->loops[li];
+    if (!o->body_instrs)
+      continue;
+    const int shared = done && o->body_instrs >= loops->ramp && o->body_instrs < loops->ramp + loops->ramp_len;
+    for (int b = 0; b < o->num_body_instrs; b++)
+    {
+      if (shared)
+      {
+        ptrdiff_t k = o->body_instrs + b - loops->ramp;
+        if (k < 0 || k >= loops->ramp_len || done[k])
+          continue;
+        done[k] = 1;
+      }
+      if (o->body_instrs[b] >= pos)
+        o->body_instrs[b] += delta;
+    }
+  }
+  tcc_free(done);
 }
 
 int tcc_ir_is_in_loop(IRLoop *loop, int instr_idx)

@@ -80,13 +80,38 @@ static int dls_call_result_used(TCCIRState *ir, int n, int ci)
   return 0;
 }
 
-/* Resolve a TEMP vreg to its exact frame offset via Addr[StackLoc](+/-#const)*(ASSIGN/LEA)* chains; returns 1 iff every def-chain step is constant. */
-static int dls_vreg_frame_off(TCCIRState *ir, int32_t vr, int before_idx, int *out_off)
+/* Value defs of each TEMP (saturating at 2); a STORE through one is no def. */
+static uint8_t *dls_temp_defs(TCCIRState *ir, int n)
+{
+  int nt = ir->next_temporary_variable;
+  uint8_t *defs = tcc_mallocz((size_t)(nt > 0 ? nt : 1));
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest || tcc_ir_op_dest_is_lval(ir, q))
+      continue;
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
+    if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+      continue;
+    int p = TCCIR_DECODE_VREG_POSITION(vr);
+    if (p < nt && defs[p] < 2)
+      defs[p]++;
+  }
+  return defs;
+}
+
+/* Resolve a TEMP vreg to its exact frame offset via Addr[StackLoc](+/-#const)*(ASSIGN/LEA)* chains; returns 1 iff every def-chain step is constant.
+ * Every step must be a single-def TEMP: `p = c ? &a : &b` reaches its use with
+ * either address, and the def nearest the use names only one of them. */
+static int dls_vreg_frame_off(TCCIRState *ir, const uint8_t *temp_defs, int32_t vr, int before_idx, int *out_off)
 {
   long acc = 0;
   for (int guard = 0; guard < 32; guard++)
   {
     if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+      return 0;
+    int p = TCCIR_DECODE_VREG_POSITION(vr);
+    if (p >= ir->next_temporary_variable || temp_defs[p] != 1)
       return 0;
     int d = tcc_ir_find_defining_instruction(ir, vr, before_idx);
     if (d < 0)
@@ -252,8 +277,13 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
     }
     if (op == TCCIR_OP_SWITCH_TABLE)
       dls_has_backedge = 1; /* targets unknown here — conservatively a back-edge */
+    /* An asm goto label at or above the asm is a back-edge too. */
+    for (int k = 0, tg; op == TCCIR_OP_INLINE_ASM && (tg = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+      if (tg <= i)
+        dls_has_backedge = 1;
   }
   int dls_precise_ok = !dls_has_indexed && !dls_has_backedge;
+  uint8_t *dls_tdefs = dls_temp_defs(ir, n);
 
   int max_call_id = ir->next_call_id;
   /* Per-call bitmaps: write-through-PARAM0 helpers (memset/memcpy/memmove). */
@@ -611,7 +641,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
         {
           int foff;
           /* A deref via a resolvable exact offset is recorded precisely in lv.r[] below, so no poison (gated on dls_precise_ok). */
-          if (!dls_precise_ok || !dls_vreg_frame_off(ir, vr, i, &foff))
+          if (!dls_precise_ok || !dls_vreg_frame_off(ir, dls_tdefs, vr, i, &foff))
           {
             int idx = dls_tame_find_or_add(&ts, v_slot);
             if (idx >= 0)
@@ -805,7 +835,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
         if (rvr != -1 && TCCIR_DECODE_VREG_TYPE(rvr) == TCCIR_VREG_TYPE_TEMP)
         {
           int foff;
-          if (dls_vreg_frame_off(ir, rvr, i, &foff))
+          if (dls_vreg_frame_off(ir, dls_tdefs, rvr, i, &foff))
           {
             int w = ir_opt_store_btype_size_bytes(irop_get_btype(op));
             if (w <= 0)
@@ -897,7 +927,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
          * one of several slots, `p = c ? &a : &b.f` -- the whole frame.  The
          * SD driver's get_config lost its config copy to the last case. */
         int foff;
-        if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP && dls_vreg_frame_off(ir, vr, i, &foff))
+        if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP && dls_vreg_frame_off(ir, dls_tdefs, vr, i, &foff))
           dls_live_add(&lv, foff, sz, i);
         else if (slot != VR_SLOT_AMBIG)
           dls_live_add(&lv, slot, 1 << 28, i);
@@ -997,7 +1027,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
     if (irop_get_btype(dest) == IROP_BTYPE_STRUCT)
       continue;
     int foff;
-    if (!dls_vreg_frame_off(ir, vr, i, &foff))
+    if (!dls_vreg_frame_off(ir, dls_tdefs, vr, i, &foff))
       continue;
     int width = ir_opt_store_btype_size_bytes(irop_get_btype(dest));
     if (width <= 0)
@@ -1204,6 +1234,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
   tcc_free(is_memcpy_like);
   tcc_free(vreg_slot);
   tcc_free(vreg_external);
+  tcc_free(dls_tdefs);
   tcc_free(ts.off);
   tcc_free(ts.ok);
   tcc_free(ts.end);

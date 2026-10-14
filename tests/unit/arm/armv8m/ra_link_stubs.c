@@ -96,6 +96,12 @@ int tcc_ir_ssa_opt_ptr_store_dse(IRSSAOptCtx *ctx)
   return 0;
 }
 
+int tcc_ir_ssa_opt_ptr_silent_store(IRSSAOptCtx *ctx)
+{
+  (void)ctx;
+  return 0;
+}
+
 int ssa_opt_copy_fwd(IRSSAOptCtx *ctx)
 {
   (void)ctx;
@@ -119,6 +125,7 @@ int ssa_opt_reassoc(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_narrow(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_branch(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_cmp_eq_prop(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
+int ssa_opt_dup_diamond(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_vrp(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_setif_or_taut(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_setif_mask_fold(IRSSAOptCtx *ctx) { (void)ctx; return 0; }

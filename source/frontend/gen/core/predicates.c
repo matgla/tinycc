@@ -70,7 +70,14 @@ void PUT_R_RET(SValue *sv, int t)
 /* returns function return register class for type t */
 int RC_RET(int t)
 {
-  return reg_classes[R_RET(t)] & ~(RC_FLOAT | RC_INT);
+  int r = R_RET(t);
+  if (r >= 0 && r < NB_REGS)
+    return reg_classes[r] & ~(RC_FLOAT | RC_INT);
+#ifdef RC_FRET
+  if (r == REG_FRET)
+    return RC_FRET;
+#endif
+  return 0;
 }
 
 /* returns generic register class for type t */

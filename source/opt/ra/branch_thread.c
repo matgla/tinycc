@@ -36,6 +36,14 @@
  *
  * A fall-through edge costs a new jump, so it threads only when it lets J go
  * or its constant move go with it; a jump edge is just retargeted.
+ *
+ * J's test may also repeat, operand for operand, the compare of a branch the
+ * edge came through with neither operand written since (an -minline-atomics
+ * compare-exchange's failure test, then its result tested or selected after
+ * the paths join): that branch's direction decides J (bt_twin_fact), CMP x, y
+ * of two registers included.  J may end in `d <- a SELECT b` instead of a
+ * JUMPIF: when every edge is decided, each side's value is a move of a or b
+ * (after J's copies) and a jump past J, and the edges go there.
  */
 
 #define USING_GLOBALS
@@ -45,6 +53,7 @@
 
 #define BT_MAX_COPIES 4
 #define BT_MAX_WALK 64
+#define BT_SELECT_MAX_EDGES 3
 
 TCC_DBG_ENV_FLAG(bt_stats_on, "TCC_BT_STATS")
 static long bt_stat[16];
@@ -60,10 +69,13 @@ typedef struct BTJoin
   int test_idx, jumpif_idx;
   int32_t tested;                 /* vreg the test reads, as it enters J */
   int bits, minbits, uniform;     /* widths along J's copies */
-  int is_cmp;                     /* CMP x,#imm (else TEST_ZERO x) */
+  int is_cmp;                     /* CMP x,#imm or CMP x,y (else TEST_ZERO x) */
   int64_t imm;
+  int32_t x, y;                   /* the test's operands as J reads them (y -1: none) */
+  int twin_ok;                    /* J's copies write neither */
   int tok;
   int taken, fall;                /* successors */
+  int is_select;                  /* J ends in `d <- a SELECT b` on the test, not a JUMPIF */
 } BTJoin;
 
 /* What is known about the tested value on one edge. */
@@ -234,6 +246,29 @@ typedef struct BTState
   int *stack;
 } BTState;
 
+/* A value a move can carry: a plain constant, or a register vreg of up to 32
+ * bits of the width `bt` (-1: any). */
+static int bt_movable(IROperand o, int bt)
+{
+  if (irop_get_tag(o) == IROP_TAG_IMM32)
+    return !o.is_lval && !o.is_sym;
+  int b = irop_get_btype(o);
+  return irop_get_tag(o) == IROP_TAG_VREG && irop_get_vreg(o) >= 0 && !o.is_lval && !o.is_llocal && !o.is_local &&
+         (b == IROP_BTYPE_INT32 || b == IROP_BTYPE_INT16 || b == IROP_BTYPE_INT8) && (bt < 0 || b == bt);
+}
+
+/* `d <- a SELECT b` that a move of a, or of b, can stand in for. */
+static int bt_select_threadable(TCCIRState *ir, IRQuadCompact *q)
+{
+  if (bt_annotated(ir, q) || tcc_ir_op_dest_is_lval(ir, q))
+    return 0;
+  IROperand d = tcc_ir_op_get_dest(ir, q);
+  if (irop_get_tag(d) != IROP_TAG_VREG || !bt_movable(d, -1))
+    return 0;
+  return bt_movable(tcc_ir_op_get_src1(ir, q), irop_get_btype(d)) &&
+         bt_movable(tcc_ir_op_get_src2(ir, q), irop_get_btype(d));
+}
+
 /* The value J's test reads, followed back through J's own copies to what it
  * is when J is entered. */
 static int bt_parse_join(BTState *st, int start, BTJoin *j)
@@ -275,24 +310,51 @@ static int bt_parse_join(BTState *st, int start, BTJoin *j)
       return (bt_why = 1027, 0);
     j->is_cmp = q->op == TCCIR_OP_CMP;
     j->imm = 0;
+    j->y = -1;
     if (j->is_cmp && !bt_imm(ir, tcc_ir_op_get_src2(ir, q), &j->imm))
-      return (bt_why = 1031, 0);
+    {
+      /* Only a twin compare decides CMP x, y (bt_twin_fact). */
+      IROperand y = tcc_ir_op_get_src2(ir, q);
+      if (!bt_scalar_temp(y) || bt_annotated(ir, q))
+        return (bt_why = 1031, 0);
+      j->y = irop_get_vreg(y);
+    }
     j->test_idx = i;
-    j->tested = irop_get_vreg(x);
+    j->tested = j->x = irop_get_vreg(x);
     j->bits = j->minbits = bt_bits(x);
     j->uniform = 1;
     break;
   }
   int ji = st->next_real[j->test_idx + 1];
-  if (ji >= st->n || st->refs[ji] || ir->compact_instructions[ji].op != TCCIR_OP_JUMPIF)
+  if (ji >= st->n || st->refs[ji])
     return (bt_why = 1039, 0);
   IRQuadCompact *jq = &ir->compact_instructions[ji];
   j->jumpif_idx = ji;
-  j->tok = (int)tcc_ir_op_src1_imm(ir, jq);
-  j->taken = (int)tcc_ir_op_dest_imm(ir, jq);
-  j->fall = ji + 1;
+  j->is_select = jq->op == TCCIR_OP_SELECT;
+  if (j->is_select)
+  {
+    if (!bt_select_threadable(ir, jq))
+      return (bt_why = 1040, 0);
+    j->tok = (int)tcc_ir_op_cond_imm(ir, jq);
+    j->taken = j->fall = ji + 1;
+  }
+  else
+  {
+    if (jq->op != TCCIR_OP_JUMPIF)
+      return (bt_why = 1039, 0);
+    j->tok = (int)tcc_ir_op_src1_imm(ir, jq);
+    j->taken = (int)tcc_ir_op_dest_imm(ir, jq);
+    j->fall = ji + 1;
+  }
   if (j->taken < 0 || j->taken > st->n)
     return (bt_why = 1046, 0);
+  j->twin_ok = 1;
+  for (int c = 0; c < j->ncopies; c++)
+  {
+    IRQuadCompact *cq = &ir->compact_instructions[j->copy_idx[c]];
+    if (bt_defines(ir, cq, j->x) || (j->y >= 0 && bt_defines(ir, cq, j->y)))
+      j->twin_ok = 0;
+  }
   /* Back through J's copies (last to first) to J's entry. */
   for (int c = j->ncopies - 1; c >= 0; c--)
   {
@@ -386,6 +448,77 @@ static int bt_copied_before(BTState *st, int at, int32_t vr, int32_t x, BTWidth 
   return 0;
 }
 
+/* Do the compares at a and b read the same operands, the same way? */
+static int bt_same_compare(TCCIRState *ir, int a, int b)
+{
+  IRQuadCompact *qa = &ir->compact_instructions[a], *qb = &ir->compact_instructions[b];
+  if (qa->op != qb->op || bt_annotated(ir, qa) || bt_annotated(ir, qb))
+    return 0;
+  for (int s = 1; s <= (qa->op == TCCIR_OP_CMP ? 2 : 1); s++)
+  {
+    IROperand oa = bt_slot(ir, qa, s), ob = bt_slot(ir, qb, s);
+    int64_t ka, kb;
+    if (irop_get_btype(oa) != irop_get_btype(ob))
+      return 0;
+    if (bt_imm(ir, oa, &ka) && bt_imm(ir, ob, &kb))
+    {
+      if (ka != kb)
+        return 0;
+    }
+    else if (!bt_scalar_temp(oa) || !bt_scalar_temp(ob) || irop_get_vreg(oa) != irop_get_vreg(ob))
+      return 0;
+  }
+  return 1;
+}
+
+/* `vr <- SETIF c` after a compare that the one at `setter` repeats, in the
+ * same straight run with neither's operands nor vr written in between (the
+ * frontend's compare-exchange: `ok <- old == expected`, then the failure
+ * test `old == expected` again).  The branch's edge that satisfies cc then
+ * knows vr: 1 when c is cc, 0 when it is cc's inverse. */
+static int bt_setif_twin_fact(BTState *st, int setter, int cc, int32_t vr, BTWidth *w, int64_t *c)
+{
+  TCCIRState *ir = st->ir;
+  IRQuadCompact *sq = &ir->compact_instructions[setter];
+  int32_t reads[2] = {irop_get_vreg(tcc_ir_op_get_src1(ir, sq)),
+                      sq->op == TCCIR_OP_CMP ? irop_get_vreg(tcc_ir_op_get_src2(ir, sq)) : -1};
+  if (cc < 0 || st->refs[setter])
+    return BT_UNKNOWN;
+  for (int i = setter, walked = 0; i > 0 && walked < 16; walked++)
+  {
+    i = st->prev_real[i - 1];
+    if (i < 0)
+      return BT_UNKNOWN;
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (bt_is_uncond(q->op) || q->op == TCCIR_OP_JUMPIF)
+      return BT_UNKNOWN;
+    if (bt_writes_operands(q->op) &&
+        (bt_names(ir, q, vr) || bt_names(ir, q, reads[0]) || (reads[1] >= 0 && bt_names(ir, q, reads[1]))))
+      return BT_UNKNOWN;
+    if (bt_defines(ir, q, reads[0]) || (reads[1] >= 0 && bt_defines(ir, q, reads[1])))
+      return BT_UNKNOWN;
+    if (bt_defines(ir, q, vr))
+    {
+      int cmp = i > 0 ? st->prev_real[i - 1] : -1;
+      if (q->op != TCCIR_OP_SETIF || bt_annotated(ir, q) || !bt_scalar_temp(tcc_ir_op_get_dest(ir, q)) ||
+          cmp < 0 || st->refs[i] || !bt_same_compare(ir, cmp, setter))
+        return BT_UNKNOWN;
+      int set_cc = (int)tcc_ir_op_src1_imm(ir, q);
+      if (set_cc == cc)
+        *c = 1;
+      else if (set_cc == invert_cond_token(cc))
+        *c = 0;
+      else
+        return BT_UNKNOWN;
+      bt_width_add(w, tcc_ir_op_get_dest(ir, q));
+      return BT_CONST;
+    }
+    if (st->refs[i])
+      return BT_UNKNOWN;
+  }
+  return BT_UNKNOWN;
+}
+
 /* The flag test feeding the JUMPIF at `jumpif`: what the branch says about
  * the TEMP vr on its taken (want_taken) or fall-through edge.  *fitbits: how
  * many low bits vr's value is known to fit. */
@@ -403,7 +536,15 @@ static int bt_branch_fact(BTState *st, int jumpif, int want_taken, int32_t vr, B
   if (!bt_scalar_temp(x))
     return (bt_why = 284, BT_UNKNOWN);
   if (irop_get_vreg(x) != vr && !bt_copied_before(st, setter, vr, irop_get_vreg(x), w))
+  {
+    const int tok = (int)tcc_ir_op_src1_imm(ir, &ir->compact_instructions[jumpif]);
+    if (bt_setif_twin_fact(st, setter, want_taken ? tok : invert_cond_token(tok), vr, w, c) == BT_CONST)
+    {
+      *fitbits = 1;
+      return BT_CONST;
+    }
     return (bt_why = 285, BT_UNKNOWN);
+  }
   bt_width_add(w, x);
   *c = 0;
   if (sq->op == TCCIR_OP_CMP && !bt_imm(ir, tcc_ir_op_get_src2(ir, sq), c))
@@ -417,6 +558,106 @@ static int bt_branch_fact(BTState *st, int jumpif, int want_taken, int32_t vr, B
   return (bt_why = 293, BT_UNKNOWN);
 }
 
+/* The JUMPIF at `br`, left by its taken (or fall-through) edge, follows a
+ * compare that J's test repeats: on that edge the flags J's test would set
+ * satisfy *cc. */
+static int bt_twin_branch(BTState *st, const BTJoin *j, int br, int taken, int *cc)
+{
+  TCCIRState *ir = st->ir;
+  int setter = br > 0 ? st->prev_real[br - 1] : -1;
+  if (setter < 0 || st->refs[br])
+    return 0;
+  int op = ir->compact_instructions[setter].op;
+  if ((op != TCCIR_OP_CMP && op != TCCIR_OP_TEST_ZERO) || !bt_same_compare(ir, setter, j->test_idx))
+    return 0;
+  int tok = (int)tcc_ir_op_src1_imm(ir, &ir->compact_instructions[br]);
+  *cc = taken ? tok : invert_cond_token(tok);
+  return *cc >= 0;
+}
+
+/* Which way J's test goes on the edge that leaves at `end` (as in
+ * bt_edge_fact) when a branch on the way in made the same compare and
+ * neither operand has been written since: the walk goes back through
+ * straight code, over other branches' fall-through and taken edges, until it
+ * meets that branch.  1 taken (the SELECT's first value), 0 not, -1 unknown.
+ * The compare reads the same registers, so it sets the same flags whatever
+ * their widths. */
+static int bt_twin_fact(BTState *st, const BTJoin *j, int end)
+{
+  TCCIRState *ir = st->ir;
+  if (!j->twin_ok)
+    return -1;
+  int at, p, taken = 0, cc = -1;
+  if (end == j->start)
+  {
+    at = end;
+    p = -1;
+  }
+  else
+  {
+    at = -1;
+    p = end;
+    taken = 1;
+  }
+  for (int walked = 0; walked < BT_MAX_WALK; walked++)
+  {
+    if (p < 0)
+    {
+      /* Who enters `at`: J (the walk's start) by this edge's fall-through;
+       * any other instruction by its predecessor's fall-through, or by one
+       * branch when none falls in. */
+      if (at <= 0)
+        return -1;
+      int prev = st->prev_real[at - 1];
+      int prev_uncond = prev < 0 || bt_is_uncond(ir->compact_instructions[prev].op);
+      if (walked > 0 && st->refs[at])
+      {
+        if (!prev_uncond || st->refs[at] != 1)
+          return -1;
+        p = st->ref_from[at];
+        taken = 1;
+      }
+      else
+      {
+        if (prev_uncond)
+          return -1;
+        p = prev;
+        taken = 0;
+      }
+    }
+    IRQuadCompact *q = &ir->compact_instructions[p];
+    if (q->op == TCCIR_OP_JUMPIF)
+    {
+      if (bt_twin_branch(st, j, p, taken, &cc))
+        break;
+    }
+    else if (q->op == TCCIR_OP_JUMP)
+    {
+      if (!taken)
+        return -1;
+    }
+    else
+    {
+      if (taken || bt_is_uncond(q->op) || q->op == TCCIR_OP_SWITCH_LOAD || q->op == TCCIR_OP_SETJMP ||
+          q->op == TCCIR_OP_NL_SETJMP || q->op == TCCIR_OP_INLINE_ASM || q->op == TCCIR_OP_ASM_INPUT ||
+          q->op == TCCIR_OP_ASM_OUTPUT)
+        return -1;
+      if (bt_defines(ir, q, j->x) || (j->y >= 0 && bt_defines(ir, q, j->y)))
+        return -1;
+      if (bt_writes_operands(q->op) && (bt_names(ir, q, j->x) || (j->y >= 0 && bt_names(ir, q, j->y))))
+        return -1;
+    }
+    at = p;
+    p = -1;
+  }
+  if (cc < 0)
+    return -1;
+  if (j->tok == cc)
+    return 1;
+  if (j->tok == invert_cond_token(cc))
+    return 0;
+  return -1;
+}
 
 /* The tested value where an edge leaves its predecessor: `end` is the jump
  * into J, or J's first instruction for the fall-through edge.  *def is the
@@ -493,10 +734,12 @@ static int bt_edge_fact(BTState *st, int end, int32_t vr, BTWidth *w, int64_t *c
       if (bt_writes_operands(q->op) && bt_names(ir, q, vr))
         return (bt_why = 345, BT_UNKNOWN);
     }
-    if (st->refs[i])
-      return (bt_why = 347, BT_UNKNOWN); /* other paths join here */
     if (i == 0)
       return (bt_why = 349, BT_UNKNOWN);
+    /* Other paths join here, unless the block is entered only by branches:
+     * the unconditional instruction before it decides (above). */
+    if (st->refs[i] && (st->prev_real[i - 1] < 0 || !bt_is_uncond(ir->compact_instructions[st->prev_real[i - 1]].op)))
+      return (bt_why = 347, BT_UNKNOWN);
     i = st->prev_real[i - 1];
   }
   return (bt_why = 352, BT_UNKNOWN);
@@ -666,16 +909,18 @@ typedef struct BTInsert
 {
   int before;    /* old index the instruction goes in front of */
   int seq;       /* queue order, kept among instructions at one point */
-  int copy_from; /* J copy to duplicate, or -1 for a branch */
+  int copy_from; /* J copy (or SELECT) to turn into a move, or -1 for a branch */
+  int src_slot;  /* the move's source: copy_from's src1 or src2 */
   int cond;      /* branch: -1 JUMP, else a JUMPIF on this condition */
   int jump_to;   /* branch: old index */
   int to_pad;    /* JUMP: to the instructions put in front of jump_to */
 } BTInsert;
 
-/* An old JUMP retargeted to the instructions put in front of `pad`. */
+/* An old JUMP retargeted to the instructions put in front of `pad`, or to
+ * the one queued as `ins` (its seq) when that is not -1. */
 typedef struct BTPadJump
 {
-  int jump, pad;
+  int jump, pad, ins;
 } BTPadJump;
 
 static int bt_ins_cmp(const void *a, const void *b)
@@ -717,8 +962,18 @@ static void bt_apply_inserts(TCCIRState *ir, BTInsert *ins, int nins, BTPadJump 
     if (t >= 0 && t <= n)
       tcc_ir_op_set_dest_imm32(ir, q, BT_MAP(t), IROP_BTYPE_INT32);
   }
+  /* where each queued instruction lands, by seq */
+  int *pos = tcc_malloc(sizeof(int) * (nins + 1));
+  for (int k = 0, group = 0; k < nins; k++)
+  {
+    if (k == 0 || ins[k].before != ins[k - 1].before)
+      group = k;
+    pos[ins[k].seq] = BT_PAD(ins[k].before) + (k - group);
+  }
   for (int k = 0; k < npads; k++)
-    tcc_ir_op_set_dest_imm32(ir, &ir->compact_instructions[pads[k].jump], BT_PAD(pads[k].pad), IROP_BTYPE_INT32);
+    tcc_ir_op_set_dest_imm32(ir, &ir->compact_instructions[pads[k].jump],
+                             pads[k].ins >= 0 ? pos[pads[k].ins] : BT_PAD(pads[k].pad), IROP_BTYPE_INT32);
+  tcc_free(pos);
   for (int t = 0; t < ir->num_switch_tables; t++)
   {
     TCCIRSwitchTable *table = &ir->switch_tables[t];
@@ -746,7 +1001,8 @@ static void bt_apply_inserts(TCCIRState *ir, BTInsert *ins, int nins, BTPadJump 
       if (ins[k].copy_from >= 0)
       {
         IRQuadCompact *src = &old[ins[k].copy_from];
-        IROperand d = tcc_ir_op_get_dest(ir, src), s1 = tcc_ir_op_get_src1(ir, src);
+        IROperand d = tcc_ir_op_get_dest(ir, src);
+        IROperand s1 = ins[k].src_slot == 2 ? tcc_ir_op_get_src2(ir, src) : tcc_ir_op_get_src1(ir, src);
         q->op = TCCIR_OP_ASSIGN;
         tcc_ir_pool_add(ir, d);
         tcc_ir_pool_add(ir, s1);
@@ -909,6 +1165,7 @@ static void bt_q_insert(BTQueue *qu, int before, int copy_from, int cond, int ju
   x->before = before;
   x->seq = qu->nins++;
   x->copy_from = copy_from;
+  x->src_slot = 1;
   x->cond = cond;
   x->jump_to = jump_to;
   x->to_pad = to_pad;
@@ -922,8 +1179,24 @@ static void bt_q_pad(BTQueue *qu, int jump, int pad)
     qu->pads = tcc_realloc(qu->pads, sizeof(BTPadJump) * qu->pcap);
   }
   qu->pads[qu->npads].jump = jump;
+  qu->pads[qu->npads].ins = -1;
   qu->pads[qu->npads++].pad = pad;
 }
+
+/* The old branch `jump` retargeted to the instruction queued as seq `ins`. */
+static void bt_q_pad_ins(BTQueue *qu, int jump, int ins)
+{
+  bt_q_pad(qu, jump, -1);
+  qu->pads[qu->npads - 1].ins = ins;
+}
+
+/* `d <- a` (slot 1) or `d <- b` (slot 2) for J's `d <- a SELECT b`. */
+static void bt_q_select_move(BTQueue *qu, int before, int select, int slot)
+{
+  bt_q_insert(qu, before, select, -1, -1, 0);
+  qu->ins[qu->nins - 1].src_slot = slot;
+}
+
 
 static void bt_q_def(BTQueue *qu, int def)
 {
@@ -933,6 +1206,48 @@ static void bt_q_def(BTQueue *qu, int def)
     qu->defs = tcc_realloc(qu->defs, sizeof(int) * qu->dcap);
   }
   qu->defs[qu->ndefs++] = def;
+}
+
+/* Every edge into a SELECT join decided: the value it picks on each side is
+ * a block of J's copies, the move of that value and a jump past J, in front
+ * of J -- the fall-through edge's side first, where that edge runs into it --
+ * and the other edges' branches go to their side's block. */
+static int bt_thread_select(BTState *st, const BTJoin *j, BTEdge *edges, int nedge, BTQueue *qu)
+{
+  int s = j->fall;
+  if (s < st->n && !bt_flags_safe(st, s))
+    return 0;
+  int used[2] = {0, 0}, first[2] = {-1, -1}, order[2] = {1, 0};
+  for (int e = 0; e < nedge; e++)
+  {
+    used[edges[e].side] = 1;
+    if (edges[e].end == j->start)
+    {
+      order[0] = edges[e].side;
+      order[1] = !edges[e].side;
+    }
+  }
+  for (int k = 0; k < 2; k++)
+  {
+    int side = order[k];
+    if (!used[side])
+      continue;
+    first[side] = qu->nins;
+    for (int c = 0; c < j->ncopies; c++)
+      bt_q_insert(qu, j->start, j->copy_idx[c], -1, -1, 0);
+    bt_q_select_move(qu, j->start, j->jumpif_idx, side ? 1 : 2);
+    /* past NOPs: what is put in front of the next instruction (another
+     * SELECT join's blocks) belongs to that instruction's own edges */
+    bt_q_insert(qu, j->start, -1, -1, s < st->n ? st->next_real[s] : s, 0);
+  }
+  for (int e = 0; e < nedge; e++)
+  {
+    if (edges[e].end != j->start)
+      bt_q_pad_ins(qu, edges[e].end, first[edges[e].side]);
+    if (edges[e].def >= 0)
+      bt_q_def(qu, edges[e].def);
+  }
+  return nedge;
 }
 
 static void bt_state_init(BTState *st, TCCIRState *ir)
@@ -968,6 +1283,9 @@ static void bt_state_free(BTState *st)
   tcc_free(st->ref_from);
   tcc_free(st->refs);
 }
+
+#define BT_CLAIM_EDGE 1
+#define BT_CLAIM_SELECT 2
 
 static int bt_run(TCCIRState *ir)
 {
@@ -1024,6 +1342,14 @@ static int bt_run(TCCIRState *ir)
 
   BTQueue qu;
   memset(&qu, 0, sizeof qu);
+  /* Per real instruction s, what this round sends to or queues in front of
+   * it: BT_CLAIM_EDGE a join's threaded edges to a successor that is s or
+   * NOPs before s (with its pad copies, in front of s), BT_CLAIM_SELECT a
+   * SELECT join's per-side blocks (s = its start).  A pad jump lands on the
+   * first instruction put in front of s and a jump to a NOP before s runs
+   * on into what is put in front of s: into a side block, not J.  So one
+   * excludes the other, in either order. */
+  unsigned char *claim = tcc_mallocz(n + 2);
   int threaded = 0;
   BTEdge *edges = NULL;
   int ecap = 0;
@@ -1069,9 +1395,9 @@ static int bt_run(TCCIRState *ir)
       int fitbits = 32, fact = BT_UNKNOWN;
       ed->def = -1;
       ed->nchain = 0;
-      if (is_cond)
+      if (is_cond && j.y < 0)
         fact = bt_branch_fact(&st, ed->end, 1, j.tested, &w, &c, &fitbits);
-      if (fact == BT_UNKNOWN)
+      if (fact == BT_UNKNOWN && j.y < 0)
       {
         w = (BTWidth){j.bits, j.minbits, j.uniform};
         fact = bt_edge_fact(&st, ed->end, j.tested, &w, &c, &ed->def, &fitbits, ed->chain, &ed->nchain);
@@ -1088,8 +1414,21 @@ static int bt_run(TCCIRState *ir)
         fprintf(stderr, "[bt] J%d edge %d fact %d why %d\n", start, ed->end, fact, bt_why);
       int cc = -1;
       int r = fact == BT_UNKNOWN ? -1 : bt_decide(&j, &w, fact, c, fitbits, &cc);
-      if (r < 0)
+      if (r < 0 || (r == 2 && j.is_select))
+      {
+        /* the same compare decided a branch on the way in */
+        r = bt_twin_fact(&st, &j, ed->end);
+        ed->def = -1;
+        ed->nchain = 0;
+        if (r < 0)
+          continue;
+      }
+      if (j.is_select)
+      {
+        ed->side = r;
+        decided++;
         continue;
+      }
       int good = 1;
       for (int side = 0; side < 2 && good; side++)
       {
@@ -1099,6 +1438,9 @@ static int bt_run(TCCIRState *ir)
         {
           int s = succ[side];
           ok[side] = !(s >= j.start && s <= j.jumpif_idx) && bt_flags_safe(&st, s);
+          /* a SELECT join's blocks already go in front of it */
+          if (ok[side] && s < n && (claim[st.next_real[s]] & BT_CLAIM_SELECT))
+            ok[side] = 0;
           if (ok[side])
           {
             ncopy[side] = bt_needed_copies(&st, &j, s, copy[side]);
@@ -1142,7 +1484,19 @@ static int bt_run(TCCIRState *ir)
       bt_stat[7] += all;
       bt_stat[8] += blocking > 0;
     }
-    int pad_used[2] = {0, 0};
+    if (j.is_select)
+    {
+      /* each edge gets the move and a jump: worth it only when J goes */
+      if (all && nedge <= BT_SELECT_MAX_EDGES && !(claim[start] & BT_CLAIM_EDGE))
+      {
+        int done = bt_thread_select(&st, &j, edges, nedge, &qu);
+        if (done)
+          claim[start] |= BT_CLAIM_SELECT;
+        threaded += done;
+      }
+      continue;
+    }
+    int pad_used[2] = {0, 0}, sent[2] = {0, 0};
     for (int e = 0; e < nedge; e++)
     {
       BTEdge *ed = &edges[e];
@@ -1153,8 +1507,10 @@ static int bt_run(TCCIRState *ir)
       if (!all && is_fall)
         continue;
       int r0 = ed->side == 2 ? 0 : ed->side; /* where the jump (or JMP) goes */
+      sent[r0] = 1;
       if (ed->side == 2)
       {
+        sent[1] = 1;
         /* JUMPIF cc -> taken side, in front of the edge's end */
         bt_q_insert(&qu, ed->end, -1, ed->cc, succ[1], ncopy[1] > 0);
         pad_used[1] |= ncopy[1] > 0;
@@ -1181,8 +1537,12 @@ static int bt_run(TCCIRState *ir)
         bt_stat[9 + is_fall]++;
     }
     for (int r = 0; r < 2; r++)
+    {
       for (int c = 0; pad_used[r] && c < ncopy[r]; c++)
         bt_q_insert(&qu, succ[r], copy[r][c], -1, -1, 0);
+      if (sent[r] && succ[r] < n)
+        claim[st.next_real[succ[r]]] |= BT_CLAIM_EDGE;
+    }
   }
   if (qu.nins || qu.npads)
     bt_apply_inserts(ir, qu.ins, qu.nins, qu.pads, qu.npads, qu.defs, qu.ndefs);
@@ -1203,6 +1563,7 @@ static int bt_run(TCCIRState *ir)
     }
     bt_state_free(&ls);
   }
+  tcc_free(claim);
   tcc_free(edges);
   tcc_free(qu.ins);
   tcc_free(qu.pads);
@@ -1227,7 +1588,12 @@ static void bt_print_stats(void)
 
 int ra_thread_known_branches(TCCIRState *ir)
 {
-  if (!ir || ir->next_instruction_index < 4 || ir->func_has_label_addr || tcc_ir_calls_returns_twice(ir))
+  /* A computed goto's labels have no IR edge, and an asm goto's labels are
+   * edges only in the CFG: refs[] and bt_sweep_unreachable scan the IR's own
+   * branches, so they would count a block such a label enters as entered by
+   * its one IR branch, or delete a block only the label enters. */
+  if (!ir || ir->next_instruction_index < 4 || ir->func_has_label_addr || ir->func_has_asm_goto ||
+      tcc_ir_calls_returns_twice(ir))
     return 0;
   for (int i = 0; i < ir->next_instruction_index; i++)
   {

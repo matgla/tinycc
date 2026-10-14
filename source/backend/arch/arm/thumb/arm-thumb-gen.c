@@ -210,12 +210,17 @@ int rodata_anchor_reg = -1;
 
 /* Registers no scratch picker may ever hand out in this function: R9 is the
  * GOT base under text/data separation, and the rodata anchor holds a value
- * with no interval behind it, so liveness always reports it dead. */
+ * with no interval behind it, so liveness always reports it dead.  So does
+ * the static chain: a nested function reads its captures as [R10, #off] off
+ * the live register, and a parent's SET_CHAIN value must reach the call. */
 uint32_t scratch_exclude_baseline(void)
 {
   uint32_t mask = text_and_data_separation ? (1u << R9) : 0;
   if (rodata_anchor_reg >= 0)
     mask |= 1u << rodata_anchor_reg;
+  const TCCIRState *ir = tcc_state ? tcc_state->ir : NULL;
+  if (ir && (ir->has_static_chain || ir->emits_set_chain))
+    mask |= 1u << architecture_config.static_chain_reg;
   return mask;
 }
 
@@ -329,6 +334,28 @@ thumb_opcode thumb_call_imm_handler(thumb_imm_handler_t fn, uint32_t rd, uint32_
  * dry_run_state which is defined later in the file. */
 static int g_insn_scratch_allocs = 0;     /* total scratch allocs this instruction */
 static uint16_t g_insn_scratch_saves = 0; /* registers that required PUSH this instruction */
+static int g_insn_scratch_save_n = 0;     /* how many of them saved a register */
+static uint32_t g_insn_scratch_excl = 0;  /* registers excluded at them, see below */
+static uint32_t g_insn_scratch_picked = 0; /* registers they returned */
+
+/* Phase-3 recording of one scratch allocation made with `excl_in` (the
+ * caller's exclusions plus the sticky ones): how many there were, which
+ * register a save took, and what the picker could not choose besides the
+ * instruction's own earlier scratches -- operands, values a lowering holds by
+ * hand.  The fixup asks the latter before it trusts a register it vacated to
+ * be free in the real run. */
+static void insn_note_scratch(ScratchRegAlloc alloc, uint32_t excl_in)
+{
+  g_insn_scratch_allocs++;
+  g_insn_scratch_excl |= excl_in & ~g_insn_scratch_picked;
+  if (alloc.reg >= 0 && alloc.reg < 16)
+    g_insn_scratch_picked |= 1u << (unsigned)alloc.reg;
+  if (alloc.would_save)
+  {
+    g_insn_scratch_saves |= (uint16_t)(1u << (unsigned)alloc.reg);
+    g_insn_scratch_save_n++;
+  }
+}
 int is_vfp_reg(int r) { return LS_IS_VFP_REG(r); }
 int vfp_num(int r) { return LS_VFP_REG_NUM(r); }
 
@@ -339,14 +366,13 @@ int mach_alloc_scratch(MachineCodegenContext *ctx, uint32_t excl)
 {
   if (ctx->n_scratch >= MACH_CTX_MAX_SCRATCH)
     tcc_ice("mach_alloc_scratch: per-instruction scratch limit exceeded");
+  const uint32_t excl_in = excl | scratch_global_exclude;
   ScratchRegAlloc alloc = get_scratch_reg_with_save(excl);
   ctx->scratches[ctx->n_scratch++] = alloc;
   /* Phase-3 constraint recording: track count and save-mask per instruction.
    * Reset with tcc_gen_machine_insn_scratch_reset() before each dispatch call;
    * read back with the tcc_gen_machine_insn_scratch_*() accessors after it. */
-  g_insn_scratch_allocs++;
-  if (alloc.would_save)
-    g_insn_scratch_saves |= (uint16_t)(1u << (unsigned)alloc.reg);
+  insn_note_scratch(alloc, excl_in);
   return alloc.reg;
 }
 
@@ -359,11 +385,10 @@ int mach_alloc_scratch_for_sym(MachineCodegenContext *ctx, uint32_t excl, Sym *s
 {
   if (ctx->n_scratch >= MACH_CTX_MAX_SCRATCH)
     tcc_ice("mach_alloc_scratch: per-instruction scratch limit exceeded");
+  const uint32_t excl_in = excl | scratch_global_exclude;
   ScratchRegAlloc alloc = get_scratch_reg_for_sym_addr(sym, imm, excl);
   ctx->scratches[ctx->n_scratch++] = alloc;
-  g_insn_scratch_allocs++;
-  if (alloc.would_save)
-    g_insn_scratch_saves |= (uint16_t)(1u << (unsigned)alloc.reg);
+  insn_note_scratch(alloc, excl_in);
   return alloc.reg;
 }
 
@@ -375,11 +400,10 @@ static int mach_alloc_scratch_for_const(MachineCodegenContext *ctx, uint32_t exc
 {
   if (ctx->n_scratch >= MACH_CTX_MAX_SCRATCH)
     tcc_ice("mach_alloc_scratch: per-instruction scratch limit exceeded");
+  const uint32_t excl_in = excl | scratch_global_exclude;
   ScratchRegAlloc alloc = get_scratch_reg_for_const(value, excl);
   ctx->scratches[ctx->n_scratch++] = alloc;
-  g_insn_scratch_allocs++;
-  if (alloc.would_save)
-    g_insn_scratch_saves |= (uint16_t)(1u << (unsigned)alloc.reg);
+  insn_note_scratch(alloc, excl_in);
   return alloc.reg;
 }
 
@@ -1010,14 +1034,333 @@ ST_FUNC int tcc_gen_machine_pool_entries_total(void) { return pool_entries_total
  * bytes; 2 at the default word alignment), for the branch-narrowing bounds. */
 int align_pad_max;
 
-ST_FUNC void tcc_gen_machine_align_branch_target(int align)
+/* The last instruction ot() wrote in the real pass, for th_widen_last_insn. */
+ThumbLastInsn th_last_insn = {-1, -1, 0, 0, 0};
+/* Where the current function's code (its prolog) starts. */
+int th_func_code_start = -1;
+
+/* The 32-bit encoding of a 16-bit instruction that does exactly the same --
+ * same registers, same result, same flags -- when executed OUTSIDE an IT block
+ * (where the 16-bit data-processing forms always set flags).  Only forms with
+ * nothing PC-relative and nothing backpatched later; a conditional branch is
+ * still the zero-offset placeholder its backpatch decodes (th_patch_call
+ * handles both widths).  Returns 0 for anything else. */
+static int th_t16_to_t32(uint16_t hw, uint16_t *w1, uint16_t *w2)
+{
+  const unsigned rd = hw & 7, rn = (hw >> 3) & 7, rm = (hw >> 6) & 7;
+  if ((hw >> 13) == 0 && ((hw >> 11) & 3) != 3)
+  {
+    /* LSLS/LSRS/ASRS #imm5 (LSL #0 is MOVS): MOVS.W Rd, Rm, <shift> #imm5.
+     * An LSR/ASR imm5 of 0 means 32 in both encodings. */
+    const unsigned type = (hw >> 11) & 3, imm5 = (hw >> 6) & 31;
+    *w1 = 0xea5f;
+    *w2 = (uint16_t)(((imm5 >> 2) << 12) | (rd << 8) | ((imm5 & 3) << 6) | (type << 4) | rn);
+    return 1;
+  }
+  if ((hw >> 11) == 3)
+  {
+    /* ADDS/SUBS Rd, Rn, Rm | #imm3 */
+    const int sub = (hw >> 9) & 1;
+    if (hw & 0x400)
+    {
+      *w1 = (uint16_t)((sub ? 0xf1b0 : 0xf110) | rn);
+      *w2 = (uint16_t)((rd << 8) | rm);
+    }
+    else
+    {
+      *w1 = (uint16_t)((sub ? 0xebb0 : 0xeb10) | rn);
+      *w2 = (uint16_t)((rd << 8) | rm);
+    }
+    return 1;
+  }
+  if ((hw >> 13) == 1)
+  {
+    /* MOVS/CMP/ADDS/SUBS Rdn, #imm8 (a modified immediate with no rotation
+     * leaves C alone, as the 16-bit MOVS does). */
+    const unsigned rdn = (hw >> 8) & 7, imm8 = hw & 0xff;
+    switch ((hw >> 11) & 3)
+    {
+    case 0: *w1 = 0xf05f; *w2 = (uint16_t)((rdn << 8) | imm8); return 1;
+    case 1: *w1 = (uint16_t)(0xf1b0 | rdn); *w2 = (uint16_t)(0x0f00 | imm8); return 1;
+    case 2: *w1 = (uint16_t)(0xf110 | rdn); *w2 = (uint16_t)((rdn << 8) | imm8); return 1;
+    default: *w1 = (uint16_t)(0xf1b0 | rdn); *w2 = (uint16_t)((rdn << 8) | imm8); return 1;
+    }
+  }
+  if ((hw >> 10) == 0x10)
+  {
+    /* Data processing, flag-setting: <op>S.W Rdn, Rdn, Rm. */
+    static const uint16_t dp[16] = {
+        0xea10, /* AND */ 0xea90, /* EOR */ 0xfa10, /* LSL */ 0xfa30, /* LSR */
+        0xfa50, /* ASR */ 0xeb50, /* ADC */ 0xeb70, /* SBC */ 0xfa70, /* ROR */
+        0xea10, /* TST */ 0xf1d0, /* RSB #0 */ 0xebb0, /* CMP */ 0xeb10, /* CMN */
+        0xea50, /* ORR */ 0,      /* MUL: no flag-setting T32 form */ 0xea30, /* BIC */ 0xea7f, /* MVN */
+    };
+    const unsigned op = (hw >> 6) & 15;
+    if (!dp[op])
+      return 0;
+    switch (op)
+    {
+    case 2: case 3: case 4: case 7: /* register shifts */
+      *w1 = (uint16_t)(dp[op] | rd);
+      *w2 = (uint16_t)(0xf000 | (rd << 8) | rn);
+      return 1;
+    case 8: case 10: case 11: /* TST/CMP/CMN Rn, Rm: Rd = 1111 */
+      *w1 = (uint16_t)(dp[op] | rd);
+      *w2 = (uint16_t)(0x0f00 | rn);
+      return 1;
+    case 9: /* NEGS Rd, Rm = RSBS.W Rd, Rm, #0 */
+      *w1 = (uint16_t)(dp[op] | rn);
+      *w2 = (uint16_t)(rd << 8);
+      return 1;
+    case 15: /* MVNS Rd, Rm */
+      *w1 = dp[op];
+      *w2 = (uint16_t)((rd << 8) | rn);
+      return 1;
+    default:
+      *w1 = (uint16_t)(dp[op] | rd);
+      *w2 = (uint16_t)((rd << 8) | rn);
+      return 1;
+    }
+  }
+  if ((hw >> 10) == 0x11)
+  {
+    /* ADD/CMP/MOV with high registers (ADD and MOV set no flags); never SP/PC. */
+    const unsigned rdn = ((hw >> 4) & 8) | rd, rm4 = (hw >> 3) & 15;
+    if (rdn >= 13 || rm4 >= 13)
+      return 0;
+    switch ((hw >> 8) & 3)
+    {
+    case 0: *w1 = (uint16_t)(0xeb00 | rdn); *w2 = (uint16_t)((rdn << 8) | rm4); return 1;
+    case 1: *w1 = (uint16_t)(0xebb0 | rdn); *w2 = (uint16_t)(0x0f00 | rm4); return 1;
+    case 2: *w1 = 0xea4f; *w2 = (uint16_t)((rdn << 8) | rm4); return 1;
+    default: return 0; /* BX/BLX */
+    }
+  }
+  if ((hw >> 12) == 5)
+  {
+    /* STR/STRH/STRB/LDRSB/LDR/LDRH/LDRB/LDRSH Rt, [Rn, Rm] */
+    static const uint16_t ls[8] = {0xf840, 0xf820, 0xf800, 0xf910, 0xf850, 0xf830, 0xf810, 0xf930};
+    *w1 = (uint16_t)(ls[(hw >> 9) & 7] | rn);
+    *w2 = (uint16_t)((rd << 12) | rm);
+    return 1;
+  }
+  if ((hw >> 13) == 3 || (hw >> 12) == 8)
+  {
+    /* STR/LDR (imm5 * 4), STRB/LDRB (imm5), STRH/LDRH (imm5 * 2) */
+    const unsigned imm5 = (hw >> 6) & 31, load = (hw >> 11) & 1;
+    unsigned base, off;
+    if ((hw >> 12) == 8)
+      base = 0xf8a0, off = imm5 * 2;
+    else if (hw & 0x1000)
+      base = 0xf880, off = imm5;
+    else
+      base = 0xf8c0, off = imm5 * 4;
+    *w1 = (uint16_t)(base | (load << 4) | rn);
+    *w2 = (uint16_t)((rd << 12) | off);
+    return 1;
+  }
+  if ((hw >> 12) == 9)
+  {
+    /* STR/LDR Rt, [SP, #imm8 * 4] */
+    const unsigned rt = (hw >> 8) & 7;
+    *w1 = (uint16_t)(((hw & 0x800) ? 0xf8d0 : 0xf8c0) | 13);
+    *w2 = (uint16_t)((rt << 12) | ((hw & 0xff) * 4));
+    return 1;
+  }
+  if ((hw >> 11) == 0x15)
+  {
+    /* ADD Rd, SP, #imm8 * 4 = ADDW Rd, SP, #imm12 */
+    const unsigned rdx = (hw >> 8) & 7, imm = (hw & 0xff) * 4;
+    *w1 = (uint16_t)(0xf20d | ((imm >> 11) << 10));
+    *w2 = (uint16_t)((((imm >> 8) & 7) << 12) | (rdx << 8) | (imm & 0xff));
+    return 1;
+  }
+  if ((hw >> 8) == 0xb2)
+  {
+    /* SXTH/SXTB/UXTH/UXTB Rd, Rm */
+    static const uint16_t ext[4] = {0xfa0f, 0xfa4f, 0xfa1f, 0xfa5f};
+    *w1 = ext[(hw >> 6) & 3];
+    *w2 = (uint16_t)(0xf080 | (rd << 8) | rn);
+    return 1;
+  }
+  if ((hw >> 9) == 0x5a || (hw >> 9) == 0x5e)
+  {
+    /* PUSH {list[, lr]} / POP {list} (never {pc}): the 32-bit STMDB/LDMIA
+     * forms need two or more registers. */
+    const int pop = (hw >> 9) == 0x5e;
+    const unsigned extra = (hw >> 8) & 1, list = hw & 0xff;
+    if (pop && extra)
+      return 0;
+    if (__builtin_popcount(list) + (int)extra < 2)
+      return 0;
+    *w1 = pop ? 0xe8bd : 0xe92d;
+    *w2 = (uint16_t)((extra << 14) | list);
+    return 1;
+  }
+  if ((hw >> 12) == 0xd && ((hw >> 8) & 15) < 14 && (hw & 0xff) == 0)
+  {
+    /* B<c>.N placeholder -> B<c>.W placeholder (offset patched later) */
+    *w1 = (uint16_t)(0xf000 | (((hw >> 8) & 15) << 6));
+    *w2 = 0x8000;
+    return 1;
+  }
+  return 0;
+}
+
+/* Whether any branch encoded in [from, end) already lands on `target`.  Every
+ * halfword position is tried, not a linear decode, so literal data or a
+ * misread 32-bit pair can only produce a false hit -- which keeps the NOP.
+ * Unpatched placeholders decode as offset 0 (the next instruction). */
+static int th_branch_in_range_targets(int from, int end, int target)
+{
+  const uint8_t *code = cur_text_section->data;
+  for (int p = from & ~1; p + 2 <= end; p += 2)
+  {
+    const uint16_t hw = *(const uint16_t *)(code + p);
+    int t = -1;
+    if ((hw & 0xf000) == 0xd000 && ((hw >> 8) & 15) < 14) /* B<c>.N */
+      t = p + 4 + (int)(int8_t)(hw & 0xff) * 2;
+    else if ((hw & 0xf800) == 0xe000) /* B.N */
+      t = p + 4 + ((int)((uint32_t)(hw & 0x7ff) << 21) >> 20);
+    else if ((hw & 0xf500) == 0xb100) /* CBZ/CBNZ */
+      t = p + 4 + (int)((((hw >> 9) & 1) << 6) | (((hw >> 3) & 31) << 1));
+    if (t == target)
+      return 1;
+    if (p + 4 > end || (hw & 0xf800) != 0xf000)
+      continue;
+    const uint16_t hw2 = *(const uint16_t *)(code + p + 2);
+    const uint32_t s_ = (hw >> 10) & 1, j1 = (hw2 >> 13) & 1, j2 = (hw2 >> 11) & 1;
+    int32_t off;
+    if ((hw2 & 0xd000) == 0x8000 && ((hw >> 6) & 15) < 14) /* B<c>.W */
+    {
+      off = (int32_t)((s_ << 20) | (j2 << 19) | (j1 << 18) | ((uint32_t)(hw & 0x3f) << 12) |
+                      ((uint32_t)(hw2 & 0x7ff) << 1));
+      off = (off << 11) >> 11;
+    }
+    else if ((hw2 & 0xd000) == 0x9000) /* B.W */
+    {
+      const uint32_t i1 = !(j1 ^ s_), i2 = !(j2 ^ s_);
+      off = (int32_t)((s_ << 24) | (i1 << 23) | (i2 << 22) | ((uint32_t)(hw & 0x3ff) << 12) |
+                      ((uint32_t)(hw2 & 0x7ff) << 1));
+      off = (off << 7) >> 7;
+    }
+    else
+      continue;
+    if (p + 4 + off == target)
+      return 1;
+  }
+  return 0;
+}
+
+/* Positions of the instructions th_widen_last_insn widened in the current
+ * function (ascending), so a late backpatch landing inside one ICEs instead
+ * of miscompiling. */
+static int *th_widened_pos;
+static int th_widened_count, th_widened_cap;
+
+void th_widened_reset(void) { th_widened_count = 0; }
+
+int th_widened_contains_mid(int addr)
+{
+  int lo = 0, hi = th_widened_count - 1;
+  while (lo <= hi)
+  {
+    const int mid = (lo + hi) / 2;
+    const int m = th_widened_pos[mid] + 2;
+    if (m == addr)
+      return 1;
+    if (m < addr)
+      lo = mid + 1;
+    else
+      hi = mid - 1;
+  }
+  return 0;
+}
+
+static void th_widened_record(int pos)
+{
+  while (th_widened_count > 0 && th_widened_pos[th_widened_count - 1] >= pos)
+    th_widened_count--; /* a re-emitted stretch: keep the list ascending */
+  if (th_widened_count == th_widened_cap)
+  {
+    th_widened_cap = th_widened_cap ? th_widened_cap * 2 : 64;
+    th_widened_pos = tcc_realloc(th_widened_pos, th_widened_cap * sizeof(*th_widened_pos));
+  }
+  th_widened_pos[th_widened_count++] = pos;
+}
+
+/* A word-alignment pad that execution falls into costs an instruction per
+ * entry -- a loop head right after its counter is zeroed runs `movs r5,#0;
+ * nop` on every call.  When the instruction just before the pad is a 16-bit
+ * one ot() emitted, still unchanged in place, outside any IT block and with no
+ * relocation on it, rewrite it to its 32-bit form instead: same bytes, same
+ * alignment, one instruction fewer.  Real pass only; the dry passes lay out
+ * the pad, which has the same size. */
+static int th_widen_last_insn(int widen_from)
+{
+  if (widen_from == TCC_ALIGN_WIDEN_FROM_PROLOG)
+    widen_from = th_func_code_start;
+  if (widen_from < 0)
+    return 0;
+  if (dry_run_state.active || nocode_wanted || !thumb_gen_state.generating_function || !cur_text_section)
+    return 0;
+  if (tcc_gen_machine_outline_suppressing())
+    return 0;
+  if (th_last_insn.end != ind || th_last_insn.size != 2 || th_last_insn.conditional)
+    return 0;
+  if (mov_equiv_it_pending != 0 || pool_flush_it_pending != 0)
+    return 0;
+  const int pos = ind - 2;
+  uint16_t hw = *(uint16_t *)(cur_text_section->data + pos);
+  if (hw != (uint16_t)th_last_insn.opcode)
+    return 0;
+  /* An IT written with raw o() (tcc_machine_load_cmp_result) is invisible to
+   * ot()'s IT tracking, and inside IT the 16-bit forms set no flags.  Refuse
+   * when any halfword an IT block could reach back from (4 x 32-bit) looks like
+   * an IT; a false match only keeps the NOP. */
+  for (int back = pos - 2; back >= pos - 16 && back >= 0; back -= 2)
+  {
+    const uint16_t prev = *(uint16_t *)(cur_text_section->data + back);
+    if ((prev & 0xff00) == 0xbf00 && (prev & 0xf))
+      return 0;
+  }
+  Section *sr = cur_text_section->reloc;
+  if (sr && sr->data_offset >= sizeof(ElfW_Rel))
+  {
+    const ElfW_Rel *rel = (const ElfW_Rel *)(sr->data + sr->data_offset - sizeof(ElfW_Rel));
+    if ((int)rel->r_offset >= pos)
+      return 0;
+  }
+  /* The pad's address must not be a branch target: the caller guarantees no
+   * IR op is mapped there, and the previous op's own branches (a skip over
+   * its last instruction, an internal label at its end) are checked here. */
+  if (widen_from > pos || th_branch_in_range_targets(widen_from, ind, ind))
+    return 0;
+  uint16_t w1, w2;
+  if (!th_t16_to_t32(hw, &w1, &w2))
+    return 0;
+  th_widened_record(pos);
+  o(w2);
+  *(uint16_t *)(cur_text_section->data + pos) = w1;
+  th_last_insn.pos = pos;
+  th_last_insn.end = ind;
+  th_last_insn.size = 4;
+  th_last_insn.opcode = ((uint32_t)w1 << 16) | w2;
+  return 1;
+}
+
+ST_FUNC void tcc_gen_machine_align_branch_target(int align, int widen_from)
 {
   if (align < 2)
     return;
   if (align - 2 > align_pad_max)
     align_pad_max = align - 2;
   while (ind & (align - 1))
+  {
+    if ((ind & 2) && th_widen_last_insn(widen_from))
+      continue;
     o(0xbf00);
+  }
 }
 int dry_run_literal_pool_size = 0;
 TCCChainedHash literal_pool_hash;
@@ -1380,6 +1723,25 @@ ST_FUNC uint32_t tcc_gen_machine_dry_run_get_scratch_regs_pushed(void)
   return dry_run_state.scratch_regs_pushed;
 }
 
+/* Every save the discovery run made, attributed to an instruction or not. */
+ST_FUNC int tcc_gen_machine_dry_run_get_scratch_push_count(void)
+{
+  return dry_run_state.scratch_push_count;
+}
+
+/* Before the discovery run: the callee-saved registers the prologue will push
+ * (see scratch_dry_pushed_dead_reg).  After it: those the run used as scratch,
+ * which the prologue must push whatever else changes. */
+ST_FUNC void tcc_gen_machine_dry_run_set_prolog_pushes(uint32_t regs)
+{
+  dry_run_state.prolog_pushes = regs & 0x0FF0u;
+}
+
+ST_FUNC uint32_t tcc_gen_machine_dry_run_get_prolog_pushes_used(void)
+{
+  return dry_run_state.prolog_pushes_used;
+}
+
 /* Max nested-call save slots any call site used during the dry run — the
  * exact demand the static max_nested_save_regs reservation over-approximates. */
 ST_FUNC int tcc_gen_machine_dry_run_get_max_nested_saves(void)
@@ -1506,6 +1868,22 @@ ST_FUNC void tcc_gen_machine_insn_scratch_reset(void)
 {
   g_insn_scratch_allocs = 0;
   g_insn_scratch_saves = 0;
+  g_insn_scratch_save_n = 0;
+  g_insn_scratch_excl = 0;
+  g_insn_scratch_picked = 0;
+}
+
+/* How many of the most recent instruction's scratch allocations saved a
+ * register, and what its allocations excluded other than each other (the
+ * instruction's operands and hand-held values, and the sticky exclusions). */
+ST_FUNC int tcc_gen_machine_insn_scratch_save_count(void)
+{
+  return g_insn_scratch_save_n;
+}
+
+ST_FUNC uint32_t tcc_gen_machine_insn_scratch_exclude(void)
+{
+  return g_insn_scratch_excl;
 }
 
 ST_FUNC int tcc_gen_machine_insn_scratch_count(void)
@@ -1521,13 +1899,10 @@ ST_FUNC uint16_t tcc_gen_machine_insn_scratch_saves_mask(void)
   return g_insn_scratch_saves;
 }
 
-/* Prolog-pushed reg from `mask`, dead at the current instruction — usable as
- * scratch for free (prolog/epilog hides the clobber).  Real-run only:
- * pushed_registers is not valid during dry-run. */
-static int scratch_pushed_dead_reg(TCCIRState *ir, uint32_t exclude_regs, uint32_t mask)
+/* A register of `pushed` (and `mask`) that is dead at the current instruction
+ * and reserved for nothing else. */
+static int scratch_dead_reg_in(TCCIRState *ir, uint32_t pushed, uint32_t exclude_regs, uint32_t mask)
 {
-  if (DRY_RUN_MODELLING || !pushed_registers)
-    return PREG_NONE;
   uint32_t reserved = (1u << R_FP) | scratch_exclude_baseline();
   if (tcc_state->text_and_data_separation)
     reserved |= (1u << 9);
@@ -1535,8 +1910,35 @@ static int scratch_pushed_dead_reg(TCCIRState *ir, uint32_t exclude_regs, uint32
   if (ir->ls.live_regs_by_instruction && ir->codegen_instruction_idx >= 0 &&
       ir->codegen_instruction_idx < ir->ls.live_regs_by_instruction_size)
     live |= ir->ls.live_regs_by_instruction[ir->codegen_instruction_idx];
-  uint32_t candidate = pushed_registers & mask & ~exclude_regs & ~live & ~reserved;
+  uint32_t candidate = pushed & mask & ~exclude_regs & ~live & ~reserved;
   return candidate ? (int)__builtin_ctz(candidate) : PREG_NONE;
+}
+
+/* Prolog-pushed reg from `mask`, dead at the current instruction — usable as
+ * scratch for free (prolog/epilog hides the clobber).  Real-run only:
+ * pushed_registers is not valid during dry-run. */
+static int scratch_pushed_dead_reg(TCCIRState *ir, uint32_t exclude_regs, uint32_t mask)
+{
+  if (DRY_RUN_MODELLING || !pushed_registers)
+    return PREG_NONE;
+  return scratch_dead_reg_in(ir, pushed_registers, exclude_regs, mask);
+}
+
+/* The discovery run's model of the fallback above.  The prologue is not
+ * emitted yet, so it draws on the callee-saved registers the allocation is
+ * expected to push (tcc_gen_machine_dry_run_set_prolog_pushes); those it takes
+ * are forced into the push list afterwards (..._prolog_pushes_used), so the
+ * real pass finds them pushed.  Without the model the discovery run recorded a
+ * save wherever only such a register was free, and the frame kept a scratch
+ * save area that no pass ever stored to. */
+static int scratch_dry_pushed_dead_reg(TCCIRState *ir, uint32_t exclude_regs)
+{
+  if (!DRY_RUN_MODELLING || !dry_run_state.prolog_pushes)
+    return PREG_NONE;
+  int r = scratch_dead_reg_in(ir, dry_run_state.prolog_pushes, exclude_regs, 0x0FF0u);
+  if (r != PREG_NONE)
+    dry_run_state.prolog_pushes_used |= 1u << r;
+  return r;
 }
 
 /* Get a free scratch register using liveness information.
@@ -1590,6 +1992,8 @@ ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
     if (reg == PREG_NONE)
     {
       int sreg = scratch_pushed_dead_reg(ir, exclude_regs, 0x0FF0u);
+      if (sreg == PREG_NONE)
+        sreg = scratch_dry_pushed_dead_reg(ir, exclude_regs);
       if (sreg != PREG_NONE)
       {
         LOG_SCRATCH("-> returning reg=%d (pre-pushed callee-saved, dead here) exclude=0x%x", sreg, exclude_regs);
@@ -3015,6 +3419,9 @@ ST_FUNC void arm_deinit(struct TCCState *s)
   thumb_gen_state.cached_global_sym = NULL;
   thumb_gen_state.cached_global_reg = PREG_NONE;
   thumb_free_call_sites();
+  tcc_free(th_widened_pos);
+  th_widened_pos = NULL;
+  th_widened_count = th_widened_cap = 0;
 }
 
 /*

@@ -1,0 +1,25 @@
+find 4 0 2863311530 1
+first_set 4
+create 10 0 8
+trim [hello world] 11
+trim.len 1
+mix 3 7 4005 -5
+ll 12884901890
+fi 250 42
+dbl 250
+un 55667788 11223344
+bf 5 1000 -995
+nest 63 9 -91
+arr 20 19 18 17
+q4 1 2 3 4
+shrink [cdef] 4
+via_ptr [abcdef] 6
+pm 7 15 8009 -9
+pt [ab] 2
+table 5 0
+pll -16
+psh [def] 3
+same 1 1
+early [one] 3
+early direct [three] 5
+args 5 1

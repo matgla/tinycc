@@ -49,3 +49,17 @@ unsigned mix(const unsigned char *p, int n)
     h = h * 31 + *p++;
   return h;
 }
+
+/* A function that takes a label's address never widens an instruction to
+ * align a loop head (fix/executed-nops), so its -O2 pad stays a NOP: the
+ * loops above may all align by widening, which leaves no NOP to count. */
+unsigned mix_label_addr(const unsigned char *p, int n)
+{
+  static void *const out[] = {&&done};
+  unsigned h = 7;
+  while (n-- > 0)
+    h = h * 31 + *p++;
+  goto *out[0];
+done:
+  return h;
+}

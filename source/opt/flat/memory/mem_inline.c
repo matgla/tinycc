@@ -8,26 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-/* memcpy/memset calls with a small constant size become plain
- * LOAD_INDEXED/STORE_INDEXED quads so store-load forwarding, DSE and the
- * fusion group see the accesses (and the call + argument marshaling
- * disappear).  Thresholds mirror arm-none-eabi-gcc -O2 on Cortex-M33
- * (measured 2026-07-21):
- *
- *   memcpy   small const n -> word/halfword/byte copies.  ARMv8-M mainline
- *            tolerates unaligned ldr/ldrh/str/strh, so no alignment proof is
- *            needed; the pieces carry an UNDERALIGN hint which keeps the
- *            ldrd/strd pairing peepholes away from possibly-unaligned pairs.
- *   memset   small const n AND constant fill value -> immediate stores.
- *   memmove  NEVER inlined -- gcc calls it even for n == 8, and TCC emits
- *            __aeabi_memmove exactly where overlap is possible.
- *
- * Copies are emitted in groups of two pieces (ld,ld,st,st) - bounded register
- * pressure, and adjacent word loads stay pairable should alignment become
- * provable later.  Loads within a group precede stores, so an exactly
- * self-overlapping copy (s = s) stays correct; partial overlap is UB for
- * memcpy and cannot occur for the compiler-generated __aeabi_memcpy* struct
- * copies (those use __aeabi_memmove when overlap is possible). */
+/* Small mem* calls become optimizer-visible accesses; see docs/bugs/kernel-memset-clear-loop-and-call-policy.md. */
 
 #define USING_GLOBALS
 
@@ -37,17 +18,7 @@
 #include "opt_utils.h"
 #include <string.h>
 
-/* Size ceilings are set where the expansion is a strict static win over the
- * call site (>= the `movs #n; bl` minimum), NOT at gcc's -O2 ceilings
- * (memcpy 32 / memset 28).  Mirroring gcc was measured at +46k corpus
- * instructions and ~zero cycle change: the static metric favours a bl over a
- * 6-18 instruction expansion, and the runtime helpers are already fast for
- * one-shot calls.  Kept core:
- *   memcpy, single piece (n in {1,2,4})   -> ld + st        (2 <= 2)
- *   memset, <= 2 pieces (n in 1,2,3..6,8) -> movs + <=2 str (3 <= 3)
- * plus n == 0 calls dropped outright.  These still delete a call, unlock
- * store-load forwarding through the copied bytes (the float-bits memcpy(&u,
- * &f,4) reinterpret idiom), and never grow code. */
+/* Copies and nonzero fills favor size; zero fills through 16 bytes favor executed instructions. */
 #define MI_MEMCPY_MAX 4
 /* A copy whose destination (or source) is a local reached through its address
  * is a different case: that local exists only to be read back, so the pieces
@@ -59,6 +30,8 @@
 #define MI_MEMCPY_LOCAL_MAX 8
 #define MI_MEMCPY_LOCAL_PIECES 2
 #define MI_MEMSET_MAX 8
+#define MI_MEMCLR_MAX 16
+#define MI_MEMCLR_PIECES 5
 #define MI_MEMCPY_PIECES 1
 #define MI_MEMSET_PIECES 2
 #define MI_MAX_PIECES 10 /* 32 bytes -> at most 8 words + 1 half + 1 byte */
@@ -215,13 +188,7 @@ static int mi_pieces(int n, int offs[MI_MAX_PIECES], int ws[MI_MAX_PIECES])
   return n == 0 ? cnt : -1;
 }
 
-/* Rewrite the quad at an existing slot in place.  Pool layout matches the
- * INDEXED convention: [dest, src1, src2, scale].  Slots are recycled from the
- * call's own PARAM/CALL quads (never inserted): inserting quads grows the
- * NOP-inclusive slot count that the auto-inline gates read, flipping inline
- * decisions in callers (20141107-1 main 15->84).  A local-slot copy is the
- * exception - see mi_try_expand - where foreign argument evaluation leaves no
- * free quad and the pieces are inserted at the call position instead. */
+/* Recycle call quads where possible; insert bounded local copies or clears after argument evaluation otherwise. */
 static void mi_emit_at(TCCIRState *ir, int slot, int insert, int op, IROperand dest, IROperand src1, IROperand src2)
 {
   IRQuadCompact fresh, *q;
@@ -325,7 +292,7 @@ static int mi_try_expand(TCCIRState *ir, int ci, int kind, int aligned4)
       return 0;
     val = irop_get_imm64_ex(ir, p1);
     nn = irop_get_imm64_ex(ir, p2);
-    if (nn < 0 || nn > MI_MEMSET_MAX)
+    if (nn < 0 || nn > MI_MEMCLR_MAX)
       return 0;
     break;
   case MI_MEMSET_AEABI:
@@ -333,19 +300,22 @@ static int mi_try_expand(TCCIRState *ir, int ci, int kind, int aligned4)
       return 0;
     nn = irop_get_imm64_ex(ir, p1);
     val = irop_get_imm64_ex(ir, p2);
-    if (nn < 0 || nn > MI_MEMSET_MAX)
+    if (nn < 0 || nn > MI_MEMCLR_MAX)
       return 0;
     break;
   case MI_MEMCLR:
     if (!has1 || !irop_is_plain_imm(p1))
       return 0;
     nn = irop_get_imm64_ex(ir, p1);
-    if (nn < 0 || nn > MI_MEMSET_MAX)
+    if (nn < 0 || nn > MI_MEMCLR_MAX)
       return 0;
     break;
   default:
     return 0;
   }
+
+  if (kind != MI_MEMCPY && (val & 0xff) != 0 && nn > MI_MEMSET_MAX)
+    return 0;
 
   if (nn > 0 && !mi_base_ok(&dst, &dst_stk))
     return 0;
@@ -355,13 +325,10 @@ static int mi_try_expand(TCCIRState *ir, int ci, int kind, int aligned4)
   np = mi_pieces((int)nn, offs, ws);
   if (np < 0)
     return 0;
-  /* Piece caps enforce the strict static-win policy (see header) and keep
-   * the expansion within the call's own quad slots, so function IR size
-   * stays stable and auto-inline decisions for callers don't flip (the
-   * slot-count trap: 20141107-1 main 15->84 with insertion-based emission).
-   * A local-slot copy is the exception: it may insert, and its pieces are
-   * justified by the dead slot rather than by a static win. */
-  if (np > (kind == MI_MEMCPY ? (local_copy ? MI_MEMCPY_LOCAL_PIECES : MI_MEMCPY_PIECES) : MI_MEMSET_PIECES))
+  int small_clear = kind != MI_MEMCPY && (val & 0xff) == 0;
+  int piece_limit = kind == MI_MEMCPY ? (local_copy ? MI_MEMCPY_LOCAL_PIECES : MI_MEMCPY_PIECES)
+                                    : (small_clear ? MI_MEMCLR_PIECES : MI_MEMSET_PIECES);
+  if (np > piece_limit)
     return 0;
   /* STACKOFF offsets are abstract slot IDs remapped by frame allocation --
    * NEVER do arithmetic on them, and never rebuild them: reuse the original
@@ -447,13 +414,9 @@ static int mi_try_expand(TCCIRState *ir, int ci, int kind, int aligned4)
       for (int k = 0; k < quads_needed; k++)
         target[k] = slots[n_slots - quads_needed + k];
     }
-    else if (local_copy)
+    else if (local_copy || small_clear)
     {
-      /* Foreign argument evaluation (the LEA of the local's address, the
-       * computed source pointer) sits between the params, so the call's own
-       * quads are not all free.  Such a copy ends in a slot that exists only
-       * to be read back, so the pieces are worth keeping: insert them at the
-       * call position instead of recycling.  Bounded by the piece cap. */
+      /* Argument evaluation must precede all stores; insert when recycling cannot fit the bounded expansion. */
       insert = 1;
       for (int k = 0; k < quads_needed; k++)
         target[k] = ci + k;

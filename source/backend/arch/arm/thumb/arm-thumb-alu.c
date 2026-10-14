@@ -477,6 +477,7 @@ static void thumb_emit_data_processing_mop64(const MachineOperand *src1, const M
     HALF_COPY_S1,    /* result half is src1's */
     HALF_COPY_S2,    /* result half is src2's */
     HALF_CARRY_IMM0, /* carry op, src2 half is zero: `adc/sbc rd, rn, #0` */
+    HALF_CONST,      /* literal src2, src1 half is zero: the literal's half */
     HALF_DEAD        /* nothing reads the result half; emit nothing at all */
   };
   /* A non-64-bit source is zero-extended by construction; the annotation adds
@@ -518,6 +519,18 @@ static void thumb_emit_data_processing_mop64(const MachineOperand *src1, const M
    * emitter's choice is unambiguous. */
   if (uses_carry && op != TCCIR_OP_CMP && src2->kind != MACH_OP_IMM && s2_hi_zero)
     hi_plan = HALF_CARRY_IMM0;
+  /* Against a literal, a zero half of src1 makes the result half a constant:
+   * the literal's half for OR/XOR, zero for AND.  `(uint64_t)u16 ^ C`, the
+   * first step of IntegerContext(u16).hash, materialized a zero just to EOR it
+   * with C's high word.  zero_half64's zh_use_ignores_half mirrors this. */
+  if (!uses_carry && src2->kind == MACH_OP_IMM &&
+      (op == TCCIR_OP_AND || op == TCCIR_OP_OR || op == TCCIR_OP_XOR))
+  {
+    if (s1_lo_zero)
+      lo_plan = (op == TCCIR_OP_AND) ? HALF_ZERO : HALF_CONST;
+    if (s1_hi_zero)
+      hi_plan = (op == TCCIR_OP_AND) ? HALF_ZERO : HALF_CONST;
+  }
 
   /* A 64-bit compare against a constant with a zero low half, read only by
    * strict order tests: the low words cannot decide it, so drop that half and
@@ -596,9 +609,14 @@ static void thumb_emit_data_processing_mop64(const MachineOperand *src1, const M
       const bool can_simplify = (half == 0) ? can_simplify_lo : can_simplify_hi;
       const ThumbDataProcessingHandler *h = (half == 0 || cmp_hi_only) ? &regular : &carry_h;
 
-      if ((half == 0 ? lo_plan : hi_plan) == HALF_DEAD)
+      const int plan = half == 0 ? lo_plan : hi_plan;
+      if (plan == HALF_DEAD)
         continue;
-      if (can_simplify && (is_or || is_xor) && imm == 0)
+      if (plan == HALF_ZERO)
+        ot_check(th_mov_imm((uint32_t)rd, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+      else if (plan == HALF_CONST)
+        tcc_machine_load_constant(rd, PREG_NONE, (int32_t)imm, 0, NULL);
+      else if (can_simplify && (is_or || is_xor) && imm == 0)
       {
         if (rd != rn)
           ot_check_mov_reg((uint32_t)rd, (uint32_t)rn, flags_safe(),
@@ -740,10 +758,12 @@ static void thumb_emit_data_processing_mop64(const MachineOperand *src1, const M
  * fill for SAR), which is what GCC's inline expansion produces as well.
  */
 static void thumb_emit_shift64_reg_mop(const MachineOperand *src1, const MachineOperand *src2,
-                                       const MachineOperand *dest, TccIrOp op, bool skip_lo, bool skip_hi)
+                                       const MachineOperand *dest, TccIrOp op, bool skip_lo, bool skip_hi,
+                                       bool s1_hi_zero)
 {
   const bool is_left = (op == TCCIR_OP_SHL);
-  const bool arith_right = (op == TCCIR_OP_SAR);
+  /* zero_half64 proved the high word zero: the sign is 0, SAR is SHR. */
+  const bool arith_right = (op == TCCIR_OP_SAR) && !s1_hi_zero;
 
   MachineCodegenContext mctx = {0};
   uint32_t excl = 0;
@@ -795,7 +815,7 @@ static void thumb_emit_shift64_reg_mop(const MachineOperand *src1, const Machine
    * float builds every alignment sticky-bit from, is exactly this shape: the
    * generic sequence would materialize a zero just to shift and OR it in. */
   const int hi_is_zero =
-      !arith_right && (!src1->is_64bit ||
+      !arith_right && (!src1->is_64bit || s1_hi_zero ||
                        (src1->kind == MACH_OP_IMM && ((uint64_t)src1->u.imm.val >> 32) == 0));
 
   int src_hi = (int)PREG_REG_NONE;
@@ -973,16 +993,20 @@ static void thumb_emit_shift64_reg_mop(const MachineOperand *src1, const Machine
  * extracted from MachineOperand rather than IROperand fields.
  */
 static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOperand *src2, const MachineOperand *dest,
-                                   TccIrOp op, bool skip_lo, bool skip_hi)
+                                   TccIrOp op, bool skip_lo, bool skip_hi, bool s1_hi_zero)
 {
   if (src2->kind != MACH_OP_IMM)
   {
-    thumb_emit_shift64_reg_mop(src1, src2, dest, op, skip_lo, skip_hi);
+    thumb_emit_shift64_reg_mop(src1, src2, dest, op, skip_lo, skip_hi, s1_hi_zero);
     return;
   }
   const uint32_t sh = (uint32_t)(uint64_t)src2->u.imm.val;
   const bool is_left = (op == TCCIR_OP_SHL);
-  const bool arith_right = (op == TCCIR_OP_SAR);
+  /* `s1_hi_zero`: zero_half64 proved src1's high word zero (ZH64_S1_HI), so
+   * the result is built from the low word alone and the high register is
+   * never read -- zh_use_ignores_half relies on exactly that to let the
+   * widening skip its `mov hi, #0`.  The sign is 0, so SAR is SHR. */
+  const bool arith_right = (op == TCCIR_OP_SAR) && !s1_hi_zero;
 
   thumb_imm_handler_t dst_lo_shift, dst_hi_shift, cross_shift;
   if (is_left)
@@ -1053,7 +1077,9 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
    * SHR/SAR with sh >= 64 produces a 0/sign-fill that the emit tail
    * generates directly without referencing src_hi. */
   int hi_needed = 1;
-  if (is_left && sh >= 32)
+  if (s1_hi_zero)
+    hi_needed = 0;
+  else if (is_left && sh >= 32)
     hi_needed = 0;
   else if (!is_left && sh >= 64 && !arith_right)
     hi_needed = 0;
@@ -1100,7 +1126,46 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
    * written dst_lo, so dst_lo aliasing src_hi rules the pair out; every other
    * aliasing case is safe, since each instruction reads its sources before
    * writing its destination. */
-  if (is_left && sh == 1 && !skip_lo && !skip_hi &&
+  if (s1_hi_zero && sh == 0)
+  {
+    if (!skip_lo && dst_lo != src_lo)
+      ot_check_mov_reg((uint32_t)dst_lo, (uint32_t)src_lo, flags_safe(), THUMB_SHIFT_DEFAULT,
+                       ENFORCE_ENCODING_NONE, false);
+    if (!skip_hi)
+      ot_check(th_mov_imm((uint32_t)dst_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+  }
+  else if (s1_hi_zero && sh < 32)
+  {
+    /* Zero high word: SHL is `hi = lo >> (32-sh); lo <<= sh`, SHR is
+     * `lo >>= sh; hi = 0`.  Whichever destination aliases src_lo is written
+     * last. */
+    if (is_left)
+    {
+      const bool lo_first = (dst_hi == src_lo);
+      if (lo_first && !skip_lo)
+        ot_check(th_lsl_imm((uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
+      if (!skip_hi)
+        ot_check(th_lsr_imm((uint32_t)dst_hi, (uint32_t)src_lo, 32 - sh, flags_safe(), ENFORCE_ENCODING_NONE));
+      if (!lo_first && !skip_lo)
+        ot_check(th_lsl_imm((uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
+    }
+    else
+    {
+      if (!skip_lo)
+        ot_check(th_lsr_imm((uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
+      if (!skip_hi)
+        ot_check(th_mov_imm((uint32_t)dst_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+    }
+  }
+  else if (s1_hi_zero && !is_left)
+  {
+    /* SHR by >= 32 of a zero high word is zero. */
+    if (!skip_lo)
+      ot_check(th_mov_imm((uint32_t)dst_lo, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+    if (!skip_hi)
+      ot_check(th_mov_imm((uint32_t)dst_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+  }
+  else if (is_left && sh == 1 && !skip_lo && !skip_hi &&
       thumb_is_hw_reg(src_lo) && thumb_is_hw_reg(src_hi) && dst_lo != src_hi &&
       !(tcc_state->ir && tcc_state->ir->codegen_flags_live))
   {
@@ -1550,9 +1615,25 @@ void tcc_gen_machine_data_processing_mop_flags(MachineOperand src1, MachineOpera
   data_processing_mop_impl(src1, src2, dest, op, FLAGS_BEHAVIOUR_SET, barrel_shift);
 }
 
+ST_FUNC int tcc_gen_machine_ands_is_direct(MachineOperand src2)
+{
+  if (src2.is_64bit)
+    return 0;
+  if (src2.kind != MACH_OP_IMM)
+    return 1;
+  return !src2.needs_deref && th_pack_const((uint32_t)src2.u.imm.val) != 0;
+}
+
 static void data_processing_mop_impl(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op,
                                      thumb_flags_behaviour flags_override, uint32_t barrel_shift)
 {
+  if (op == TCCIR_OP_SHR && src1.is_64bit && !dest.is_64bit &&
+      src2.kind == MACH_OP_IMM && src2.u.imm.val == 32 && !(barrel_shift & 0xffffu))
+  {
+    MachineOperand hi = mach_make_hi_half(&src1);
+    tcc_gen_machine_assign_mop(hi, dest, TCCIR_OP_ASSIGN);
+    return;
+  }
   ThumbDataProcessingHandler handler;
   ThumbDataProcessingHandler carry_handler; /* used for hi word of 64-bit ops */
   bool uses_carry = false;
@@ -1643,7 +1724,7 @@ static void data_processing_mop_impl(MachineOperand src1, MachineOperand src2, M
       const uint32_t zh = (barrel_shift >> 18) & 0x7Fu;
       bool skip_lo = ((barrel_shift >> 16) & 1) || (zh & ZH64_D_LO) != 0;
       bool skip_hi = ((barrel_shift >> 17) & 1) || (zh & ZH64_D_HI) != 0;
-      thumb_emit_shift64_mop(&src1, &src2, &dest, op, skip_lo, skip_hi);
+      thumb_emit_shift64_mop(&src1, &src2, &dest, op, skip_lo, skip_hi, (zh & ZH64_S1_HI) != 0);
     }
     else
       thumb_emit_data_processing_mop64(&src1, &src2, &dest, op, handler, carry_handler, uses_carry,
@@ -2850,13 +2931,7 @@ ST_FUNC int tcc_machine_has_umaal(void)
   return arm_target_dependent.feat.t32 && arm_target_dependent.feat.dsp;
 }
 
-/* tcc_gen_machine_umaal_mop: TCCIR_OP_UMAAL,
- *   dest = (uint32)src1 * (uint32)src2 + lo32(accum) + hi32(accum)
- * UMAAL accumulates in place ({RdHi:RdLo} = Rn * Rm + RdLo + RdHi), so the
- * accumulator's words go to the destination pair first -- no move at all when
- * the allocator put them there.  The pair the moves overwrite must not hold a
- * multiplicand; a destination that overlaps one is replaced by a scratch pair
- * and written back after. */
+/* Materialize a word accumulator's implicit zero directly in the output pair. */
 ST_FUNC void tcc_gen_machine_umaal_mop(MachineOperand src1, MachineOperand src2, MachineOperand accum,
                                        MachineOperand dest)
 {
@@ -2866,7 +2941,8 @@ ST_FUNC void tcc_gen_machine_umaal_mop(MachineOperand src1, MachineOperand src2,
   MachineOperand s2 = src2;
   s2.is_64bit = false;
   MachineOperand acc_lo = mach_make_lo_half(&accum);
-  MachineOperand acc_hi = mach_make_hi_half(&accum);
+  MachineOperand acc_hi = accum.is_64bit ? mach_make_hi_half(&accum)
+                                        : (MachineOperand){.kind = MACH_OP_IMM, .u.imm.val = 0};
   acc_lo.btype = IROP_BTYPE_INT32;
   acc_hi.btype = IROP_BTYPE_INT32;
   MachineOperand dst_lo = mach_make_lo_half(&dest);
@@ -2903,9 +2979,7 @@ ST_FUNC void tcc_gen_machine_umaal_mop(MachineOperand src1, MachineOperand src2,
     excl |= 1u << (uint32_t)rd_hi;
   }
 
-  /* The two addends are summed symmetrically, so either may go in either
-   * register: keep whichever is already in place, which also means neither
-   * move can overwrite the other addend before it is read. */
+  /* The addends commute; choose the order that preserves an overlapping source. */
   if (al == rd_hi || ah == rd_lo)
   {
     mach_move_into(&ctx, rd_lo, &acc_hi, excl);

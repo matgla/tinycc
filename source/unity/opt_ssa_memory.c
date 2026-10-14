@@ -3,6 +3,7 @@
 #undef CFW_AF_UNKNOWN
 #undef CFW_DBG
 #undef CFW_MAX_READS
+#undef CFW_RELAY_MAX
 #undef USING_GLOBALS
 #include "../opt/ssa/memory/diamond_store_fwd.c"
 #undef USING_GLOBALS

@@ -1,0 +1,10 @@
+walk done err=9 id=0 w0=0 w5=0 ft=0 len=0 sum=0
+walk error err=3 id=0 w0=0 w5=0 ft=0 len=0 sum=0
+walk found err=0 id=170000000b w0=2300 w5=2306 ft=3 len=24 sum=2686817379
+walk empty err=9 id=0 w0=0 w5=0 ft=0 len=0 sum=0
+visits=17
+partial null=0 id=40000000b w0=5 w5=406 sum=1884209497 extra=0
+read_after null=0 id=160000000b w0=2200 w5=2205 sum=2580333471 extra=2580335674
+read_between null=0 id=180000000b w0=2400 w5=2405 sum=3837129685 extra=302
+call_between null=0 id=1c0000000b w0=2800 w5=2805 sum=4173736693 extra=1233905439
+2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 1

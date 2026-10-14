@@ -179,6 +179,13 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
     return 0;
   }
 
+  return try_unroll_loop_ivs(ir, loop, loops, loop_idx, ivs, num_ivs);
+}
+
+/* The late pass supplies counters represented by resolved phi copies. */
+int try_unroll_loop_ivs(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_idx,
+                        InductionVar *ivs, int num_ivs)
+{
   /* Primary IV = the one in the exit condition; accumulators match the pattern but are body instrs. */
   int cmp_idx, jmpif_idx, limit, cond, exit_target;
   InductionVar *iv = NULL;
@@ -364,12 +371,8 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
           other->header_idx += extra;
         if (other->preheader_idx > orig_end)
           other->preheader_idx += extra;
-        for (int b = 0; b < other->num_body_instrs; b++)
-        {
-          if (other->body_instrs[b] > orig_end)
-            other->body_instrs[b] += extra;
-        }
       }
+      tcc_ir_loops_shift_bodies(loops, 0, loop_idx, orig_end + 1, extra);
     }
   }
 

@@ -13,6 +13,7 @@
 #include "cfg.h"
 #include "memory/small_sequence.h"
 #include "memory/unique_ptr.h"
+#include "opt.h"
 
 typedef struct IRCycleWork
 {
@@ -44,6 +45,19 @@ add_pred:
   tb->preds[tb->num_preds++] = from;
 }
 
+/* An instruction control never continues past: a TRAP, or a call to a
+ * provably noreturn callee (the predicate DCE already trusts).  It ends its
+ * block with no fall-through successor, so the cold block of a panic guard
+ * does not become a predecessor of the code after the guard. */
+int tcc_ir_cfg_instr_ends_flow(TCCIRState *ir, IRQuadCompact *q)
+{
+  if (q->op == TCCIR_OP_TRAP)
+    return 1;
+  if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
+    return 0;
+  return tcc_ir_callee_is_noreturn(tcc_ir_op_src1_sym(ir, q));
+}
+
 static void cfg_build_edges(TCCIRState *ir, IRCFG *cfg, int fill)
 {
   int n = cfg->num_instrs;
@@ -65,6 +79,13 @@ static void cfg_build_edges(TCCIRState *ir, IRCFG *cfg, int fill)
       int target = (int)tcc_ir_op_dest_imm(ir, q);
       if (target >= 0 && target < n)
         cfg_add_edge(cfg, b, cfg->instr_to_block[target], fill);
+      if (b + 1 < cfg->num_blocks)
+        cfg_add_edge(cfg, b, b + 1, fill);
+    }
+    else if (q->op == TCCIR_OP_INLINE_ASM) {
+      for (int k = 0, target; (target = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+        if (target < n)
+          cfg_add_edge(cfg, b, cfg->instr_to_block[target], fill);
       if (b + 1 < cfg->num_blocks)
         cfg_add_edge(cfg, b, b + 1, fill);
     }
@@ -96,7 +117,7 @@ static void cfg_build_edges(TCCIRState *ir, IRCFG *cfg, int fill)
       }
     }
     else if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
-             q->op == TCCIR_OP_IJUMP) {
+             q->op == TCCIR_OP_IJUMP || tcc_ir_cfg_instr_ends_flow(ir, q)) {
       /* no successors */
     }
     else {
@@ -114,6 +135,10 @@ int tcc_ir_cfg_flat_has_backedge(TCCIRState *ir)
   int n = ir->next_instruction_index;
   for (int i = 0; i < n; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_INLINE_ASM)
+      for (int k = 0, target; (target = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+        if (target <= i)
+          return 1;
     if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_SWITCH_LOAD)
       return 1;
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
@@ -179,6 +204,10 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
   is_leader[0] = 1;
   for (int i = 0; i < n; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_INLINE_ASM)
+      for (int k = 0, target; (target = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+        if (target < n)
+          is_leader[target] = 1;
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
       int target = (int)tcc_ir_op_dest_imm(ir, q);
       if (target >= 0 && target < n) {
@@ -202,7 +231,9 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
     }
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF ||
         q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
-        q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE) {
+        q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE ||
+        (q->op == TCCIR_OP_INLINE_ASM && tcc_ir_asm_goto_target(ir, q, 0) >= 0) ||
+        tcc_ir_cfg_instr_ends_flow(ir, q)) {
       if (i + 1 < n) {
         is_leader[i + 1] = 1;
       }

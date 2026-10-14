@@ -229,15 +229,18 @@ ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier)
       cstr_ccat(add_str, '#');
     if (r & VT_SYM)
     {
-      const char *name = get_tok_str(sv->sym->v, NULL);
-      if (sv->sym->v >= SYM_FIRST_ANOM)
+      /* An r0/r1 function is reached from asm as from a pointer: through its
+       * AAPCS adapter, entered into the asm labels like an anonymous one. */
+      Sym *sym = gfunc_regpair_address_sym(sv->sym);
+      const char *name = get_tok_str(sym->v, NULL);
+      if (sym->v >= SYM_FIRST_ANOM || sym != sv->sym)
       {
         /* In case of anonymous symbols ("L.42", used
            for static data labels) we can't find them
            in the C symbol table when later looking up
            this name.  So enter them now into the asm label
            list when we still know the symbol.  */
-        get_asm_sym(tok_alloc(name, strlen(name))->tok, sv->sym);
+        get_asm_sym(tok_alloc(name, strlen(name))->tok, sym);
       }
       if (tcc_state->leading_underscore)
         cstr_ccat(add_str, '_');

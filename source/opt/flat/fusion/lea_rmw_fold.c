@@ -249,6 +249,7 @@ int tcc_ir_opt_lea_rmw_fold(TCCIRState *ir)
       IROperand new_op = irop_make_stackoff(-1, folded_off, /*is_lval*/ 1, /*is_llocal*/ 0,
                                             /*is_param_flag*/ (int)lea_src.is_param, old_op.btype);
       new_op.is_unsigned = old_op.is_unsigned;
+      new_op.is_complex = old_op.is_complex;
       new_op.is_static = lea_src.is_static;
       irop_carry_access_marks(&new_op, old_op); /* same access: same volatility */
       if (which == 1)

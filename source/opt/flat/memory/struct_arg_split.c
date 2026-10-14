@@ -47,7 +47,8 @@ extern int gsym_cse_insert_before(TCCIRState *ir, int before_idx, IRQuadCompact 
  *     or write it.  Inline asm, setjmp-style returns-twice ops, static chains
  *     and nested functions end the pass for the whole function.
  *   - A word's value is the one stored by the nearest preceding direct word
- *     store in the same basic block; any other write overlapping the word on
+ *     store in the same basic block, and the PARAM must not start a block of
+ *     its own (a join reached past those stores); any other write overlapping the word on
  *     the way (a partial store, a struct copy into the slot) rejects the
  *     argument.  The stored vreg must not be redefined between the store and
  *     the PARAM.  Nothing may write the argument's bytes between the PARAM and
@@ -478,8 +479,11 @@ int tcc_ir_opt_struct_arg_split(TCCIRState *ir)
     SasObj *ob = sas_obj_at(&s, off);
     c->obj = ob ? (int)(ob - s.obj) : -1;
     c->call = sas_call_of(&s, i);
+    /* A PARAM that is itself a jump target is reached from a path that ran
+     * none of the stores above it (`if (p) a = b; else a = k; f(a)` with the
+     * PARAM as the join): the words would come from the fall-through arm only. */
     c->ok = ob && c->call >= 0 && !ob->escaped && !ob->opaque && off >= ob->lo && off + size <= ob->hi &&
-            !s.target[i + 1] && !sas_call_has_vfp_arg(&s, c->call) && sas_resolve(&s, c);
+            !s.target[i] && !s.target[i + 1] && !sas_call_has_vfp_arg(&s, c->call) && sas_resolve(&s, c);
     const int argc = c->call >= 0 ? TCCIR_DECODE_CALL_ARGC(tcc_ir_op_src2_imm(ir, &ir->compact_instructions[c->call])) : 0;
     if (c->ok && argc + c->words - 1 > 0x7FFF)
       c->ok = 0;

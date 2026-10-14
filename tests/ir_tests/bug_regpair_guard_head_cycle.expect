@@ -1,0 +1,20 @@
+k=0 v=0 none=0 freed=4 frees=10
+k=1 v=4 none=0 freed=4 frees=137
+k=2 v=6 none=1 freed=3 frees=148
+k=3 v=4 none=0 freed=4 frees=459
+k=4 v=12 none=0 freed=8 frees=478
+k=5 v=4 none=0 freed=4 frees=555
+k=6 v=18 none=1 freed=7 frees=706
+k=7 v=4 none=0 freed=4 frees=797
+p k=0 v=30 none=1 frees=1176
+p k=1 v=4 none=0 frees=1176
+p k=2 v=36 none=0 frees=1689
+p k=3 v=4 none=0 frees=1754
+p k=4 v=42 none=1 frees=2667
+p k=5 v=4 none=0 frees=2898
+trim abc 3
+id 0 1016
+id 1 1003
+id 2 1026
+id 3 5
+frees 2898

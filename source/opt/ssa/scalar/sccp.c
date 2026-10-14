@@ -57,6 +57,8 @@ typedef struct {
   /* Some volatile access touches the frame (volatile_frame_access). */
   int vol_done;
   int vol_frame;
+  int asm_back_done;
+  int asm_back;
 } SCCPState;
 
 static SCCPCell *sccp_cell(SCCPState *s, int32_t vreg)
@@ -469,6 +471,8 @@ static int sccp_slot_addr_escapes(SCCPState *s, int load_lo, int load_hi)
   TCCIRState *ir = s->ctx->ir;
   if (!s->esc_done) {
     s->esc_done = 1;
+    /* A nested function's call reaches frame objects with no address here. */
+    s->esc_all = tcc_ir_frame_shared_with_nested(ir);
     uint8_t *visited = tcc_mallocz(s->ctx->vinfo_cap ? s->ctx->vinfo_cap : 1);
     for (int i = 0; i < ir->next_instruction_index && !s->esc_all; i++) {
       IRQuadCompact *q = &ir->compact_instructions[i];
@@ -943,11 +947,29 @@ static int sccp_volatile_frame_access(SCCPState *s)
   return s->vol_frame;
 }
 
+/* Does an asm goto jump back to a label at or above it?  The loop scans here
+ * (tcc_ir_detect_loops) know only JUMP/JUMPIF back edges, so a slot written in
+ * such a loop would read as the value stored before it. */
+static int sccp_has_asm_goto_back_edge(SCCPState *s)
+{
+  if (s->asm_back_done)
+    return s->asm_back;
+  s->asm_back_done = 1;
+  TCCIRState *ir = s->ctx->ir;
+  if (!ir->func_has_asm_goto)
+    return 0;
+  for (int i = 0; i < ir->next_instruction_index && !s->asm_back; i++)
+    for (int k = 0, t; (t = tcc_ir_asm_goto_target(ir, &ir->compact_instructions[i], k)) >= 0; k++)
+      if (t <= i)
+        s->asm_back = 1;
+  return s->asm_back;
+}
+
 static int sccp_resolve_stack_load_raw(SCCPState *s, int soff, int load_btype,
                                        int instr_idx, int64_t *out, int *dep_pos)
 {
   IRCFG *cfg = s->ctx->cfg;
-  if (sccp_volatile_frame_access(s))
+  if (sccp_volatile_frame_access(s) || sccp_has_asm_goto_back_edge(s))
     return SCCP_BOTTOM;
   int block = cfg->instr_to_block[instr_idx];
   IRBasicBlock *bb = &cfg->blocks[block];
@@ -1032,9 +1054,33 @@ static int sccp_resolve_stack_load(SCCPState *s, int soff, int load_btype, int l
 }
 
 /* *dep_src_pos reports the TEMP a STORE-based resolution depends on, or -1. */
-static int sccp_resolve_var(SCCPState *s, int32_t var_vreg, int instr_idx,
+/* A STORE that writes V at the read's own width defines what the read sees;
+ * a narrower or wider one leaves other bytes or drops some, so the walk
+ * stops.  An 8/16-bit read extends the stored bytes by its signedness. */
+static int sccp_var_store_value(SCCPState *s, IRQuadCompact *q, IROperand use,
+                                int instr_idx, int via_addr, int64_t *out,
+                                int *dep_src_pos)
+{
+  TCCIRState *ir = s->ctx->ir;
+  int bt = irop_get_btype(use);
+  if (irop_get_btype(tcc_ir_op_get_dest(ir, q)) != bt)
+    return SCCP_BOTTOM;
+  IROperand src = tcc_ir_op_get_src1(ir, q);
+  int st = via_addr ? sccp_get_store_src_value(s, src, out, dep_src_pos)
+                    : sccp_get_store_src_value_ex(s, src, instr_idx, out, dep_src_pos);
+  if (st != SCCP_CONST)
+    return st;
+  if (bt == IROP_BTYPE_INT8)
+    *out = use.is_unsigned ? (int64_t)(uint8_t)*out : (int64_t)(int8_t)*out;
+  else if (bt == IROP_BTYPE_INT16)
+    *out = use.is_unsigned ? (int64_t)(uint16_t)*out : (int64_t)(int16_t)*out;
+  return st;
+}
+
+static int sccp_resolve_var(SCCPState *s, IROperand use, int instr_idx,
                             int64_t *out, int *dep_src_pos)
 {
+  int32_t var_vreg = irop_get_vreg(use);
   TCCIRState *ir = s->ctx->ir;
   IRCFG *cfg = s->ctx->cfg;
   int block = cfg->instr_to_block[instr_idx];
@@ -1079,8 +1125,7 @@ static int sccp_resolve_var(SCCPState *s, int32_t var_vreg, int instr_idx,
           TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_VAR &&
           TCCIR_DECODE_VREG_POSITION(dv) == var_pos &&
           dest.is_local) {
-        return sccp_get_store_src_value_ex(s, tcc_ir_op_get_src1(ir, q), i,
-                                           out, dep_src_pos);
+        return sccp_var_store_value(s, q, use, i, 0, out, dep_src_pos);
       }
     }
 
@@ -1145,8 +1190,7 @@ static int sccp_resolve_var(SCCPState *s, int32_t var_vreg, int instr_idx,
             break;
         }
         if (resolved) {
-          return sccp_get_store_src_value(s, tcc_ir_op_get_src1(ir, q), out,
-                                          dep_src_pos);
+          return sccp_var_store_value(s, q, use, i, 1, out, dep_src_pos);
         }
 
         /* Never walk past an unknown pointer store: it may alias this VAR. */
@@ -1225,7 +1269,7 @@ static int sccp_get_operand_value_ex(SCCPState *s, IROperand op,
 
   if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR) {
     int dep_src_pos;
-    return sccp_resolve_var(s, vr, instr_idx, out, &dep_src_pos);
+    return sccp_resolve_var(s, op, instr_idx, out, &dep_src_pos);
   }
 
   return SCCP_BOTTOM;
@@ -1533,7 +1577,7 @@ static void sccp_visit_instr(SCCPState *s, int idx)
       if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_VAR) {
         int64_t val;
         int dep_src_pos;
-        int st = sccp_resolve_var(s, svr, idx, &val, &dep_src_pos);
+        int st = sccp_resolve_var(s, src, idx, &val, &dep_src_pos);
         if (dep_src_pos >= 0)
           sccp_add_mem_dep(s, dep_src_pos, idx);
         int changed = 0;

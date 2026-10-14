@@ -732,6 +732,10 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   /* save CMP operands for the tail test before the region is overwritten */
   IROperand cmp_src1 = tcc_ir_op_get_src1(ir, cmp_q);
   IROperand cmp_src2 = tcc_ir_op_get_src2(ir, cmp_q);
+  /* The tail test is a clone of the header CMP: it needs that CMP's
+   * orig_index-keyed annotations too, or a fused `cmp i, n, lsr #4` guard
+   * pairs with a plain `cmp i, n` latch (body ran n times, not n >> 4). */
+  const int cmp_orig = cmp_q->orig_index;
 
   /* IROperand is packed (9 bytes), so every sub-array of this scratch buffer must be explicitly 8-aligned */
   int bc = body_count, lc = eff_latch_count;
@@ -914,6 +918,10 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   }
 
   write_instr_at_nop(ir, wp, TCCIR_OP_CMP, (IROperand){0}, cmp_src1, cmp_src2);
+  /* The header CMP stays as the entry guard, so the tail copy takes a fresh
+   * index plus its annotations: barrel fusion runs before this pass, and a
+   * fused `cmp i, len, lsr #2` copied bare compared i against len. */
+  tcc_ir_copy_orig_annotations(ir, cmp_orig, ir->compact_instructions[wp].orig_index);
   wp++;
 
   {

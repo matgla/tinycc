@@ -43,7 +43,7 @@
 #include "opt.h"
 #include "opt_utils.h"
 
-#define SRA_MAX_BYTES 36 /* 32 bytes, plus the guard word frame_record adds */
+#define SRA_MAX_BYTES 64 /* Includes frame-record guards; padding is a 64-bit mask. */
 
 /* TCC_SRA_PTRVAR=0 keeps objects reached through pointer VARs in memory. */
 TCC_DBG_ENV_INT(sra_ptrvar, "TCC_SRA_PTRVAR", 1)
@@ -53,7 +53,7 @@ TCC_DBG_ENV_INT(sra_ptrvar_df, "TCC_SRA_PTRVAR_DF", 1)
  * arithmetic (`&obj.field + index`) in memory. */
 TCC_DBG_ENV_INT(sra_addr_alu, "TCC_SRA_ADDR_ALU", 1)
 /* TCC_SRA_PARAM_MAX: the largest struct argument split into words, in bytes. */
-TCC_DBG_ENV_INT(sra_param_max, "TCC_SRA_PARAM_MAX", SRA_MAX_BYTES - 4)
+TCC_DBG_ENV_INT(sra_param_max, "TCC_SRA_PARAM_MAX", 32)
 /* TCC_SRA_NARROW_IDX_OFF=1 keeps objects with a narrow indexed store in memory. */
 TCC_DBG_ENV_FLAG(sra_narrow_idx_off, "TCC_SRA_NARROW_IDX_OFF")
 /* TCC_SRA_MIXED_OFF=1 keeps objects whose narrow fields are also read wider in memory. */
@@ -123,6 +123,7 @@ typedef struct
   int nloads;                    /* field loads */
   int npart;                     /* partial stores of a non-constant (each a read-modify-write) */
   uint8_t fstart[SRA_MAX_BYTES]; /* per byte: the start of the field holding it, 0xFF none (sra_index_fields) */
+  uint64_t word_cmp;             /* Word comparisons require an exact, unmasked field. */
   uint64_t pad;                  /* bytes no member of its type covers (tcc_ir_frame_padding) */
 } SraUnit;
 
@@ -516,7 +517,14 @@ static int32_t sra_field_mask(int bytes)
  * (ssa_store_slot_def_pos).  Only the forms the frontend puts ahead of a
  * narrow store are recognised -- a constant, a mask by a subset of it, and a
  * value that is itself a narrow unsigned one.  `def` maps a TEMP to its only
- * defining instruction, or -1 when it has none or several. */
+ * defining instruction, or -1 when it has none or several.
+ *
+ * NOT decided from the stored operand's own btype: the frontend gives a
+ * narrow STORE's value the STORE's width and leaves the truncation to the
+ * store (vstore's delayed char/short cast), so `q.s = word` stores a word
+ * operand typed u16.  It is the definition that has to say so, as in
+ * sl_forward's sl_fwd_value_within_bits.  A store whose value only looks
+ * narrow by its type (sra_narrow_store_typed) still promotes, through a mask. */
 static int sra_narrow_store_fits(TCCIRState *ir, IRQuadCompact *q, int bytes,
                                  const int32_t *def, int ntemp)
 {
@@ -526,9 +534,6 @@ static int sra_narrow_store_fits(TCCIRState *ir, IRQuadCompact *q, int bytes,
     return (irop_get_imm32(op) & ~mask) == 0;
   if (irop_get_tag(op) != IROP_TAG_VREG || op.is_lval || op.is_llocal)
     return 0;
-  int ob = sra_btype_bytes(irop_get_btype(op));
-  if (ob && ob <= bytes && op.is_unsigned)
-    return 1;
   int t = sra_temp_pos(op, ntemp);
   if (t < 0 || !def || def[t] < 0)
     return 0;
@@ -548,12 +553,38 @@ static int sra_narrow_store_fits(TCCIRState *ir, IRQuadCompact *q, int bytes,
   return 0;
 }
 
+/* Is a narrow store's value a narrow unsigned register value by its type
+ * alone?  Such a type does not say the value fits (sra_narrow_store_fits):
+ * the frontend left the truncation to the store.  The field then takes the
+ * value masked to its width (sra_store_as_def), as the store would have cut
+ * it -- most such values do fit, and known_ext drops the mask again. */
+static int sra_narrow_store_typed(TCCIRState *ir, IRQuadCompact *q, int bytes)
+{
+  IROperand op = tcc_ir_op_get_src1(ir, q);
+  if (irop_get_tag(op) != IROP_TAG_VREG || op.is_lval || op.is_llocal)
+    return 0;
+  int ob = sra_btype_bytes(irop_get_btype(op));
+  return ob && ob <= bytes && op.is_unsigned;
+}
+
+static void sra_relay(TCCIRState *ir, IRQuadCompact *q, TccIrOp op, IROperand dest, IROperand src1,
+                      IROperand src2);
+
 /* A narrow field's STORE becomes an ASSIGN -- a definition of the VAR -- with
- * the same two operands and the VAR widened to 32 bits. */
-static void sra_store_as_def(TCCIRState *ir, int i, IROperand rep)
+ * the same two operands and the VAR widened to 32 bits; with MASK_BYTES, an
+ * AND that first cuts the value to that width (sra_narrow_store_typed). */
+static void sra_store_as_def(TCCIRState *ir, int i, IROperand rep, int mask_bytes)
 {
   rep.is_lval = 0; /* a value definition of the VAR, not a write through it */
-  ir->compact_instructions[i].op = TCCIR_OP_ASSIGN;
+  IRQuadCompact *q = &ir->compact_instructions[i];
+  if (mask_bytes)
+  {
+    IROperand x = irop_retype_scalar(tcc_ir_op_get_src1(ir, q), IROP_BTYPE_INT32);
+    x.is_unsigned = 1;
+    sra_relay(ir, q, TCCIR_OP_AND, rep, x, irop_make_imm32(-1, sra_field_mask(mask_bytes), IROP_BTYPE_INT32));
+    return;
+  }
+  q->op = TCCIR_OP_ASSIGN;
   tcc_ir_set_dest(ir, i, rep);
 }
 
@@ -596,6 +627,9 @@ static int sra_slot_bytes(TCCIRState *ir, TccIrOp op, int s, IROperand o)
   if (!o.is_lval || o.is_llocal || o.is_complex || tcc_ir_access_is_volatile(ir, o))
     return 0;
   int bt = irop_get_btype(o);
+  if ((s == 1 || s == 2) && op == TCCIR_OP_CMP && bt == IROP_BTYPE_INT32 &&
+      !o.is_complex && !tcc_ir_access_is_volatile(ir, o))
+    return 4;
   if (sra_btype_bytes(bt) &&
       ((s == 1 && (op == TCCIR_OP_LOAD || op == TCCIR_OP_ASSIGN)) || (s == 0 && op == TCCIR_OP_STORE)))
     return sra_btype_bytes(bt);
@@ -945,6 +979,7 @@ static void sra_ins_apply(TCCIRState *ir, SraInsList *l)
 {
   if (l->n == 0)
     return;
+  tcc_ir_label_sync(ir);
   tcc_qsort(l->v, l->n, sizeof(SraIns), sra_ins_cmp);
   const int n = ir->next_instruction_index, nn = n + l->n;
   IRQuadCompact *out = tcc_malloc(sizeof(IRQuadCompact) * (nn + 1));
@@ -1031,7 +1066,7 @@ static void sra_rewrite_wide(TCCIRState *ir, SraInsList *ins, int i, int s, IROp
   {
     IROperand rep = sra_field_op(ir, u, at, IROP_BTYPE_INT64, o.is_unsigned);
     if (s == 0)
-      sra_store_as_def(ir, i, rep);
+      sra_store_as_def(ir, i, rep, 0);
     else if (s == 1)
       tcc_ir_set_src1(ir, i, rep);
     else
@@ -1115,6 +1150,47 @@ static int sra_access_through(TCCIRState *ir, IRQuadCompact *q, int ntemp, int *
   if (irop_is_64bit(*acc) || acc->is_complex || !sra_btype_bytes(irop_get_btype(*acc)) ||
       tcc_ir_access_is_volatile(ir, *acc))
     return -1;
+  return t;
+}
+
+/* sra_access_through for a 64-bit integer access instead: the Zig C backend
+ * writes a u64 member through a pointer temporary (`t2 = &t0._offset;
+ * (*t2) = a1;`).  A store's value must be a plain TEMP or constant, as for a
+ * direct 64-bit slot store (sra_wide_access); the doubleword is then a field
+ * like that one, and sra_rewrite_wide rewrites the access. */
+static int sra_wide_through(TCCIRState *ir, IRQuadCompact *q, int ntemp, int *disp, IROperand *acc)
+{
+  int op = q->op;
+  if (op != TCCIR_OP_STORE && op != TCCIR_OP_LOAD && op != TCCIR_OP_STORE_INDEXED && op != TCCIR_OP_LOAD_INDEXED)
+    return -1;
+  int is_store = op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED;
+  int indexed = op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_LOAD_INDEXED;
+  IROperand base = tcc_ir_op_get_dest_or_src1(ir, q, !is_store);
+  int t = sra_temp_pos(base, ntemp);
+  if (t < 0 || irop_get_tag(base) != IROP_TAG_VREG || base.is_local || base.is_llocal || base.is_lval == indexed)
+    return -1;
+  *disp = 0;
+  *acc = base;
+  if (indexed)
+  {
+    IROperand scale = tcc_ir_op_get_scale(ir, q);
+    if (tcc_ir_op_src2_tag(ir, q) != IROP_TAG_IMM32 || tcc_ir_op_src2_is_lval(ir, q) ||
+        (!irop_is_none(scale) && (irop_get_tag(scale) != IROP_TAG_IMM32 || irop_get_imm32(scale) != 0)))
+      return -1;
+    *disp = tcc_ir_op_src2_imm32(ir, q);
+    *acc = tcc_ir_op_get_dest_or_src1(ir, q, is_store);
+    acc->aux = base.aux;
+  }
+  if (irop_get_btype(*acc) != IROP_BTYPE_INT64 || acc->is_complex || tcc_ir_access_is_volatile(ir, *acc))
+    return -1;
+  if (is_store)
+  {
+    IROperand v = tcc_ir_op_get_src1(ir, q);
+    int tag = irop_get_tag(v);
+    if (v.is_lval || v.is_complex || v.is_local || v.is_llocal ||
+        !((tag == IROP_TAG_VREG && irop_get_vreg(v) >= 0) || tag == IROP_TAG_IMM32 || tag == IROP_TAG_I64))
+      return -1;
+  }
   return t;
 }
 
@@ -1454,6 +1530,12 @@ static void sra_expand_whole(TCCIRState *ir, SraInsList *ins, SraUnit *u, const 
     if (!w)
       continue;
     const int d = at - a0;
+    /* The copy helper (__aeabi_memmove4/8) promises a word-aligned pointer,
+     * so a field a whole number of words into it is a word-aligned access:
+     * one LDRD/STRD or LDM/STM may carry it. */
+    IROperand abase = base;
+    if (!(d & 3))
+      abase.aux = (abase.aux | IROP_AUX_ALIGN4_OK) & ~IROP_AUX_UNDERALIGN;
     IROperand imm = irop_make_imm32(-1, d, IROP_BTYPE_INT32);
     IROperand imm4 = irop_make_imm32(-1, d + 4, IROP_BTYPE_INT32);
     if (e->dir == 0 && w == 8)
@@ -1465,8 +1547,8 @@ static void sra_expand_whole(TCCIRState *ir, SraInsList *ins, SraUnit *u, const 
       else
       {
         IROperand lo = sra_new_temp(ir, IROP_BTYPE_INT32), hi = sra_new_temp(ir, IROP_BTYPE_INT32);
-        sra_ins_add(ir, ins, anchor, after, TCCIR_OP_LOAD_INDEXED, lo, base, imm);
-        sra_ins_add(ir, ins, anchor, after, TCCIR_OP_LOAD_INDEXED, hi, base, imm4);
+        sra_ins_add(ir, ins, anchor, after, TCCIR_OP_LOAD_INDEXED, lo, abase, imm);
+        sra_ins_add(ir, ins, anchor, after, TCCIR_OP_LOAD_INDEXED, hi, abase, imm4);
         sra_ins_add(ir, ins, anchor, after, TCCIR_OP_PACK64, x, lo, hi);
       }
       IROperand rep = sra_field_op(ir, u, at, IROP_BTYPE_INT64, 1);
@@ -1480,7 +1562,7 @@ static void sra_expand_whole(TCCIRState *ir, SraInsList *ins, SraUnit *u, const 
         sra_ins_add(ir, ins, anchor, after, TCCIR_OP_LOAD, x, sra_slot_op(e->slot, u->lo + at, sra_width_btype(w)),
                     IROP_NONE);
       else
-        sra_ins_add(ir, ins, anchor, after, TCCIR_OP_LOAD_INDEXED, x, base, imm);
+        sra_ins_add(ir, ins, anchor, after, TCCIR_OP_LOAD_INDEXED, x, abase, imm);
       /* A narrow field's definition is an ASSIGN (sra_store_as_def). */
       IROperand rep = sra_field_op(ir, u, at, IROP_BTYPE_INT32, 1);
       if (w < 4)
@@ -1495,8 +1577,8 @@ static void sra_expand_whole(TCCIRState *ir, SraInsList *ins, SraUnit *u, const 
       sra_ins_add(ir, ins, anchor, after, TCCIR_OP_ASSIGN, lo, x, IROP_NONE);
       sra_ins_add(ir, ins, anchor, after, TCCIR_OP_SHR, th, x, irop_make_imm32(-1, 32, IROP_BTYPE_INT32));
       sra_ins_add(ir, ins, anchor, after, TCCIR_OP_ASSIGN, hi, th, IROP_NONE);
-      sra_ins_add(ir, ins, anchor, after, TCCIR_OP_STORE_INDEXED, base, lo, imm);
-      sra_ins_add(ir, ins, anchor, after, TCCIR_OP_STORE_INDEXED, base, hi, imm4);
+      sra_ins_add(ir, ins, anchor, after, TCCIR_OP_STORE_INDEXED, abase, lo, imm);
+      sra_ins_add(ir, ins, anchor, after, TCCIR_OP_STORE_INDEXED, abase, hi, imm4);
     }
     else
     {
@@ -1504,7 +1586,7 @@ static void sra_expand_whole(TCCIRState *ir, SraInsList *ins, SraUnit *u, const 
       sra_ins_add(ir, ins, anchor, after, TCCIR_OP_LOAD, x, sra_field_op(ir, u, at, IROP_BTYPE_INT32, 1), IROP_NONE);
       IROperand v = irop_make_vreg(irop_get_vreg(x), sra_width_btype(w));
       v.is_unsigned = 1;
-      sra_ins_add(ir, ins, anchor, after, TCCIR_OP_STORE_INDEXED, base, v, imm);
+      sra_ins_add(ir, ins, anchor, after, TCCIR_OP_STORE_INDEXED, abase, v, imm);
     }
     at += w - 1;
   }
@@ -1766,6 +1848,9 @@ static int sra_objects(TCCIRState *ir)
   /* Each TEMP's only defining instruction, or -1: what a narrow store's value
    * has to be looked up through (sra_narrow_store_fits). */
   int32_t *def_idx = ntemp > 0 ? tcc_malloc(sizeof(int32_t) * ntemp) : NULL;
+  /* Per instruction: a narrow store whose value fits only by its type, so
+   * the field takes it masked to this many bytes (sra_narrow_store_typed). */
+  uint8_t *smask = tcc_mallocz(n + 1);
   for (int t = 0; t < ntemp; t++)
     def_idx[t] = -1;
   int32_t *toff = ntemp > 0 ? tcc_malloc(sizeof(int32_t) * ntemp) : NULL;
@@ -2202,6 +2287,8 @@ static int sra_objects(TCCIRState *ir)
     int disp, dt = sra_addr_def(ir, q, ntemp);
     IROperand acc;
     int bt = sra_access_through(ir, q, ntemp, &disp, &acc);
+    if (bt < 0 && !no_wide)
+      bt = sra_wide_through(ir, q, ntemp, &disp, &acc);
     int base_slot = q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ? 0 : 1;
     for (int s = 0; s < 4; s++)
     {
@@ -2391,7 +2478,11 @@ static int sra_objects(TCCIRState *ir)
       {
         if (bytes < 4 && s == 0 && q->op == TCCIR_OP_STORE && off - u[k].lo >= 0 && off - u[k].lo < SRA_MAX_BYTES)
         {
-          if (!sra_narrow_store_fits(ir, q, bytes, def_idx, ntemp))
+          if (sra_narrow_store_fits(ir, q, bytes, def_idx, ntemp))
+            ;
+          else if (sra_narrow_store_typed(ir, q, bytes))
+            smask[i] = (uint8_t)bytes;
+          else
             u[k].nofit[off - u[k].lo] |= (uint8_t)bytes;
           if (!irop_is_plain_imm(tcc_ir_op_get_src1(ir, q)))
           {
@@ -2400,6 +2491,8 @@ static int sra_objects(TCCIRState *ir)
           }
         }
         sra_note_field(&u[k], off, bytes, o.is_unsigned, s == 0);
+        if (q->op == TCCIR_OP_CMP && !u[k].bad)
+          u[k].word_cmp |= (uint64_t)1 << (off - u[k].lo);
         u[k].ok_refs++;
       }
       else
@@ -2412,6 +2505,22 @@ static int sra_objects(TCCIRState *ir)
     int disp;
     IROperand acc;
     int t = ntemp > 0 ? sra_access_through(ir, q, ntemp, &disp, &acc) : -1;
+    int wt = t < 0 && ntemp > 0 && !no_wide ? sra_wide_through(ir, q, ntemp, &disp, &acc) : -1;
+    if (wt >= 0 && toff[wt] != SRA_NO_ADDR && !tbad[wt] && troot[wt] >= 0)
+    {
+      int off = toff[wt] + disp, k = sra_find_unit(u, nu, off);
+      if (k != troot[wt])
+      {
+        u[troot[wt]].bad = 1; /* strays outside the object */
+        sra_why(&u[troot[wt]], "stray", q->op);
+      }
+      else
+      {
+        u[k].refs++;
+        u[k].ok_refs++;
+        sra_note_wide(&u[k], off);
+      }
+    }
     if (t >= 0 && toff[t] != SRA_NO_ADDR && !tbad[t] && troot[t] >= 0)
     {
       int off = toff[t] + disp, k = sra_find_unit(u, nu, off);
@@ -2437,7 +2546,11 @@ static int sra_objects(TCCIRState *ir)
         else if (abytes < 4 && (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) && off - u[k].lo >= 0 &&
                  off - u[k].lo < SRA_MAX_BYTES)
         {
-          if (!sra_narrow_store_fits(ir, q, abytes, def_idx, ntemp))
+          if (sra_narrow_store_fits(ir, q, abytes, def_idx, ntemp))
+            ;
+          else if (sra_narrow_store_typed(ir, q, abytes))
+            smask[i] = (uint8_t)abytes;
+          else
             u[k].nofit[off - u[k].lo] |= (uint8_t)abytes;
           if (!irop_is_plain_imm(tcc_ir_op_get_src1(ir, q)))
           {
@@ -2465,6 +2578,13 @@ static int sra_objects(TCCIRState *ir)
   for (int k = 0; k < nu; k++)
     if (!u[k].bad)
       sra_resolve_wide(&u[k]);
+  for (int k = 0; k < nu; k++)
+    for (int at = 0; !u[k].bad && at < SRA_MAX_BYTES; at++)
+      if (((u[k].word_cmp >> at) & 1) && (u[k].width[at] != 4 || u[k].pmask[at]))
+      {
+        u[k].bad = 1;
+        sra_why(&u[k], "cmp-field", TCCIR_OP_CMP);
+      }
   /* Ranges accessed whole: inside the object, with a field for each byte a
    * call writes and a later whole read passes on, and no field across an
    * end. */
@@ -2733,6 +2853,18 @@ static int sra_objects(TCCIRState *ir)
     int disp;
     IROperand acc;
     int t = ntemp > 0 ? sra_access_through(ir, q, ntemp, &disp, &acc) : -1;
+    int wt = t < 0 && ntemp > 0 && !no_wide ? sra_wide_through(ir, q, ntemp, &disp, &acc) : -1;
+    if (wt >= 0 && toff[wt] != SRA_NO_ADDR && !tbad[wt] && troot[wt] >= 0 && !u[troot[wt]].bad)
+    {
+      /* A doubleword through an address TEMP: the access as a plain slot
+       * LOAD / STORE first, the value or dest kept, then the wide rewrite. */
+      int k = troot[wt], at = toff[wt] + disp - u[k].lo;
+      int is_store = q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED;
+      q->op = is_store ? TCCIR_OP_STORE : TCCIR_OP_LOAD;
+      sra_rewrite_wide(ir, &ins, i, is_store ? 0 : 1, acc, &u[k], at);
+      changes++;
+      continue;
+    }
     if (t >= 0 && toff[t] != SRA_NO_ADDR && !tbad[t] && troot[t] >= 0 && !u[troot[t]].bad)
     {
       int k = troot[t], at = toff[t] + disp - u[k].lo;
@@ -2749,7 +2881,7 @@ static int sra_objects(TCCIRState *ir)
           sra_partial_store_bfi(ir, i, &u[k], fs, at - fs, abytes, tcc_ir_op_get_src1(ir, q));
         else if (is_store)
           sra_partial_store(ir, &ins, i, &u[k], fs, at - fs, abytes, tcc_ir_op_get_src1(ir, q),
-                            !(u[k].nofit[at] & abytes));
+                            !(u[k].nofit[at] & abytes) && !smask[i]);
         else
           sra_partial_load(ir, &ins, i, &u[k], fs, at - fs, abytes, acc.is_unsigned, tcc_ir_op_get_dest(ir, q));
         changes++;
@@ -2780,7 +2912,7 @@ static int sra_objects(TCCIRState *ir)
       }
       if (is_store && narrow)
       {
-        sra_store_as_def(ir, i, rep);
+        sra_store_as_def(ir, i, rep, smask[i]);
         changes++;
         continue;
       }
@@ -2915,7 +3047,7 @@ static int sra_objects(TCCIRState *ir)
           sra_partial_store_bfi(ir, i, &u[k], fs, at - fs, obytes, tcc_ir_op_get_src1(ir, q));
         else if (s == 0)
           sra_partial_store(ir, &ins, i, &u[k], fs, at - fs, obytes, tcc_ir_op_get_src1(ir, q),
-                            !(u[k].nofit[at] & obytes));
+                            !(u[k].nofit[at] & obytes) && !smask[i]);
         else
           sra_partial_load(ir, &ins, i, &u[k], fs, at - fs, obytes ? obytes : 4, obytes ? o.is_unsigned : 1,
                            tcc_ir_op_get_dest(ir, q));
@@ -2951,7 +3083,7 @@ static int sra_objects(TCCIRState *ir)
       }
       if (s == 0 && narrow && q->op == TCCIR_OP_STORE)
       {
-        sra_store_as_def(ir, i, rep);
+        sra_store_as_def(ir, i, rep, smask[i]);
         changes++;
         continue;
       }
@@ -2987,6 +3119,7 @@ static int sra_objects(TCCIRState *ir)
   tcc_free(vdef);
   tcc_free(vdefroot);
   tcc_free(def_idx);
+  tcc_free(smask);
   tcc_free(tbad);
   tcc_free(tbad_op);
   tcc_free(tbad_at);

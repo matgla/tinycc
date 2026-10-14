@@ -47,6 +47,17 @@ uint8_t *ir_opt_build_merge_bitmap(TCCIRState *ir, int n)
           pred_count[table->default_target]++;
       }
     }
+    else if (q->op == TCCIR_OP_INLINE_ASM)
+    {
+      /* An asm goto's labels are edges out of the asm, which also falls through. */
+      for (int k = 0, target; (target = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+        if (target < n)
+        {
+          pred_count[target]++;
+          if (i >= target)
+            is_merge[target / 8] |= (1 << (target % 8));
+        }
+    }
     /* NOP falls through: count that edge or a merge behind DCE-left NOP padding is missed */
     if (i + 1 < n && q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_RETURNVALUE &&
         q->op != TCCIR_OP_RETURNVOID && q->op != TCCIR_OP_SWITCH_TABLE)
@@ -93,6 +104,12 @@ void ir_opt_mark_block_starts(TCCIRState *ir, int *block_start_seen, int gen, in
           block_start_seen[table->default_target] = gen;
       }
     }
+    else if (q->op == TCCIR_OP_INLINE_ASM)
+    {
+      for (int k = 0, tgt; (tgt = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+        if (tgt < n)
+          block_start_seen[tgt] = gen;
+    }
   }
 }
 
@@ -126,6 +143,14 @@ uint8_t *ir_opt_build_block_starts_bitmap(TCCIRState *ir, int n)
         if (table->default_target >= 0 && table->default_target < n)
           bs[table->default_target / 8] |= (1 << (table->default_target % 8));
       }
+    }
+    else if (q->op == TCCIR_OP_INLINE_ASM && tcc_ir_asm_goto_target(ir, q, 0) >= 0)
+    {
+      for (int k = 0, tgt; (tgt = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+        if (tgt < n)
+          bs[tgt / 8] |= (1 << (tgt % 8));
+      if (i + 1 < n)
+        bs[(i + 1) / 8] |= (1 << ((i + 1) % 8));
     }
   }
   return bs;

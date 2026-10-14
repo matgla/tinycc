@@ -1,0 +1,7 @@
+goto free: 0 w=1 sink=0
+goto found: 306 w=1 sink=102
+goto none: -1 w=1
+round free: -1 w=5 sink=0
+round found: 2004 w=0 sink=2004
+round none: -1 w=0
+round mixed: 1002 w=7 sink=1002

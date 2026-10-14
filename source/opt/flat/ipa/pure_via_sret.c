@@ -16,19 +16,29 @@
 
 
 
+/* Opcode hazards a pure body may have: control flow, memory reads, flags and
+ * the parameters of a call the CALL case vets.  The saved-LR read of
+ * __builtin_return_address is not one: inlined, it would name the caller's. */
+#define PURE_VIA_SRET_OP_HZ                                                                                            \
+  (IR_HZ_BRANCH | IR_HZ_RETURN | IR_HZ_MEM_READ | IR_HZ_UPDATES_SRC | IR_HZ_FLAGS_SET | IR_HZ_FLAGS_READ |            \
+   IR_HZ_CALL_PARAM)
+
 void tcc_ir_analyze_pure_via_sret(TCCIRState *ir, Sym *func_sym)
 {
   if (!ir || !func_sym)
     return;
-  if (func_sym->f.func_pure_via_sret)
+  if (func_sym->a.pure_via_sret)
     return;
   /* A weak body may be replaced by one with side effects. */
   if (func_sym->a.weak)
     return;
 
   /* Non-zero func_vc is the local slot holding the spilled sret pointer --
-   * not a parameter when the result is returned in s0-s7. */
-  if (func_vc == 0 || ir->vfp_ret_words)
+   * not a parameter when the result is returned in s0-s7.  An aggregate
+   * returned in r0/r1 (gfunc_regpair_ret) has no buffer: only frame stores
+   * are then allowed, and the class is the same. */
+  const int has_sret = func_vc != 0 && !ir->vfp_ret_words;
+  if (!has_sret && !(func_vc == 0 && gfunc_regpair_ret(func_sym)))
     return;
 
   /* P0 is seeded unconditionally: the prolog store to the slot may already be forwarded away. */
@@ -69,7 +79,8 @@ void tcc_ir_analyze_pure_via_sret(TCCIRState *ir, Sym *func_sym)
     _r;                                                                                                                \
   })
 
-  SRET_MARK(sret_param_vr);
+  if (has_sret)
+    SRET_MARK(sret_param_vr);
 
   int changes = 1;
   while (changes)
@@ -92,7 +103,8 @@ void tcc_ir_analyze_pure_via_sret(TCCIRState *ir, Sym *func_sym)
       if (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_ASSIGN)
       {
         IROperand src = tcc_ir_op_get_src1(ir, q);
-        if (src.is_local && irop_get_tag(src) == IROP_TAG_STACKOFF && (int32_t)irop_get_stack_offset(src) == sret_slot)
+        if (has_sret && src.is_local && irop_get_tag(src) == IROP_TAG_STACKOFF &&
+            (int32_t)irop_get_stack_offset(src) == sret_slot)
         {
           SRET_MARK(dest_vr);
           changes++;
@@ -130,35 +142,6 @@ void tcc_ir_analyze_pure_via_sret(TCCIRState *ir, Sym *func_sym)
     }
     switch (q->op)
     {
-    case TCCIR_OP_NOP:
-    case TCCIR_OP_LOAD:
-    case TCCIR_OP_LOAD_INDEXED:
-    case TCCIR_OP_LOAD_POSTINC:
-    case TCCIR_OP_LEA:
-    case TCCIR_OP_ASSIGN:
-    case TCCIR_OP_ADD:
-    case TCCIR_OP_SUB:
-    case TCCIR_OP_MUL:
-    case TCCIR_OP_DIV:
-    case TCCIR_OP_IMOD:
-    case TCCIR_OP_UMOD:
-    case TCCIR_OP_AND:
-    case TCCIR_OP_OR:
-    case TCCIR_OP_XOR:
-    case TCCIR_OP_SHL:
-    case TCCIR_OP_SHR:
-    case TCCIR_OP_SAR:
-    case TCCIR_OP_CMP:
-    case TCCIR_OP_FCMP:
-    case TCCIR_OP_FUNCPARAMVAL:
-    case TCCIR_OP_FUNCPARAMVOID:
-    case TCCIR_OP_RETURNVOID:
-    case TCCIR_OP_RETURNVALUE:
-    case TCCIR_OP_JUMP:
-    case TCCIR_OP_JUMPIF:
-    case TCCIR_OP_SELECT:
-      break;
-
     case TCCIR_OP_STORE:
     case TCCIR_OP_STORE_INDEXED:
     case TCCIR_OP_STORE_POSTINC:
@@ -184,10 +167,9 @@ void tcc_ir_analyze_pure_via_sret(TCCIRState *ir, Sym *func_sym)
         pure = 0;
         break;
       }
-      int callee_pure = callee->f.func_pure | callee->f.func_const | callee->f.func_pure_via_sret;
+      int callee_pure = callee->f.func_pure | callee->f.func_const | callee->a.pure_via_sret;
       if (callee->type.ref)
-        callee_pure |=
-            callee->type.ref->f.func_pure | callee->type.ref->f.func_const | callee->type.ref->f.func_pure_via_sret;
+        callee_pure |= callee->type.ref->f.func_pure | callee->type.ref->f.func_const;
       if (callee_pure)
         break;
       const char *name = get_tok_str(callee->v, NULL);
@@ -198,9 +180,27 @@ void tcc_ir_analyze_pure_via_sret(TCCIRState *ir, Sym *func_sym)
     }
 
     default:
-      /* Unknown or side-effecting op (INLINE_ASM, SETJMP, VLA_ALLOC, ...): bail. */
-      pure = 0;
+    {
+      /* Any other op computes, reads memory or branches -- or it is a side
+       * effect (asm, setjmp, a VLA, a trap, ...).  Asking op_props keeps the
+       * bit and count ops (clz/rbit of a ctz, ubfx, setif) that a list of
+       * names missed: the kernel's next_bit scans were never pure. */
+      if (ir_op_has(q->op, IR_HZ_FROM_OP & ~PURE_VIA_SRET_OP_HZ) || q->op == TCCIR_OP_RETURN_ADDRESS)
+      {
+        pure = 0;
+        break;
+      }
+      /* An lvalue destination stores through it, as a STORE would. */
+      if (irop_config[q->op].has_dest)
+      {
+        IROperand dst = tcc_ir_op_get_dest(ir, q);
+        int32_t dest_vr = irop_get_vreg(dst);
+        if (dst.is_lval && !(dst.is_local && irop_get_tag(dst) == IROP_TAG_STACKOFF) &&
+            !(dest_vr >= 0 && SRET_TEST(dest_vr)))
+          pure = 0;
+      }
       break;
+    }
     }
   }
 
@@ -208,7 +208,7 @@ void tcc_ir_analyze_pure_via_sret(TCCIRState *ir, Sym *func_sym)
 
   if (pure)
   {
-    func_sym->f.func_pure_via_sret = 1;
+    func_sym->a.pure_via_sret = 1;
     LOG_IR_GEN("=== PURE_VIA_SRET: function marked pure (sret_slot=%d) ===", (int)sret_slot);
   }
 

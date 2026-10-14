@@ -185,6 +185,8 @@ typedef struct CodeGenDryRunState
   int instruction_count;        /* IR instructions processed */
   int max_nested_saves;         /* Max nested-call save slots used at any call site */
   int rodata_anchor_sites;      /* Shared-.rodata addresses materialised in the body */
+  uint32_t prolog_pushes;       /* Callee-saved regs the prologue is expected to push */
+  uint32_t prolog_pushes_used;  /* ...of which the run took one as a dead scratch */
 } CodeGenDryRunState;
 /* True only for the discovery dry run: "model what would happen" rather than
  * "emit what the real pass emits". */
@@ -485,6 +487,21 @@ extern ThumbLiteralPoolEntry *dry_run_literal_pool;
 extern int dry_run_literal_pool_count;
 extern int pool_entries_total;
 extern int align_pad_max;
+/* The last instruction ot() wrote (real pass): where it ends, its encoding,
+ * and whether it is conditional (an IT or inside an IT block). */
+typedef struct ThumbLastInsn
+{
+  int pos, end;
+  uint32_t opcode;
+  int size;
+  int conditional;
+} ThumbLastInsn;
+extern ThumbLastInsn th_last_insn;
+extern int th_func_code_start;
+/* Instructions widened in place of an alignment pad this function: reset at
+ * the prolog; th_patch_call ICEs on a branch into the middle of one. */
+void th_widened_reset(void);
+int th_widened_contains_mid(int addr);
 extern int dry_run_literal_pool_size;
 extern TCCChainedHash literal_pool_hash;
 extern LiteralPoolLookupCache literal_pool_last_lookup;

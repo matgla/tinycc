@@ -443,6 +443,11 @@ static void emit_inline_functions(TCCState *s, int owed_only)
                   get_tok_str(sym->v & ~SYM_FIELD, NULL));
         continue;
       }
+      /* A GNU nested function is compiled by its parent only (its captures,
+       * typedefs and siblings are bound there); an entry whose auto-inline
+       * was revoked by that compile is never a body this TU still owes. */
+      if (sym && sym->a.nested_func)
+        continue;
       if (sym && sym->type.ref && sym->type.ref->f.func_keep_tokens_for_noreturn &&
           !sym->type.ref->f.func_late_reopt)
         continue;
@@ -510,8 +515,20 @@ void free_inline_functions(TCCState *s)
     if (fn->sym)
       tok_str_free(fn->func_str);
     tcc_free(fn->pack);
+    tcc_free(fn->def_binds);
+    tcc_free(fn->spliced);
   }
   dynarray_reset(&s->inline_fns, &s->nb_inline_fns);
+  for (i = 0; i < s->nb_guard_heads; ++i)
+  {
+    tok_str_free(s->guard_heads[i]->func_str);
+    tcc_free(s->guard_heads[i]->pack);
+    tcc_free(s->guard_heads[i]->guard_free);
+  }
+  dynarray_reset(&s->guard_heads, &s->nb_guard_heads);
+  tcc_free(s->guard_head_by_tok);
+  s->guard_head_by_tok = NULL;
+  s->guard_head_by_tok_size = 0;
   tcc_free(s->inline_fn_by_tok);
   s->inline_fn_by_tok = NULL;
   s->inline_fn_by_tok_size = 0;
@@ -588,6 +605,89 @@ InlineFunc *inline_fn_lookup(TCCState *s, Sym *sym)
     if (s->inline_fns[i]->sym == sym)
       return s->inline_fns[i];
   return NULL;
+}
+
+/* The guard_heads entry of sym, whether or not its head is active; a table
+ * keyed by symbol token, as inline_fn_by_tok, keeps a call site's lookup
+ * O(1). */
+static InlineFunc *guard_head_find(TCCState *s, Sym *sym)
+{
+  int k = (sym->v & ~SYM_FIELD) - TOK_IDENT;
+  if (k >= 0 && s->guard_head_by_tok_size)
+  {
+    InlineFunc *g = inline_fn_slot(s->guard_head_by_tok, s->guard_head_by_tok_size, k)->fn;
+    if (!g || g->sym == sym)
+      return g;
+  }
+  /* another symbol of the same name holds the slot */
+  for (int i = 0; i < s->nb_guard_heads; i++)
+    if (s->guard_heads[i]->sym == sym)
+      return s->guard_heads[i];
+  return NULL;
+}
+
+static void guard_head_index(TCCState *s, InlineFunc *g)
+{
+  int k = (g->sym->v & ~SYM_FIELD) - TOK_IDENT;
+  if (k < 0)
+    return;
+  if ((s->nb_guard_heads + 1) * 2 > s->guard_head_by_tok_size)
+  {
+    int n = s->guard_head_by_tok_size ? s->guard_head_by_tok_size * 2 : 32;
+    InlineFnSlot *grown = tcc_mallocz(sizeof(InlineFnSlot) * n);
+    for (int i = 0; i < s->guard_head_by_tok_size; i++)
+      if (s->guard_head_by_tok[i].fn)
+        *inline_fn_slot(grown, n, s->guard_head_by_tok[i].k) = s->guard_head_by_tok[i];
+    tcc_free(s->guard_head_by_tok);
+    s->guard_head_by_tok = grown;
+    s->guard_head_by_tok_size = n;
+  }
+  InlineFnSlot *slot = inline_fn_slot(s->guard_head_by_tok, s->guard_head_by_tok_size, k);
+  if (!slot->fn)
+  {
+    slot->k = k;
+    slot->fn = g;
+  }
+}
+
+/* A recompiled body replaces its earlier guard head; one that has none
+ * (head == NULL) deactivates it. */
+void guard_head_register(TCCState *s, Sym *sym, TokenString *head, const int *pack, int *free_names)
+{
+  if (!head)
+  {
+    sym->a.guard_head = 0;
+    return;
+  }
+  InlineFunc *g = guard_head_find(s, sym);
+  if (!g)
+  {
+    g = tcc_mallocz(sizeof *g);
+    g->sym = sym;
+    guard_head_index(s, g);
+    dynarray_add(&s->guard_heads, &s->nb_guard_heads, g);
+  }
+  else
+  {
+    tok_str_free(g->func_str);
+    tcc_free(g->pack);
+    tcc_free(g->guard_free);
+    g->pack = NULL;
+  }
+  g->func_str = head;
+  g->guard_free = free_names;
+  if (pack)
+  {
+    size_t size = sizeof(int) * (pack[0] + 2);
+    g->pack = tcc_malloc(size);
+    memcpy(g->pack, pack, size);
+  }
+  sym->a.guard_head = 1;
+}
+
+InlineFunc *guard_head_lookup(TCCState *s, Sym *sym)
+{
+  return sym->a.guard_head ? guard_head_find(s, sym) : NULL;
 }
 
 /* ---- -finline-functions-called-once ------------------------------------
@@ -1314,7 +1414,7 @@ void gen_deferred_function_bodies(TCCState *s)
    * by '(' is a call; anything else (address taken, sizeof, a same-named
    * local) is another mention, which rules the function out. */
   int *calls = deferred_alloc(sizeof(int) * n), *mentions = deferred_alloc(sizeof(int) * n);
-  int *caller = deferred_alloc(sizeof(int) * n);
+  int *caller = deferred_alloc(sizeof(int) * n), *self_calls = deferred_alloc(sizeof(int) * n);
   int *edge_start = deferred_alloc(sizeof(int) * (n + 1)), nedges = 0, edge_cap = 0;
   int *edges = NULL;
   for (int i = 0; i < n; i++)
@@ -1335,6 +1435,7 @@ void gen_deferred_function_bodies(TCCState *s)
         if (next_t == '(')
         {
           calls[j]++;
+          self_calls[j] += i == j;
           caller[j] = i;
           if (nedges == edge_cap)
           {
@@ -1363,6 +1464,12 @@ void gen_deferred_function_bodies(TCCState *s)
   {
     DeferredFunc *d = s->deferred_fns[j];
     Sym *sym = d->sym;
+    /* Referenced by direct calls only, none recursive: gen_function may make
+     * it a few-callers inline (each site expands it; the copy goes with the
+     * last reference). */
+    if ((sym->type.t & VT_STATIC) && calls[j] >= 2 && !mentions[j] && !self_calls[j] && !sym->c &&
+        !sym->a.addrtaken && d->body && !is_pending_alias_target(sym) && called_once_body_ok(sym, d->body))
+      d->call_sites = calls[j];
     if (!TCC_OPT(s, opt_inline_called_once) || !(sym->type.t & VT_STATIC) || calls[j] != 1 || mentions[j] ||
         caller[j] == j || sym->c || sym->a.addrtaken || !d->body || is_pending_alias_target(sym) ||
         !called_once_body_ok(sym, d->body))
@@ -1405,6 +1512,7 @@ void gen_deferred_function_bodies(TCCState *s)
   deferred_release(calls);
   deferred_release(mentions);
   deferred_release(caller);
+  deferred_release(self_calls);
 
   /* Generate the others callees first (post-order over the call edges,
    * iteratively: call chains in generated C run deep). */

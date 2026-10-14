@@ -1,0 +1,7 @@
+'/usr/lib': root=1 not=0 two=11 scaled=5 reused=0 narrowed=0 field=17
+'usr': root=0 not=1 two=0 scaled=0 reused=1 narrowed=1 field=27
+'': root=0 not=1 two=12 scaled=0 reused=2 narrowed=2 field=27
+'/': root=1 not=0 two=11 scaled=5 reused=3 narrowed=3 field=17
+'xa': root=0 not=1 two=0 scaled=0 reused=1105 narrowed=1105 field=27
+'/a': root=1 not=0 two=11 scaled=5 reused=1106 narrowed=1106 field=17
+'aa': root=0 not=1 two=0 scaled=0 reused=1107 narrowed=1107 field=27

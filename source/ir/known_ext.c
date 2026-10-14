@@ -36,6 +36,13 @@
  * at all is unknown for the same reason.  Masks start empty and only grow, so
  * loops converge (optimistically) in a few sweeps.
  *
+ * Alongside the masks it computes, for every TEMP, the narrowest width its
+ * register image is the sign extension of (SXTB/SXTH, LDRSB/LDRSH, SBFX), and
+ * turns a sign extension -- an SBFX #0,#w, or a narrow signed read of a
+ * register -- of a value already extended from at most w bits into a copy:
+ * `sxth r1,r1; sxth r0,r1`, an i16 passed through a struct field.  A narrow
+ * unsigned read of a register whose mask fits is a copy the same way.
+ *
  * The same pass publishes what r0 holds at every return of a static function
  * (FuncAttr.func_ret_zext) for the direct calls compiled after it, drops the
  * second of two identical extensions on one path, removes a BFI that
@@ -63,6 +70,7 @@ typedef struct
   uint8_t *ndefs;   /* [nt]: definitions, saturating at 2 */
   int *defidx;      /* [nt]: the defining instruction of a single-def TEMP, or -1 */
   uint8_t *nuses;   /* [nt]: reads, phi operands included, saturating at 2 */
+  uint8_t *sw;      /* [nt]: the image is the sign extension of its low sw bits (0: no value yet) */
   int nt;
   /* A direct call of the function itself reads what its returns may hold,
    * assumed as it is being computed: a return's mask built from recursive
@@ -105,6 +113,46 @@ static uint32_t ke_val(const KnownExt *ke, IROperand op)
 static uint32_t ke_width_mask(int btype)
 {
   return btype == IROP_BTYPE_INT8 ? 0xFFu : btype == IROP_BTYPE_INT16 ? 0xFFFFu : KE_ALL;
+}
+
+/* The narrowest w (1..32) whose sign extension of the low w bits is v. */
+static int ke_imm_sw(int32_t v)
+{
+  int w = 1;
+  while (w < 32 && (int32_t)((uint32_t)v << (32 - w)) >> (32 - w) != v)
+    w++;
+  return w;
+}
+
+/* A value with no bit outside m is non-negative below bit ke_smear(m)'s top. */
+static int ke_mask_sw(uint32_t m)
+{
+  int w = 1;
+  while (w < 32 && (m >> (w - 1)) != 0)
+    w++;
+  return w;
+}
+
+/* The width a value operand is known to be sign-extended from, 32 when unknown. */
+static int ke_sw(const KnownExt *ke, IROperand op)
+{
+  if (irop_is_none(op) || op.is_lval || op.is_llocal)
+    return 32;
+  int tag = irop_get_tag(op);
+  if (tag == IROP_TAG_IMM32 && !op.is_sym && ke_is_scalar32(op))
+    return ke_imm_sw(irop_get_imm32(op));
+  if (tag != IROP_TAG_VREG || irop_is_64bit(op))
+    return 32;
+  int pos = ke_temp_pos(ke, op);
+  if (pos < 0 || ke->poison[pos] || !ke->defined[pos])
+    return 32;
+  int w = ke_mask_sw(ke->bits[pos]);
+  return ke->sw[pos] < w ? ke->sw[pos] : w;
+}
+
+static int ke_max(int a, int b)
+{
+  return a > b ? a : b;
 }
 
 /* A narrow load zero-extends when the emitter reads it unsigned. */
@@ -271,7 +319,14 @@ static uint32_t ke_transfer(const KnownExt *ke, IRQuadCompact *q)
     if (!ke_read_imm(s2, &k))
       return KE_ALL;
     int width = (k >> 5) & 0x1F;
-    return width > 0 ? (1u << width) - 1u : KE_ALL;
+    if (width <= 0)
+      return KE_ALL;
+    /* The field holds only bits its operand can have there: `(uint8_t)x` of a
+     * 0/1 x is still 0/1.  A high-word field reads a 64-bit operand. */
+    uint32_t field = (1u << width) - 1u;
+    if (k & UBFX_HI_HALF)
+      return field;
+    return (ke_val(ke, s1) >> (k & 0x1F)) & field;
   }
   case TCCIR_OP_SETIF:
   case TCCIR_OP_BOOL_OR:
@@ -288,6 +343,102 @@ static uint32_t ke_transfer(const KnownExt *ke, IRQuadCompact *q)
   }
   default:
     return KE_ALL;
+  }
+}
+
+/* The width instruction q's plain TEMP destination is sign-extended from, as
+ * ke_transfer gives its bits (the masks bound it too, in ke_sw). */
+static int ke_transfer_sw(const KnownExt *ke, IRQuadCompact *q)
+{
+  TCCIRState *ir = ke->ir;
+  if (tcc_ir_barrel_shift_at(ir, q) || tcc_ir_shift64_dead_half_at(ir, q) || tcc_ir_zero_half64_at(ir, q) ||
+      tcc_ir_bfi_params_at(ir, q))
+    return 32;
+  IROperand d = tcc_ir_op_get_dest(ir, q);
+  IROperand s1 = irop_config[q->op].has_src1 ? tcc_ir_op_get_src1(ir, q) : IROP_NONE;
+  IROperand s2 = irop_config[q->op].has_src2 ? tcc_ir_op_get_src2(ir, q) : IROP_NONE;
+  int32_t k;
+  switch (q->op)
+  {
+  case TCCIR_OP_ASSIGN:
+    return ke_sw(ke, s1);
+  case TCCIR_OP_LOAD:
+  {
+    /* LDRSB/LDRSH by the source operand; a register read at a narrow signed
+     * type is SXTB/SXTH of it (see ke_transfer). */
+    if (irop_is_64bit(s1) || s1.is_complex)
+      return 32;
+    int bt = irop_get_btype(s1);
+    int narrow = bt == IROP_BTYPE_INT8 || bt == IROP_BTYPE_INT16;
+    int w = bt == IROP_BTYPE_INT8 ? 8 : 16;
+    if (s1.is_lval)
+      return narrow && !s1.is_unsigned ? w : 32;
+    if (irop_get_tag(s1) != IROP_TAG_VREG || !narrow)
+      return ke_sw(ke, s1);
+    if (s1.is_unsigned)
+      return 32;
+    int sv = ke_sw(ke, s1);
+    return sv < w ? sv : w;
+  }
+  case TCCIR_OP_LOAD_INDEXED:
+  case TCCIR_OP_LOAD_POSTINC:
+  {
+    int bt = irop_get_btype(d);
+    if (d.is_complex || d.is_unsigned || (bt != IROP_BTYPE_INT8 && bt != IROP_BTYPE_INT16))
+      return 32;
+    return bt == IROP_BTYPE_INT8 ? 8 : 16;
+  }
+  case TCCIR_OP_STORE:
+  {
+    /* A register copy; spilled, a narrow destination is extended by its own
+     * type, which keeps the value only when it already fits that extension. */
+    int sv;
+    if (s1.is_lval)
+    {
+      int sbt = irop_get_btype(s1);
+      sv = (sbt == IROP_BTYPE_INT8 || sbt == IROP_BTYPE_INT16) && !s1.is_unsigned && !s1.is_complex
+               ? (sbt == IROP_BTYPE_INT8 ? 8 : 16)
+               : 32;
+    }
+    else
+      sv = ke_sw(ke, s1);
+    int bt = irop_get_btype(d);
+    if (bt == IROP_BTYPE_INT8 || bt == IROP_BTYPE_INT16)
+    {
+      if (d.is_unsigned)
+        return 32;
+      return sv <= (bt == IROP_BTYPE_INT8 ? 8 : 16) ? sv : 32;
+    }
+    return sv;
+  }
+  case TCCIR_OP_AND:
+  case TCCIR_OP_OR:
+  case TCCIR_OP_XOR:
+  case TCCIR_OP_SELECT:
+    return ke_max(ke_sw(ke, s1), ke_sw(ke, s2));
+  case TCCIR_OP_SAR:
+  {
+    if (!ke_read_imm(s2, &k) || k < 0 || k > 31)
+      return 32;
+    int sv = ke_sw(ke, s1) - k;
+    return sv < 1 ? 1 : sv;
+  }
+  case TCCIR_OP_SBFX:
+  {
+    if (!ke_read_imm(s2, &k))
+      return 32;
+    int width = (k >> 5) & 0x1F, lsb = k & 0x1F;
+    if (width == 0)
+      width = 8; /* tcc_gen_machine_sbfx_mop's default */
+    if (lsb == 0)
+    {
+      int sv = ke_sw(ke, s1);
+      return sv < width ? sv : width;
+    }
+    return width;
+  }
+  default:
+    return 32;
   }
 }
 
@@ -489,6 +640,105 @@ static int ke_bfi_is_identity(const KnownExt *ke, IRQuadCompact *q)
   }
 }
 
+/* `X SBFX #0,#w`, or `X [LOAD]` of a register TEMP at a narrow type (MOV plus
+ * SXTB/SXTH/UXTB/UXTH): the TEMP operand, the width, and whether the
+ * extension is signed; -1 when q is neither. */
+static int ke_reg_ext_operand(const KnownExt *ke, IRQuadCompact *q, IROperand *src, int *width, int *is_signed)
+{
+  TCCIRState *ir = ke->ir;
+  if (q->op != TCCIR_OP_SBFX && q->op != TCCIR_OP_LOAD)
+    return -1;
+  if (tcc_ir_barrel_shift_at(ir, q) || tcc_ir_shift64_dead_half_at(ir, q) || tcc_ir_zero_half64_at(ir, q) ||
+      tcc_ir_bfi_params_at(ir, q))
+    return -1;
+  IROperand d = tcc_ir_op_get_dest(ir, q);
+  IROperand s1 = tcc_ir_op_get_src1(ir, q);
+  if (d.is_lval || irop_get_tag(d) != IROP_TAG_VREG || !ke_is_scalar32(d))
+    return -1;
+  if (s1.is_lval || s1.is_llocal || s1.is_complex || irop_get_tag(s1) != IROP_TAG_VREG || irop_is_64bit(s1))
+    return -1;
+  int32_t k;
+  if (q->op == TCCIR_OP_SBFX)
+  {
+    if (!ke_read_imm(tcc_ir_op_get_src2(ir, q), &k) || (k & 0x1F) != 0)
+      return -1;
+    *width = (k >> 5) & 0x1F;
+    if (*width == 0)
+      *width = 8; /* tcc_gen_machine_sbfx_mop's default */
+    *is_signed = 1;
+  }
+  else
+  {
+    int bt = irop_get_btype(s1);
+    if (bt != IROP_BTYPE_INT8 && bt != IROP_BTYPE_INT16)
+      return -1;
+    *width = bt == IROP_BTYPE_INT8 ? 8 : 16;
+    *is_signed = !s1.is_unsigned;
+  }
+  int pos = ke_temp_pos(ke, s1);
+  if (pos < 0)
+    return -1;
+  *src = s1;
+  return pos;
+}
+
+/* `TEST_ZERO X` (or `CMP X, #0`) and right after it `d <- SELECT #1, #0` on NE
+ * or `#0, #1` on EQ -- `X ? 1 : 0` -- or `d <- SETIF NE`, with X a TEMP: its
+ * position, and in *flip whether the select is the complement (`#0, #1` on NE,
+ * `#1, #0` on EQ; a SETIF has no slot for the `^ 1` and is only taken as the
+ * copy); otherwise -1.  Zig's ComponentIterator.init spells root_len as
+ * `if (len > 0 and path[0] == '/') 1 else 0` through a bool, so the 0/1 join
+ * was tested again and the same 0/1 selected from it. */
+static int ke_bool_select_operand(const KnownExt *ke, int i, IROperand *x, int *flip)
+{
+  TCCIRState *ir = ke->ir;
+  IRQuadCompact *q = &ir->compact_instructions[i];
+  if ((q->op != TCCIR_OP_SELECT && q->op != TCCIR_OP_SETIF) || q->is_jump_target || ke_plain_def(ke, q) < 0 ||
+      !ke_is_scalar32(tcc_ir_op_get_dest(ir, q)))
+    return -1;
+  if (tcc_ir_barrel_shift_at(ir, q) || tcc_ir_shift64_dead_half_at(ir, q) || tcc_ir_zero_half64_at(ir, q))
+    return -1;
+  int32_t a = 1, b = 0, k;
+  int cond;
+  if (q->op == TCCIR_OP_SETIF)
+  {
+    cond = (int)tcc_ir_op_src1_imm(ir, q);
+    if (cond != TOK_NE)
+      return -1;
+  }
+  else
+  {
+    if (!ke_read_imm(tcc_ir_op_get_src1(ir, q), &a) || !ke_read_imm(tcc_ir_op_get_src2(ir, q), &b))
+      return -1;
+    cond = (int)tcc_ir_op_cond_imm(ir, q);
+  }
+  if ((a != 1 || b != 0) && (a != 0 || b != 1))
+    return -1;
+  if (cond != TOK_NE && cond != TOK_EQ)
+    return -1;
+  *flip = (a == 1) != (cond == TOK_NE);
+  int t = i - 1;
+  while (t >= 0 && ir->compact_instructions[t].op == TCCIR_OP_NOP)
+    t--;
+  if (t < 0)
+    return -1;
+  IRQuadCompact *tq = &ir->compact_instructions[t];
+  if (tq->op != TCCIR_OP_TEST_ZERO && tq->op != TCCIR_OP_CMP)
+    return -1;
+  if (tcc_ir_barrel_shift_at(ir, tq) || tcc_ir_shift64_dead_half_at(ir, tq) || tcc_ir_zero_half64_at(ir, tq))
+    return -1;
+  if (tq->op == TCCIR_OP_CMP && (!ke_read_imm(tcc_ir_op_get_src2(ir, tq), &k) || k != 0))
+    return -1;
+  IROperand s = tcc_ir_op_get_src1(ir, tq);
+  if (s.is_lval || s.is_llocal || irop_get_tag(s) != IROP_TAG_VREG || irop_is_64bit(s) || !ke_is_scalar32(s))
+    return -1;
+  int pos = ke_temp_pos(ke, s);
+  if (pos < 0)
+    return -1;
+  *x = s;
+  return pos;
+}
+
 /* `T <- [p] (word); X <- T AND #0xFF` with T read nowhere else: the load
  * itself can be the narrow one, `ldrb X,[p]` -- a byte or halfword field of a
  * struct copied as words.  Little-endian: the low bits are the first bytes.
@@ -581,6 +831,7 @@ int tcc_ir_known_ext(TCCIRState *ir, IRSSAState *ssa)
   ke.ndefs = tcc_mallocz(nt);
   ke.defidx = tcc_malloc(sizeof(int) * nt);
   ke.nuses = tcc_mallocz(nt);
+  ke.sw = tcc_mallocz(nt);
   for (int t = 0; t < nt; t++)
     ke.defidx[t] = -1;
 
@@ -623,7 +874,10 @@ int tcc_ir_known_ext(TCCIRState *ir, IRSSAState *ssa)
     }
     IROperand src;
     uint32_t mask;
-    if (ke_ext_operand(&ke, q, &src, &mask) >= 0)
+    int ew, es;
+    int flip;
+    if (ke_ext_operand(&ke, q, &src, &mask) >= 0 || ke_reg_ext_operand(&ke, q, &src, &ew, &es) >= 0 ||
+        ke_bool_select_operand(&ke, i, &src, &flip) >= 0)
       candidates++;
   }
   const int nb = ssa && ssa->cfg && ssa->block_phis ? ssa->cfg->num_blocks : 0;
@@ -675,6 +929,12 @@ int tcc_ir_known_ext(TCCIRState *ir, IRSSAState *ssa)
         ke.bits[pos] = m;
         grew = 1;
       }
+      int w = ke_max(ke.sw[pos], ke_transfer_sw(&ke, q));
+      if (w != ke.sw[pos])
+      {
+        ke.sw[pos] = (uint8_t)w;
+        grew = 1;
+      }
     }
     for (int b = 0; b < nb; b++)
       for (IRPhiNode *phi = ssa->block_phis[b]; phi; phi = phi->next)
@@ -687,21 +947,29 @@ int tcc_ir_known_ext(TCCIRState *ir, IRSSAState *ssa)
         if (ke.poison[pos])
           continue;
         uint32_t m = ke.bits[pos];
-        for (int pi = 0; pi < phi->num_operands && m != KE_ALL; pi++)
+        int w = ke.sw[pos];
+        for (int pi = 0; pi < phi->num_operands && (m != KE_ALL || w != 32); pi++)
         {
           int32_t ov = phi->operands[pi].vreg;
           if (ov < 0 || TCCIR_DECODE_VREG_TYPE(ov) != TCCIR_VREG_TYPE_TEMP ||
               TCCIR_DECODE_VREG_POSITION(ov) >= nt)
           {
             m = KE_ALL;
+            w = 32;
             break;
           }
           int op = TCCIR_DECODE_VREG_POSITION(ov);
-          m |= (ke.poison[op] || !ke.defined[op]) ? KE_ALL : ke.bits[op];
+          int unknown = ke.poison[op] || !ke.defined[op];
+          m |= unknown ? KE_ALL : ke.bits[op];
+          int ow = unknown ? 32 : ke_mask_sw(ke.bits[op]);
+          if (!unknown && ke.sw[op] < ow)
+            ow = ke.sw[op];
+          w = ke_max(w, ow);
         }
-        if (m != ke.bits[pos])
+        if (m != ke.bits[pos] || w != ke.sw[pos])
         {
           ke.bits[pos] = m;
+          ke.sw[pos] = (uint8_t)w;
           grew = 1;
         }
       }
@@ -746,6 +1014,26 @@ int tcc_ir_known_ext(TCCIRState *ir, IRSSAState *ssa)
     changes++;
   }
 
+  for (int i = 0; i < n && !tcc_ir_opt_pass_disabled("ra:known_ext_sext"); i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    IROperand src;
+    int width, is_signed;
+    int pos = ke_reg_ext_operand(&ke, q, &src, &width, &is_signed);
+    if (pos < 0 || ke.poison[pos] || !ke.defined[pos])
+      continue;
+    if (is_signed ? ke_sw(&ke, src) > width : (ke.bits[pos] & ~ke_width_mask(width == 8 ? IROP_BTYPE_INT8 : IROP_BTYPE_INT16)) != 0)
+      continue;
+    /* A copy of the TEMP, typed as the destination (as above). */
+    int dbt = tcc_ir_op_dest_btype(ir, q);
+    if (irop_get_btype(src) != dbt)
+      src = irop_retype_scalar(src, dbt);
+    q->op = TCCIR_OP_ASSIGN;
+    tcc_ir_set_src1(ir, i, src);
+    tcc_ir_set_src2_none(ir, i);
+    changes++;
+  }
+
   for (int i = 0; i < n && !tcc_ir_opt_pass_disabled("ra:known_ext_bfi"); i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -759,6 +1047,31 @@ int tcc_ir_known_ext(TCCIRState *ir, IRSSAState *ssa)
     tcc_ir_set_src1(ir, i, x);
     tcc_ir_set_src2_none(ir, i);
     ir->bfi_params[q->orig_index] = 0;
+    changes++;
+  }
+
+  /* `X ? 1 : 0` (or `X != 0`) of a TEMP that is 0 or 1 is X; the complement
+   * is `X ^ 1`.
+   * The test it read stays for the post-RA orphan-flags cleanup. */
+  for (int i = 0; i < n && !tcc_ir_opt_pass_disabled("ra:known_ext_select"); i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    IROperand x;
+    int flip;
+    int pos = ke_bool_select_operand(&ke, i, &x, &flip);
+    if (pos < 0 || ke.poison[pos] || !ke.defined[pos] || (ke.bits[pos] & ~1u) != 0)
+      continue;
+    int dbt = tcc_ir_op_dest_btype(ir, q);
+    if (irop_get_btype(x) != dbt)
+      x = irop_retype_scalar(x, dbt);
+    /* A SETIF (dest, cond) has the copy's operand slots. */
+    int was_setif = q->op == TCCIR_OP_SETIF;
+    q->op = flip ? TCCIR_OP_XOR : TCCIR_OP_ASSIGN;
+    tcc_ir_set_src1(ir, i, x);
+    if (flip)
+      tcc_ir_set_src2_imm32(ir, i, 1, dbt);
+    else if (!was_setif)
+      tcc_ir_set_src2_none(ir, i);
     changes++;
   }
 
@@ -778,5 +1091,6 @@ out:
   tcc_free(ke.ndefs);
   tcc_free(ke.defidx);
   tcc_free(ke.nuses);
+  tcc_free(ke.sw);
   return changes;
 }

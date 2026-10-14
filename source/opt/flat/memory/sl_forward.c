@@ -438,6 +438,15 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
           pred_count[target]++;
         }
       }
+      else if (jq->op == TCCIR_OP_INLINE_ASM)
+      {
+        for (int k = 0, target; (target = tcc_ir_asm_goto_target(ir, jq, k)) >= 0; k++)
+          if (target < n)
+          {
+            actual_targets[target / 8] |= (1 << (target % 8));
+            pred_count[target]++;
+          }
+      }
       /* Switch case/default targets are predecessors too; count them for correct pred_count. */
       else if (jq->op == TCCIR_OP_SWITCH_TABLE)
       {
@@ -1664,14 +1673,17 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
            * frontend truncates ahead of a narrow store to a LOCAL but not to a
            * struct FIELD (`s.a = x` stores x and lets the width cut it), so
            * `s.a = x + i; use(s.a)` read x + i unmasked from -O1 up.  Forward
-           * it masked instead.  A signed field would need a sign-extend, and
-           * an ASSIGN has no room to emit one, so it keeps its load. */
+           * it masked instead.  A signed field reads the low bits sign-
+           * extended, so only a value below the sign bit is the same either
+           * way -- a struct copy moves an i16 field as a u16 -- and any other
+           * forwards as `dest <- value SBFX #0,#bits`. */
           if (!irop_is_immediate(e->stored_value) &&
               (src1.btype == IROP_BTYPE_INT8 || src1.btype == IROP_BTYPE_INT16) &&
-              !sl_fwd_value_within_bits(ir, e->stored_value, src1.btype == IROP_BTYPE_INT8 ? 8 : 16))
+              !sl_fwd_value_within_bits(ir, e->stored_value,
+                                        (src1.btype == IROP_BTYPE_INT8 ? 8 : 16) - !src1.is_unsigned))
           {
             const int nbits = src1.btype == IROP_BTYPE_INT8 ? 8 : 16;
-            if (q->op != TCCIR_OP_LOAD || !src1.is_unsigned || irop_get_vreg(e->stored_value) < 0 ||
+            if (q->op != TCCIR_OP_LOAD || irop_get_vreg(e->stored_value) < 0 ||
                 irop_op_is_lval(e->stored_value) || tcc_ir_op_dest_vreg(ir, q) < 0)
             {
               LOG_SL_FWD("LOAD@i=%d REJECT narrow store not truncated: store@i=%d bits=%d", i,
@@ -1686,8 +1698,16 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
             int base = ir->iroperand_pool_count;
             tcc_ir_pool_add(ir, load_dest);
             tcc_ir_pool_add(ir, value);
-            tcc_ir_pool_add(ir, irop_make_imm32(-1, (int32_t)((1u << nbits) - 1), IROP_BTYPE_INT32));
-            q->op = TCCIR_OP_AND;
+            if (src1.is_unsigned)
+            {
+              tcc_ir_pool_add(ir, irop_make_imm32(-1, (int32_t)((1u << nbits) - 1), IROP_BTYPE_INT32));
+              q->op = TCCIR_OP_AND;
+            }
+            else
+            {
+              tcc_ir_pool_add(ir, irop_make_imm32(-1, nbits << 5, IROP_BTYPE_INT32));
+              q->op = TCCIR_OP_SBFX;
+            }
             q->operand_base = base;
             if (fwd_store_count < SL_FWD_MAX_DEAD_STORES && !e->addr_addrtaken &&
                 tcc_ir_op_dest_vreg(ir, &ir->compact_instructions[e->instruction_idx]) < 0)

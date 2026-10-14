@@ -368,11 +368,9 @@ ST_FUNC void gexpr(void)
   {
     do
     {
-      gv_discarded_volatile();
-      vpop();
+      vpop_discarded();
       next();
       expr_eq();
-      tcc_ir_codegen_drop_return(tcc_state->ir);
     } while (tok == ',');
 
     /* convert array & function to pointer.  It also strips the qualifiers, so

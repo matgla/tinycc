@@ -1,0 +1,8 @@
+null drop: frees=0 len=0
+live drop: frees=6 ptr=0 len=aaaaaaaa
+pair: frees=13 a=0 b=0
+walk: 5 frees=17
+pointer: frees=19
+expr: 6 frees=80
+arr=11,0 q0=0/2 q1=4/1 q2=0/9 budget=0
+3 -3 0 104 1 0 202 2 0 201 1 0 306 6 0 408 8 0 504 4 0 600 0 0 604 4 0 600 0 0 702 2 0

@@ -44,6 +44,7 @@ SSA_OPT_SRC = \
 	source/opt/ssa/cfg/switch_fold.c \
 	source/opt/ssa/cfg/or_bool_diamond.c \
 	source/opt/ssa/cfg/cmp_eq.c \
+	source/opt/ssa/cfg/dup_diamond.c \
 	source/opt/ssa/cfg/vrp.c \
 	source/opt/ssa/dce/temp_worklist.c \
 	source/opt/ssa/dce/unreachable.c \
@@ -95,6 +96,7 @@ SSA_OPT_HDRS = \
 	source/opt/ssa/include/opt/ssa/phi.h \
 	source/opt/ssa/include/opt/ssa/branch.h \
 	source/opt/ssa/include/opt/ssa/cmp_eq.h \
+	source/opt/ssa/include/opt/ssa/dup_diamond.h \
 	source/opt/ssa/include/opt/ssa/vrp.h \
 	source/opt/ssa/include/opt/ssa/setif_or_taut.h \
 	source/opt/ssa/include/opt/ssa/bool_norm.h \

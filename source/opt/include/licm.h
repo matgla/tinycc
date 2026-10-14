@@ -39,7 +39,10 @@ typedef struct IRLoops
   int capacity;  /* Capacity of loops array */
   int *ramp;     /* ramp[k] == k for every instruction; each loop's body_instrs is a
                     window of it.  One array per detection instead of one copy of every
-                    body -- nested loops in a big function summed to megabytes. */
+                    body -- nested loops in a big function summed to megabytes.  Windows
+                    of nested loops overlap, so a shift goes through
+                    tcc_ir_loops_shift_bodies (each shared entry once). */
+  int ramp_len;  /* entries in ramp */
 } IRLoops;
 
 typedef enum TCCFuncPurity
@@ -87,6 +90,12 @@ int tcc_ir_loop_call_promotion_budget(TCCIRState *ir, IRLoops *loops);
 IRLoops *tcc_ir_detect_loops(TCCIRState *ir);
 
 void tcc_ir_free_loops(IRLoops *loops);
+
+/* After `delta` instructions were inserted at `pos`: add delta to every body
+ * entry >= pos of the loops first..num_loops-1 other than `skip` (-1: none).
+ * Nested loops share ramp entries; each entry moves once, not once per loop
+ * that contains it. */
+void tcc_ir_loops_shift_bodies(IRLoops *loops, int first, int skip, int pos, int delta);
 
 int tcc_ir_is_in_loop(IRLoop *loop, int instr_idx);
 

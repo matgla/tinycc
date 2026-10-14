@@ -484,6 +484,7 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
                                                      /*is_param_flag*/ (int)lea_src.is_param,
                                                      width_op.btype);
               stack_op.is_unsigned = width_op.is_unsigned;
+              stack_op.is_complex = width_op.is_complex;
               stack_op.is_static = lea_src.is_static;
               /* An indexed access keeps its marks on the base operand. */
               irop_carry_access_marks(&stack_op, base);
@@ -569,6 +570,7 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
       new_op = irop_make_stackoff(-1, folded_off, /*is_lval*/ 1, /*is_llocal*/ 0,
                                   /*is_param_flag*/ (int)lea_src.is_param, old_op.btype);
       new_op.is_unsigned = old_op.is_unsigned;
+      new_op.is_complex = old_op.is_complex; /* btype FLOAT32/64 + complex = two halves */
       new_op.is_static = lea_src.is_static;
       /* The access is the same one: its volatility and alignment marks go
        * with it.  Left unmarked, it reads as volatile in any function that

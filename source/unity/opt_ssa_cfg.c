@@ -2,6 +2,12 @@
 #include "../opt/ssa/cfg/branch.c"
 #undef SSA_SA_SLOT
 #undef USING_GLOBALS
+#include "../opt/ssa/cfg/dup_diamond.c"
+#undef DD_HZ_READS
+#undef DD_HZ_VAR_WRITE
+#undef DD_MAX_ARM
+#undef DD_MAX_OUT
+#undef USING_GLOBALS
 #include "../opt/ssa/cfg/guard_collapse.c"
 #undef USING_GLOBALS
 #include "../opt/ssa/cfg/phi.c"

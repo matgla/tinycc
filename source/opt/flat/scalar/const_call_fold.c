@@ -100,6 +100,8 @@ int tcc_ir_detect_const_result(TCCIRState *ir, int64_t *value, int *btype)
 
 void tcc_ir_cache_const_result(TCCState *s, int func_token, int64_t value, int btype)
 {
+  if (!func_token)
+    return; /* func_cache_token: never cached */
   if (s->func_const_result_cache_count >= FUNC_CONST_RESULT_CACHE_SIZE)
     return;
   for (int i = 0; i < s->func_const_result_cache_count; i++)
@@ -124,6 +126,8 @@ void tcc_ir_cache_const_result(TCCState *s, int func_token, int64_t value, int b
 
 int tcc_ir_lookup_const_result(TCCState *s, int func_token, int64_t *value, int *btype)
 {
+  if (!func_token)
+    return 0;
   for (int i = 0; i < s->func_const_result_cache_count; i++)
   {
     if (s->func_const_result_cache[i].token == func_token)
@@ -156,7 +160,7 @@ int tcc_ir_opt_const_call_replace(TCCIRState *ir)
 
     int64_t val;
     int btype;
-    if (!tcc_ir_lookup_const_result(tcc_state, callee->v, &val, &btype))
+    if (!tcc_ir_lookup_const_result(tcc_state, func_cache_token(callee), &val, &btype))
       continue;
 
     IROperand dest = tcc_ir_op_get_dest(ir, q);
@@ -215,6 +219,8 @@ typedef struct SwitchSimOp
 {
   uint8_t op;
   uint8_t flags;
+  /* barrel_shifts[] annotation on src2 ((type << 5) | amount), or 0. */
+  uint8_t bshift;
   int32_t dest_vreg;
   int32_t src1_vreg;
   int64_t src1_imm;
@@ -295,6 +301,35 @@ static int switch_func_decode_lval_sym(TCCIRState *ir, IROperand op, SwitchSimOp
   snap_op->sym_flags = (uint16_t)sr->flags;
   snap_op->sym_btype = (int8_t)btype;
   return 1;
+}
+
+/* The snapshot is taken from the final IR, after tcc_ir_barrel_shift_fusion
+ * folded single-use shifts into src2 of ADD/SUB/CMP as side-table annotations:
+ * the real RHS is `src2 SHIFT #n`.  Record it; 0 for an unmodelled encoding. */
+static int switch_func_decode_barrel(TCCIRState *ir, IRQuadCompact *q, SwitchSimOp *o)
+{
+  uint8_t bs = tcc_ir_barrel_shift_at(ir, q);
+  int type = bs >> 5;
+  if (bs && (type < 1 || type > 4))
+    return 0;
+  o->bshift = bs;
+  return 1;
+}
+
+/* Apply a recorded barrel shift to a 32-bit value (result sign-extended). */
+static int64_t switch_sim_barrel(int64_t v, uint8_t bs)
+{
+  uint32_t x = (uint32_t)v;
+  unsigned amount = bs & 31u;
+  switch (bs >> 5)
+  {
+  case 1: x = x << amount; break;
+  case 2: x = x >> amount; break;
+  case 3: x = (uint32_t)((int32_t)x >> amount); break;
+  case 4: x = amount ? ((x >> amount) | (x << (32 - amount))) : x; break;
+  default: break;
+  }
+  return (int64_t)(int32_t)x;
 }
 
 int tcc_ir_detect_switch_func(TCCIRState *ir, TCCFuncSwitchSnapshot **out)
@@ -412,6 +447,8 @@ int tcc_ir_detect_switch_func(TCCIRState *ir, TCCFuncSwitchSnapshot **out)
       if (!switch_func_decode_operand(ir, s2, &vr, &imm))
         goto fail;
       if (vr < 0) { o->flags |= 2; o->src2_imm = imm; } else o->src2_vreg = vr;
+      if (!switch_func_decode_barrel(ir, q, o))
+        goto fail;
       break;
     }
     case TCCIR_OP_CMP:
@@ -426,6 +463,8 @@ int tcc_ir_detect_switch_func(TCCIRState *ir, TCCFuncSwitchSnapshot **out)
       if (!switch_func_decode_operand(ir, s2, &vr, &imm))
         goto fail;
       if (vr < 0) { o->flags |= 2; o->src2_imm = imm; } else o->src2_vreg = vr;
+      if (!switch_func_decode_barrel(ir, q, o))
+        goto fail;
       break;
     }
     case TCCIR_OP_JUMP:
@@ -487,7 +526,7 @@ fail:
 
 void tcc_ir_cache_switch_func(TCCState *s, int func_token, TCCFuncSwitchSnapshot *snap)
 {
-  if (!s || !snap)
+  if (!s || !snap || !func_token)
   {
     tcc_ir_switch_func_snapshot_free(snap);
     return;
@@ -511,7 +550,7 @@ void tcc_ir_cache_switch_func(TCCState *s, int func_token, TCCFuncSwitchSnapshot
 
 const TCCFuncSwitchSnapshot *tcc_ir_lookup_switch_func(TCCState *s, int func_token)
 {
-  if (!s)
+  if (!s || !func_token)
     return NULL;
   for (int i = 0; i < s->func_switch_cache_count; i++)
   {
@@ -587,8 +626,24 @@ static int switch_sim_read_src(const SwitchSimEnv *env, const SwitchSimOp *o,
     if (o->flags & 1) { *out = o->src1_imm; return 1; }
     return switch_sim_get(env, o->src1_vreg, out);
   }
-  if (o->flags & 2) { *out = o->src2_imm; return 1; }
-  return switch_sim_get(env, o->src2_vreg, out);
+  int r = 1;
+  if (o->flags & 2)
+    *out = o->src2_imm;
+  else
+    r = switch_sim_get(env, o->src2_vreg, out);
+  if (o->bshift && r == 1)
+    *out = switch_sim_barrel(*out, o->bshift);
+  /* A replayed op carries no annotation: an unknown shifted src2 is a bail. */
+  if (o->bshift && r == 2)
+    return 0;
+  return r;
+}
+
+/* 32-bit ADD/SUB as the machine does it: wrapped, held sign-extended. */
+static int64_t switch_sim_addsub(int op, int64_t l, int64_t r)
+{
+  uint32_t v = (op == TCCIR_OP_ADD) ? (uint32_t)l + (uint32_t)r : (uint32_t)l - (uint32_t)r;
+  return (int64_t)(int32_t)v;
 }
 
 /* Record an op index for replay at the caller; cap protects unbounded growth. */
@@ -692,7 +747,7 @@ int tcc_ir_simulate_switch_func_ex(const TCCFuncSwitchSnapshot *snap, int64_t ar
         return 0;
       if (rl == 1 && rr == 1)
       {
-        int64_t v = (o->op == TCCIR_OP_ADD) ? (l + r1) : (l - r1);
+        int64_t v = switch_sim_addsub(o->op, l, r1);
         if (!switch_sim_set(&env, o->dest_vreg, v, 1))
           return 0;
       }
@@ -860,17 +915,15 @@ static int build_caller_src1(TCCIRState *caller_ir, VregMap *m, const SwitchSimO
 static int build_caller_src2(TCCIRState *caller_ir, VregMap *m, const SwitchSimOp *o,
                              const SwitchSimEnv *sim_env, int btype, IROperand *out)
 {
-  if (o->flags & 2)
-  {
-    *out = irop_make_imm32(-1, (int32_t)o->src2_imm, btype);
-    return 1;
-  }
   int64_t v;
-  if (switch_sim_get(sim_env, o->src2_vreg, &v) == 1)
+  int r = switch_sim_read_src(sim_env, o, 2, &v);
+  if (r == 1)
   {
     *out = irop_make_imm32(-1, (int32_t)v, btype);
     return 1;
   }
+  if (r != 2)
+    return 0;
   int32_t cvr = map_callee_vreg(m, caller_ir, o->src2_vreg);
   if (cvr < 0)
     return 0;
@@ -986,7 +1039,7 @@ static int rebuild_sim_env(const TCCFuncSwitchSnapshot *snap, int64_t arg_value,
       if (rl == 0 || rr == 0) return 0;
       if (rl == 1 && rr == 1)
       {
-        int64_t v = (o->op == TCCIR_OP_ADD) ? (l + r1) : (l - r1);
+        int64_t v = switch_sim_addsub(o->op, l, r1);
         switch_sim_set(env, o->dest_vreg, v, 1);
       }
       else switch_sim_set(env, o->dest_vreg, 0, 0);
@@ -1051,7 +1104,7 @@ int tcc_ir_opt_switch_call_replace(TCCIRState *ir)
     if (!callee)
       continue;
 
-    const TCCFuncSwitchSnapshot *snap = tcc_ir_lookup_switch_func(tcc_state, callee->v);
+    const TCCFuncSwitchSnapshot *snap = tcc_ir_lookup_switch_func(tcc_state, func_cache_token(callee));
     if (!snap)
       continue;
 
@@ -1126,21 +1179,29 @@ int tcc_ir_opt_switch_call_replace(TCCIRState *ir)
       }
     }
 
-    /* Rewrite the (now-shifted) FUNCCALLVAL into the result ASSIGN. */
+    /* Rewrite the (now-shifted) FUNCCALLVAL into the result ASSIGN; a
+     * discarded result (no dest) leaves only the replayed stores -- an
+     * ASSIGN without a destination would be emitted into r0. */
     q = &ir->compact_instructions[call_idx];
-    q->op = TCCIR_OP_ASSIGN;
-    if (ret_val == (int32_t)ret_val)
-      tcc_ir_set_src1_imm32(ir, call_idx, (int32_t)ret_val, ret_btype);
+    if (irop_get_vreg(dest) < 0)
+      q->op = TCCIR_OP_NOP;
     else
     {
-      uint32_t pool_idx = tcc_ir_pool_add_i64(ir, ret_val);
-      tcc_ir_set_src1(ir, call_idx, irop_make_i64(-1, pool_idx, ret_btype));
+      q->op = TCCIR_OP_ASSIGN;
+      if (ret_val == (int32_t)ret_val)
+        tcc_ir_set_src1_imm32(ir, call_idx, (int32_t)ret_val, ret_btype);
+      else
+      {
+        uint32_t pool_idx = tcc_ir_pool_add_i64(ir, ret_val);
+        tcc_ir_set_src1(ir, call_idx, irop_make_i64(-1, pool_idx, ret_btype));
+      }
+      tcc_ir_set_src2_none(ir, call_idx);
+      tcc_ir_set_dest(ir, call_idx, dest);
     }
-    tcc_ir_set_src2_none(ir, call_idx);
-    tcc_ir_set_dest(ir, call_idx, dest);
 
-    /* NOP the matching FUNCPARAMVAL(s).  Scan backward from the call. */
-    for (int j = call_idx - 1; j >= 0; j--)
+    /* NOP the matching FUNCPARAMVAL(s).  Scan backward from the call's
+     * original position: the replay ops sit between it and the params. */
+    for (int j = i - 1; j >= 0; j--)
     {
       IRQuadCompact *pq = &ir->compact_instructions[j];
       if (pq->op == TCCIR_OP_NOP)

@@ -228,9 +228,10 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
           !(var_addr_taken[_p >> 3] & (uint8_t)(1u << (_p & 7))))                                                      \
         _t = 1;                                                                                                        \
     }                                                                                                                  \
-    /* Bare stack-slot read (StackLoc[X] as a value source, vreg=-1). */                                               \
+    /* Bare stack-slot read (StackLoc[X] as a value source, vreg=-1); the     \
+     * incoming argument area (is_param) holds the caller's arguments. */                                              \
     if (!_t && !stack_blocked_overflow && irop_get_tag(sop) == IROP_TAG_STACKOFF &&                                    \
-        (sop).is_local && (sop).is_lval && irop_get_vreg(sop) == -1)                                                   \
+        (sop).is_local && (sop).is_lval && !(sop).is_param && irop_get_vreg(sop) == -1)                                \
     {                                                                                                                  \
       int32_t _off = irop_get_stack_offset(sop);                                                                       \
       int _blocked = 0;                                                                                                \

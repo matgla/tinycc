@@ -152,6 +152,19 @@ static void vt_analyze(TCCIRState *ir, int n, ValueTrackingAnalysis *a)
           a->is_merge[target / 8] |= (1 << (target % 8));
       }
     }
+    if (q->op == TCCIR_OP_INLINE_ASM)
+    {
+      for (int k = 0, target; (target = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+      {
+        a->has_control_flow = 1;
+        if (target < n)
+        {
+          pred_count[target]++;
+          if (target <= i)
+            a->is_merge[target / 8] |= (1 << (target % 8));
+        }
+      }
+    }
     if (q->op == TCCIR_OP_SWITCH_TABLE)
     {
       int table_id = (int)tcc_ir_op_src2_imm(ir, q);
@@ -1275,6 +1288,19 @@ static void vt_step_lea(VTCtx *c, int i, IROperand src1, int32_t dest_vr)
              irop_get_vreg(src1) >= 0 ? TCCIR_DECODE_VREG_TYPE(irop_get_vreg(src1)) : -1);
 }
 
+/* A store through &V is V's whole value only when it writes all of V: a
+ * 32-bit store into a 32-bit scalar, a 64-bit one into a long long.  A
+ * narrower store replaces some of V's bytes, and an 8/16-bit V would also
+ * need the reader's signedness, so those only invalidate V. */
+static int vt_store_covers_var(TCCIRState *ir, IROperand dest, int var_pos)
+{
+  IRLiveInterval *vi = tcc_ir_get_live_interval(ir, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, var_pos));
+  if (!vi || vi->is_float || vi->is_complex || vi->is_struct)
+    return 0;
+  int bt = irop_get_btype(dest);
+  return vi->is_llong ? bt == IROP_BTYPE_INT64 : bt == IROP_BTYPE_INT32;
+}
+
 static void vt_step_store(VTCtx *c, int i, IROperand dest, IROperand src1, int dest_pos)
 {
   TCCIRState *ir = c->ir;
@@ -1288,7 +1314,7 @@ static void vt_step_store(VTCtx *c, int i, IROperand dest, IROperand src1, int d
       int var_pos = c->lea_map[tmp_pos].var_pos;
       if (var_pos <= c->max_vreg)
       {
-        if (irop_is_immediate(src1))
+        if (irop_is_immediate(src1) && vt_store_covers_var(ir, dest, var_pos))
         {
           VT_SET_CONST(c->state, var_pos, irop_get_imm64_ex(ir, src1));
           if (c->is_addrtaken[var_pos / 8] & (1 << (var_pos % 8)))

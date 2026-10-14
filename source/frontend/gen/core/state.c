@@ -205,6 +205,8 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   anon_sym = SYM_FIRST_ANOM;
   pending_aliases = NULL;
   nb_pending_aliases = 0;
+  gfunc_regpair_reset(s1);
+  s1->tu_parsed = 0; /* a previous TU's */
   nocode_wanted = DATA_ONLY_WANTED; /* no code outside of functions */
   discarded_call_vtop = NULL;
   /* an error may have left them set mid-'&' */
@@ -322,6 +324,9 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   }
   /* The statics dropped as unused are still checked for errors. */
   check_dropped_statics(s1);
+  /* The AAPCS entries of the r0/r1 functions whose address is taken. */
+  regpair_adapt_pending_aliases();
+  gfunc_regpair_emit_adapters(s1);
   /* What the optimizer left unreferenced goes too. */
   gc_unreferenced_statics(s1);
   resolve_pending_aliases();
@@ -355,6 +360,7 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   inline_release_hidden_label_bindings();
   free_deferred_functions(s1);
   free_dropped_statics(s1);
+  gfunc_regpair_reset(s1);
   free_tentative_definitions(s1);
   tcc_icf_reset();
   tcc_gen_machine_outline_reset();
@@ -426,12 +432,18 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   free_inline_functions(s1);
   /* Before the pop: nothing may materialise a prototype onto a dying stack. */
   tccgen_predef_protos_disarm();
+  nested_names_reset(); /* an error may leave a nested function's name bound */
   sym_pop(&global_stack, NULL, 0);
   sym_pop(&local_stack, NULL, 0);
   sym_parked_free_all();
   /* free nested functions array */
   for (int i = 0; i < s1->nested_funcs_capacity; i++)
+  {
+    if (s1->nested_funcs[i])
+      nested_func_release(s1->nested_funcs[i]);
     tcc_free(s1->nested_funcs[i]);
+  }
+  nested_names_free();
   tcc_free(s1->nested_funcs);
   s1->nested_funcs = NULL;
   s1->nb_nested_funcs = 0;

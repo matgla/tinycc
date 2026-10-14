@@ -164,10 +164,11 @@ static int pf_arg_is_param(IROperand op, const IRParamForm *f)
  * backend's forwarding wrappers, `f(a0) { g(a0); }` -- finds every argument
  * already where the callee expects it: r0-r3 as received, the stack arguments
  * in the caller's outgoing area.  Its parameters are dropped from the call and
- * the call becomes the whole function: a branch (tail_call_only).  The one
- * body instruction besides the parameters, the call and the return that may
- * appear is the prologue's store of a register-passed struct into its home
- * slot, from the very registers the callee expects it in. */
+ * the call becomes the whole function: a branch (tail_call_only).  The only
+ * body instructions besides the parameters, the call and the return that may
+ * appear are the prologue's copy of a struct into its home slot: stores from
+ * the very registers the callee expects it in, and loads of its stack words
+ * from where the callee finds them, stored right back into the home. */
 void tcc_ir_backend_fold_pure_forward(TCCIRState *ir, Sym *sym)
 {
   if (!ir || !sym || !sym->type.ref || TCC_OPT(tcc_state, optimize) <= 0 || tcc_ir_opt_pass_disabled("pure_forward"))
@@ -183,7 +184,7 @@ void tcc_ir_backend_fold_pure_forward(TCCIRState *ir, Sym *sym)
     return;
 
   const int n = ir->next_instruction_index;
-  int call = -1, ret = -1, nparams = 0, nstores = 0;
+  int call = -1, ret = -1, nparams = 0, nstores = 0, nloads = 0;
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -198,6 +199,9 @@ void tcc_ir_backend_fold_pure_forward(TCCIRState *ir, Sym *sym)
       break;
     case TCCIR_OP_STORE:
       nstores++;
+      break;
+    case TCCIR_OP_LOAD:
+      nloads++;
       break;
     case TCCIR_OP_FUNCCALLVAL:
     case TCCIR_OP_FUNCCALLVOID:
@@ -262,13 +266,20 @@ void tcc_ir_backend_fold_pure_forward(TCCIRState *ir, Sym *sym)
       return;
     seen |= 1u << k;
   }
-  /* Stores: a register-passed struct's words into its home, each from the
-   * PARAM vreg that arrived in the register the callee reads it from. */
-  int home_words = 0;
+  /* Stores: a struct's words into its home, each from the PARAM vreg that
+   * arrived in the register the callee reads it from, or from a load of the
+   * stack word the callee reads it from; every home word exactly once. */
+  int home_words = 0, stack_words = 0;
+  uint64_t home_seen[32] = {0};
   for (int k = 0; k < np; k++)
     if (ir->param_forms[k].kind == IR_PF_HOME)
-      home_words += ir->param_forms[k].words;
-  if (nstores != home_words)
+    {
+      if (ir->param_forms[k].words + ir->param_forms[k].stack_words > 64)
+        return;
+      home_words += ir->param_forms[k].words + ir->param_forms[k].stack_words;
+      stack_words += ir->param_forms[k].stack_words;
+    }
+  if (nstores != home_words || nloads != stack_words)
     return;
   for (int i = 0; i < call; i++)
   {
@@ -278,17 +289,42 @@ void tcc_ir_backend_fold_pure_forward(TCCIRState *ir, Sym *sym)
     IROperand d = tcc_ir_op_get_dest(ir, q), v = tcc_ir_op_get_src1(ir, q);
     int32_t vr = irop_get_vreg(v);
     if (irop_get_tag(d) != IROP_TAG_STACKOFF || irop_get_vreg(d) >= 0 || !d.is_lval || d.is_param ||
-        d.btype != IROP_BTYPE_INT32 || irop_get_tag(v) != IROP_TAG_VREG || v.is_lval || vr < 0 ||
-        TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_PARAM)
+        d.btype != IROP_BTYPE_INT32 || irop_get_tag(v) != IROP_TAG_VREG || v.is_lval || vr < 0)
       return;
-    IRLiveInterval *iv = tcc_ir_vreg_live_interval(ir, vr);
+    const int from_param = TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_PARAM;
+    IRLiveInterval *iv = from_param ? tcc_ir_vreg_live_interval(ir, vr) : NULL;
+    /* A stored temporary: the offset of the parameter word its load read. */
+    int32_t load_off = -1;
+    if (!from_param)
+    {
+      for (int j = i - 1; j >= 0 && load_off < 0; j--)
+      {
+        IRQuadCompact *lq = &ir->compact_instructions[j];
+        if (lq->op != TCCIR_OP_LOAD || irop_get_vreg(tcc_ir_op_get_dest(ir, lq)) != vr)
+          continue;
+        IROperand s = tcc_ir_op_get_src1(ir, lq);
+        if (irop_get_tag(s) != IROP_TAG_STACKOFF || irop_get_vreg(s) >= 0 || !s.is_lval || !s.is_param ||
+            s.btype != IROP_BTYPE_INT32 || irop_get_stack_offset(s) < 0)
+          return;
+        load_off = irop_get_stack_offset(s);
+      }
+      if (load_off < 0)
+        return;
+    }
     int32_t off = irop_get_stack_offset(d), ok = 0;
     for (int k = 0; k < np && !ok; k++)
     {
       const IRParamForm *f = &ir->param_forms[k];
       int w = (off - f->off) / 4;
-      ok = f->kind == IR_PF_HOME && off >= f->off && !((off - f->off) & 3) && w < f->words && iv &&
-           iv->incoming_reg0 == f->reg_base + w;
+      if (f->kind != IR_PF_HOME || off < f->off || ((off - f->off) & 3) || w >= f->words + f->stack_words ||
+          (home_seen[k] >> w & 1))
+        continue;
+      if (from_param)
+        ok = w < f->words && iv && iv->incoming_reg0 == f->reg_base + w;
+      else
+        ok = w >= f->words && load_off == f->stack_off + (w - f->words) * 4;
+      if (ok)
+        home_seen[k] |= 1ull << w;
     }
     if (!ok)
       return;
@@ -311,7 +347,7 @@ void tcc_ir_backend_fold_pure_forward(TCCIRState *ir, Sym *sym)
       tcc_ir_op_set_src2(ir, q, enc);
       marker = 1;
     }
-    else if (q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_STORE)
+    else if (q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_LOAD)
       q->op = TCCIR_OP_NOP;
   }
   if (!marker)
@@ -339,6 +375,13 @@ static int ir_asm_clobbers_lr(TCCIRState *ir)
   return 0;
 }
 
+/* A call that makes the function a non-leaf: one that clobbers LR and does not
+ * save it itself. */
+static int ir_call_makes_nonleaf(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return !tcc_ir_call_clobbers_nothing(ir, q) && !tcc_ir_call_saves_lr_itself(ir, q);
+}
+
 void tcc_ir_backend_analyze_leaf_and_tail_calls(TCCIRState *ir, int func_var)
 {
   ir->leaffunc = 1;
@@ -351,7 +394,8 @@ void tcc_ir_backend_analyze_leaf_and_tail_calls(TCCIRState *ir, int func_var)
     const IRQuadCompact *q = &ir->compact_instructions[i];
     if ((q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID) && !tcc_ir_call_clobbers_nothing(ir, q))
     {
-      ir->leaffunc = 0;
+      if (ir_call_makes_nonleaf(ir, q))
+        ir->leaffunc = 0;
       call_count++;
       call_idx = i;
     }
@@ -787,15 +831,32 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
         if (irop_get_tag(ops[j]) == IROP_TAG_STACKOFF && (nested || irop_get_vreg(ops[j]) < 0))
         {
           int32_t off = irop_get_stack_offset(ops[j]);
-          if (off < min_local_offset)
+          int32_t chain_off;
+          if (off < min_local_offset && tcc_ir_capture_lookup(ir, off, &chain_off) < 0)
             min_local_offset = off;
         }
       }
     }
+    /* A capture may be addressed by its nested functions only: the parent
+     * indexing `arr[7]` names [-4], the array starts at [-32], and the frame
+     * must still hold all of it. */
+    int min_capture_offset = 0;
+    for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++)
+    {
+      const NestedFunc *nf = tcc_state->nested_funcs[ni];
+      for (int j = 0; j < nf->nb_captured; j++)
+        if (nested_capture_owned_by(nf, j, tcc_state->current_nested_func) &&
+            nf->captured_offsets[j] < min_capture_offset)
+          min_capture_offset = nf->captured_offsets[j];
+    }
+    if (min_capture_offset < min_local_offset)
+      min_local_offset = min_capture_offset;
     if (min_local_offset > loc)
     {
       loc = min_local_offset;
     }
+    if (min_capture_offset < loc)
+      loc = min_capture_offset;
     /* The incoming static chain is saved at frame offset -4, and that slot is
      * not an IR operand — nothing in the scan above can see it.  A nested
      * function that only forwards the chain to a child of its own (no locals,
@@ -1024,6 +1085,8 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
 
   tcc_ir_register_allocation_params(ir);
   tcc_ir_build_stack_layout(ir);
+  if (ir->captured_count > 0 && loc <= ir->captured_space_end)
+    tcc_error("nested function: frame and captured variables exceed 32 KiB");
 }
 
 
@@ -1061,16 +1124,26 @@ static void finalize_nested_functions(TCCIRState *ir, Sym *sym)
     int can_omit_fp = (tcc_state->nb_nested_funcs > 0);
     for (int i = 0; i < tcc_state->nb_nested_funcs && can_omit_fp; i++) {
       NestedFunc *nf = tcc_state->nested_funcs[i];
-      if (nf->trampoline_needed ||
+      /* auto_inline is a hope: a call left a real call that passes a chain off R7 */
+      if (nf->trampoline_needed || nf->nb_real_calls > 0 ||
           !nf->sym || !nf->sym->type.ref ||
           !nf->sym->type.ref->f.func_auto_inline)
         can_omit_fp = 0;
     }
+    /* Inline-marked does not mean every call was inlined: one that stayed a
+     * call (a recursive nested function expanded up to the inliner's cycle
+     * check) passes the chain, which SET_CHAIN reads off the frame pointer. */
+    int chain_needs_fp = 0;
+    for (int i = 0; i < ir->next_instruction_index && !chain_needs_fp; i++)
+      chain_needs_fp = ir->compact_instructions[i].op == TCCIR_OP_SET_CHAIN ||
+                       ir->compact_instructions[i].op == TCCIR_OP_INIT_CHAIN_SLOT;
     int needs_fp_for_nested = !can_omit_fp;
     compile_nested_functions(sym);
     tcc_state->force_frame_pointer = saved_force_fp;
     tcc_state->force_lr_save = saved_force_lr;
     tcc_state->need_frame_pointer = needs_fp_for_nested ? tcc_state->need_frame_pointer : saved_need_fp;
+    if (chain_needs_fp)
+      tcc_state->need_frame_pointer = 1;
 
     func_ind = ind;
     put_extern_sym(sym, cur_text_section, ind + 1, 0);
@@ -1187,7 +1260,7 @@ static void run_post_alloc_passes(TCCIRState *ir, Sym *sym,
     {
       int op = ir->compact_instructions[i].op;
       if (((op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID) &&
-           !tcc_ir_call_clobbers_nothing(ir, &ir->compact_instructions[i])) ||
+           ir_call_makes_nonleaf(ir, &ir->compact_instructions[i])) ||
           op == TCCIR_OP_BUILTIN_APPLY)
       {
         still_has_call = 1;

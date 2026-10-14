@@ -51,6 +51,7 @@
 #include "opt/ssa/strength.h"
 #include "opt/ssa/reassoc.h"
 #include "opt/ssa/gvn.h"
+#include "opt/ssa/dup_diamond.h"
 #include "opt/ssa/vrp.h"
 #include "opt/ssa/setif_or_taut.h"
 #include "opt/ssa/bool_norm.h"
@@ -331,8 +332,9 @@ TCC_DBG_ENV_FLAG(ra_mem_ssa_verify_on, "TCC_MEM_SSA")
  *     spill needed anyway (dropped when V has one def and no other use);
  *   - reload groups: uses after an earlier use of V in one call-free region
  *     share `T <- V` (one reload) placed before that first use.
- * Then the allocator runs again on the rewritten IR.  The new temps are short
- * and cross no call, so they mostly land in caller-saved registers.
+ * Then the allocator runs again on the rewritten IR, and loop-splits once
+ * more the carriers that rescan evicted.  The new temps are short and cross
+ * no call, so they mostly land in caller-saved registers.
  * zig.c at -O2: -22 KB of .text; about half of the reloads it removes were
  * already elided by the encoder's slot cache, and in the giant functions
  * some temps spill again.  TCC_DISABLE_PASS=ra:spill_split turns it off.

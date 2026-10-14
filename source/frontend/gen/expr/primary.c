@@ -1827,14 +1827,15 @@ tok_next:
           if (nf->captured_tokens[i] == t)
           {
             /* Found a match - create a fake symbol for this captured variable.
-             * The offset is the parent's FP-relative offset (resolved after
-             * parent's register allocation). Access goes through R10 (static chain). */
+             * Access goes through R10 (static chain). */
             s = sym_malloc();
             memset(s, 0, sizeof(*s));
             s->v = t;
             s->type = nf->captured_types[i]; /* Use actual captured variable type */
             s->r = VT_LOCAL | VT_LVAL;       /* LOCAL + LVAL so it works as both value and assignment target */
-            s->c = nf->captured_offsets[i];  /* Parent's FP offset */
+            /* The capture's own offset range in this frame (gen_function);
+             * codegen maps it onto the parent's offset through the chain. */
+            s->c = tcc_state->ir && i < 32 ? tcc_state->ir->captured_vbase[i] : nf->captured_offsets[i];
             s->vreg = -1;                    /* No vreg in nested function's IR — pure stack offset via chain */
             s->sym_scope = 0;
             nested_track_captured_sym(s);
@@ -1871,6 +1872,20 @@ tok_next:
        regvars.  */
     vtop->sym = s;
     vtop->vr = s->vreg;
+    /* An old-style definition with a prototype in scope is called (and its
+     * address typed) as the prototype says. */
+    if ((s->type.t & VT_BTYPE) == VT_FUNC && s->type.ref->f.func_type == FUNC_OLD && s->type.ref->next)
+    {
+      const SymLocalFacts *facts = sym_facts_peek(s);
+      if (facts && facts->knr_proto)
+        vtop->type.ref = facts->knr_proto;
+    }
+
+    /* A designator not called right here decays to a pointer (return g,
+     * fp = g, an argument): an always_inline body then needs a real symbol,
+     * as for `&g`.  `(g)(x)` stays conservative and keeps the body too. */
+    if ((s->type.t & VT_BTYPE) == VT_FUNC && tok != '(' && s->type.ref && s->type.ref->f.func_alwinl)
+      s->type.ref->f.func_outofline_needed = 1;
 
     /* Array-to-pointer decay for captured variables (nested functions).
      * Captured arrays have VT_ARRAY type and VT_LVAL set. They need to

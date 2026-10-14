@@ -64,7 +64,9 @@ RA_OPT_SRC = \
 	source/opt/ra/const_branch_fold.c \
 	source/opt/ra/exit_sink.c \
 	source/opt/ra/incomplete_calls.c \
+	source/opt/ra/load_sink.c \
 	source/opt/ra/phi_const_chain.c \
+	source/opt/ra/return_sink.c \
 	source/opt/ra/umaal_fusion.c
 
 $(X)source/opt/ra/%.o: source/opt/ra/%.c $(CORE_OPT_HDRS) source/ir/regalloc.h

@@ -292,7 +292,9 @@ UT_MODULE_SRCS := \
 		$(TOP)/source/ir/known_ext.c \
 		$(TOP)/source/opt/ra/const_branch_fold.c \
 		$(TOP)/source/opt/ra/incomplete_calls.c \
+		$(TOP)/source/opt/ra/load_sink.c \
 		$(TOP)/source/opt/ra/phi_const_chain.c \
+		$(TOP)/source/opt/ra/return_sink.c \
 		$(TOP)/source/opt/ra/umaal_fusion.c \
 		$(TOP)/source/ir/codegen.c \
 		$(TOP)/source/ir/machine_op.c \
@@ -353,6 +355,7 @@ UT_COVERAGE_ONLY_SRCS := \
 	$(TOP)/source/opt/ssa/engine/driver.c \
 	$(TOP)/source/opt/ssa/cfg/branch.c \
 	$(TOP)/source/opt/ssa/cfg/cmp_eq.c \
+	$(TOP)/source/opt/ssa/cfg/dup_diamond.c \
 	$(TOP)/source/opt/ssa/cfg/vrp.c \
 	$(TOP)/source/opt/ssa/scalar/setif_or_taut.c \
 	$(TOP)/source/opt/ssa/scalar/bool_norm.c \
@@ -485,6 +488,7 @@ UT_LOCAL_SRCS := \
 	test_opt_memset_fold.c \
 	test_opt_mem_inline.c \
 	test_opt_dead_init_call.c \
+	test_opt_pure_via_sret.c \
 	test_opt_memmove.c \
 	test_opt_loop_utils.c \
 	test_opt_du.c \
@@ -867,9 +871,11 @@ $(COV_STAMP3):
 # vreg_query.c likewise: gen/value/longlong.c's detect_ll_ext_provenance rejects
 # multi-definition vregs through tcc_ir_vreg_has_single_def, an out-of-line IR
 # query that lives in the opt module (the cross build gets it from libopt.a).
+# vector.c: inline/analysis.c's free-name scan of a replayed callee body.
 UT3_MODULE_SRCS := \
 	$(TOP)/source/ir/tccir_operand.c \
 	$(TOP)/source/memory/sort.c \
+	$(TOP)/source/memory/vector.c \
 	$(TOP)/source/opt/util/vreg_query.c
 UT3_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR3)/%.o,$(UT3_MODULE_SRCS))
 
@@ -1484,6 +1490,7 @@ UT11_MODULE_SRCS := \
 	$(TOP)/source/opt/ssa/cfg/guard_collapse.c \
 	$(TOP)/source/opt/ssa/cfg/branch.c \
 	$(TOP)/source/opt/ssa/cfg/cmp_eq.c \
+	$(TOP)/source/opt/ssa/cfg/dup_diamond.c \
 	$(TOP)/source/opt/ssa/cfg/vrp.c \
 	$(TOP)/source/opt/ssa/scalar/setif_or_taut.c \
 	$(TOP)/source/opt/ssa/scalar/bool_norm.c \

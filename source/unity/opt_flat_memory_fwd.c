@@ -22,6 +22,8 @@
 #undef USING_GLOBALS
 #include "../opt/flat/memory/ptr_local_fwd.c"
 #undef PLF_CONFLICT
+#undef PLF_DF_CELLS
+#undef PLF_TOP
 #undef PLF_UNKNOWN
 #undef USING_GLOBALS
 #include "../opt/flat/memory/sl_forward.c"

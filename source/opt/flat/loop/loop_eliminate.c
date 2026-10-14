@@ -43,6 +43,8 @@ int try_eliminate_loop_symbolic(TCCIRState *ir, IRLoop *loop)
         continue; /* constant limit — try_eliminate_loop handles this. */
       if (ivs[k].step != 1 || ivs[k].init_val != 0)
         continue; /* restrict to the common case */
+      if (tcc_ir_barrel_shift_at(ir, &ir->compact_instructions[ci]))
+        continue; /* `i < n >> 2` fused: the limit is not the bare src2 */
       counter_iv = &ivs[k];
       cmp_idx = ci; jmpif_idx = ji; limit_op = lop; cond = c; exit_target = et;
       break;

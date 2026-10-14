@@ -351,6 +351,10 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
   if (!irop_has_vreg(addr_op))
     return 0;
 
+  /* A _Complex access is two halves; the indexed forms carry one register. */
+  if (addr_op.is_complex)
+    return 0;
+
   int32_t addr_vr = irop_get_vreg(addr_op);
   if (!is_store && TCCIR_DECODE_VREG_TYPE(addr_vr) == TCCIR_VREG_TYPE_VAR)
     return 0;
@@ -596,6 +600,12 @@ static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
     int src_pos = operand_positions[d];
     IROperand deref_op = tcc_ir_op_get_src1_or_2(ir, q, src_pos != 1);
 
+    /* A STRUCT lvalue (a by-value PARAM) means "the struct at this address":
+     * its address must reach the consumer, and no single load yields it.
+     * Nor does one load yield a _Complex value's two halves. */
+    if (deref_op.btype == IROP_BTYPE_STRUCT || deref_op.is_complex)
+      continue;
+
     int32_t addr_vr = irop_get_vreg(deref_op);
     if (addr_vr < 0)
       continue;
@@ -684,8 +694,7 @@ static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
 
       {
         int access_btype = deref_op.btype;
-        if (access_btype == IROP_BTYPE_INT64 || access_btype == IROP_BTYPE_FLOAT64 ||
-            access_btype == IROP_BTYPE_STRUCT)
+        if (access_btype == IROP_BTYPE_INT64 || access_btype == IROP_BTYPE_FLOAT64)
           continue;
       }
 

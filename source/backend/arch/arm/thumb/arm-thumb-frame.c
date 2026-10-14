@@ -207,12 +207,14 @@ ST_FUNC void tcc_gen_machine_outline_window_open(void)
   frame_word_last.kind = 0;
 }
 
-/* The window's ops are done, and `bytes` of them were recorded, not emitted:
- * the BL to the shared body replaces them. */
+/* The recorded window is replaced by a BL to its shared body. */
 ST_FUNC void tcc_gen_machine_outline_window_closed(int bytes)
 {
   thumb_gen_state.code_size -= bytes;
   frame_word_last.kind = 0;
+  /* Rewinding ind can alias a spill reload's virtual position inside the window. */
+  if (tcc_state->ir)
+    tcc_state->ir->spill_cache.last_emit_kind = 0;
 }
 
 /* The BL to a shared body.  Not through ot(): the caches saw the window's own
@@ -246,6 +248,9 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
 
   thumb_gen_state.generating_function = 1;
   thumb_gen_state.code_size = 0;
+  th_last_insn.end = -1; /* no instruction of this function to widen yet */
+  th_widened_reset();
+  th_func_code_start = ind;
   /* Clear global symbol cache at function start */
   thumb_gen_state.cached_global_sym = NULL;
   thumb_gen_state.cached_global_reg = PREG_NONE;
@@ -471,13 +476,15 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
    */
   if (func_var)
   {
-    /* Store r0-r3 at frame offsets -16..-4 for named parameter access.
-     * (The contiguous PUSH'd copy is at FP+offset_to_args-16..FP+offset_to_args-4
-     * and is used by va_arg for anonymous argument traversal.) */
-    tcc_gen_machine_store_to_stack_ex(R0, fp_adjust_local_offset(-16, 0), prologue_incoming_mask);
-    tcc_gen_machine_store_to_stack_ex(R1, fp_adjust_local_offset(-12, 0), prologue_incoming_mask);
-    tcc_gen_machine_store_to_stack_ex(R2, fp_adjust_local_offset(-8, 0), prologue_incoming_mask);
-    tcc_gen_machine_store_to_stack_ex(R3, fp_adjust_local_offset(-4, 0), prologue_incoming_mask);
+    /* Store r0-r3 at frame offsets -16..-4 (-20..-8 beside a static chain)
+     * for named parameter access.  (The contiguous PUSH'd copy is at
+     * FP+offset_to_args-16..FP+offset_to_args-4 and is used by va_arg for
+     * anonymous argument traversal.) */
+    const int save = tcc_ir_variadic_reg_save_base(ir);
+    tcc_gen_machine_store_to_stack_ex(R0, fp_adjust_local_offset(save, 0), prologue_incoming_mask);
+    tcc_gen_machine_store_to_stack_ex(R1, fp_adjust_local_offset(save + 4, 0), prologue_incoming_mask);
+    tcc_gen_machine_store_to_stack_ex(R2, fp_adjust_local_offset(save + 8, 0), prologue_incoming_mask);
+    tcc_gen_machine_store_to_stack_ex(R3, fp_adjust_local_offset(save + 12, 0), prologue_incoming_mask);
 
     /* The frame-metadata triple that used to live at FP-20/-24/-28 (__gr_top,
      * named_arg_reg_bytes, named_arg_stack_bytes) is gone: it existed purely so

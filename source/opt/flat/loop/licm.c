@@ -13,6 +13,7 @@
 #include "opt_alias.h"
 #include "opt_range.h"
 #include "opt_utils.h"
+#include "opt_loop_utils.h"
 #include "cfg.h"
 #include "core.h"
 #include "pool.h"
@@ -870,20 +871,14 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
           later_loop->end_idx += hoisted_this_loop;
         if (later_loop->preheader_idx >= loop->preheader_idx)
           later_loop->preheader_idx += hoisted_this_loop;
-        for (int k = 0; k < later_loop->num_body_instrs; k++)
-        {
-          if (later_loop->body_instrs[k] >= loop->preheader_idx)
-            later_loop->body_instrs[k] += hoisted_this_loop;
-        }
       }
 
-      /* Update this loop's indices too */
+      /* Update this loop's indices too.  Its body entries all lie past the
+       * preheader, so one shift of entries >= preheader covers it and the
+       * later loops, each shared entry once. */
+      tcc_ir_loops_shift_bodies(loops, loop_idx, -1, loop->preheader_idx, hoisted_this_loop);
       loop->header_idx += hoisted_this_loop;
       loop->start_idx += hoisted_this_loop;
-      for (int k = 0; k < loop->num_body_instrs; k++)
-      {
-        loop->body_instrs[k] += hoisted_this_loop;
-      }
     }
   }
 
@@ -1107,10 +1102,11 @@ static int glh_writes_sym(const GLHWrites *w, const Sym *sym)
 }
 
 /* A SYMREF value read (global lvalue used as a value); volatility is checked
- * separately via the resolved symbol's type. */
+ * separately via the resolved symbol's type.  A STRUCT lvalue (a by-value
+ * PARAM) names the struct's address, which no single load produces. */
 static int glh_operand_is_global_value(IROperand op)
 {
-  return op.is_lval && op.is_sym && !op.is_llocal && !op.is_local;
+  return op.is_lval && op.is_sym && !op.is_llocal && !op.is_local && irop_get_btype(op) != IROP_BTYPE_STRUCT;
 }
 
 /* Shift the still-unprocessed loops' indices by `delta` for entries >= pos,
@@ -1123,9 +1119,8 @@ static void glh_shift_after(IRLoops *loops, int after_li, int pos, int delta)
     if (o->start_idx >= pos) o->start_idx += delta;
     if (o->end_idx >= pos) o->end_idx += delta;
     if (o->preheader_idx >= pos) o->preheader_idx += delta;
-    for (int b = 0; b < o->num_body_instrs; b++)
-      if (o->body_instrs[b] >= pos) o->body_instrs[b] += delta;
   }
+  tcc_ir_loops_shift_bodies(loops, after_li + 1, -1, pos, delta);
 }
 
 static int tcc_ir_hoist_invariant_global_loads(TCCIRState *ir, IRLoops *loops)
@@ -1796,6 +1791,18 @@ int ssa_opt_licm_global_load(TCCIRState *ir)
  * a PARAM, an address-never-taken VAR, or any vreg the loop never redefines:
  * its value is then fixed for the whole loop, and every candidate and write
  * address is compared as (root vreg, constant offset, width).
+ *
+ * A read the frontend did not type (no IROP_AUX_ALIAS_PTR: a field of an
+ * inlined by-value aggregate copy) has no alias class, so any memory write in
+ * the loop kills it; in a loop that writes nothing it is invariant all the
+ * same.
+ *
+ * The hoisted load must not run where the source never reads: the load is
+ * kept only when its block runs on every trip that reaches an exit or a latch
+ * (fph_exec_check).  A top-tested loop's header is the zero-trip exit no body
+ * block dominates; when that header is a bare `CMP; JUMPIF` the preheader
+ * gets a copy of the test and the loads go behind it (ssa:loop_header_dup
+ * later drops the header test the copy makes redundant).
  * ==========================================================================*/
 
 #define FPH_MAX_PER_LOOP 4
@@ -1818,6 +1825,8 @@ typedef struct
   FPHOcc occ[FPH_MAX_OCC];
   int n_occ;
   int alive;
+  int marked; /* every read carries IROP_AUX_ALIAS_PTR */
+  int bt, uns; /* the loaded value's btype and signedness: every read must agree */
 } FPHLoc;
 
 static int fph_trace(void)
@@ -1834,6 +1843,18 @@ static int fph_trace(void)
     if (fph_trace())                                                                                                 \
       fprintf(stderr, "[licm:fph] " __VA_ARGS__);                                                                   \
   } while (0)
+
+/* A second read of a candidate location must load the same value: the same
+ * width and extension (`ldrb` of a flag byte and `ldr` of the word holding it
+ * share root and offset). */
+static void fph_note_read_type(FPHLoc *l, IROperand v)
+{
+  if (l->alive && (l->bt != irop_get_btype(v) || l->uns != v.is_unsigned))
+  {
+    FPH_LOG("root=%d off=%lld read with two types\n", l->root, (long long)l->off);
+    l->alive = 0;
+  }
+}
 
 /* Defs of `vr` inside the loop's certain range [start,end].  A store THROUGH
  * vr is not a def OF vr. */
@@ -1981,6 +2002,14 @@ static void fph_note_write(TCCIRState *ir, IRLoop *loop, int qidx, FPHLoc *locs,
   if (!have_w)
     return;
 
+  /* A read without an alias class may alias any write. */
+  for (int c = 0; c < nlocs; c++)
+    if (locs[c].alive && !locs[c].marked)
+    {
+      FPH_LOG("loop write at %d kills unmarked root=%d off=%lld\n", qidx, locs[c].root, (long long)locs[c].off);
+      locs[c].alive = 0;
+    }
+
   /* A store of a non-pointer scalar object cannot legally modify a
    * pointer-typed object (C11 6.5p7): the mark tcc_ir_put sets only when the
    * frontend knew the lvalue's type. */
@@ -2042,6 +2071,243 @@ static void fph_note_write(TCCIRState *ir, IRLoop *loop, int qidx, FPHLoc *locs,
   }
 }
 
+/* The guard copy for a top-tested loop: `CMP a,b; JUMPIF cond -> exit_idx`. */
+typedef struct
+{
+  int cmp_idx;  /* the header's CMP */
+  int exit_idx; /* where the copy branches when the loop runs no trip */
+  int cond;     /* the copy's condition */
+} FPHGuard;
+
+/* A CMP operand the guard copy may read a second time: what the header reads
+ * right after the copy, with no memory access of its own. */
+static int fph_guard_operand_ok(TCCIRState *ir, IROperand op)
+{
+  if (irop_is_immediate(op))
+    return !op.is_lval;
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0 || op.is_sym || op.is_llocal)
+    return 0;
+  if (!op.is_lval)
+    return 1;
+  return TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && op.is_local &&
+         !tcc_ir_access_is_volatile(ir, op) && !tcc_ir_operand_names_volatile_var(ir, op);
+}
+
+/* 1 when the header block is nothing but `CMP; JUMPIF` with exactly one edge
+ * leaving the loop. */
+static int fph_header_is_bare_test(TCCIRState *ir, IRCFG *cfg, const uint8_t *in_loop, int hb, FPHGuard *g)
+{
+  IRBasicBlock *b = &cfg->blocks[hb];
+  int cmp = -1, jif = b->end_idx - 1;
+  for (int i = b->start_idx; i < jif; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (q->op != TCCIR_OP_CMP || cmp >= 0)
+      return 0;
+    cmp = i;
+  }
+  if (cmp < 0 || jif + 1 >= ir->next_instruction_index)
+    return 0;
+  IRQuadCompact *cq = &ir->compact_instructions[cmp];
+  IRQuadCompact *jq = &ir->compact_instructions[jif];
+  if (jq->op != TCCIR_OP_JUMPIF || tcc_ir_instr_access_is_volatile(ir, cq))
+    return 0;
+  if (!fph_guard_operand_ok(ir, tcc_ir_op_get_src1(ir, cq)) || !fph_guard_operand_ok(ir, tcc_ir_op_get_src2(ir, cq)))
+    return 0;
+  int target = (int)tcc_ir_op_dest_imm(ir, jq);
+  int cond = (int)tcc_ir_op_src1_imm(ir, jq);
+  if (target < 0 || target >= cfg->num_instrs || jif + 1 >= cfg->num_instrs)
+    return 0;
+  int t_in = in_loop[cfg->instr_to_block[target]];
+  int f_in = in_loop[cfg->instr_to_block[jif + 1]];
+  g->cmp_idx = cmp;
+  if (!t_in && f_in)
+  {
+    g->exit_idx = target;
+    g->cond = cond;
+    return 1;
+  }
+  if (t_in && !f_in)
+  {
+    g->exit_idx = jif + 1;
+    g->cond = invert_condition(cond);
+    return g->cond >= 0;
+  }
+  return 0;
+}
+
+/* Keep only the candidates whose load the source performs on every trip.
+ * A candidate qualifies when one of its in-loop reads sits in a block that
+ * dominates every exiting block and every latch of the natural loop: the
+ * first trip then reads it before it can leave or come round.  A read that
+ * misses only the header's exit qualifies behind a guard copy (*need_guard);
+ * reads outside the natural loop (exit blocks inside the linear range) are
+ * never rewritten.  An inner cycle may spin without reaching the read, so
+ * only header reads qualify then. */
+static void fph_exec_check(TCCIRState *ir, IRLoop *loop, FPHLoc *locs, int nlocs, int *need_guard, FPHGuard *g)
+{
+  *need_guard = 0;
+  IRCFG *cfg = tcc_ir_cfg_build(ir);
+  int hb = -1;
+  if (cfg && cfg->num_blocks > 0 && loop->header_idx < cfg->num_instrs)
+  {
+    tcc_ir_cfg_compute_dominators(cfg);
+    hb = cfg->instr_to_block[loop->header_idx];
+    if (hb >= 0 && cfg->blocks[hb].start_idx != loop->header_idx)
+      hb = -1;
+  }
+  if (hb >= 0)
+  {
+    /* The fall-through into the header is the only edge from outside. */
+    int pb = cfg->instr_to_block[loop->header_idx - 1];
+    int falls = 0;
+    for (int si = 0; si < cfg->blocks[pb].num_succs; si++)
+      if (cfg->blocks[pb].succs[si] == hb)
+        falls = 1;
+    IRQuadCompact *pq = &ir->compact_instructions[loop->header_idx - 1];
+    /* A branch at the header's own index would be renumbered past the loads. */
+    if (!falls || pq->op == TCCIR_OP_JUMP ||
+        (pq->op == TCCIR_OP_JUMPIF && (int)tcc_ir_op_dest_imm(ir, pq) == loop->header_idx))
+      hb = -1;
+    for (int pi = 0; hb >= 0 && pi < cfg->blocks[hb].num_preds; pi++)
+    {
+      int p = cfg->blocks[hb].preds[pi];
+      if (p != pb && !tcc_ir_cfg_dominates(cfg, hb, p))
+        hb = -1;
+    }
+    if (hb >= 0 && tcc_ir_cfg_dominates(cfg, hb, pb))
+      hb = -1;
+  }
+  if (hb < 0)
+  {
+    fph_kill_all(locs, nlocs, "no cfg header", loop->header_idx);
+    if (cfg)
+      tcc_ir_cfg_free(cfg);
+    return;
+  }
+
+  int nb = cfg->num_blocks;
+  uint8_t *in_loop = tcc_mallocz(nb);
+  uint8_t *must_pass = tcc_mallocz(nb); /* exiting blocks and latches */
+  int *wl = tcc_malloc(nb * sizeof(int));
+  int nwl = 0;
+  in_loop[hb] = 1;
+  for (int b = 0; b < nb; b++)
+    for (int si = 0; si < cfg->blocks[b].num_succs; si++)
+      if (cfg->blocks[b].succs[si] == hb && tcc_ir_cfg_dominates(cfg, hb, b))
+      {
+        must_pass[b] = 1;
+        if (!in_loop[b])
+        {
+          in_loop[b] = 1;
+          wl[nwl++] = b;
+        }
+      }
+  while (nwl > 0)
+  {
+    IRBasicBlock *nbk = &cfg->blocks[wl[--nwl]];
+    for (int pi = 0; pi < nbk->num_preds; pi++)
+    {
+      int p = nbk->preds[pi];
+      if (p >= 0 && p < nb && !in_loop[p])
+      {
+        in_loop[p] = 1;
+        wl[nwl++] = p;
+      }
+    }
+  }
+  int inner_cycle = 0;
+  for (int b = 0; b < nb; b++)
+  {
+    if (!in_loop[b])
+      continue;
+    for (int si = 0; si < cfg->blocks[b].num_succs; si++)
+    {
+      int sb = cfg->blocks[b].succs[si];
+      if (sb < 0 || sb >= nb || !in_loop[sb])
+        must_pass[b] = 1;
+      else if (sb != hb && tcc_ir_cfg_dominates(cfg, sb, b))
+        inner_cycle = 1;
+    }
+  }
+  int guard_ok = fph_header_is_bare_test(ir, cfg, in_loop, hb, g);
+
+  for (int c = 0; c < nlocs; c++)
+  {
+    if (!locs[c].alive)
+      continue;
+    int n = 0;
+    for (int o = 0; o < locs[c].n_occ; o++)
+      if (in_loop[cfg->instr_to_block[locs[c].occ[o].idx]])
+        locs[c].occ[n++] = locs[c].occ[o];
+    locs[c].n_occ = n;
+    if (locs[c].form_a_idx >= 0 && !in_loop[cfg->instr_to_block[locs[c].form_a_idx]])
+      locs[c].alive = 0;
+    int level = 0; /* 2: always read; 1: read once the header test passes */
+    for (int r = -1; r < locs[c].n_occ && locs[c].alive && level < 2; r++)
+    {
+      int idx = r < 0 ? locs[c].form_a_idx : locs[c].occ[r].idx;
+      if (idx < 0)
+        continue;
+      int cb = cfg->instr_to_block[idx];
+      if (inner_cycle && cb != hb)
+        continue;
+      int all = 1, but_header = 1;
+      for (int b = 0; b < nb && but_header; b++)
+        if (in_loop[b] && must_pass[b] && !tcc_ir_cfg_dominates(cfg, cb, b))
+        {
+          all = 0;
+          if (b != hb)
+            but_header = 0;
+        }
+      if (all)
+        level = 2;
+      else if (but_header && guard_ok)
+        level = 1;
+    }
+    if (level == 0)
+    {
+      if (locs[c].alive)
+        FPH_LOG("root=%d off=%lld not read on every trip\n", locs[c].root, (long long)locs[c].off);
+      locs[c].alive = 0;
+    }
+    else if (level == 1)
+      *need_guard = 1;
+  }
+  tcc_free(wl);
+  tcc_free(must_pass);
+  tcc_free(in_loop);
+  tcc_ir_cfg_free(cfg);
+}
+
+/* Emit the guard copy at `at` (the header's position): `CMP a,b` and a
+ * JUMPIF to the loop exit.  Back edges and the header move past it.  Returns
+ * the number of instructions inserted (2), or -1 when nothing was. */
+static int fph_emit_guard(TCCIRState *ir, int at, const FPHGuard *g)
+{
+  IRQuadCompact *cq = &ir->compact_instructions[g->cmp_idx];
+  IROperand s1 = tcc_ir_op_get_src1(ir, cq), s2 = tcc_ir_op_get_src2(ir, cq);
+  int orig = cq->orig_index, line = (int)cq->line_num;
+  IROperand none_op = irop_make_none();
+  if (insert_instr_at(ir, at, TCCIR_OP_NOP, none_op, none_op, none_op) < 0)
+    return -1;
+  if (insert_instr_at(ir, at + 1, TCCIR_OP_NOP, none_op, none_op, none_op) < 0)
+    return -2;
+  int exit_idx = g->exit_idx + (g->exit_idx >= at ? 2 : 0);
+  write_instr_at_nop(ir, at, TCCIR_OP_CMP, none_op, s1, s2);
+  tcc_ir_copy_orig_annotations(ir, orig, ir->compact_instructions[at].orig_index);
+  ir->compact_instructions[at].line_num = line;
+  write_instr_at_nop(ir, at + 1, TCCIR_OP_JUMPIF, irop_make_imm32(-1, exit_idx, IROP_BTYPE_INT32),
+                     irop_make_imm32(-1, g->cond, IROP_BTYPE_INT32), none_op);
+  ir->compact_instructions[at + 1].line_num = line;
+  if (exit_idx < ir->next_instruction_index)
+    ir->compact_instructions[exit_idx].is_jump_target = 1;
+  return 2;
+}
+
 static int tcc_ir_hoist_invariant_field_ptr_loads(TCCIRState *ir, IRLoops *loops)
 {
   int total = 0;
@@ -2049,22 +2315,15 @@ static int tcc_ir_hoist_invariant_field_ptr_loads(TCCIRState *ir, IRLoops *loops
   {
     IRLoop *loop = &loops->loops[li];
 
-    /* Preheader-insertion safety: identical requirements to the global-load
-     * hoist above (and pure-call hoisting, docs/bugs.md #7) — a real
-     * fall-through preheader that is the header's immediate predecessor,
-     * not nested in another loop, no entry edge from outside bypassing it,
-     * and no VLA. */
-    if (loop->preheader_idx < 0 || loop->preheader_idx != loop->header_idx - 1)
+    /* Preheader-insertion safety (pure-call hoisting, docs/bugs.md #7): no
+     * entry edge from outside the range, and no VLA.  The code goes in front
+     * of the header; fph_exec_check makes sure the only way into the loop
+     * falls through to it -- from a plain preheader, or past the zero-trip
+     * JUMPIF of a rotated loop.  A loop nested in another one is fine: the
+     * loads then run once per outer trip. */
+    if (loop->header_idx < 1)
       continue;
     int bad = 0;
-    for (int oi = 0; oi < loops->num_loops && !bad; oi++)
-    {
-      if (oi == li)
-        continue;
-      IRLoop *o = &loops->loops[oi];
-      if (loop->preheader_idx >= o->start_idx && loop->preheader_idx <= o->end_idx)
-        bad = 1;
-    }
     for (int j = 0; j < ir->next_instruction_index && !bad; j++)
     {
       if (j >= loop->start_idx && j <= loop->end_idx)
@@ -2108,7 +2367,7 @@ static int tcc_ir_hoist_invariant_field_ptr_loads(TCCIRState *ir, IRLoops *loops
           continue;
         if (dest.is_lval || irop_get_tag(dest) != IROP_TAG_VREG || irop_get_vreg(dest) < 0)
           continue;
-        if (!irop_access_alias_ptr(base) || tcc_ir_access_is_volatile(ir, base))
+        if (tcc_ir_access_is_volatile(ir, base))
           continue;
         int32_t root;
         int64_t off;
@@ -2129,9 +2388,16 @@ static int tcc_ir_hoist_invariant_field_ptr_loads(TCCIRState *ir, IRLoops *loops
           locs[found].off = off + tcc_ir_op_src2_imm(ir, q);
           locs[found].width = ir_opt_store_btype_size_bytes(irop_get_btype(dest));
           locs[found].alive = 1;
+          locs[found].marked = 1;
           locs[found].form_a_idx = -1;
           locs[found].src_op = base;
+          locs[found].bt = irop_get_btype(dest);
+          locs[found].uns = dest.is_unsigned;
         }
+        if (found >= 0)
+          fph_note_read_type(&locs[found], dest);
+        if (found >= 0 && !irop_access_alias_ptr(base))
+          locs[found].marked = 0;
         if (found >= 0 && locs[found].form_a_idx < 0)
         {
           locs[found].form_a_idx = idx;
@@ -2151,7 +2417,10 @@ static int tcc_ir_hoist_invariant_field_ptr_loads(TCCIRState *ir, IRLoops *loops
           IROperand s = tcc_ir_op_get_src1_or_2(ir, q, side != 0);
           if (irop_get_tag(s) != IROP_TAG_VREG || !s.is_lval || s.is_local || s.is_llocal || s.is_sym)
             continue;
-          if (!irop_access_alias_ptr(s) || tcc_ir_access_is_volatile(ir, s))
+          /* A STRUCT lvalue (a by-value PARAM) is the struct's address. */
+          if (irop_get_btype(s) == IROP_BTYPE_STRUCT)
+            continue;
+          if (tcc_ir_access_is_volatile(ir, s))
             continue;
           int32_t root;
           int64_t off;
@@ -2169,9 +2438,16 @@ static int tcc_ir_hoist_invariant_field_ptr_loads(TCCIRState *ir, IRLoops *loops
             locs[found].off = off;
             locs[found].width = ir_opt_store_btype_size_bytes(irop_get_btype(s));
             locs[found].alive = 1;
+            locs[found].marked = 1;
             locs[found].form_a_idx = -1;
             locs[found].src_op = s;
+            locs[found].bt = irop_get_btype(s);
+            locs[found].uns = s.is_unsigned;
           }
+          if (found >= 0)
+            fph_note_read_type(&locs[found], s);
+          if (found >= 0 && !irop_access_alias_ptr(s))
+            locs[found].marked = 0;
           if (found >= 0 && locs[found].n_occ < FPH_MAX_OCC)
           {
             locs[found].occ[locs[found].n_occ].idx = idx;
@@ -2204,8 +2480,40 @@ static int tcc_ir_hoist_invariant_field_ptr_loads(TCCIRState *ir, IRLoops *loops
     if (alive == 0)
       continue;
 
+    /* Speculation: only loads the source performs on every trip. */
+    FPHGuard guard = {-1, -1, -1};
+    int need_guard;
+    fph_exec_check(ir, loop, locs, nlocs, &need_guard, &guard);
+    alive = 0;
+    for (int c = 0; c < nlocs; c++)
+      if (locs[c].alive)
+        alive++;
+    if (alive == 0)
+      continue;
+
+    /* The header test's copy goes first: the loads run behind it. */
+    int insert_at = loop->header_idx;
+    int ng = 0;
+    if (need_guard)
+    {
+      ng = fph_emit_guard(ir, insert_at, &guard);
+      if (ng < 0)
+      {
+        glh_shift_after(loops, li, insert_at, -ng - 1);
+        continue;
+      }
+      for (int c = 0; c < nlocs; c++)
+      {
+        if (locs[c].form_a_idx >= insert_at)
+          locs[c].form_a_idx += ng;
+        for (int o = 0; o < locs[c].n_occ; o++)
+          if (locs[c].occ[o].idx >= insert_at)
+            locs[c].occ[o].idx += ng;
+      }
+      FPH_LOG("loop %d: guard copy of header test at %d\n", li, insert_at);
+    }
+
     /* Rewrite Form B sources while indices are stable, and assign temps. */
-    int rewrote = 0;
     for (int c = 0; c < nlocs; c++)
     {
       if (!locs[c].alive)
@@ -2222,11 +2530,8 @@ static int tcc_ir_hoist_invariant_field_ptr_loads(TCCIRState *ir, IRLoops *loops
           tcc_ir_set_src2(ir, locs[c].occ[o].idx, nv);
         else
           tcc_ir_set_src1(ir, locs[c].occ[o].idx, nv);
-        rewrote++;
       }
     }
-    if (rewrote == 0 && alive == 0)
-      continue;
 
     /* Emit into the preheader (insertion renumbers the header past the new
      * instructions, so back edges re-enter below them — the loads run exactly
@@ -2234,15 +2539,18 @@ static int tcc_ir_hoist_invariant_field_ptr_loads(TCCIRState *ir, IRLoops *loops
      * stripped ROOT: the chain vregs the strip walked through (e.g.
      * `T16 <-- P1` inside the body) are defined per-iteration and must not be
      * named before their def. */
-    int insert_at = loop->preheader_idx + 1;
+    int guard_at = insert_at;
+    insert_at += ng;
     int k = 0;
     for (int c = 0; c < nlocs; c++)
     {
       if (!locs[c].alive)
         continue;
       IRQuadCompact lq = {0};
-      IROperand ldest = irop_make_vreg(locs[c].value, irop_get_btype(locs[c].src_op));
-      ldest.is_unsigned = locs[c].src_op.is_unsigned;
+      /* The value's own type: for Form A src_op is the base pointer, and a
+       * byte field loaded as its pointer's INT32 read the bytes after it too. */
+      IROperand ldest = irop_make_vreg(locs[c].value, locs[c].bt);
+      ldest.is_unsigned = locs[c].uns;
       IROperand lbase = irop_make_vreg(locs[c].root, irop_get_btype(locs[c].src_op));
       lbase.is_unsigned = locs[c].src_op.is_unsigned;
       /* Same access, same marks: volatility/alias-class/alignment facts of
@@ -2281,7 +2589,7 @@ static int tcc_ir_hoist_invariant_field_ptr_loads(TCCIRState *ir, IRLoops *loops
       licm_move_jump_target_off_nop(ir, nop_pos);
     }
 
-    glh_shift_after(loops, li, insert_at, k);
+    glh_shift_after(loops, li, guard_at, ng + k);
   }
   return total;
 }
@@ -2444,6 +2752,27 @@ static int licm_q_is_speculatable(TCCIRState *ir, IRQuadCompact *q)
          licm_is_plain_reg(tcc_ir_op_get_src1(ir, q));
 }
 
+/* A late-pipeline load the dominance LICM may hoist out of a loop that
+ * writes no memory: a non-volatile word-or-narrower LOAD through a register,
+ * or LOAD_INDEXED off a register.  Only the late run takes these (the frame
+ * copies of inlined by-value aggregates are gone by then); the caller checks
+ * that the loop writes nothing and that every trip performs the load. */
+static int licm_q_is_stable_load(TCCIRState *ir, IRQuadCompact *q)
+{
+  if (q->op != TCCIR_OP_LOAD && q->op != TCCIR_OP_LOAD_INDEXED)
+    return 0;
+  IROperand d = tcc_ir_op_get_dest(ir, q), s1 = tcc_ir_op_get_src1(ir, q);
+  if (!licm_is_plain_reg(d) || irop_is_64bit(d) || tcc_ir_instr_access_is_volatile(ir, q))
+    return 0;
+  if (irop_get_tag(s1) != IROP_TAG_VREG || irop_get_vreg(s1) < 0 || s1.is_local || s1.is_llocal || s1.is_sym ||
+      s1.is_complex)
+    return 0;
+  if (q->op == TCCIR_OP_LOAD)
+    return s1.is_lval;
+  IROperand s2 = tcc_ir_op_get_src2(ir, q);
+  return !s1.is_lval && (licm_is_plain_reg(s2) || (irop_is_immediate(s2) && !s2.is_sym && !s2.is_lval));
+}
+
 /* Q is the only instruction anywhere that names each of its register sources:
  * hoisting it ends those sources at the preheader, so the loop holds Q's
  * result instead of them and no register is added across the loop. */
@@ -2499,6 +2828,8 @@ static int licm_late_register_cost(TCCIRState *ir, int idx, int *register_cost)
     IROperand src = tcc_ir_op_get_src1_or_2(ir, q, side != 0);
     if (irop_is_immediate(src))
       continue;
+    if (q->op == TCCIR_OP_LOAD && side == 0 && src.is_lval)
+      src.is_lval = 0; /* the address register a stable load reads through */
     if (!licm_is_plain_reg(src) || irop_is_64bit(src))
       return 0;
     int32_t vr = irop_get_vreg(src);
@@ -2737,6 +3068,65 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
               total_loop_instrs += cfg->blocks[bi].end_idx - cfg->blocks[bi].start_idx;
 
           uint8_t *is_invariant = tcc_mallocz(ir->next_instruction_index);
+          /* Late only: a loop that writes no memory keeps every non-volatile
+           * load invariant whose address is.  One latch, no inner cycle: the
+           * hoist below must see every path round the loop. */
+          int stable_mem = 0;
+          if (late) {
+            int latches = 0, inner = 0;
+            for (int pi = 0; pi < cfg->blocks[h].num_preds; pi++)
+              if (tcc_ir_cfg_dominates(cfg, h, cfg->blocks[h].preds[pi]))
+                latches++;
+            for (int bi = 0; bi < cfg->num_blocks && !inner; bi++) {
+              if (!in_loop[bi])
+                continue;
+              for (int si = 0; si < cfg->blocks[bi].num_succs; si++) {
+                int sb = cfg->blocks[bi].succs[si];
+                if (sb >= 0 && sb != h && in_loop[sb] && tcc_ir_cfg_dominates(cfg, sb, bi))
+                  inner = 1;
+              }
+            }
+            stable_mem = latches == 1 && !inner && !cfg_loop_may_clobber_memory(ir, cfg, in_loop);
+            /* Preheader code ahead of a zero-trip JUMPIF runs when the loop does not. */
+            int pend = entry_header ? 0 : cfg->blocks[preheader].end_idx;
+            if (!entry_header && pend > cfg->blocks[preheader].start_idx &&
+                ir->compact_instructions[pend - 1].op == TCCIR_OP_JUMPIF)
+              stable_mem = 0;
+          }
+          /* The blocks a stable load may be hoisted from: they dominate the
+           * latch and every exiting block, so every trip reads.  Marking a
+           * load elsewhere invariant would only pull its address chain out
+           * of the loop (the hoist gate below keeps the load itself in). */
+          uint8_t *load_blk_ok = NULL;
+          if (stable_mem) {
+            load_blk_ok = tcc_mallocz(cfg->num_blocks);
+            int nexit = 0;
+            for (int bi = 0; bi < cfg->num_blocks; bi++)
+              for (int si = 0; in_loop[bi] && si < cfg->blocks[bi].num_succs; si++) {
+                int sb = cfg->blocks[bi].succs[si];
+                if (sb < 0 || sb >= cfg->num_blocks || !in_loop[sb]) {
+                  nexit++;
+                  break;
+                }
+              }
+            for (int bi = 0; nexit && bi < cfg->num_blocks; bi++) {
+              if (!in_loop[bi] || !tcc_ir_cfg_dominates(cfg, bi, b))
+                continue;
+              int ok = 1;
+              for (int ei = 0; ei < cfg->num_blocks && ok; ei++) {
+                if (!in_loop[ei])
+                  continue;
+                for (int si = 0; si < cfg->blocks[ei].num_succs; si++) {
+                  int sb = cfg->blocks[ei].succs[si];
+                  if ((sb < 0 || sb >= cfg->num_blocks || !in_loop[sb]) && !tcc_ir_cfg_dominates(cfg, bi, ei)) {
+                    ok = 0;
+                    break;
+                  }
+                }
+              }
+              load_blk_ok[bi] = ok;
+            }
+          }
           LicmSlotCtx slot_ctx;
           LicmVregSet addr_taken = {0}, outside_defs = {0};
           int inv_changed = 1;
@@ -2755,8 +3145,12 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
                   continue;
                 /* Only hoist side-effect-free arithmetic/assign, and the
                  * register-source LOAD that extends a narrow parameter */
-                if (!licm_q_is_speculatable(ir, q))
-                  continue;
+                int stable_load = 0;
+                if (!licm_q_is_speculatable(ir, q)) {
+                  if (!load_blk_ok || !load_blk_ok[bi] || !licm_q_is_stable_load(ir, q))
+                    continue;
+                  stable_load = 1;
+                }
                 /* Dest must have single def in loop AND must not be
                  * defined outside the loop.  If the vreg carries a value
                  * INTO the loop (live at entry), hoisting clobbers it. */
@@ -2827,7 +3221,7 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
                       continue; /* named local, address never taken — def_count covers it */
                     has_deref = 1;
                   }
-                  if (has_deref) continue;
+                  if (has_deref && !stable_load) continue;
                 }
                 /* Check all source operands */
                 int all_inv = 1;
@@ -2902,6 +3296,7 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
 
           tcc_free(addr_taken.bits);
           tcc_free(outside_defs.bits);
+          tcc_free(load_blk_ok);
 
           /* Find exit blocks */
           uint8_t *is_exit = tcc_mallocz(cfg->num_blocks);
@@ -3029,6 +3424,11 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
               }
             }
           }
+          int has_exit = 0;
+          for (int ei = 0; ei < cfg->num_blocks; ei++)
+            has_exit |= is_exit[ei];
+          int insert_guarded = !entry_header && insert_pos < cfg->blocks[preheader].end_idx &&
+                               ir->compact_instructions[insert_pos].op == TCCIR_OP_JUMPIF;
           int body_shift = 0;
           /* Dests actually emitted to the preheader.  is_invariant marks a
            * whole chain, but the gates below (speculation profitability, the
@@ -3068,6 +3468,14 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
                 if (!tcc_ir_cfg_dominates(cfg, instr_block, ei))
                   dominates_exits = 0;
               }
+              /* A load must not move onto a path that never read: its block
+               * must also dominate the latch (a trip round the loop reads it),
+               * the loop must have an exit, and the preheader code must run
+               * only on the way into the loop -- not ahead of a zero-trip
+               * JUMPIF that ends the preheader. */
+              if (licm_q_is_stable_load(ir, q) && !licm_q_is_speculatable(ir, q) &&
+                  (!dominates_exits || !has_exit || !tcc_ir_cfg_dominates(cfg, instr_block, b) || insert_guarded))
+                continue;
               if (!dominates_exits) {
                 /* This hoist speculates onto the zero-trip path (e.g. a rotated
                  * for-loop's body never dominates its guard exit).  Only sound
@@ -3128,9 +3536,13 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
               IROperand orig_dest = tcc_ir_op_get_dest(ir, q);
               IROperand orig_src1 = tcc_ir_op_get_src1(ir, q);
               IROperand orig_src2 = tcc_ir_op_get_src2(ir, q);
+              int has_slot3 = ir_op_has(q->op, IROP_A_SLOT3);
+              IROperand orig_slot3 = has_slot3 ? tcc_ir_op_get_scale(ir, q) : irop_make_none();
               hoist_q.operand_base = tcc_ir_pool_add(ir, orig_dest);
               tcc_ir_pool_add(ir, orig_src1);
               tcc_ir_pool_add(ir, orig_src2);
+              if (has_slot3)
+                tcc_ir_pool_add(ir, orig_slot3); /* LOAD_INDEXED's scale */
 
               int adj_insert = insert_pos + total_hoisted_here;
               tcc_ir_insert_instruction_before(ir, adj_insert, &hoist_q);

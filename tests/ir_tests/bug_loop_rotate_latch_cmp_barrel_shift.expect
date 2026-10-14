@@ -1,0 +1,11 @@
+sum_quarter(16)=10
+sum_quarter(3)=0
+sum_quarter(0)=0
+words_equal(17)=1
+words_equal(21)=0
+count_rev(40)=15
+count_signed(9)=10
+count_signed(-8)=0
+count_lsl(3)=78
+count_call(40)=5
+count_ptr(64)=10

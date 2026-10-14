@@ -215,7 +215,8 @@ def frames(tmp_path_factory):
     src = d / "frames.c"
     src.write_text(SOURCE)
     obj = d / "frames.o"
-    subprocess.run([str(TCC), "-O2", "-c", str(src), "-o", str(obj)], check=True)
+    subprocess.run([str(TCC), "-O2", "-fno-pic", "-mno-sb-relative-got",
+                    "-fno-module-local-calls", "-c", str(src), "-o", str(obj)], check=True)
     return _frames(obj)
 
 
@@ -289,7 +290,8 @@ def sret_frames(tmp_path_factory):
     src = d / "sret.c"
     src.write_text(SRET_SOURCE)
     obj = d / "sret.o"
-    subprocess.run([str(TCC), "-O2", "-c", str(src), "-o", str(obj)], check=True)
+    subprocess.run([str(TCC), "-O2", "-fno-pic", "-mno-sb-relative-got",
+                    "-fno-module-local-calls", "-c", str(src), "-o", str(obj)], check=True)
     return _frames(obj)
 
 
@@ -394,7 +396,8 @@ def char_result_frames(tmp_path_factory):
     src = d / "char_result.c"
     src.write_text(CHAR_RESULT_SOURCE)
     obj = d / "char_result.o"
-    subprocess.run([str(TCC), "-O2", "-c", str(src), "-o", str(obj)], check=True)
+    subprocess.run([str(TCC), "-O2", "-fno-pic", "-mno-sb-relative-got",
+                    "-fno-module-local-calls", "-c", str(src), "-o", str(obj)], check=True)
     return _frames(obj)
 
 

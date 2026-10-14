@@ -25,6 +25,12 @@ BUILD_DIR = Path(__file__).parent / "build" / "asm"
 OBJDUMP = "arm-none-eabi-objdump"
 
 
+def test_kernel_validator_overwritten_zeroing():
+    funcs = _disassemble(_compile("bug_kernel_validator_overwritten_zeroing", src_dir=ROOT / "tests/ir_tests"))
+    scalar_stores = [(m, a) for m, a in funcs["sum_records"] if re.fullmatch(r"str(?:b|h)?(?:\.w|\.n)?", m)]
+    assert not scalar_stores, f"overwritten zero stores survived: {scalar_stores}"
+
+
 def _compile(name, extra_cflags=(), src_dir=None):
     """Cross-compile a case in asm/<name>.c (or <src_dir>/<name>.c) to an object file."""
     src = (src_dir or ASM_DIR) / f"{name}.c"
@@ -839,6 +845,22 @@ def test_ldrd_deref_pairing_and_packed_safety():
         assert paired == 0, f"{name}: LDRD/STRD on a packed access would fault, got {paired}"
 
 
+def test_memset_small_clear():
+    funcs = _disassemble(_compile("bug_memset_small_clear", src_dir=ASM_DIR.parent))
+    for name in [f"clear{n}" for n in range(17)] + ["evaluated", "aeabi_set", "aeabi_clear", "truncated_zero"]:
+        fn = funcs[name]
+        if name != "evaluated":
+            assert _count_mnem_regex(fn, r"^(bl|b\.w)\s") == 0, f"{name}: clear must expand: {fn}"
+        else:
+            assert _count_mnem(fn, "bl") == 1, f"{name}: only argument evaluation may call: {fn}"
+        assert _count_mnem_regex(fn, r"^(strd|stm)") == 0, f"{name}: possibly unaligned destination: {fn}"
+    assert _count_mnem_regex(funcs["aeabi_aligned"], r"^(bl|b\.w)\s") == 0
+    for name in ("clear17", "fill16", "dynamic", "return16"):
+        assert _count_mnem_regex(funcs[name], r"^(bl|b\.w)\s") >= 1, f"{name}: keep runtime helper"
+    funcs = _disassemble(_compile("bug_memset_small_clear", extra_cflags=["-fno-builtin"], src_dir=ASM_DIR.parent))
+    assert _count_mnem_regex(funcs["clear16"], r"^(bl|b\.w)\s") >= 1
+
+
 def test_mem_inline_expansion_policy():
     obj = _compile("mem_inline_expand")
     funcs = _disassemble(obj)
@@ -1025,6 +1047,17 @@ def test_auto_inline_accepts_shared_backward_return_tail():
     assert "select_word" in funcs and "select_word_again" in funcs
     relocations = subprocess.check_output([OBJDUMP, "-r", str(obj)], text=True)
     assert not re.search(r"\bR_ARM_\S+\s+word_at\b", relocations), relocations
+
+
+def test_nested_inline_keeps_callee_own_names_inlinable():
+    """The free-name check below the first inline level must not cost inlining:
+    a callee's own parameters and locals (typedef-declared, for-loop, in an
+    inner block) may share names with the outer inlined body's locals, and a
+    nested function called where it is defined still inlines."""
+    obj = _compile("inline_nested_self_names")
+    funcs = _disassemble(obj)
+    for name in ("h1", "use_w", "use_om", "use_ol", "par"):
+        assert _count_mnem(funcs[name], "bl") == 0, f"{name}: a helper stayed a call"
 
 
 def test_inlined_bool_predicate_branches_like_the_written_test():
@@ -1467,6 +1500,17 @@ def test_struct_arg_split_words_reach_the_call(opt):
     assert not failures, f"at {opt}:\n  " + "\n  ".join(failures)
 
 
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
+def test_frame_word_pair_not_across_it_block(opt):
+    """codegen:frame_word_pair must not rewind over the last access of an IT
+    block: `ite eq; ldreq; ldrne r4,[sp,#36]; ldr r1,[sp,#32]` became
+    `ldrdne r1,r4,[sp,#32]` and r1 was loaded on one path only."""
+    funcs = _disassemble(_compile("bug_frame_word_pair_it_block", (opt,), src_dir=ASM_DIR.parent))
+    fn = funcs["apart"]
+    cond_pairs = [(m, o) for m, o in fn if re.fullmatch(r"(ldrd|strd)(eq|ne|cs|cc|mi|pl|vs|vc|hi|ls|ge|lt|gt|le)(\.w)?", m)]
+    assert not cond_pairs, fn
+
+
 def test_struct_arg_split_knob_restores_slot_shape():
     """The same source with the pass off keeps the slot: proves the shape test
     above is sensitive to the pass (and that TCC_DISABLE_PASS reaches it)."""
@@ -1598,7 +1642,61 @@ def test_ra_caller_save_keeps_hot_index_out_of_the_frame(opt):
     assert len(on) < len(off), f"{opt}: {len(on)} SP loads with ra:caller_save, {len(off)} without:\n{on_insns}"
 
 
-def _call_targets(opt_flags, disable=None, case="inline_accessor_classes"):
+def _loop_carrier_reloads(obj, name):
+    """SP loads inside `name`'s loops that read a slot no store in the same loop wrote:
+    reloads of a value held across the loop, not a scratch saved and restored in it."""
+    out = subprocess.run([OBJDUMP, "-d", "--no-show-raw-insn", str(obj)], stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, errors="replace").stdout
+    insns, cur = [], None
+    for line in out.splitlines():
+        h = re.match(r"^\s*[0-9a-f]+\s+<([^>]+)>:$", line)
+        if h:
+            cur = h.group(1)
+            continue
+        m = re.match(r"^\s*([0-9a-f]+):\s+(\S+)(?:\s+(.*))?$", line)
+        if m and cur == name:
+            insns.append((int(m.group(1), 16), m.group(2), m.group(3) or ""))
+    assert insns, f"{name} not found in {obj}"
+
+    def slots(mnem, ops):
+        s = re.search(r"\[sp(?:, #(\d+))?\]", ops)
+        if not s:
+            return []
+        off = int(s.group(1) or 0)
+        return [off, off + 4] if mnem.startswith(("ldrd", "strd")) else [off]
+
+    bad = []
+    for addr, mnem, ops in insns:
+        t = re.match(r"([0-9a-f]+)\b", ops)
+        if not (mnem.startswith("b") and not mnem.startswith(("bl", "bx", "bic")) and t and int(t.group(1), 16) < addr):
+            continue
+        body = [i for i in insns if int(t.group(1), 16) <= i[0] <= addr]
+        stored = {o for _, m, op in body if m.startswith("str") for o in slots(m, op)}
+        bad += [(hex(a), m, op) for a, m, op in body
+                if m.startswith("ldr") and any(o not in stored for o in slots(m, op))]
+    return bad
+
+
+def test_ra_loop_split_rescan_carriers():
+    """ra:loop_split gives the loop carriers entry copies even when the carrier is a
+    graph-coalesced value with defs on both arms (replay's `bases`) or is evicted
+    only by the rescan after the first split (apply3's three replay loops)."""
+    obj = _compile("bug_ra_loop_split_rescan_carriers", src_dir=ROOT / "tests/ir_tests")
+    for name in ("replay", "apply3"):
+        reloads = _loop_carrier_reloads(obj, name)
+        assert not reloads, f"{name}: loop carriers reloaded every iteration: {reloads}"
+
+
+def test_ra_live_through_loop_split():
+    """A value read before and after a loop but not in it (`v`) gives up its register
+    across that loop: ra:loop_split splits it before the loop, so the rescan spills
+    the copy instead of reloading the loop's own `out` every iteration."""
+    obj = _compile("bug_ra_live_through_loop_split", src_dir=ROOT / "tests/ir_tests")
+    reloads = _loop_carrier_reloads(obj, "live_through")
+    assert not reloads, f"live_through: loop values reloaded every iteration: {reloads}"
+
+
+def _call_targets(opt_flags, disable=None, case="inline_accessor_classes", src_dir=None):
     """{function: [called symbols]} for asm/inline_accessor_classes.c; `disable` names TCC_DISABLE_PASS knobs."""
     import os
 
@@ -1606,7 +1704,7 @@ def _call_targets(opt_flags, disable=None, case="inline_accessor_classes"):
     obj = BUILD_DIR / f"{case}.{tag}.o"
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     cmd = [str(TCC), *opt_flags.split(), "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb",
-           "-mfloat-abi=soft", "-ffunction-sections", "-c", str(ASM_DIR / f"{case}.c"), "-o", str(obj)]
+           "-mfloat-abi=soft", "-ffunction-sections", "-c", str((src_dir or ASM_DIR) / f"{case}.c"), "-o", str(obj)]
     env = dict(os.environ)
     env.pop("TCC_DISABLE_PASS", None)
     if disable:
@@ -1672,10 +1770,11 @@ def test_inline_leaf_rescue_keeps_limit_monotonic():
     The off case needs the revoke to actually bite, so asm/mix is sized for
     the post-opt economics: over 24 IR slots (which the late barrel-shift
     fusion shrinks by folding shifts into consumers) yet <= 24 real ops, so
-    only leaf_rescue's small_leaf class keeps it inlined."""
+    only leaf_rescue's small_leaf class keeps it inlined.  With two call
+    sites mix is a few-callers leaf as well; that class is off too."""
     on = _call_targets("-O2 -finline-limit=200")
     assert not on["use_mix"] and not on["use_mix2"], f"{on['use_mix']} {on['use_mix2']}"
-    off = _call_targets("-O2 -finline-limit=200", "inline:leaf_rescue")
+    off = _call_targets("-O2 -finline-limit=200", "inline:leaf_rescue,inline:few_callers")
     assert "mix" in off["use_mix"], off["use_mix"]
 
 
@@ -1721,6 +1820,30 @@ def test_addreg_indexed_access(opt):
         f"{opt}: find_sentinel still forms the address with ADD: {scan}"
     assert not any(re.search(r"\[r\d+, r\d+\]", o or "") for _, o in funcs["get64"]), \
         f"{opt}: get64 must not use a register offset: {funcs['get64']}"
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
+def test_deref_indexed_struct_arg(opt):
+    """A struct by-value argument `f(arr[i])` passes the element's address to
+    the argument copy: deref_indexed_fusion must not turn it into a load of
+    the first word that the call then dereferences (`ldr.w rX, [.., lsl #2]`
+    then `ldr r0, [rX]`).  A scalar element read as an ALU operand still
+    folds into `ldr.w [Rn, Rm, lsl #2]`."""
+    funcs = _disassemble(_compile("deref_indexed_struct_arg", extra_cflags=[opt]))
+    for name in ("pass4", "pass8"):
+        fn = funcs[name]
+        loaded = set()
+        for m, o in fn:
+            mem = re.search(r"\[(r\d+|ip|lr)", o or "")
+            if m.startswith("ldr") and mem and mem.group(1) in loaded:
+                pytest.fail(f"{opt}: {name} dereferences a word loaded from the element: {fn}")
+            dst = re.match(r"(r\d+|ip|lr),", o or "")
+            if m.startswith("ldr") and dst and re.search(r"lsl #\d\]", o or ""):
+                loaded.add(dst.group(1))
+    add_elem = funcs["add_elem"]
+    assert any(m.startswith("ldr") and re.search(r"\[r\d+, r\d+, lsl #2\]", o or "") for m, o in add_elem), \
+        f"{opt}: add_elem lost the [Rn, Rm, lsl #2] load: {add_elem}"
+    assert not any(m == "lsls" for m, _ in add_elem), f"{opt}: add_elem shifts the index separately: {add_elem}"
 
 
 @pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
@@ -1937,7 +2060,7 @@ def test_inline_wrapper_budget_is_local_to_caller(opt):
     on = _call_targets(opt, case="inline_readonly_wrapper")
     for i in range(10):
         assert set(on[f"name_caller_{i}"]) <= {"scan"}, on[f"name_caller_{i}"]
-    off = _call_targets(opt, "inline:wrapper_local_budget", case="inline_readonly_wrapper")
+    off = _call_targets(opt, "inline:wrapper_local_budget,abi:regpair_ret", case="inline_readonly_wrapper")
     assert "name_of" in off["name_caller_9"], off["name_caller_9"]
 
 
@@ -2031,7 +2154,9 @@ def test_reroll_copy_pair_body_stays_straight_line():
     funcs = _disassemble(_compile("reroll_copy_pair_body"))
 
     def counter_loop(fn):
-        init = _count_mnem_regex(fn, r"^movs\s+r\d+, #0$")
+        # movs.w: a counter zeroed right before an aligned loop head is
+        # widened instead of padding with an executed NOP.
+        init = _count_mnem_regex(fn, r"^movs(?:\.w)?\s+r\d+, #0$")
         back = _count_mnem_regex(fn, r"^blt\.n?\s")
         return init, back
 
@@ -2063,6 +2188,36 @@ def test_kernel_eql_slice_prologue():
     assert not any(m.startswith(("ldr", "str")) and "[sp" in o for m, o in prologue), prologue
 
 
+def test_mem_eql_entry_shape():
+    # std.mem.eql's out-of-line body (docs/bugs kernel-mem-eql report): the
+    # incoming slices stay in their argument registers, the late unroll's
+    # `#0` index and `0 | x` accumulator fold away, no frame is reserved, and
+    # each arm returns its 0/1 in r0 (ra:return_sink) instead of joining
+    # through a bool carrier and a `uxtb`.
+    funcs = _disassemble(_compile("bug_mem_eql_entry_shape", src_dir=ASM_DIR.parent))
+    fn = funcs["mem_eql_generic"]
+    assert not any("sp" in o and not m.startswith(("push", "pop", "stmdb", "ldmia")) for m, o in fn), fn
+    first_test = next(i for i, (m, _) in enumerate(fn) if m.startswith(("cmp", "cbz", "cbnz")))
+    assert not any(m.startswith("mov") and re.fullmatch(r"(r\d+|ip), (r\d+|ip)", o)
+                   for m, o in fn[:first_test]), fn[:first_test]
+    assert not any(m.startswith("uxtb") for m, _ in fn), fn
+    saved = re.findall(r"r\d+|ip|lr", fn[0][1])
+    assert fn[0][0].startswith(("push", "stmdb")) and len(saved) <= 4, fn[0]
+    assert sum(m.startswith("orr") for m, _ in fn) == 5, fn
+    # mem.trim: findScalarPos's `0 >= len` guard (a CMP #0,x) and the rotated
+    # loop's own `0 < len` test collapse to one zero test per loop (a CMP #0,
+    # or the CBZ an unsigned `<= 0` can be).
+    trim = funcs["mem_trim__anon_22429__11731"]
+    assert (_count_mnem_regex(trim, r"^cmp(\.w)? \w+, #0$") + sum(m.startswith(("cbz", "cbnz")) for m, _ in trim)
+            == 2), trim
+    # goto-out returns: each constant arm materializes straight into r0...
+    assert _count_mnem_regex(funcs["ret_goto"], r"^mvn(\.w)? r0, #") == 2, funcs["ret_goto"]
+    # ...but a volatile carrier is still read back on every path.
+    vol = funcs["ret_volatile"]
+    assert _count_mnem_regex(vol, r"^ldr(\.w)? r0, \[sp") == 1, vol
+    assert not _count_mnem_regex(vol, r"^movs? r0, #"), vol
+
+
 def test_metadata_byte_local_stays_in_register():
     funcs = _disassemble(_compile("906_narrow_local_probe", src_dir=ASM_DIR.parent))
     for name in ("metadata_used", "signed_byte", "signed_half"):
@@ -2074,3 +2229,843 @@ def test_metadata_byte_local_stays_in_register():
 def test_borrowed_header_initialized_in_return_buffer():
     fn = _disassemble(_compile("907_borrowed_header_nrvo", src_dir=ASM_DIR.parent))["make_header"]
     assert not any(m.startswith(("ldm", "stm")) and "sp!" not in o for m, o in fn), fn
+
+
+def test_return_try_forwards_into_return_buffer():
+    # kernel-romfs-fileheader-return-copies: `return try f()` (t5 = f();
+    # t9 = t5.payload; t8.payload = t9; return t8) hands the caller's buffer to
+    # f as its result buffer -- no 160-byte frame local, no copy loop out.
+    funcs = _disassemble(_compile("bug_sret_nrvo_partial_forward", src_dir=ASM_DIR.parent))
+    for name in ("forward", "forward2"):
+        fn = funcs[name]
+        assert not any(m.startswith(("ldm", "stm")) for m, _ in fn), (name, fn)
+        frames = [int(x) for m, o in fn if m.startswith("sub") and o.startswith("sp, ")
+                  for x in re.findall(r"#(\d+)", o)]
+        assert all(f < 160 for f in frames), (name, frames, fn)
+
+
+def _copy_loops(fn):
+    return sum(m.startswith("ldm") and re.match(r"r\d+!", o) is not None for m, o in fn)
+
+
+def test_optional_copies_between_locals_forwarded():
+    # kernel-romfs-fileheader-return-copies: the walk loop's `t16 = t9` only to
+    # test t16.is_null, and the relay `t16.is_null = false; t16.payload = t21;
+    # t9 = t16`, are gone; what stays copies the result in and out.
+    fn = _disassemble(_compile("bug_copy_fwd_relay_padding", src_dir=ASM_DIR.parent))["walk"]
+    assert _copy_loops(fn) <= 5, fn
+
+
+def _frame_reserved(fn):
+    return [(m, o) for m, o in fn if re.fullmatch(r"sub(?:\.w|w)?", m) and o.startswith("sp,")]
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
+def test_inlined_sret_call_leaves_no_frame(opt):
+    # The inlined callee's sret parameter used to survive the call it belonged
+    # to and keep the return buffer's 8-byte slot in a frameless thunk.
+    fn = _disassemble(_compile("bug_inline_sret_orphan_param", (opt,), src_dir=ASM_DIR.parent))["vcall_name"]
+    assert not any("sp" in o for _, o in fn), fn
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2"])
+def test_small_leaf_inlines_past_nested_budget(opt):
+    # scan's 48 nested `work` expansions used to spend the budget, leaving the
+    # 147-token small leaf is_set a call inside try_extend's loop.
+    fn = _disassemble(_compile("bug_inline_small_leaf_nested_budget", (opt,), src_dir=ASM_DIR.parent))["try_extend"]
+    assert not any(m.startswith("bl") for m, _ in fn), fn
+
+
+@pytest.mark.parametrize(
+    "caller", ["claim_range", "release_range", "find_free", "first_set", "first_clear"]
+)
+def test_few_caller_bitmap_helpers_inline(caller):
+    # kernel-bitmap-helpers-out-of-line-overhead: setRangeValue (two sites,
+    # constant `value`) and the ctz scans next_set / next_clear (three and two
+    # sites, ?usize through memory) were too large for a small leaf and stayed
+    # calls in every caller.
+    funcs = _disassemble(_compile("bug_inline_few_callers_static", src_dir=ASM_DIR.parent))
+    fn = funcs[caller]
+    assert not any(m in ("bl", "blx") for m, _ in fn), fn
+
+
+def test_few_caller_class_is_what_inlines_set_range():
+    # inline:few_callers off: setRangeValue is a call again in both callers.
+    off = _call_targets("-O2", "inline:few_callers", case="bug_inline_few_callers_static", src_dir=ASM_DIR.parent)
+    for caller in ("claim_range", "release_range"):
+        assert "set_range_value" in off[caller], (caller, off[caller])
+
+
+def test_few_caller_set_range_folds_constant_value():
+    # Expanded with `value` constant, neither caller negates the 0/1 byte
+    # into a mask (`rsb rX, rY, #0`): every boolMask(value) folded.
+    funcs = _disassemble(_compile("bug_inline_few_callers_static", src_dir=ASM_DIR.parent))
+    for caller in ("claim_range", "release_range"):
+        fn = funcs[caller]
+        assert not any(m.startswith("rsb") and o.endswith("#0") for m, o in fn), (caller, fn)
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
+def test_ctz_zero_guard_folds_under_nonzero_test(opt):
+    # The loop's `b != 0` already decided ctz32's `v == 0` guard: one zero
+    # test of the word, no `return 32` arm.
+    fn = _disassemble(_compile("bug_cmp_eq_prop_const_fact", (opt,), src_dir=ASM_DIR.parent))["first_set"]
+    # (the loop's own `0 < n` entry test of r1 may be a CBZ as well)
+    assert sum(m.startswith(("cbz", "cbnz")) and not o.startswith("r1,") for m, o in fn) == 1, fn
+    assert not any(m.startswith("mov") and o.endswith("#32") for m, o in fn), fn
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
+def test_ctz_return_slot_read_is_not_reextended(opt):
+    # ctz32's u8 return slot has one store left once the zero arm folds: the
+    # CLZ result is added as it stands -- no UXTB, no copy into the slot's
+    # register, and so no callee-saved register pushed for it.
+    fn = _disassemble(_compile("bug_narrow_ret_slot_load_fwd", (opt,), src_dir=ASM_DIR.parent))["first_set"]
+    assert not any(m.startswith("uxtb") for m, _ in fn), fn
+    clz = [i for i, (m, _) in enumerate(fn) if m.startswith("clz")]
+    assert len(clz) == 1 and fn[clz[0] + 1][0].startswith("add"), fn
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
+def test_sign_extension_of_sign_extended_value_is_a_copy(opt):
+    # ra:known_ext knows what a value is sign-extended from: the i16 passed
+    # through two struct fields is extended once, a shift of an i16 stays an
+    # i16, and the join of two i8s needs no SXTH.
+    funcs = _disassemble(_compile("bug_known_ext_sext_copy", (opt,), src_dir=ASM_DIR.parent))
+    sext = lambda fn, w: [m for m, _ in fn if m.startswith("sxt" + w)]
+    assert len(sext(funcs["vcall"], "")) == 1 and not any("[sp" in o for _, o in funcs["vcall"]), funcs["vcall"]
+    assert len(sext(funcs["sar_cut"], "h")) == 1, funcs["sar_cut"]
+    assert not sext(funcs["join8"], "h"), funcs["join8"]
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
+def test_dry_run_scratch_uses_dead_pushed_register(opt):
+    # r0-r3 are all live at next_clear_bit's first `none` store; the discovery
+    # run must see the dead pushed callee-saved register the real pass takes
+    # instead of reserving a scratch save area nothing stores to.
+    fn = _disassemble(_compile("bug_dry_scratch_pushed_dead_reg", (opt,), src_dir=ASM_DIR.parent))["next_clear_bit"]
+    assert not _frame_reserved(fn), fn
+    assert not any("[sp" in o for _, o in fn), fn
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
+def test_scratch_area_skips_fixed_up_insns(opt):
+    # At -Os the discovery run saves a scratch at the `none` stores and the
+    # phase-3 fixup frees a register there: no save slot may remain.
+    fn = _disassemble(_compile("bug_scratch_area_fixed_insns", (opt,), src_dir=ASM_DIR.parent))["next_clear_bit"]
+    assert not _frame_reserved(fn), fn
+    assert not any("[sp" in o for _, o in fn), fn
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
+def test_scratch_area_trim_leaves_no_body_push(opt):
+    # The trim above may only drop a slot the real run never needs: counting a
+    # vacated register the real run cannot take left it PUSHing a scratch
+    # around the instruction (span's inner loop, srem4's every lane).
+    funcs = _disassemble(_compile("bug_scratch_area_no_real_push", (opt,), src_dir=ASM_DIR.parent))
+    for name in ("span", "srem4"):
+        body = funcs[name][1:]  # past the prologue's own push
+        assert not [(m, o) for m, o in body if m.startswith("push")], (name, funcs[name])
+
+
+def test_bool_diamond_or_merge_branches_on_flags():
+    # The `c1 || c2` diamonds whose constant arm jumps into the merged bool
+    # test (the Zig C backend's error-check idiom): bool_diamond_branch's
+    # mirrored orientation redirects that edge and setif fusion then branches
+    # on the compare's own flags -- no ITE-materialized 0/1 anywhere.
+    # and_merge's constant arm is entered by a guard's fallthrough (a
+    # handwritten-C shape the CBE does not emit), and or_value_read reads the
+    # bool as a value, so neither is asserted.
+    funcs = _disassemble(_compile("908_bool_diamond_or_merge", src_dir=ASM_DIR.parent))
+    for name in ("or_merge", "or3_chain", "loop_or_chain"):
+        fn = funcs[name]
+        assert not any(m.startswith("it") for m, _ in fn), (name, fn)
+
+
+def test_nonstatic_one_call_wrapper_inlines():
+    # kernel-exported-trivial-wrappers-out-of-line: a non-static one-call
+    # wrapper past the registration token threshold is promoted by
+    # gen_function's post-opt wrapper tier, which used to require VT_STATIC.
+    # The intra-TU caller must branch straight to the wrapped callee, while
+    # the GLOBAL wrapper definition stays emitted for other translation units.
+    funcs = _disassemble(_compile("nonstatic_wrapper_inline"))
+    caller = funcs["caller"]
+    assert any(m in ("bl", "b.w") and "inner" in ops for m, ops in caller), \
+        "caller does not call inner directly (wrapper not expanded)"
+    assert not any(m in ("bl", "b.w") and "big_wrap" in ops for m, ops in caller), \
+        "caller still calls big_wrap out of line"
+    wrap = funcs.get("big_wrap")
+    assert wrap and any(m in ("bl", "b.w") and "inner" in ops for m, ops in wrap), \
+        "the exported wrapper definition must remain, calling inner"
+
+
+def test_const_local_table_direct_frame_reads_fold():
+    # kernel-indexed-constant-aggregate-copy: a constant table whose bytes are
+    # read at constant offsets takes those values; it never keeps its stores and
+    # its slots on the frame, whether or not a dynamic index also sends its
+    # bytes to an image.  A slot written twice (written) and a table whose
+    # address is passed to a call (escapes) keep the stack copy.
+    funcs = _disassemble(_compile("bug_const_local_table_direct_frame_reads", src_dir=ROOT / "tests/ir_tests"))
+    for name in ("onlyconst", "mixed"):
+        frame = [(m, o) for m, o in funcs[name] if m.startswith(("ldr", "str")) and "[sp" in o]
+        assert not frame, f"{name} still materialises the table on the frame: {frame}"
+    assert any(m.startswith("ldr") and "[r" in o and "lsl" in o for m, o in funcs["mixed"]), \
+        "the dynamic index must still read the image"
+    for name in ("written", "escapes"):
+        assert any(m == "str" and "[sp" in o for m, o in funcs[name]), \
+            f"{name} must keep the table on the stack"
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
+def test_const_local_table_var_dest_keeps_written_local(opt):
+    # const-local-table-var-dest-aliases-temp-slot: `V0 <- T0 ADD #imm` took
+    # the VAR for the tracked TEMP at the same position, so the local became a
+    # .rodata image and `*p = 9` stored into it.  The written locals must not
+    # load an image address or store anywhere but the frame; a read-only
+    # table indexed dynamically must still read its image.
+    funcs = _disassemble(_compile("bug_const_local_table_var_dest", (opt,), src_dir=ROOT / "tests/ir_tests"))
+    for name in ("interior", "sub_dest", "param_dest"):
+        fn = funcs[name]
+        assert not [(m, o) for m, o in fn if m.startswith("str") and "[sp" not in o], \
+            f"{name}: write goes outside the frame (into a .rodata image): {fn}"
+        assert not [(m, o) for m, o in fn if m.startswith("ldr") and "[pc" in o], \
+            f"{name}: loads an image address: {fn}"
+    lookup = funcs["lookup"]
+    assert any(m.startswith("ldr") and "lsl" in o for m, o in lookup), lookup
+    assert not [(m, o) for m, o in lookup if m.startswith("str")], \
+        f"lookup must stay a .rodata table, not a frame copy: {lookup}"
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
+def test_const_local_table_one_past_end_keeps_written_local(opt):
+    # const-local-table-one-past-end-escape: an address at the table's end
+    # (`t + 4`) is the table's, so a table written or escaping through it
+    # keeps its frame copy; a read-only table still becomes an image.
+    funcs = _disassemble(_compile("bug_clt_one_past_end_escape", (opt,), src_dir=ROOT / "tests/ir_tests"))
+    for name in ("via_var", "via_call", "via_char"):
+        fn = funcs[name]
+        assert any(m.startswith("str") and "[sp" in o for m, o in fn), \
+            f"{name} must keep the table on the stack: {fn}"
+    lookup = funcs["lookup"]
+    assert any(m.startswith("ldr") and "lsl" in o for m, o in lookup), lookup
+    assert not [(m, o) for m, o in lookup if m.startswith("str")], \
+        f"lookup must stay a .rodata table, not a frame copy: {lookup}"
+
+
+def test_addrof_local_copy_reload_no_pair_roundtrip():
+    # kernel-hash-map-u16-key-mix-emulation: a u64 built in a local and read
+    # back through its address (the Zig C backend's tuple destructuring) must
+    # not take a strd/add/ldrd stack round-trip: ptr_local_fwd resolves the
+    # value-copy pointer hand-off and rewrites the deref to the local's slot.
+    funcs = _disassemble(_compile("bug_addrof_local_copy_reload", src_dir=ROOT / "tests/ir_tests"))
+    fn = funcs["hash_key"]
+    spilled = [(m, o) for m, o in fn if m.startswith("str") and "[sp" in o]
+    assert not spilled, f"locally built u64 pair spilled and reloaded: {spilled}"
+    # hash_escapes and pointer_value keep their slot by design (execution-checked).
+
+
+def test_hash_map_capacity_guard_once():
+    # kernel-hash-map-capacity-guard-duplication: getIndex's two inlined
+    # capacity() calls test the same pointer; the second diamond must reuse the
+    # first one's result (one test, one load), and the header field is read at
+    # a negative displacement off the metadata pointer, not after `sub #12`.
+    funcs = _disassemble(_compile("bug_hash_map_capacity_guard", src_dir=ROOT / "tests/ir_tests"))
+    tests = lambda fn: sum(1 for m, _ in fn if re.fullmatch(r"(?:cbz|cbnz|cmp)(?:\.w|\.n)?", m))
+    neg = lambda fn, d: sum(1 for m, o in fn if m.startswith("ldr") and re.search(rf", #-{d}\]", o))
+    subs12 = lambda fn: [(m, o) for m, o in fn if m.startswith("sub") and o.endswith("#12")]
+    for name in ("two_caps", "two_caps_inverted"):
+        fn = funcs[name]
+        assert tests(fn) == 1, f"{name}: the second capacity guard survived: {fn}"
+        assert neg(fn, 4) == 1, f"{name}: capacity not loaded once at [m, #-4]: {fn}"
+    for name in ("two_caps", "cap_of", "cap_plus_key"):
+        assert not subs12(funcs[name]), f"{name}: header base still computed by sub #12: {funcs[name]}"
+    assert neg(funcs["cap_of"], 4) == 1, funcs["cap_of"]
+    assert neg(funcs["cap_plus_key"], 8) == 1, funcs["cap_plus_key"]
+    # A store to the header between them, another field, another map: two tests.
+    for name in ("caps_around_store", "cap_then_key0", "two_maps"):
+        assert tests(funcs[name]) >= 2, f"{name}: a guard that must stay was merged: {funcs[name]}"
+
+
+def test_ptr_local_fwd_multidef_copy_no_record_roundtrip():
+    # kernel-validate-reused-copy-local-roundtrip: the Zig C backend re-reads a
+    # record through reused pointer locals (`t101 = t100; t74 = t101; *t74`,
+    # multi-def copies of `&t99`).  ptr_local_fwd must resolve them so the
+    # record stays in registers: no strd/str to a stack slot in the loop.
+    funcs = _disassemble(_compile("bug_ptr_local_fwd_multidef_copy", src_dir=ROOT / "tests/ir_tests"))
+    fn = funcs["validate_data_relocs"]
+    spilled = [(m, o) for m, o in fn if m.startswith("str") and "[sp" in o]
+    assert not spilled, f"relocation record spilled and re-read through its address: {spilled}"
+    fn = funcs["reread_after_store"]
+    spilled = [(m, o) for m, o in fn if m.startswith("str") and "[sp" in o]
+    assert not spilled, f"reread_after_store kept the local's slot: {spilled}"
+    # The reused copy names a different record in each loop: per-use resolution.
+    fn = funcs["two_tables"]
+    spilled = [(m, o) for m, o in fn if m.startswith("str") and "[sp" in o]
+    assert not spilled, f"two_tables kept a record slot: {spilled}"
+    # A copy reading a volatile local is never swept as a dead tracked copy.
+    fn = funcs["volatile_copy_src"]
+    assert any(m.startswith("str") and "[sp" in o for m, o in fn), f"volatile store dropped: {fn}"
+    assert any(m.startswith("ldr") and "[sp" in o for m, o in fn), f"volatile read dropped: {fn}"
+
+
+def test_redundant_assign_keeps_volatile_reads():
+    # redundant_assign must not delete a redefined VAR's def that reads (or
+    # writes) a volatile local: three `d = x` are three loads of x.
+    funcs = _disassemble(_compile("bug_redundant_assign_volatile_read", src_dir=ROOT / "tests/ir_tests"))
+    slot = lambda fn, mn: sum(1 for m, o in fn if m.startswith(mn) and "[sp" in o)
+    assert slot(funcs["vol_scalar"], "ldr") >= 3, f"volatile reads dropped: {funcs['vol_scalar']}"
+    assert slot(funcs["vol_ptr"], "ldr") >= 3, f"volatile pointer reads dropped: {funcs['vol_ptr']}"
+    assert slot(funcs["vol_dest"], "str") >= 3, f"volatile stores dropped: {funcs['vol_dest']}"
+    # Plain redefined copies still collapse to the last one.
+    loads = [o for m, o in funcs["plain_copies"] if m.startswith("ldr")]
+    assert len(loads) == 1, f"dead plain copies survived: {funcs['plain_copies']}"
+
+
+def test_romfs_reader_temporaries():
+    funcs = _disassemble(_compile("bug_romfs_reader_temporaries", src_dir=ROOT / "tests/ir_tests"))
+    insns = funcs["build_reader"]
+    calls = [(m, a) for m, a in insns if m in ("bl", "blx", "bl.w")]
+    assert not calls, f"reader aggregate copy helper survived: {calls}"
+
+
+def test_romfs_mapped_slice_compares_in_registers():
+    funcs = _disassemble(_compile("bug_romfs_reader_temporaries", src_dir=ROOT / "tests/ir_tests"))
+    insns = funcs["mapped_slice"]
+    assert not any("sp" in a for _, a in insns), f"mapped slice retained a stack temporary: {insns}"
+
+
+def test_romfs_volatile_comparison_keeps_reads():
+    funcs = _disassemble(_compile("bug_romfs_reader_temporaries", src_dir=ROOT / "tests/ir_tests"))
+    loads = [(m, a) for m, a in funcs["compare_volatile"] if m.startswith("ldr")]
+    volatile_loads = [(m, a) for m, a in loads if re.search(r"\[sp(?:, #0)?\]", a)]
+    assert len(volatile_loads) == 2, f"volatile comparisons lost a field read: {loads}"
+
+
+def _sp_data_accesses(insns):
+    """Loads/stores addressing sp (the stack round trips), not push/pop."""
+    return [(m, a) for m, a in insns if re.match(r"(?:ldr|str)", m) and re.search(r"\[sp\b", a)]
+
+
+@pytest.mark.parametrize("fn", ["zig_tail", "direct_tail"])
+def test_romfs_load_u64_tail_stays_in_registers(fn):
+    """The reader's u64 fields go straight to the destination: sra splits a
+    64-bit store through an address TEMP into word VARs, and the low word of
+    `P PACK64 x` folds to the parameter, so nothing passes through the frame."""
+    funcs = _disassemble(_compile("bug_romfs_load_u64_tail", src_dir=ROOT / "tests/ir_tests"))
+    sp = _sp_data_accesses(funcs[fn])
+    assert not sp, f"{fn}: u64 fields went through the stack: {sp}"
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
+def test_romfs_load_name_scan_bottom_tested(opt):
+    """The inlined findScalarPos header is copies, two masks and two ANDs;
+    copies do not count against ssa:loop_header_dup's size cap, so the scan
+    is bottom-tested with no unconditional back-edge (find_zero), and a
+    found-path identity copy does not keep one either (name_len)."""
+    back = _backward_unconditional_branches(_compile("bug_romfs_load_u64_tail", extra_cflags=[opt],
+                                                     src_dir=ROOT / "tests/ir_tests"))
+    assert back.get("find_zero") == [], f"find_zero at {opt}: {back.get('find_zero')}"
+    # The found path's `idx <- i` is an identity move: branch_tidy inverts
+    # `bcs exit; b head` over it into `bcc head`.
+    assert back.get("name_len") == [], f"name_len at {opt}: {back.get('name_len')}"
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
+def test_interleaved_word_copy_pairs_or_blocks(opt):
+    """A word copy that reaches codegen as ldr/str per word through one base
+    register moves in LDRD/STRD pairs or LDM/STM chunks when no store hits a
+    word a later load reads (reader_tail is ra:load_sink's FileHeader.load
+    tail, its source word-aligned through sra's __aeabi_memmove4 expansion).
+    Through two pointers that may alias it stays one word at a time."""
+    funcs = _disassemble(_compile("bug_interleaved_word_copy_ldm", extra_cflags=[opt],
+                                  src_dir=ROOT / "tests/ir_tests"))
+    def single_words(fn):
+        return [(m, a) for m, a in funcs[fn] if re.fullmatch(r"(?:ldr|str)(?:\.w|\.n)?", m)]
+    def blocks(fn):
+        return [(m, a) for m, a in funcs[fn] if m.startswith(("ldrd", "strd", "ldm", "stm"))
+                and "sp" not in a.split(",")[0] and "sp!" not in a]
+    for fn in ("reader_tail", "tail_keeps_live", "shift_down"):
+        assert blocks(fn), f"{fn} at {opt}: no paired copy: {funcs[fn]}"
+    # The reader's header words and its 8 dev words: no lone word left.
+    assert not single_words("reader_tail"), f"reader_tail at {opt}: {funcs['reader_tail']}"
+    assert not single_words("shift_down"), f"shift_down at {opt}: {funcs['shift_down']}"
+    assert not blocks("copy5"), f"copy5 at {opt}: {funcs['copy5']}"
+    # shift_up: dst 8 bytes above src -- at most two words before one is reread.
+    assert not any(m.startswith(("ldm", "stm")) for m, _ in funcs["shift_up"]), f"shift_up at {opt}: {funcs['shift_up']}"
+
+
+def test_kernel_eql_offset_table_eliminated(monkeypatch):
+    monkeypatch.delenv("TCC_DISABLE_PASS", raising=False)
+    on = _disassemble(_compile("bug_kernel_eql_slice", ("-DTEST_LATE_UNROLL_ON",), src_dir=ASM_DIR.parent))["kernel_eql"]
+    assert not any(m.startswith(("ldr", "str")) and "[sp" in o for m, o in on), on
+    monkeypatch.setenv("TCC_DISABLE_PASS", "ra:loop_unroll")
+    off = _disassemble(_compile("bug_kernel_eql_slice", ("-DTEST_LATE_UNROLL_OFF",), src_dir=ASM_DIR.parent))["kernel_eql"]
+    assert any(m.startswith("str") and "[sp" in o for m, o in off), off
+
+
+def test_kernel_slice_scan_bounded_inlining():
+    on = _call_targets("-O2", case="bug_kernel_slice_scan", src_dir=ASM_DIR.parent)
+    for fn in ("scan_payload", "scan_present"):
+        assert on[fn] == [], on[fn]
+    assert on["scan_three"].count("find_pos") == 1, on["scan_three"]
+    # find_pos costs 16 marshalling-free ops, inside the generic small-loop
+    # class too; the old raw count (30) is what kept it to this class alone.
+    off = _call_targets("-O2", "inline:sret_loop,inline:marshal_cost", case="bug_kernel_slice_scan",
+                        src_dir=ASM_DIR.parent)
+    for fn in ("scan_payload", "scan_present"):
+        assert off[fn] == ["find_pos"], off[fn]
+    assert off["scan_three"].count("find_pos") == 3, off["scan_three"]
+    fn = _disassemble(_compile("bug_kernel_slice_scan", src_dir=ASM_DIR.parent))["scan_present"]
+    assert not any(m.startswith("str") for m, _ in fn), fn
+
+
+def test_sret_loop_leaf_not_charged_to_nested_budget():
+    """A pure aggregate-return loop (inline:sret_loop) is bounded per caller,
+    not also charged by its tokens to the nested-inline budget: four padded
+    inits and peekNext all expand inside the called-once walk (the kernel's
+    get_file_header kept peekNext out of line)."""
+    calls = _call_targets("-O2", case="bug_inline_sret_loop_nested_budget", src_dir=ASM_DIR.parent)
+    assert calls["lookup"] == [], calls["lookup"]
+    assert calls["prefixes"] == [], calls["prefixes"]
+
+
+def _compile_regpair(opt="-O2", disable=None, extra=()):
+    """asm/regpair_static_return.c; `disable` names a TCC_DISABLE_PASS knob."""
+    import os
+
+    tag = hashlib.sha1(f"{opt}|{disable}|{extra}".encode()).hexdigest()[:8]
+    obj = BUILD_DIR / f"regpair_static_return.{tag}.o"
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    cmd = [str(TCC), opt, "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft",
+           "-ffunction-sections", *extra, "-c", str(ASM_DIR / "regpair_static_return.c"), "-o", str(obj)]
+    env = dict(os.environ)
+    env.pop("TCC_DISABLE_PASS", None)
+    if disable:
+        env["TCC_DISABLE_PASS"] = disable
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", env=env)
+    assert result.returncode == 0, f"compile failed: {cmd}\n{result.stderr}"
+    return obj
+
+
+def _elf_funcs(obj):
+    """{name: (section index, value)} of the object's function symbols."""
+    out = subprocess.run(["arm-none-eabi-readelf", "-sW", str(obj)], stdout=subprocess.PIPE, text=True).stdout
+    syms = {}
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) == 8 and p[3] == "FUNC":
+            syms[p[7]] = (p[6], p[1])
+    return syms
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2", "-Os"])
+def test_regpair_static_return_in_registers(opt):
+    """kernel-bitmap-helpers-out-of-line-overhead: a static function's 8-byte
+    aggregate (Zig's E!*T, ?usize) comes back in r0/r1, built from its members:
+    at -O1+ the body stores nothing and the caller reads the members from
+    r0/r1 instead of an sret buffer.  Not at -O0: every body is generated
+    while the TU is parsed, before its later declarations, attributes and
+    asm are known, so the convention is only chosen once the TU is parsed."""
+    funcs = _disassemble(_compile_regpair(opt))
+    off = _disassemble(_compile_regpair(opt, "abi:regpair_ret"))
+    if opt == "-O0":
+        assert funcs["find"] == off["find"], funcs["find"]
+        return
+    assert funcs["find"] != off["find"], funcs["find"]
+    for name in ("create", "find"):
+        assert not any(m.startswith("str") for m, _ in funcs[name]), (name, funcs[name])
+    for name in ("use_create", "use_find"):
+        assert not any(m.startswith(("str", "ldr")) for m, _ in funcs[name]), (name, funcs[name])
+    assert any(m.startswith("str") for m, _ in off["find"]), off["find"]
+
+
+def test_regpair_static_return_adapters():
+    """An address taken after a direct call names the AAPCS adapter
+    `find.aapcs`; one taken before anything else keeps `early` AAPCS (it stores
+    through r0) with no adapter; an uncalled-through function gets none."""
+    obj = _compile_regpair()
+    syms = _elf_funcs(obj)
+    assert "find.aapcs" in syms, syms
+    assert "early.aapcs" not in syms and "create.aapcs" not in syms, syms
+    funcs = _disassemble(obj)
+    assert any(m.startswith("str") for m, _ in funcs["early"]), funcs["early"]
+    adapter = [m for m, _ in funcs["find.aapcs"]]
+    assert adapter[:2] == ["push", "mov"] and "bl" in adapter and adapter[-1] == "pop", adapter
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2", "-Os"])
+def test_regpair_static_return_alias_keeps_aapcs(opt):
+    """An alias names the body itself, which therefore stays AAPCS (it stores
+    through r0), with no adapter."""
+    obj = _compile_regpair(opt, extra=("-DREGPAIR_ALIAS",))
+    syms = _elf_funcs(obj)
+    assert "create.aapcs" not in syms, syms
+    assert syms["create_alias"] == syms["create"], syms
+    funcs = _disassemble(obj)
+    body = funcs.get("create") or funcs["create_alias"]  # one label per address
+    assert any(m.startswith("str") for m, _ in body), body
+
+
+def _compile_regpair_src(src, opt, disable=None):
+    """Compile the C text SRC (soft float); returns (returncode, stderr, obj)."""
+    import os
+
+    tag = hashlib.sha1(f"{opt}|{disable}|{src}".encode()).hexdigest()[:8]
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    c = BUILD_DIR / f"regpair_src.{tag}.c"
+    obj = BUILD_DIR / f"regpair_src.{tag}.o"
+    c.write_text(src)
+    cmd = [str(TCC), opt, "-nostdlib", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft", "-c", str(c), "-o", str(obj)]
+    env = dict(os.environ)
+    env.pop("TCC_DISABLE_PASS", None)
+    if disable:
+        env["TCC_DISABLE_PASS"] = disable
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", env=env)
+    return result.returncode, result.stderr, obj
+
+
+_REGPAIR_LATE = """typedef struct { int a, b; } P;
+static P f(int x) { P p = {x + 1, x + 2}; return p; }
+int use(int x) { P r = f(x); return r.a * 100 + r.b; }
+%s
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+@pytest.mark.parametrize("late", [
+    "__asm__(\".global f\");",
+    "__asm__(\".weak f\");",
+    "int g(void) { P (*p)(int) = f; return p(1).a; }\nstatic P f(int x) __attribute__((used));",
+], ids=["asm_global", "asm_weak", "used"])
+def test_regpair_late_declarations_keep_aapcs(opt, late):
+    """Whatever follows the definition and the first direct call -- a
+    redeclaration adding used, asm making the name global or weak --
+    the r0/r1 choice is made after the whole TU is parsed, so it sees them:
+    f and its caller are compiled exactly as with abi:regpair_ret off."""
+    rc, err, obj = _compile_regpair_src(_REGPAIR_LATE % late, opt)
+    assert rc == 0, err
+    rc, err, off_obj = _compile_regpair_src(_REGPAIR_LATE % late, opt, "abi:regpair_ret")
+    assert rc == 0, err
+    funcs, off = _disassemble(obj), _disassemble(off_obj)
+    for name in ("f", "use"):
+        assert funcs[name] == off[name], (name, funcs[name], off[name])
+    assert "f.aapcs" not in _elf_funcs(obj)
+
+
+def test_ptr_silent_store_drops_unchanged_word():
+    """kernel-bitmap-helpers-out-of-line-overhead: setRangeValue expanded with
+    value == false stored the word it had just reloaded back unchanged (a
+    masks reload, a word reload and a store).  One store remains; the
+    hazard cases keep both of theirs."""
+    funcs = _disassemble(_compile("bug_ptr_silent_store", src_dir=ASM_DIR.parent))
+    stores = lambda fn: [m for m, _ in funcs[fn] if m.startswith("str")]
+    assert len(stores("clear_range")) == 1, funcs["clear_range"]
+    assert len([m for m, _ in funcs["clear_range"] if m.startswith("ldr")]) == 2, funcs["clear_range"]
+    assert len(stores("restore_after")) == 2, funcs["restore_after"]
+    assert len(stores("restore_call")) == 2, funcs["restore_call"]  # global_p, then *p
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-Os"])
+def test_kernel_slice_scan_retains_size_policy(opt):
+    calls = _call_targets(opt, case="bug_kernel_slice_scan", src_dir=ASM_DIR.parent)
+    for fn in ("scan_payload", "scan_present"):
+        assert calls[fn] == ["find_pos"], calls[fn]
+
+
+def test_componentiterator_by_value_methods_inline():
+    """Zig's ComponentIterator.peekNext (24-byte by-value self, sret ?Component, a
+    loop) is sized without its aggregate marshalling, so it expands into next
+    and has_more, and next loses the iterator copy and the result reload.
+    next itself expands into its callers (test_loop_leaf_wrapper_inlines), so
+    its body is checked there."""
+    calls = _call_targets("-O2", case="bug_componentiterator_inline", src_dir=ASM_DIR.parent)
+    for fn in ("count_components", "last_len", "has_more"):
+        assert "peekNext" not in calls[fn], (fn, calls[fn])
+    off = _call_targets("-O2", "inline:marshal_cost", case="bug_componentiterator_inline", src_dir=ASM_DIR.parent)
+    assert "peekNext" in off["next"], off["next"]
+    funcs = _disassemble(_compile("bug_componentiterator_inline", src_dir=ASM_DIR.parent))
+    for name in ("count_components", "last_len"):
+        fn = funcs[name]
+        assert not any("[sp" in o for m, o in fn if m.startswith(("ldr", "str"))), (name, fn)
+
+
+def test_componentiterator_retains_size_policy():
+    calls = _call_targets("-Os", case="bug_componentiterator_inline", src_dir=ASM_DIR.parent)
+    assert "peekNext" in calls["next"], calls["next"]
+
+
+def test_loop_leaf_wrapper_inlines():
+    """ComponentIterator.next (a *self-writing wrapper around the small loop
+    leaf peekNext) keeps the wrapper class once peekNext expanded into it, and
+    so does a second wrapper level over it."""
+    for case in ("bug_loop_leaf_wrapper_inline", "bug_componentiterator_inline"):
+        calls = _call_targets("-O2", case=case, src_dir=ASM_DIR.parent)
+        for fn in ("count_components", "last_len"):
+            assert not calls[fn], (case, fn, calls[fn])
+    calls = _call_targets("-O2", case="bug_loop_leaf_wrapper_inline", src_dir=ASM_DIR.parent)
+    for fn in ("same_split", "count_twice", "first_len"):
+        assert "next" not in calls[fn] and "next_name_len" not in calls[fn], (fn, calls[fn])
+    off = _call_targets("-O2", "inline:leaf_wrapper", case="bug_loop_leaf_wrapper_inline", src_dir=ASM_DIR.parent)
+    assert "next" in off["count_components"], off["count_components"]
+    size = _call_targets("-Os", case="bug_loop_leaf_wrapper_inline", src_dir=ASM_DIR.parent)
+    assert "next" in size["count_components"], size["count_components"]
+
+
+def _guarded_calls(opt_flags, disable=None, case="bug_guard_head_partial_inline"):
+    """{function: [(callee, conditional branches before that call)]} of tests/ir_tests/<case>.c."""
+    import os
+
+    tag = hashlib.sha1(f"guard|{case}|{opt_flags}|{disable}".encode()).hexdigest()[:8]
+    obj = BUILD_DIR / f"{case}.{tag}.o"
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    cmd = [str(TCC), *opt_flags.split(), "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb",
+           "-mfloat-abi=soft", "-ffunction-sections", "-fno-pic", "-mno-sb-relative-got", "-fno-module-local-calls",
+           "-c", str(ASM_DIR.parent / f"{case}.c"), "-o", str(obj)]
+    env = dict(os.environ)
+    env.pop("TCC_DISABLE_PASS", None)
+    if disable:
+        env["TCC_DISABLE_PASS"] = disable
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", env=env)
+    assert result.returncode == 0, f"compile failed: {cmd}\n{result.stderr}"
+    out = subprocess.run([OBJDUMP, "-dr", "--no-show-raw-insn", str(obj)], stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, errors="replace").stdout
+    calls, cur, conds = {}, None, 0
+    for line in out.splitlines():
+        h = re.match(r"^[0-9a-f]+ <([^>]+)>:$", line)
+        if h:
+            cur, conds = h.group(1), 0
+            calls.setdefault(cur, [])
+            continue
+        insn = re.match(r"^\s*[0-9a-f]+:\s+(\S+)", line)
+        if insn and re.fullmatch(r"cbn?z(?:\.n)?|b(?:eq|ne|lt|ge|gt|le|hi|ls|cc|cs|lo|hs|mi|pl)(?:\.[nw])?",
+                                 insn.group(1)):
+            conds += 1
+        r = re.search(r"R_ARM_THM_(?:CALL|JUMP24)\s+(\S+)", line)
+        if r and cur:
+            calls[cur].append((r.group(1), conds))
+    return calls
+
+
+def test_guard_head_tests_before_the_call():
+    """FileHeader.deinit (`if (heap.ptr) { free; reset }`, over the wrapper
+    limit) stays out of line, but each site that keeps the call tests the
+    pointer first and calls only when it is set -- also inside an expanded
+    wrapper (drop_pair) and a loop (walk)."""
+    calls = _guarded_calls("-O2")
+    for fn, n in (("drop", 1), ("drop_both", 2), ("walk", 1)):
+        sites = [c for c in calls[fn] if c[0] == "deinit"]
+        assert len(sites) == n and all(conds for _, conds in sites), (fn, calls[fn])
+        assert "allocator_free" not in [c for c, _ in calls[fn]], (fn, calls[fn])
+    for fn in ("use_init", "use_and"):
+        assert calls[fn] and calls[fn][0][1], (fn, calls[fn])
+
+
+def test_guard_head_rejects_unsafe_shapes():
+    """A prefix that writes a parameter, work after the `if`, an else arm,
+    recursion and a call in the test keep the plain call."""
+    calls = _guarded_calls("-O2")
+    for fn, callee in (("use_param", "adv_param"), ("use_tail", "adv_tail"), ("use_else", "adv_else"),
+                       ("use_rec", "adv_rec"), ("use_call", "adv_call")):
+        assert calls[fn] == [(callee, 0)], (fn, calls[fn])
+
+
+def test_guard_head_keeps_func_name():
+    """__func__ / __FUNCTION__ name the caller once replayed there: a head
+    reading one keeps the plain call; the same shape without it is guarded."""
+    calls = _guarded_calls("-O2", case="bug_guard_head_func_name")
+    for fn, callee in (("use_func", "touch"), ("use_func2", "touch"), ("use_function", "touch_upper"),
+                       ("use_function2", "touch_upper")):
+        assert calls[fn] == [(callee, 0)], (fn, calls[fn])
+    for fn in ("use_plain", "use_plain2"):
+        sites = [c for c in calls[fn] if c[0] == "touch_plain"]
+        assert len(sites) == 1 and sites[0][1], (fn, calls[fn])
+
+
+@pytest.mark.parametrize("opt,disable", [("-Os", None), ("-O2", "inline:guard_head")])
+def test_guard_head_retains_policy(opt, disable):
+    calls = _guarded_calls(opt, disable)
+    assert calls["drop"] == [("deinit", 0)], calls["drop"]
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2"])
+def test_u64_constant_divmod_has_no_helper(opt):
+    calls = _call_targets(opt + " -fno-pic -mno-sb-relative-got -fno-module-local-calls",
+                          case="bug_u64_constant_divmod", src_dir=ASM_DIR.parent)
+    for i in range(15):
+        assert not calls[f"div_{i}"], (i, calls[f"div_{i}"])
+        assert not calls[f"mod_{i}"], (i, calls[f"mod_{i}"])
+    assert "__aeabi_uldivmod" in calls["variable_div"]
+    assert "__aeabi_ulmod" in calls["variable_mod"]
+    assert "__aeabi_uldivmod" in calls["zero_div"]
+    assert "__aeabi_ulmod" in calls["zero_mod"]
+    assert "__aeabi_ldivmod" in calls["signed_div"]
+    assert "__aeabi_lmod" in calls["signed_mod"]
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-Os"])
+def test_u64_constant_divmod_retains_size_policy(opt):
+    calls = _call_targets(opt + " -fno-pic -mno-sb-relative-got -fno-module-local-calls",
+                          case="bug_u64_constant_divmod", src_dir=ASM_DIR.parent)
+    assert "__aeabi_uldivmod" in calls["div_4"]
+    assert "__aeabi_ulmod" in calls["mod_7"]
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2"])
+def test_u64_quotient_remainder_shares_reciprocal(opt):
+    funcs = _disassemble(_compile("bug_u64_quotient_remainder_reuse",
+                                 extra_cflags=[opt], src_dir=ASM_DIR.parent))
+    separate = funcs["timestamp_separate"]
+    reuse = funcs["timestamp_reuse"]
+    assert _count_mnem(separate, "umull") <= _count_mnem(reuse, "umull") + 1
+    assert _count_mnem(separate, "umull") <= 7, separate
+    assert len(separate) <= len(reuse) + 4, separate
+    assert _count_mnem(funcs["reverse_pair"], "umull") <= 6
+
+
+def test_uaccess_latch_branches_on_flags():
+    funcs = _disassemble(_compile("bug_uaccess_setcc_latch", src_dir=ASM_DIR.parent))
+    assert not any(m.startswith("it") for m, _ in funcs["range_ok"]), funcs["range_ok"]
+
+
+def test_small_readonly_predicate_loop_inlines():
+    funcs = _disassemble(_compile("bug_uaccess_setcc_latch", src_dir=ASM_DIR.parent))
+    fn = funcs["range_caller"]
+    assert not any(m in ("bl", "b.w") and "inline_range_ok" in o for m, o in fn), fn
+    assert any(m.startswith("ldr") for m, _ in fn), fn
+
+
+def test_inlined_bool_predicate_returns_off_the_tests():
+    """An inlined `if (t) return true; return false;` callee's result is not
+    re-materialized and re-tested before the return (bool return slots)."""
+    funcs = _disassemble(_compile("bug_access_ok_bool_tail", src_dir=ASM_DIR.parent))
+    fn = funcs["access_ok"]
+    assert _count_mnem(fn, "uxtb") == 0, fn
+    assert not any(m in ("cbz", "cbnz") and o.startswith("r0,") for m, o in fn), fn
+
+
+def test_bool_loop_predicate_inlines_into_callers():
+    calls = _call_targets("-O2 -fno-pic -mno-sb-relative-got -fno-module-local-calls",
+                          case="bug_access_ok_bool_tail", src_dir=ASM_DIR.parent)
+    for caller in ("dispatch", "check"):
+        assert "access_ok" not in calls[caller], calls
+        assert "permitted" not in calls[caller], calls
+
+
+def test_struct_tag_declarator_keeps_body_deferred():
+    """`struct T (*fp)(...)` in a body is not a call of an unprototyped `T`:
+    the body is still deferred, so callees defined after it inline into it."""
+    calls = _call_targets("-O2 -fno-pic -mno-sb-relative-got -fno-module-local-calls",
+                          case="bug_struct_tag_paren_defers_body", src_dir=ASM_DIR.parent)
+    assert "small_check" not in calls["dispatch"], calls
+
+
+def _loop_reg_moves(obj):
+    """{function: number of register-to-register `mov`s inside a loop}, where a
+    loop is [target, branch] of any branch that jumps backwards."""
+    out = subprocess.run([OBJDUMP, "-d", "--no-show-raw-insn", str(obj)], stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, errors="replace").stdout
+    funcs, cur = {}, None
+    for line in out.splitlines():
+        h = re.match(r"^\s*[0-9a-f]+\s+<([^>]+)>:$", line)
+        if h:
+            cur = funcs.setdefault(h.group(1), [])
+            continue
+        m = re.match(r"^\s*([0-9a-f]+):\s+(\S+)\s*(.*)$", line)
+        if m and cur is not None:
+            cur.append((int(m.group(1), 16), m.group(2), m.group(3)))
+    moves = {}
+    for name, insns in funcs.items():
+        spans = []
+        for addr, mn, ops in insns:
+            t = re.match(r"(?:\w+, )?([0-9a-f]+) <", ops)
+            if re.fullmatch(r"(?:b(?:eq|ne|cs|cc|hs|lo|mi|pl|hi|ls|ge|lt|gt|le)?|cbn?z)(?:\.[nw])?", mn) and t and int(t.group(1), 16) <= addr:
+                spans.append((int(t.group(1), 16), addr))
+        moves[name] = sum(1 for addr, mn, ops in insns
+                          if any(a <= addr <= b for a, b in spans)
+                          and re.fullmatch(r"movs?(?:\.w)?", mn) and re.fullmatch(r"(r\d+|ip|fp|sl|lr), (r\d+|ip|fp|sl|lr)", ops.strip()))
+    return moves
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
+def test_ra_coalesce_contained_iv_copy(opt):
+    """A loop IV bumped under high register pressure (13+ values live across
+    the loop, as in the inlined ComponentIterator scans of get_file_header)
+    updates its own register: the `i <- i+1` copy class lies inside the IV's
+    extent, so graph coalescing merges it without the Briggs test."""
+    moves = _loop_reg_moves(_compile("bug_ra_coalesce_contained_iv_copy", (opt,), src_dir=ASM_DIR.parent))
+    assert moves["scan_fwd"] == 0 and moves["scan_two"] == 0, moves
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
+def test_known_bool_select_is_a_copy(opt):
+    """`x ? 1 : 0` / `x != 0` of a 0/1 join (Zig's ComponentIterator.init
+    root_len) is x, and `x ? 0 : 1` is `x ^ 1`: no second compare-and-IT.  A
+    join that can be 2, and a select of other constants, keep theirs.  The
+    join narrowed first (`(uint8_t)t7`, UBFX #0,#8) is still 0/1."""
+    funcs = _disassemble(_compile("bug_known_ext_bool_select", (opt,), src_dir=ASM_DIR.parent))
+
+    def its(name):
+        return sum(1 for m, _ in funcs[name] if re.fullmatch(r"it[te]*", m))
+
+    assert its("root_len") == 1 and its("not_root") == 1 and its("reused") == 1, funcs
+    assert its("narrowed") == 1, funcs
+    assert its("two_arm") == 2 and its("scaled") == 2, funcs
+
+
+def test_switch_call_fold_discarded_result_keeps_argument():
+    """ssa:switch_call_replace still folds a discarded `h(1);` (one call left
+    in t1), and leaves no destination-less result ASSIGN behind: nothing
+    overwrites r0 between the entry and the remaining call's argument."""
+    funcs = _disassemble(_compile("bug_switch_call_discarded_result", src_dir=ASM_DIR.parent))
+    fn = funcs["t1"]
+    assert len([m for m, _ in fn if m in ("bl", "b.w")]) == 1, fn
+    assert not any(m.startswith("mov") and o.startswith("r0,") for m, o in fn), fn
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2", "-Os"])
+def test_alwinl_body_only_for_decayed_designators(opt):
+    """An always_inline function used as a value without `&` gets its body
+    out of line (bug_alwinl_function_decay.c); one that is only called keeps
+    none (at -O0 the call is not expanded, so it does)."""
+    src = ("static inline __attribute__((always_inline)) int only_called(int x) { return x * 3; }\n"
+           "static inline __attribute__((always_inline)) int decayed(int x) { return x + 5; }\n"
+           "int use(int v) { return only_called(v); }\n"
+           "int (*get(void))(int) { return decayed; }\n")
+    rc, err, obj = _compile_regpair_src(src, opt)
+    assert rc == 0, err
+    syms = _elf_funcs(obj)
+    assert "decayed" in syms, syms
+    assert ("only_called" in syms) == (opt == "-O0"), syms
+
+
+def test_nested_fn_ipa_cache_keeps_file_scope_folds():
+    """The by-token IPA caches skip GNU nested functions (func_cache_token).
+
+    A nested function shares its name with other nested functions and with
+    file-scope functions, so caching it by token folded a call to one into the
+    other's result.  File-scope functions must still fold, and the nested
+    functions must still be called.
+    """
+    obj = _compile("nested_fn_ipa_cache")
+    funcs = _disassemble(obj)
+
+    for name in ("use_r", "use_sw", "use_k"):
+        fn = funcs[name]
+        assert _count_mnem_regex(fn, r"^b(l|\.w)\s") == 0, f"{name} no longer folds its call: {fn}"
+    for name, callee in (("nested_r", "r."), ("nested_sw", "sw.")):
+        fn = funcs[name]
+        assert _count_mnem_regex(fn, r"^b(l|\.w)?\s.*<" + re.escape(callee)) >= 1, (
+            f"{name} does not call its own nested function: {fn}"
+        )
+
+
+def test_pure_via_sret_flag_does_not_hide_nested_fn():
+    """ipa:pure_via_sret marks a function in SymAttr, not in the identifier
+    Sym's FuncAttr (its sym_scope word): a flagged file-scope mk no longer
+    reads as block scope, so the nested mk defined later shadows it and user
+    folds to its own z + 100 instead of calling the outer mk."""
+    obj = _compile("pure_via_sret_nested")
+    funcs = _disassemble(obj)
+    us = funcs["user"]
+    assert _count_mnem_regex(us, r"^bl?(\.w)?\s") == 0, f"user calls the file-scope mk: {us}"
+    assert _count_mnem_regex(us, r"#100\b") == 1, f"user lost its nested mk: {us}"

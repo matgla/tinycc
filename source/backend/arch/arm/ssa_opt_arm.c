@@ -600,7 +600,8 @@ static int arm_extract_add_imm_base(TCCIRState *ir, IRSSAOptCtx *ctx,
   }
 
   IRQuadCompact *dq = &ir->compact_instructions[vi->def_instr];
-  if (dq->op != TCCIR_OP_ADD)
+  int is_sub = dq->op == TCCIR_OP_SUB;
+  if (dq->op != TCCIR_OP_ADD && !is_sub)
     return 0;
 
   IROperand a = tcc_ir_op_get_src1(ir, dq);
@@ -608,12 +609,18 @@ static int arm_extract_add_imm_base(TCCIRState *ir, IRSSAOptCtx *ctx,
 
   IROperand base_op;
   IROperand imm_op;
-  if (a.tag == IROP_TAG_IMM32 && b.tag != IROP_TAG_IMM32) {
+  if (!is_sub && a.tag == IROP_TAG_IMM32 && b.tag != IROP_TAG_IMM32) {
     imm_op = a; base_op = b;
   } else if (b.tag == IROP_TAG_IMM32 && a.tag != IROP_TAG_IMM32) {
     imm_op = b; base_op = a;
   } else {
     return 0;
+  }
+  /* `b - #k` is `[b, #-k]`: one instruction only down to -255. */
+  if (is_sub) {
+    if (tcc_ir_barrel_shift_at(ir, dq) || imm_op.u.imm32 < 0 || imm_op.u.imm32 > 255)
+      return 0;
+    imm_op.u.imm32 = -imm_op.u.imm32;
   }
 
   if (base_op.is_lval)
@@ -1339,6 +1346,124 @@ static int ssa_gen_arm_mla_zero_product(IRSSAOptCtx *ctx, int instr_idx)
   return 1;
 }
 
+/* ============================================================================
+ * arm_indexed_chain: t = b +/- #k1 feeding only constant-displacement accesses
+ *
+ * Pattern: t = ADD/SUB(b, #k1); LOAD_INDEXED [t, #k2] / STORE_INDEXED [t, #k2]
+ * Result:  LOAD_INDEXED [b, #(k1+k2)] / STORE_INDEXED [b, #(k1+k2)]
+ *
+ * The flat indexed_chain fold runs before SSA, where Zig's
+ * `(Header *)(m - 12)->capacity` still reads its base through the copy of a
+ * pointer-cast local; only SSA collapses that copy.  Every use of t must fold
+ * (then the ADD dies), as for arm_extract_add_imm_base.
+ * ============================================================================ */
+
+/* May an access of width `btype` take displacement `off` in one instruction? */
+static int arm_indexed_disp_ok(int btype, int off)
+{
+  if (btype == IROP_BTYPE_INT64 || btype == IROP_BTYPE_FLOAT64 || btype == IROP_BTYPE_FLOAT32)
+    return (off & 3) == 0 && off >= -1020 && off <= 1020;
+  if (btype == IROP_BTYPE_STRUCT || btype == IROP_BTYPE_FUNC)
+    return 0;
+  return off >= -255 && off <= 4095;
+}
+
+/* The constant displacement of a constant-index indexed access of t, or 0 if
+ * the instruction is not one (t must be its base and nothing else). */
+static int arm_chain_use_disp(TCCIRState *ir, int idx, int32_t t, int *disp, int *btype)
+{
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  int is_store = q->op == TCCIR_OP_STORE_INDEXED;
+  if (q->op != TCCIR_OP_LOAD_INDEXED && !is_store)
+    return 0;
+  IROperand *ops = &ir->iroperand_pool[q->operand_base];
+  IROperand base = ops[is_store ? 0 : 1], index = ops[2], scale = ops[3];
+  if (irop_get_vreg(base) != t || irop_get_tag(base) != IROP_TAG_VREG || base.is_lval || base.is_local ||
+      base.is_llocal)
+    return 0;
+  if (irop_get_tag(index) != IROP_TAG_IMM32 || irop_get_tag(scale) != IROP_TAG_IMM32 || scale.u.imm32 != 0)
+    return 0;
+  /* The stored value (or the load's dest) must not be t itself. */
+  if (irop_get_vreg(ops[is_store ? 1 : 0]) == t)
+    return 0;
+  *disp = index.u.imm32;
+  *btype = irop_get_btype(ops[is_store ? 1 : 0]);
+  return 1;
+}
+
+static int ssa_gen_arm_indexed_chain(IRSSAOptCtx *ctx, int instr_idx)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[instr_idx];
+  int is_store = q->op == TCCIR_OP_STORE_INDEXED;
+  int32_t t = irop_get_vreg(ir->iroperand_pool[q->operand_base + (is_store ? 0 : 1)]);
+  int disp, btype;
+  if (t < 0 || TCCIR_DECODE_VREG_TYPE(t) != TCCIR_VREG_TYPE_TEMP || !arm_chain_use_disp(ir, instr_idx, t, &disp, &btype))
+    return 0;
+
+  IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, t);
+  if (!vi || ssa_opt_def_total(vi) != 1 || vi->def_instr < 0 || vi->use_count == 0)
+    return 0;
+  int def_idx = vi->def_instr;
+  IRQuadCompact *dq = &ir->compact_instructions[def_idx];
+  if (dq->op != TCCIR_OP_ADD && dq->op != TCCIR_OP_SUB)
+    return 0;
+  if (tcc_ir_barrel_shift_at(ir, dq))
+    return 0;
+  IROperand ddest = tcc_ir_op_get_dest(ir, dq);
+  IROperand a = tcc_ir_op_get_src1(ir, dq);
+  IROperand b = tcc_ir_op_get_src2(ir, dq);
+  if (ddest.is_lval || irop_get_btype(ddest) == IROP_BTYPE_INT64)
+    return 0;
+  IROperand nb;
+  int k1;
+  if (irop_get_tag(b) == IROP_TAG_IMM32 && irop_get_tag(a) == IROP_TAG_VREG) {
+    nb = a;
+    k1 = dq->op == TCCIR_OP_SUB ? -b.u.imm32 : b.u.imm32;
+  } else if (dq->op == TCCIR_OP_ADD && irop_get_tag(a) == IROP_TAG_IMM32 && irop_get_tag(b) == IROP_TAG_VREG) {
+    nb = b;
+    k1 = a.u.imm32;
+  } else {
+    return 0;
+  }
+  int32_t nvr = irop_get_vreg(nb);
+  if (nvr < 0 || nb.is_lval || nb.is_local || nb.is_llocal || irop_get_btype(nb) == IROP_BTYPE_INT64)
+    return 0;
+  if (k1 < -4096 || k1 > 4096)
+    return 0;
+
+  /* Every use is such an access whose merged displacement still encodes, and
+   * reads the same b the ADD read. */
+  for (int u = 0; u < vi->use_count; u++) {
+    if (vi->uses[u].kind != SSA_USE_INSTR)
+      return 0;
+    int ui = vi->uses[u].idx;
+    if (!arm_chain_use_disp(ir, ui, t, &disp, &btype) || !arm_indexed_disp_ok(btype, k1 + disp))
+      return 0;
+    if (!arm_indexed_operands_hold(ctx, def_idx, ui, IROP_NONE, nb))
+      return 0;
+  }
+
+  IRSSAVregInfo *nvi = ssa_opt_vinfo(ctx, nvr);
+  while (vi->use_count > 0) {
+    int ui = vi->uses[0].idx;
+    IRQuadCompact *uq = &ir->compact_instructions[ui];
+    int store = uq->op == TCCIR_OP_STORE_INDEXED;
+    IROperand *ops = &ir->iroperand_pool[uq->operand_base];
+    IROperand old = ops[store ? 0 : 1];
+    IROperand nbase = nb;
+    nbase.btype = old.btype;
+    irop_carry_access_marks(&nbase, old);
+    ops[store ? 0 : 1] = nbase;
+    ops[2] = irop_make_imm32(0, (int32_t)(k1 + ops[2].u.imm32), IROP_BTYPE_INT32);
+    ssa_opt_remove_use_instr(vi, ui);
+    if (nvi)
+      ssa_opt_add_use_instr(nvi, ui);
+  }
+  ssa_opt_nop_instr(ctx, def_idx);
+  return 1;
+}
+
 static const IRSSAOptGen ssa_gen_arm[] = {
   { TCCIR_OP_MUL,   ssa_gen_arm_fuse_mul_add_to_mla,             "arm_mla_fusion" },
   { TCCIR_OP_MUL,   ssa_gen_arm_reduce_mul_to_shift,             "arm_mul_to_shl" },
@@ -1347,6 +1472,8 @@ static const IRSSAOptGen ssa_gen_arm[] = {
   { TCCIR_OP_STORE, ssa_gen_arm_fuse_store_add_imm_combined,     "arm_store_add_imm" },
   { TCCIR_OP_MLA,   ssa_gen_arm_mla_zero_product,                "arm_mla_zero_product" },
   { TCCIR_OP_MLA,   ssa_gen_arm_fuse_mla_accum_through_add_imm,  "arm_mla_accum_add_imm" },
+  { TCCIR_OP_LOAD_INDEXED,  ssa_gen_arm_indexed_chain,         "arm_indexed_chain_load" },
+  { TCCIR_OP_STORE_INDEXED, ssa_gen_arm_indexed_chain,         "arm_indexed_chain_store" },
 };
 
 void tcc_ir_ssa_opt_arm_register(void)

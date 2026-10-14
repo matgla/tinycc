@@ -758,7 +758,7 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
         case VT_LLONG:
         case VT_PTR:
           if (vtop->r & VT_SYM)
-            greloca(sec, vtop->sym, c, R_DATA_PTR, val);
+            greloca(sec, gfunc_regpair_address_sym(vtop->sym), c, R_DATA_PTR, val);
           else
             write64le(ptr, val);
           break;
@@ -790,7 +790,7 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
               tcc_error("internal error: init_putv has garbage sym (v=0x%x, r=0x%x)", vtop->sym ? vtop->sym->v : 0,
                         vtop->r);
             }
-            greloc(sec, vtop->sym, c, R_DATA_PTR);
+            greloc(sec, gfunc_regpair_address_sym(vtop->sym), c, R_DATA_PTR);
           }
           write32le(ptr, val);
           break;
