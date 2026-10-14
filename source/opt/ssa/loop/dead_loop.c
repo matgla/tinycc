@@ -1007,6 +1007,33 @@ static int dl_single_entry_single_latch(IRSSAOptCtx *ctx, IRLoop *loop, int jpf_
   if (back_edges != 1)
     return 0;
 
+  /* The latch's fall-through is the only way out.  An early exit (a search
+   * loop's `found = 1; break` or `return`) taken on a later trip leaves with
+   * a per-edge constant the back-edge kill would turn into iteration 1's. */
+  int latch_block = cfg->instr_to_block[jpf_idx];
+  int fallthru_block = cfg->instr_to_block[jpf_idx + 1];
+  for (int b = 0; b < cfg->num_blocks; b++) {
+    if (!dl_block_in_loop(cfg, loop, b))
+      continue;
+    IRBasicBlock *bb = &cfg->blocks[b];
+    for (int s = 0; s < bb->num_succs; s++) {
+      int sb = bb->succs[s];
+      if (dl_block_in_loop(cfg, loop, sb))
+        continue;
+      if (b != latch_block || sb != fallthru_block)
+        return 0;
+    }
+    /* A jump to the epilogue (target == instruction count) has no CFG edge. */
+    for (int i = bb->start_idx; i < bb->end_idx; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
+        return 0;
+      if ((q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) && i != jpf_idx &&
+          !dl_instr_in_loop(loop, (int)tcc_ir_op_dest_imm(ir, q)))
+        return 0;
+    }
+  }
+
   int header_block = cfg->instr_to_block[loop->header_idx];
   for (int b = 0; b < cfg->num_blocks; b++) {
     if (b == header_block || !dl_block_in_loop(cfg, loop, b))
