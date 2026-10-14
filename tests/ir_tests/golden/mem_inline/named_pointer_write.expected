@@ -8,11 +8,11 @@
 0007: T1 <-- V0 SHL #2
 0008: T2 <-- P1 ADD T1
 0009: V2 <-- T2***DEREF*** ADD #3
-0010: PARAM0[call_1] V1
+0010: NOP
 0011: T4 <-- &V2
-0012: PARAM1[call_1] T4
-0013: PARAM2[call_1] #4
-0014: CALL GlobalSym(#1) --> VReg?
+0012: NOP
+0013: T8 <-- V2 [LOAD]
+0014: V1 <-- T8 STORE_INDEXED #0
 0015: V0 <-- V0 ADD #1
 0016: T7 <-- V0 [LOAD]
 0017: JMP to 1
