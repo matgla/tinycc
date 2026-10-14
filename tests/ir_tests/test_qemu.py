@@ -1011,6 +1011,7 @@ TEST_FILES = [
     ("bug_nested_capture_prescan_shadow_scope.c", 0),
     # a nested function keeps sl (the static chain) out of RA and scratch use
     ("bug_nested_static_chain_scratch_reg.c", 0),
+    ("bug_pic_ll_global_load_base_alias.c", 0),
     # a static chain comes from a real frame, at the branch, for the callee's level
     ("bug_nested_set_chain_frame.c", 0),
     # captures and calls of an outer level use that level's frame

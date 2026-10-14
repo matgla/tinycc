@@ -3122,7 +3122,12 @@ ST_FUNC void tcc_gen_machine_assign_mop_ex(MachineOperand src, MachineOperand de
       addr.needs_deref = false;
       addr.is_64bit = false;
       addr.btype = IROP_BTYPE_INT32;
-      int base_reg = mach_ensure_in_reg(&mctx, &addr, 0);
+      /* The address scratch must not be a destination register: under
+       * pressure (-fpic reserves r9, a nested function r10) the picker would
+       * save the dest's register around its use, `push {r0}; ldr r0,<&g>;
+       * ldr r0,[r0]; ldr ip,[r0,#4]; pop {r0}` -- the high word read through
+       * the loaded low word, and the low word itself popped away. */
+      int base_reg = mach_ensure_in_reg(&mctx, &addr, mach_reg_excl(&dest));
       uint32_t excl = (1u << (uint32_t)base_reg);
 
       /* Determine destination registers for lo and hi halves. */
@@ -3131,9 +3136,19 @@ ST_FUNC void tcc_gen_machine_assign_mop_ex(MachineOperand src, MachineOperand de
         excl |= (1u << (uint32_t)lo_reg);
       int hi_reg = mach_get_dest_reg(&mctx, &dst_hi, excl);
 
-      /* Load [base+0] → lo, [base+4] → hi (32-bit loads). */
-      load_from_base(lo_reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 0, 0, (uint32_t)base_reg);
-      load_from_base(hi_reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 4, 0, (uint32_t)base_reg);
+      /* Load [base+0] → lo, [base+4] → hi (32-bit loads).  An address that
+       * already sat in the low half's register is read for the high word
+       * first, while it is still the address. */
+      if (lo_reg == base_reg)
+      {
+        load_from_base(hi_reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 4, 0, (uint32_t)base_reg);
+        load_from_base(lo_reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 0, 0, (uint32_t)base_reg);
+      }
+      else
+      {
+        load_from_base(lo_reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 0, 0, (uint32_t)base_reg);
+        load_from_base(hi_reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 4, 0, (uint32_t)base_reg);
+      }
 
       mach_writeback_dest(&dst_lo, lo_reg);
       mach_writeback_dest(&dst_hi, hi_reg);
