@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from cross_includes import INCLUDE_FLAGS
+
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = Path(__file__).with_name("896_licm_promoted.c")
 
@@ -16,7 +18,7 @@ def _dump(tmp_path, function, flags=(), disabled=None):
     if disabled:
         env["TCC_DISABLE_PASS"] = disabled
     result = subprocess.run(
-        [str(ROOT / "armv8m-tcc"), "-O2", *flags,
+        [str(ROOT / "armv8m-tcc"), *INCLUDE_FLAGS, "-O2", *flags,
          "-dump-ir-passes=ra:umaal", "-c", str(SOURCE),
          "-o", str(tmp_path / "promoted.o")],
         env=env, capture_output=True, text=True, check=True,

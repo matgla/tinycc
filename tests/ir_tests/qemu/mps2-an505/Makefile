@@ -139,15 +139,20 @@ LIBTCC1_BM_CC_SUM := unknowncc
 endif
 LIBTCC1_BM_DIR := $(MAKEFILE_DIR)libtcc1-bm/$(LIBTCC1_BM_CC_SUM)/
 LIBTCC1_BM_A := $(LIBTCC1_BM_DIR)armv8m-libtcc1.a
+# Every pytest-xdist worker runs this Makefile, so on a fresh tree several
+# build the archive at once: each builds in its own directory and renames the
+# finished archive into place, so no link ever sees a half-written one.
 $(LIBTCC1_BM_A): $(wildcard $(TCC_PATH)/lib/*.c) $(wildcard $(TCC_PATH)/lib/*.S) $(wildcard $(TCC_PATH)/lib/*.h)
-	@mkdir -p $(LIBTCC1_BM_DIR)obj
-	@for f in $(LIBTCC1_BM_MEMBERS); do \
+	@mkdir -p $(LIBTCC1_BM_DIR)
+	@tmp=$$(mktemp -d $(LIBTCC1_BM_DIR)build.XXXXXX) || exit 1; \
+	for f in $(LIBTCC1_BM_MEMBERS); do \
 	  src=$(TCC_PATH)/lib/$$f.c; \
 	  [ -f "$$src" ] || src=$(TCC_PATH)/lib/$$f.S; \
 	  $(CC_WRAPPER) $(CC) -fno-pic -mno-sb-relative-got -I$(TCC_PATH)/include -I$(TCC_PATH)/lib \
-	    -c $$src -o $(LIBTCC1_BM_DIR)obj/$$f.o || exit 1; \
-	done
-	ar rcs $@ $(addprefix $(LIBTCC1_BM_DIR)obj/,$(addsuffix .o,$(LIBTCC1_BM_MEMBERS)))
+	    -c $$src -o $$tmp/$$f.o || { rm -rf $$tmp; exit 1; }; \
+	done; \
+	ar rcs $$tmp/armv8m-libtcc1.a $(addprefix $$tmp/,$(addsuffix .o,$(LIBTCC1_BM_MEMBERS))) && \
+	  mv -f $$tmp/armv8m-libtcc1.a $@; rc=$$?; rm -rf $$tmp; exit $$rc
 LDFLAGS := -L$(LIBTCC1_BM_DIR) $(LDFLAGS)
 LDFLAGS += -B$(TCC_PATH)
 # The shadowing -B: appended at the link command's very end so it is the
