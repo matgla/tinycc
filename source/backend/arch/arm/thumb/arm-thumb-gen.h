@@ -591,7 +591,7 @@ int thumb_decode_dest_reg(thumb_opcode op);
 /* Defined in arm-thumb-emit.c. */
 int ot(thumb_opcode op);
 thumb_opcode th_generic_mov_imm(uint32_t r, int imm);
-ScratchRegAlloc th_offset_to_reg_ex(int off, int sign, uint32_t exclude_regs);
+ScratchRegAlloc th_offset_to_reg_ex(int off, int sign, int base, uint32_t exclude_regs);
 int th_patch_call(int t, int a);
 void gadd_sp_ex(int val, int scratch_reg);
 void gadd_sp(int val);

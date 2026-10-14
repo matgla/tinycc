@@ -17,6 +17,8 @@
 #include "../opt/flat/dce/dce.c"
 #undef USING_GLOBALS
 #include "../opt/flat/dce/dead_addrvar_elim.c"
+#undef DAV_MANY
+#undef DAV_NONE
 #undef USING_GLOBALS
 #include "../opt/flat/dce/dead_trailing_addrvar_store.c"
 #undef USING_GLOBALS

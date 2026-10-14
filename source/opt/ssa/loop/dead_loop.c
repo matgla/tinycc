@@ -185,6 +185,10 @@ static int dead_loop_body_hi(IRSSAOptCtx *ctx, IRLoop *loop)
       if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE || op == TCCIR_OP_SWITCH_LOAD ||
           op == TCCIR_OP_RETURNVALUE || op == TCCIR_OP_RETURNVOID)
         ok = 0;
+      /* A jump to the epilogue (target past the last block) has no CFG edge. */
+      if ((op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF) &&
+          tcc_ir_op_dest_imm(ir, &ir->compact_instructions[i]) >= cfg->num_instrs)
+        ok = 0;
     }
   }
   tcc_free(work);
@@ -1003,6 +1007,33 @@ static int dl_single_entry_single_latch(IRSSAOptCtx *ctx, IRLoop *loop, int jpf_
   if (back_edges != 1)
     return 0;
 
+  /* The latch's fall-through is the only way out.  An early exit (a search
+   * loop's `found = 1; break` or `return`) taken on a later trip leaves with
+   * a per-edge constant the back-edge kill would turn into iteration 1's. */
+  int latch_block = cfg->instr_to_block[jpf_idx];
+  int fallthru_block = cfg->instr_to_block[jpf_idx + 1];
+  for (int b = 0; b < cfg->num_blocks; b++) {
+    if (!dl_block_in_loop(cfg, loop, b))
+      continue;
+    IRBasicBlock *bb = &cfg->blocks[b];
+    for (int s = 0; s < bb->num_succs; s++) {
+      int sb = bb->succs[s];
+      if (dl_block_in_loop(cfg, loop, sb))
+        continue;
+      if (b != latch_block || sb != fallthru_block)
+        return 0;
+    }
+    /* A jump to the epilogue (target == instruction count) has no CFG edge. */
+    for (int i = bb->start_idx; i < bb->end_idx; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
+        return 0;
+      if ((q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) && i != jpf_idx &&
+          !dl_instr_in_loop(loop, (int)tcc_ir_op_dest_imm(ir, q)))
+        return 0;
+    }
+  }
+
   int header_block = cfg->instr_to_block[loop->header_idx];
   for (int b = 0; b < cfg->num_blocks; b++) {
     if (b == header_block || !dl_block_in_loop(cfg, loop, b))
@@ -1018,6 +1049,32 @@ static int dl_single_entry_single_latch(IRSSAOptCtx *ctx, IRLoop *loop, int jpf_
  * direct scan rather than off the use lists, which under-report once a pass
  * has NOP'd an instruction without unlinking its uses — here that would read
  * as "nothing escapes" and delete a loop whose result is still wanted. */
+/* Every way out of the body lands on the latch's fall-through.  An exit
+ * anywhere else (`if (a[i] == x) goto found;`) fires on whichever trip its
+ * condition first holds, so dropping the back-edge would make it depend on
+ * the first element alone even when nothing the body computes is read
+ * outside. */
+static int dl_exits_only_to_fallthru(IRSSAOptCtx *ctx, IRLoop *loop, int fallthru_block)
+{
+  TCCIRState *ir = ctx->ir;
+  IRCFG *cfg = ctx->cfg;
+
+  for (int i = loop->start_idx; i <= loop->end_idx && i < ir->next_instruction_index; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_RETURNVOID ||
+        q->op == TCCIR_OP_RETURNVALUE)
+      return 0;
+    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+      continue;
+    int target = (int)tcc_ir_op_dest_imm(ir, q);
+    if (dl_instr_in_loop(loop, target))
+      continue;
+    if (target < 0 || target >= cfg->num_instrs || cfg->instr_to_block[target] != fallthru_block)
+      return 0;
+  }
+  return 1;
+}
+
 static int dl_collect_varying_defs(IRSSAOptCtx *ctx, IRLoop *loop,
                                    int32_t *cands, int *num_cands)
 {
@@ -1105,6 +1162,38 @@ static int dl_any_cand_read_outside(IRSSAOptCtx *ctx, IRLoop *loop,
   return 0;
 }
 
+/* Every way out of the body is the latch's fall-through.  A pure body can
+ * still decide WHERE control goes: a search loop's `return` / `goto` on a hit
+ * leaves by its own edge, and killing the back-edge would only ever test the
+ * first element.  A break to the fall-through block itself is harmless. */
+static int dl_rotated_exits_only_to_fallthru(TCCIRState *ir, IRCFG *cfg, IRLoop *loop, int fallthru_block)
+{
+  for (int b = 0; b < cfg->num_blocks; b++) {
+    if (!dl_block_in_loop(cfg, loop, b))
+      continue;
+    IRBasicBlock *bb = &cfg->blocks[b];
+    for (int s = 0; s < bb->num_succs; s++)
+      if (!dl_block_in_loop(cfg, loop, bb->succs[s]) && bb->succs[s] != fallthru_block)
+        return 0;
+    /* No CFG successor is not no exit: a return, a computed jump or a jump to
+     * the epilogue (target == instruction count, no block) leaves too. */
+    for (int i = bb->start_idx; i < bb->end_idx; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      int op = q->op;
+      if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF) {
+        int t = (int)tcc_ir_op_dest_imm(ir, q);
+        if (!dl_instr_in_loop(loop, t) &&
+            (t < 0 || t >= cfg->num_instrs || cfg->instr_to_block[t] != fallthru_block))
+          return 0;
+      }
+      if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE || op == TCCIR_OP_SWITCH_LOAD ||
+          op == TCCIR_OP_RETURNVALUE || op == TCCIR_OP_RETURNVOID)
+        return 0;
+    }
+  }
+  return 1;
+}
+
 static int try_kill_rotated_loop(IRSSAOptCtx *ctx, IRLoop *loop)
 {
   TCCIRState *ir = ctx->ir;
@@ -1145,6 +1234,8 @@ static int try_kill_rotated_loop(IRSSAOptCtx *ctx, IRLoop *loop)
   if (header_block < 0 || latch_block < 0 || fallthru_block < 0)
     return 0;
   if (fallthru_block == header_block || dl_block_in_loop(cfg, loop, fallthru_block))
+    return 0;
+  if (!dl_rotated_exits_only_to_fallthru(ir, cfg, loop, fallthru_block))
     return 0;
 
   /* --- the compare drives a monotone induction variable ------------------ */
@@ -1209,6 +1300,8 @@ static int try_kill_rotated_loop(IRSSAOptCtx *ctx, IRLoop *loop)
   /* Whole-IR scans last: by here the loop is known to be a pure counting one,
    * which is a handful of loops per translation unit rather than every one. */
   if (!dl_single_entry_single_latch(ctx, loop, jpf_idx))
+    return 0;
+  if (!dl_exits_only_to_fallthru(ctx, loop, fallthru_block))
     return 0;
 
   /* --- nothing the body computes may differ between iteration 1 and N ---- */

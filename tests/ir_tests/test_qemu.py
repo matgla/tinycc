@@ -134,6 +134,9 @@ TEST_FILES = [
     ("90_global_array_assignment.c", 0),
     ("bug_swap.c", 0),
     ("bug_dead_loop_exit_phi_mid_body_break.c", 0),
+    ("bug_dead_loop_rotated_early_exit.c", 0),
+    ("bug_dead_loop_rotated_side_exit.c", 0),
+    ("bug_dead_loop_rotated_mid_exit.c", 0),
     ("bug_dead_trail_addrvar_ptr_copy.c", 0),
     ("bug_dead_trail_volatile_access.c", 0),  # dead_trail_addrvar keeps writes that access volatile memory
     ("bug_narrow_volatile_load_dead_local.c", 0),  # a volatile load into a dead char/short local stays
@@ -189,6 +192,9 @@ TEST_FILES = [
     # run_register_coalescing's swap handed the blocker the high half of a live
     # 64-bit pair (r2:r3); the safety scan looked at low registers only.
     ("bug_ra_register_swap_pair_high_half.c", 0),
+    # A far (>4 KB) SP-relative spill access whose offset scratch had to be
+    # PUSHed read the slot 4 bytes low (gcc pr28982b under the YasOS ABI).
+    ("bug_far_spill_scratch_push_sp_bias.c", 0),
     # ("bug_ternary_string.c", 0),  # Nested ternary with string literals
     # ("bug_return_else_string.c", 0),  # Return string from else block
     ("test_cleanup_double.c", 0),
@@ -792,6 +798,7 @@ TEST_FILES = [
     # each trip one of its conditions (trip-count-dependent exit value, an
     # escaping counter, a store, a second back-edge, a volatile read).
     ("450_dead_loop_rotated.c", 0),
+    ("bug_dead_loop_rotated_far_early_exit.c", 0),  # an early exit past detect_loops' reach keeps the back-edge
 
     # ssa:switch_fold picks the arm of a constant-selector SWITCH_TABLE at
     # compile time.  What it has to get right is every way a selector can miss
@@ -1007,6 +1014,7 @@ TEST_FILES = [
     ("bug_nested_capture_prescan_shadow_scope.c", 0),
     # a nested function keeps sl (the static chain) out of RA and scratch use
     ("bug_nested_static_chain_scratch_reg.c", 0),
+    ("bug_pic_ll_global_load_base_alias.c", 0),
     # a static chain comes from a real frame, at the branch, for the callee's level
     ("bug_nested_set_chain_frame.c", 0),
     # captures and calls of an outer level use that level's frame
@@ -1693,6 +1701,9 @@ TEST_FILES = [
     # dead_addrvar deletes STORE_INDEXEDs through a dead local's LEA along
     # with the LEA; left behind they stored through an undefined register.
     ("494_dead_addrvar_store_indexed.c", 0),
+    # ... and keeps the LEA when its address reaches a store through a
+    # VAR-to-VAR copy (gcc 990128-1 wrote through argc on the device).
+    ("bug_dead_addrvar_var_copy_chain.c", 0),
     # A stack-copied struct argument whose base scratch is LR loads its words
     # through another register, and not through a live IP.
     ("495_stack_struct_arg_base_in_lr.c", 0),
@@ -3374,6 +3385,9 @@ PIC_TEXT_DATA_SEP_TEST_FILES = [
 
     # A call to a static function defined further down skips the R9 reload.
     ("test_r9_static_forward_call.c", 0),
+
+    # Far spill slot reached through a PUSHed offset scratch with R9 reserved.
+    ("bug_far_spill_scratch_push_sp_bias.c", 0),
 ]
 
 
