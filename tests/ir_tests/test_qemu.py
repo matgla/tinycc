@@ -419,6 +419,7 @@ TEST_FILES = [
     ("test_errunion_bool_checks.c", 0),
     # a static function identical to one already generated is dropped for it, unless its address is taken
     ("test_icf_folding.c", 0),
+    ("bug_icf_emitted_inline_body.c", 0),
     # a local copied from a call's own struct buffer is that buffer, anywhere in the function
     ("test_call_buffer_copy_alias.c", 0),
     ("test_ldm_block_copy.c", 0),
@@ -1947,6 +1948,7 @@ TEST_FILES = [
     # is_null, a relay built by member stores (copy_fwd)
     ("bug_copy_fwd_relay_padding.c", 0),
     ("bug_copy_fwd_relay_window_ops.c", 0),
+    ("bug_copy_fwd_relay_asm_escape.c", 0),
     ("642_sret_claim_shapes.c", 0),
     ("643_sret_claim_postfix.c", 0),
     ("644_sret_memop_result.c", 0),

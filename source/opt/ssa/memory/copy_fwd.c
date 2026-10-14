@@ -1643,7 +1643,7 @@ static int cfw_relay(Cfw *c, int ci)
   int *blk = tcc_malloc(sizeof(int) * (c->nacc > 0 ? c->nacc : 1)), nblk = 0;
   memset(need, 1, len);
   for (int a = 0; a < c->nacc; a++)
-    if (c->acc[a].at < ci && c->block_of[c->acc[a].at] == cb)
+    if (c->acc[a].at >= 0 && c->acc[a].at < ci && c->block_of[c->acc[a].at] == cb) /* -1: asm; desc has it */
       blk[nblk++] = a;
 
   /* Back from the copy: find the stores of every byte S hands to D. */

@@ -475,7 +475,8 @@ static void emit_inline_functions(TCCState *s, int owed_only)
         next();
         cur_text_section = function_text_section(s, sym);
         gen_function(sym);
-        end_macro();
+        end_macro(); /* frees the tokens: the next body's ICF scan must not read them */
+        fn->func_str = NULL;
         pp_pack_leave(s, saved_pack);
         called_once_budget_end(saved_budget);
 
