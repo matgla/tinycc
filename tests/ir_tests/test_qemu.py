@@ -1697,6 +1697,9 @@ TEST_FILES = [
     # dead_addrvar deletes STORE_INDEXEDs through a dead local's LEA along
     # with the LEA; left behind they stored through an undefined register.
     ("494_dead_addrvar_store_indexed.c", 0),
+    # ... and keeps the LEA when its address reaches a store through a
+    # VAR-to-VAR copy (gcc 990128-1 wrote through argc on the device).
+    ("bug_dead_addrvar_var_copy_chain.c", 0),
     # A stack-copied struct argument whose base scratch is LR loads its words
     # through another register, and not through a live IP.
     ("495_stack_struct_arg_base_in_lr.c", 0),

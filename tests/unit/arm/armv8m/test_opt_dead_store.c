@@ -187,6 +187,58 @@ UT_TEST(test_dead_addrvar_read_var_keeps_lea_and_store)
   return 0;
 }
 
+/* POSITIVE: V0's address reaches the store through a VAR-to-VAR copy
+ * (V1 <-- T0; V2 <-- V1; T1 <-- V2; *T1 = 42) and V0 is never read: the LEA,
+ * the store and every copy of the address go together. */
+UT_TEST(test_dead_addrvar_var_copy_chain_removed)
+{
+  TCCIRState *ir = utb_new();
+
+  int lea = utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
+  int c1 = utb_emit(ir, TCCIR_OP_STORE, utb_var(1, I32), utb_temp(0, I32), UTB_NONE);
+  int c2 = utb_emit(ir, TCCIR_OP_STORE, utb_var(2, I32), utb_var(1, I32), UTB_NONE);
+  int c3 = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_var(2, I32), UTB_NONE);
+  int store = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(1, I32), utb_imm(42, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_dead_addrvar_elim(ir);
+
+  UT_ASSERT_EQ(changes, 5);
+  UT_ASSERT_EQ(utb_op(ir, lea), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, c1), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, c2), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, c3), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_NOP);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE: the copied address also escapes (returned), so V0 is live through
+ * it: nothing may go.  The copy chain once hid this and the LEA was deleted
+ * under its remaining users (gcc 990128-1). */
+UT_TEST(test_dead_addrvar_var_copy_chain_escape_keeps_lea)
+{
+  TCCIRState *ir = utb_new();
+
+  int lea = utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
+  int c1 = utb_emit(ir, TCCIR_OP_STORE, utb_var(1, I32), utb_temp(0, I32), UTB_NONE);
+  int c2 = utb_emit(ir, TCCIR_OP_STORE, utb_var(2, I32), utb_var(1, I32), UTB_NONE);
+  int store = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(42, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_var(2, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_dead_addrvar_elim(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, lea), TCCIR_OP_LEA);
+  UT_ASSERT_EQ(utb_op(ir, c1), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(ir, c2), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_STORE);
+
+  utb_free(ir);
+  return 0;
+}
+
 /* ========================================================= dead_trailing_addrvar_store_elim */
 
 /* POSITIVE: a write to V0 through its address AFTER the last read of V0 is
