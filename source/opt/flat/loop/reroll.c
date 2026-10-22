@@ -540,11 +540,16 @@ int tcc_ir_opt_reroll(TCCIRState *ir)
         if (!opmatch) continue;
       }
 
+      /* A copy/fill body: the counter traffic is a plain loss. Depends on the
+       * body alone, so reject before count_repeats walks the whole run -- on a
+       * long run of such bodies (gcc.c-torture/compile/20050423-1: 200x
+       * `a += b; b -= a;`) that walk at every position made this pass
+       * quadratic, ~9 s of an on-device -O2 compile. */
+      if (reroll_body_moves_only_data(ir, i, P))
+        continue;
       collect_body_defs(ir, i, P, &defs);
       int reps = count_repeats(ir, i, P, &map, &defs);
       if (reps < REROLL_MIN_REPEATS) continue;
-      if (reroll_body_moves_only_data(ir, i, P))
-        continue; /* a copy/fill body: the counter traffic is a plain loss */
       int score = reps * P;
       if (score > best_score) {
         best_score = score;
