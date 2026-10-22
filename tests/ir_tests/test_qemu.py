@@ -2007,6 +2007,8 @@ TEST_FILES = [
     # blacklist as pure and deleted __builtin_apply / __builtin_setjmp whose
     # result was unused
     ("730_dse_keeps_builtin_apply.c", 0),
+    # The __builtin_apply_args block was left below SP at -O1+.
+    ("bug_apply_args_block_below_sp.c", 0),
     ("731_dse_keeps_builtin_setjmp.c", 0),
 
     # docs/bugs ssa-store family (2026-10-07): dead_overwrite_stores ignored

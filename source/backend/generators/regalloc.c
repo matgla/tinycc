@@ -441,6 +441,22 @@ void tcc_ir_backend_analyze_leaf_and_tail_calls(TCCIRState *ir, int func_var)
 /* ================================================================== */
 /*  Compute min stack offset from instruction operands                */
 /* ================================================================== */
+/* Frame bytes the frontend reserved that no IR operand names, so the
+ * min-offset scans below cannot see them: the variadic save area and the
+ * __builtin_apply_args block.  The block is written by the prologue and only
+ * read through the pointer __builtin_apply_args returns; raising loc past it
+ * left it below SP, where an exception frame stacked on the process stack
+ * overwrote it (821_hazard_sandwich_apply -O2: r12/lr replayed as set_pv's
+ * arguments, which stored lr into the callee's thunk). */
+static int ra_reserved_frame_floor(int loc, int func_var)
+{
+  if (func_var && loc > -28)
+    loc = -28;
+  if (tcc_state->func_save_apply_args && loc > tcc_state->apply_args_offset)
+    loc = tcc_state->apply_args_offset;
+  return loc;
+}
+
 static void compute_min_stack_ref(TCCIRState *ir, int func_var)
 {
   int min_stack_ref = 0;
@@ -472,8 +488,7 @@ static void compute_min_stack_ref(TCCIRState *ir, int func_var)
   {
     loc = min_stack_ref;
   }
-  if (func_var && loc > -28)
-    loc = -28;
+  loc = ra_reserved_frame_floor(loc, func_var);
 }
 
 /* ================================================================== */
@@ -865,8 +880,7 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
      * it.  gen_function already reserved these four bytes; keep them. */
     if (ir->has_static_chain && loc > -4)
       loc = -4;
-    if (func_var && loc > -28)
-      loc = -28;
+    loc = ra_reserved_frame_floor(loc, func_var);
   }
 
   {
@@ -999,8 +1013,7 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
       loc = min_stack_loc;
     else if (!has_nested_chain && min_stack_loc > loc)
       loc = min_stack_loc;
-    if (func_var && loc > -28)
-      loc = -28;
+    loc = ra_reserved_frame_floor(loc, func_var);
   }
 
   tcc_ir_move_coalescing(ir);
@@ -1068,8 +1081,7 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
       }
       if (post_min_op_offset > loc)
         loc = post_min_op_offset;
-      if (func_var && loc > -28)
-        loc = -28;
+      loc = ra_reserved_frame_floor(loc, func_var);
     }
   }
 
