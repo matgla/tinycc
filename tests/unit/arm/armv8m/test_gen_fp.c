@@ -46,6 +46,7 @@
 #include "source/ir/machine_op.h"
 #include "codegen_backend_stubs.h"
 #include "elfsec_stubs.h"
+#include "source/backend/arch/fpu/arm/fpv5-sp-d16.h"
 
 #include "ut.h"
 
@@ -378,5 +379,55 @@ UT_TEST(test_cvt_ftof_f64_to_f64_is_a_direct_pair_copy_no_call)
   UT_ASSERT_EQ(read_le16(cur_text_section->data + 2), 0x4629); /* MOV R1, R5 (hi) */
   UT_ASSERT_EQ(elfsec_reloc_call_count(), 0);
 
+  return 0;
+}
+
+/* ------------------------------------------------------------------ inline VFP f32 arith (softfp) */
+
+/* gcc pr28982a: `result += *ptr` with ptr in R0 and result spilled.  The
+ * scratch for the spilled src1 must not be src2's deref base: reloading result
+ * into R0 and then loading through R0 read the float's bits as an address. */
+UT_TEST(test_fadd_f32_inline_vfp_src1_scratch_avoids_src2_deref_base)
+{
+  elfsec_reset();
+  cgb_reset();
+  tcc_state->march_str = "armv8-m.main";
+  tcc_state->fpu_type = ARM_FPU_FPV5_SP_D16;
+  tcc_state->float_abi = ARM_SOFTFP_FLOAT;
+  tcc_state->text_and_data_separation = 0;
+  tcc_state->pic = 0;
+  arm_init(tcc_state);
+  cur_text_section = elfsec_new_section(".text");
+  ind = 0;
+  tcc_state->registers_for_allocator = 13;
+  architecture_config.fpu = &arm_fpv5_sp_d16_fpu_config;
+
+  MachineOperand src1;
+  memset(&src1, 0, sizeof(src1));
+  src1.kind = MACH_OP_SPILL;
+  src1.btype = IROP_BTYPE_FLOAT32;
+  src1.u.spill.offset = -16;
+  MachineOperand src2 = mop_reg(R0, IROP_BTYPE_FLOAT32);
+  src2.needs_deref = 1;
+  MachineOperand dest = mop_reg(R1, IROP_BTYPE_FLOAT32);
+
+  tcc_gen_machine_fp_mop(src1, src2, dest, TCCIR_OP_FADD, 0);
+
+  /* Unfixed: PUSH {R0}; LDR.W R0, [R7, #-16]; PUSH {R2}; LDR R2, [R0]. */
+  int spill_reloads = 0, derefs_via_r0 = 0;
+  for (int i = 0; i + 2 <= ind; i += 2)
+  {
+    uint16_t hw = read_le16(cur_text_section->data + i);
+    if (hw == 0xf857 && i + 4 <= ind) /* LDR.W Rt, [R7, #-imm8] */
+    {
+      UT_ASSERT((read_le16(cur_text_section->data + i + 2) >> 12) != R0);
+      spill_reloads++;
+      i += 2;
+    }
+    else if ((hw & 0xf838) == 0x6800) /* LDR Rt, [R0, #imm5] */
+      derefs_via_r0++;
+  }
+  UT_ASSERT_EQ(spill_reloads, 1);
+  UT_ASSERT_EQ(derefs_via_r0, 1);
   return 0;
 }
