@@ -1551,6 +1551,60 @@ static int ir_codegen_pad_unneeded(TCCIRState *ir, int l)
   return k >= 0 && ir_codegen_jump_hopped(ir, k, &fall, &j) && fall == l && ir_codegen_hop_target_fall_only(ir, j);
 }
 
+/* Real pass: plan[k] is the aligned join i that op k's straight-line block
+ * falls into -- no branch from k on, no branch target after k -- when the
+ * rehearsal ended that block in an instruction a pad cannot widen
+ * (fixed_tail[i]), else -1.  A pad there is a NOP the fall-through path runs
+ * every time (bench_bubble_sort's swap block ends in `str.w`: one per swap);
+ * emitting one of the block's ops' first instruction 32 bits wide lands the
+ * join aligned without it.  NULL when no join has such a block. */
+static int *ir_codegen_widen_ahead_plan(TCCIRState *ir, const uint8_t *fixed_tail, const uint8_t *empty,
+                                        const uint8_t *targets)
+{
+  const int n = ir->next_instruction_index;
+  int *plan = NULL;
+  for (int i = 1; i < n; i++)
+  {
+    if (!fixed_tail[i])
+      continue;
+    int j = i - 1;
+    while (j >= 0 && (empty[j] & 1))
+      j--;
+    if (j < 0)
+      continue;
+    const int jop = ir->compact_instructions[j].op;
+    if (jop == TCCIR_OP_JUMP || jop == TCCIR_OP_JUMPIF || jop == TCCIR_OP_IJUMP || jop == TCCIR_OP_SWITCH_TABLE ||
+        jop == TCCIR_OP_RETURNVOID || jop == TCCIR_OP_RETURNVALUE)
+      continue;
+    /* Only the first aligned op after the block: a code-free one before i
+     * took the pad already, and i's address includes it. */
+    int first = 1;
+    for (int m = j + 1; m < i && first; m++)
+      if (ir->compact_instructions[m].align_target)
+        first = 0;
+    if (!first)
+      continue;
+    if (!plan)
+    {
+      plan = tcc_malloc((size_t)n * sizeof(int));
+      for (int k = 0; k < n; k++)
+        plan[k] = -1;
+    }
+    for (int k = j; k >= 0 && j - k < 32; k--)
+    {
+      const int kop = ir->compact_instructions[k].op;
+      if (kop == TCCIR_OP_JUMP || kop == TCCIR_OP_JUMPIF || kop == TCCIR_OP_IJUMP || kop == TCCIR_OP_SWITCH_TABLE ||
+          kop == TCCIR_OP_RETURNVOID || kop == TCCIR_OP_RETURNVALUE)
+        break;
+      if (plan[k] < 0)
+        plan[k] = i;
+      if (targets[k] || ir->compact_instructions[k].is_jump_target)
+        break;
+    }
+  }
+  return plan;
+}
+
 /* The first op at or after `t` the rehearsal laid out as code, or n. */
 static int ir_codegen_landing(const TCCIRState *ir, int t)
 {
@@ -4483,6 +4537,11 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
    * loop before it emitted, to its IR target unthreaded
    * (ir_codegen_offer_cas_branch). */
   uint8_t *rehearsal_empty = NULL;
+  /* Rehearsal, at an aligned op: `ind` before its pad, and whether the code
+   * before it ends in an instruction the pad cannot widen.  Real pass:
+   * ir_codegen_widen_ahead_plan and the joins it has fixed. */
+  int *rehearsal_prealign = NULL, *widen_plan = NULL;
+  uint8_t *rehearsal_fixed_tail = NULL, *widen_done = NULL;
   /* Real pass: the IR target a JUMP/JUMPIF was emitted to when threading or
    * inversion moved it (ir_codegen_jumpif_form), else -1. */
   int *jump_retarget = NULL;
@@ -4596,6 +4655,16 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       tcc_free(rehearsal_empty);
       rehearsal_empty = tcc_mallocz((size_t)ir->next_instruction_index);
       ir->codegen_rehearsal_empty = rehearsal_empty;
+      tcc_free(rehearsal_prealign);
+      rehearsal_prealign = tcc_malloc((size_t)ir->next_instruction_index * sizeof(int));
+      tcc_free(rehearsal_fixed_tail);
+      rehearsal_fixed_tail = tcc_mallocz((size_t)ir->next_instruction_index);
+    }
+    if (!is_dry_run && rehearsal_fixed_tail && rehearsal_empty && branch_target_reset && cbz_dry_mapping)
+    {
+      widen_plan = ir_codegen_widen_ahead_plan(ir, rehearsal_fixed_tail, rehearsal_empty, branch_target_reset);
+      if (widen_plan)
+        widen_done = tcc_mallocz((size_t)ir->next_instruction_index);
     }
     /* Branch threading and inversion read the rehearsal's layout. */
     if (!is_dry_run && rehearsal_empty && branch_target_reset && cbz_dry_mapping)
@@ -4648,10 +4717,13 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     tcc_gen_machine_frame_word_pair_set_enabled(!ir->func_has_volatile_access &&
                                                 !tcc_ir_opt_pass_disabled("codegen:frame_word_pair"));
 
+    int last_code_op = -1; /* the op that emitted last_code_op_start_ind's code */
     /* Start address of the previous IR op (-1 before the first) and of the
      * latest op that emitted code (none yet: the prolog), for the alignment
      * pad's widening guard. */
     int prev_op_start_ind = -1, last_code_op_start_ind = TCC_ALIGN_WIDEN_FROM_PROLOG;
+    /* The join tcc_gen_machine_widen_next_op is armed for, or -1. */
+    int widen_armed_for = -1;
 
     /* ---- Instruction loop ---- */
     for (int i = 0; i < ir->next_instruction_index; i++)
@@ -4677,7 +4749,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       g_debug_current_op = (int)cq->op;
 
       if (prev_op_start_ind >= 0 && prev_op_start_ind != ind)
+      {
         last_code_op_start_ind = prev_op_start_ind; /* op i-1 emitted code */
+        last_code_op = i - 1;
+      }
 
       /* Word-align a bottom-tested loop head before its address is recorded, so
        * the back-edge branch lands on a 4-aligned instruction (see
@@ -4697,12 +4772,23 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         int widen_from = (ir->func_has_label_addr || ir->func_has_asm_goto || !branch_target_reset)
                              ? -1
                              : last_code_op_start_ind;
+        /* After a loop's conditional back-edge the pad runs once, on loop
+         * exit, while a widened back-edge costs a cycle on every taken trip
+         * (bench_bubble_sort's inner latch: +7.6%). */
+        if (last_code_op >= 0 && ir->compact_instructions[last_code_op].op == TCCIR_OP_JUMPIF &&
+            (int)tcc_ir_op_dest_imm(ir, &ir->compact_instructions[last_code_op]) <= last_code_op)
+          widen_from = -1;
         /* branch_target_reset is the exact set the backpatch resolves (JUMP,
          * JUMPIF and switch-table targets; everything under an IJUMP), unlike
          * is_jump_target, which a retargeted label keeps. */
         for (int k = i - 1; widen_from != -1 && k >= 0 && (int)ir_to_code_mapping[k] == ind; k--)
           if (branch_target_reset[k])
             widen_from = -1;
+        if (is_rehearsal && rehearsal_fixed_tail)
+        {
+          rehearsal_prealign[i] = ind;
+          rehearsal_fixed_tail[i] = widen_from == -1 || !tcc_gen_machine_pad_could_widen();
+        }
         tcc_gen_machine_align_branch_target(align_bytes, widen_from);
       }
 
@@ -4712,6 +4798,21 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         tcc_gen_machine_outline_op_end(i);
 
       ir_to_code_mapping[i] = ind;
+      if (widen_plan)
+      {
+        if (widen_armed_for >= 0 && tcc_gen_machine_widen_next_op_done())
+          widen_done[widen_armed_for] = 1;
+        widen_armed_for = -1;
+        /* The block has no branch, the one thing the real pass sizes
+         * differently, so the rehearsal's size of it says where the join
+         * lands from here. */
+        if (widen_plan[i] >= 0 && !widen_done[widen_plan[i]] &&
+            ((ind + rehearsal_prealign[widen_plan[i]] - (int)cbz_dry_mapping[i]) & 2))
+        {
+          tcc_gen_machine_widen_next_op();
+          widen_armed_for = widen_plan[i];
+        }
+      }
       const int op_i = i;
       const int op_start_ind = ind;
       prev_op_start_ind = op_start_ind;
@@ -6823,6 +6924,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         tcc_ice("codegen: IR op %d emitted %d bytes inside a dropped jump's span in %s", op_i, ind - op_start_ind,
                 funcname ? funcname : "?");
     }
+    if (widen_armed_for >= 0)
+      tcc_gen_machine_widen_next_op_done(); /* the epilogue is no block of the plan */
     if (outline_planned && !is_dry_run)
     {
       tcc_gen_machine_outline_function_end();
@@ -7311,6 +7414,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   tcc_free(jump_retarget);
   tcc_free(rehearsal_empty);
   ir->codegen_rehearsal_empty = NULL;
+  tcc_free(rehearsal_prealign);
+  tcc_free(rehearsal_fixed_tail);
+  tcc_free(widen_plan);
+  tcc_free(widen_done);
 
   /* Backpatch return jumps to point to epilogue */
   int epilogue_addr = ir_to_code_mapping[ir->next_instruction_index];

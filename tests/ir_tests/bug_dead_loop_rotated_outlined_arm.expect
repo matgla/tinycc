@@ -1,0 +1,4 @@
+cond_chain: 0 1192 1192
+arm_early_exit: -3 -5 7 0
+goto_into_arm: 0 5 9 5
+arm_escapes: 1 -500 1

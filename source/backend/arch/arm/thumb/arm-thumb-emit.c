@@ -48,6 +48,8 @@ int ot(thumb_opcode op)
 {
   if (op.size == 0)
     return op.size;
+  if (th_widen_armed)
+    th_widen_armed_apply(&op);
 
   /* Detect instructions that write to R9 when it's reserved for GOT pointer.
    * Exclude push/pop/stmdb/ldmia which legitimately save/restore R9. */
@@ -316,6 +318,13 @@ int ot(thumb_opcode op)
     }
     /* Increment ind as if we emitted the instruction, but don't write to section */
     ind += op.size;
+    if (thumb_gen_state.generating_function)
+    {
+      /* For tcc_gen_machine_pad_could_widen. */
+      th_dry_last_insn.end = ind;
+      th_dry_last_insn.size = op.size;
+      th_dry_last_insn.conditional = op_in_it_block || mov_equiv_it_block_length(op) > 0;
+    }
     return op.size;
   }
 

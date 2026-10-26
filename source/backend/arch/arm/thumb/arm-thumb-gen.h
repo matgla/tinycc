@@ -497,11 +497,18 @@ typedef struct ThumbLastInsn
   int conditional;
 } ThumbLastInsn;
 extern ThumbLastInsn th_last_insn;
+/* The same for the dry passes, which must leave th_last_insn as the prolog
+ * left it: the real pass starts from there. */
+extern ThumbLastInsn th_dry_last_insn;
 extern int th_func_code_start;
 /* Instructions widened in place of an alignment pad this function: reset at
  * the prolog; th_patch_call ICEs on a branch into the middle of one. */
 void th_widened_reset(void);
 int th_widened_contains_mid(int addr);
+/* Armed by tcc_gen_machine_widen_next_op; ot() hands its next instruction to
+ * th_widen_armed_apply. */
+extern int th_widen_armed;
+void th_widen_armed_apply(thumb_opcode *op);
 extern int dry_run_literal_pool_size;
 extern TCCChainedHash literal_pool_hash;
 extern LiteralPoolLookupCache literal_pool_last_lookup;

@@ -13,6 +13,8 @@
 #include "ssa_opt.h"
 #include "opt/ssa/ssa_opt_helpers.h"
 #include "licm.h"
+#include "memory/dynamic_bitset.h"
+#include "memory/small_sequence.h"
 
 /* Both arms of this pass are shape matchers, and every bail is silent.  The
  * block/phi/loop-bounds dump is what tells you which one you tripped -- the
@@ -220,6 +222,16 @@ static int loop_has_mid_body_exit(IRSSAOptCtx *ctx, IRLoop *loop, int hi)
   return 0;
 }
 
+/* Only the loop control flow is allowed to be a "side effect". */
+static int dl_instr_has_side_effects(int op)
+{
+  if (op == TCCIR_OP_NOP || op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF)
+    return 0;
+  if (op == TCCIR_OP_CMP || op == TCCIR_OP_TEST_ZERO)
+    return 0;
+  return ssa_opt_has_side_effects(op);
+}
+
 static int loop_body_has_side_effects(IRSSAOptCtx *ctx, IRLoop *loop)
 {
   TCCIRState *ir = ctx->ir;
@@ -230,14 +242,7 @@ static int loop_body_has_side_effects(IRSSAOptCtx *ctx, IRLoop *loop)
     hi = loop_max_idx(loop);
   for (int idx = loop->start_idx; idx <= hi && idx < ir->next_instruction_index; idx++) {
     IRQuadCompact *q = &ir->compact_instructions[idx];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-    /* Only the loop control flow is allowed to be a "side effect". */
-    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
-      continue;
-    if (q->op == TCCIR_OP_CMP || q->op == TCCIR_OP_TEST_ZERO)
-      continue;
-    if (ssa_opt_has_side_effects(q->op))
+    if (dl_instr_has_side_effects(q->op))
       return 1;
   }
   return 0;
@@ -900,17 +905,57 @@ static int rewrite_loop_exit_phis_guarded(IRSSAOptCtx *ctx, IRLoop *loop, LoopEn
 
 #define DL_MAX_ESCAPE_CANDS 64
 
-static int dl_block_in_loop(IRCFG *cfg, IRLoop *loop, int b)
+TCC_DYNAMIC_BITSET_DEFINE(DLBlockSet, 256)
+TCC_SMALL_SEQUENCE_DEFINE(DLIntSeq, int, 64)
+
+/* The rotated arm's body is the natural loop of the back-edge, not the range
+ * detect_loops reports: loop_header_dup lays an else-if arm out past the
+ * latch, with a jump back into the body. */
+static int dl_block_in_body(IRCFG *cfg, const DLBlockSet *body, int b)
 {
-  if (!cfg || b < 0 || b >= cfg->num_blocks)
-    return 0;
-  return cfg->blocks[b].start_idx >= loop->start_idx &&
-         cfg->blocks[b].start_idx <= loop->end_idx;
+  return b >= 0 && b < cfg->num_blocks && DLBlockSet_test(body, (size_t)b);
 }
 
-static int dl_instr_in_loop(IRLoop *loop, int idx)
+static int dl_instr_in_body(IRCFG *cfg, const DLBlockSet *body, int idx)
 {
-  return idx >= loop->start_idx && idx <= loop->end_idx;
+  if (idx < 0 || idx >= cfg->num_instrs)
+    return 0;
+  return dl_block_in_body(cfg, body, cfg->instr_to_block[idx]);
+}
+
+/* Marks the blocks that reach the latch without passing the header.  A block
+ * with no predecessor means the walk got to the entry around the header, so
+ * the header is not the body's only way in. */
+static int dl_collect_body(IRCFG *cfg, int header_block, int latch_block, DLBlockSet *body)
+{
+  int nb = cfg->num_blocks;
+  if (DLBlockSet_init(body, (size_t)nb) != 0)
+    return 0;
+  small_sequence(DLIntSeq) work_owner = {0};
+  if (DLIntSeq_init(&work_owner, (size_t)nb) != 0)
+    return 0;
+  int *work = DLIntSeq_data(&work_owner);
+  int nwork = 0;
+  DLBlockSet_set(body, (size_t)header_block);
+  if (latch_block != header_block) {
+    DLBlockSet_set(body, (size_t)latch_block);
+    work[nwork++] = latch_block;
+  }
+  while (nwork > 0) {
+    IRBasicBlock *bb = &cfg->blocks[work[--nwork]];
+    if (bb->num_preds == 0)
+      return 0;
+    for (int p = 0; p < bb->num_preds; p++) {
+      int pb = bb->preds[p];
+      if (pb < 0 || pb >= nb)
+        return 0;
+      if (!DLBlockSet_test(body, (size_t)pb)) {
+        DLBlockSet_set(body, (size_t)pb);
+        work[nwork++] = pb;
+      }
+    }
+  }
+  return 1;
 }
 
 /* Hop ASSIGN copies to the value's origin; returns vr itself when it isn't one. */
@@ -935,21 +980,22 @@ static int32_t dl_skip_copies(IRSSAOptCtx *ctx, int32_t vr)
 }
 
 /* Direct IR scan, not use-def chains: the bound only has to survive the body. */
-static int dl_vreg_untouched_in_loop(IRSSAOptCtx *ctx, IRLoop *loop, int32_t vr)
+static int dl_vreg_untouched_in_body(IRSSAOptCtx *ctx, const DLBlockSet *body, int32_t vr)
 {
   TCCIRState *ir = ctx->ir;
+  IRCFG *cfg = ctx->cfg;
   if (vr < 0)
     return 0;
-  for (int i = loop->start_idx; i <= loop->end_idx && i < ir->next_instruction_index; i++) {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+  for (int b = 0; b < cfg->num_blocks; b++) {
+    if (!dl_block_in_body(cfg, body, b))
       continue;
-    if (tcc_ir_op_dest_vreg(ir, q) == vr)
-      return 0;
-  }
-  for (int b = 0; ctx->cfg && b < ctx->cfg->num_blocks; b++) {
-    if (!dl_block_in_loop(ctx->cfg, loop, b))
-      continue;
+    for (int i = cfg->blocks[b].start_idx; i < cfg->blocks[b].end_idx; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+        continue;
+      if (tcc_ir_op_dest_vreg(ir, q) == vr)
+        return 0;
+    }
     for (IRPhiNode *p = ctx->ssa->block_phis[b]; p; p = p->next)
       if (p->dest_vreg == vr)
         return 0;
@@ -972,140 +1018,112 @@ static int dl_operand_is_int(IROperand op)
   return op.btype != IROP_BTYPE_FLOAT32 && op.btype != IROP_BTYPE_FLOAT64;
 }
 
-/* Exactly one back-edge, and no path from outside lands past the header:
- * removing the back-edge of one of two latches, or of a loop a switch jumps
- * into, changes where the other entry falls out to. */
-static int dl_single_entry_single_latch(IRSSAOptCtx *ctx, IRLoop *loop, int jpf_idx)
+/* The latch's fall-through is the only way out.  An early exit (a search
+ * loop's `found = 1; break` or `return`) taken on a later trip leaves with a
+ * per-edge constant the back-edge kill would turn into iteration 1's, or
+ * lands where only the first element was tested.  A return, a computed jump
+ * or a jump to the epilogue (target == instruction count, no block) leaves
+ * without a CFG edge. */
+static int dl_only_latch_exits(TCCIRState *ir, IRCFG *cfg, const DLBlockSet *body, int jpf_idx)
 {
-  TCCIRState *ir = ctx->ir;
-  IRCFG *cfg = ctx->cfg;
+  int latch_block = cfg->instr_to_block[jpf_idx];
+  int fallthru_block = cfg->instr_to_block[jpf_idx + 1];
+  for (int b = 0; b < cfg->num_blocks; b++) {
+    if (!dl_block_in_body(cfg, body, b))
+      continue;
+    IRBasicBlock *bb = &cfg->blocks[b];
+    for (int s = 0; s < bb->num_succs; s++) {
+      int sb = bb->succs[s];
+      if (!dl_block_in_body(cfg, body, sb) && (b != latch_block || sb != fallthru_block))
+        return 0;
+    }
+    for (int i = bb->start_idx; i < bb->end_idx; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      int op = q->op;
+      if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE || op == TCCIR_OP_SWITCH_LOAD ||
+          op == TCCIR_OP_RETURNVALUE || op == TCCIR_OP_RETURNVOID)
+        return 0;
+      if ((op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF) && i != jpf_idx &&
+          !dl_instr_in_body(cfg, body, (int)tcc_ir_op_dest_imm(ir, q)))
+        return 0;
+    }
+  }
+  return 1;
+}
 
+static int dl_body_has_side_effects(TCCIRState *ir, IRCFG *cfg, const DLBlockSet *body)
+{
+  for (int b = 0; b < cfg->num_blocks; b++) {
+    if (!dl_block_in_body(cfg, body, b))
+      continue;
+    for (int i = cfg->blocks[b].start_idx; i < cfg->blocks[b].end_idx; i++)
+      if (dl_instr_has_side_effects(ir->compact_instructions[i].op))
+        return 1;
+  }
+  return 0;
+}
+
+/* Exactly one back-edge: removing the back-edge of one of two latches changes
+ * where the other one falls out to.  dl_collect_body already keeps a jump
+ * from outside off every block but the header; a computed jump's targets are
+ * not in its dest operand, so one outside the body could land anywhere. */
+static int dl_single_latch(TCCIRState *ir, IRCFG *cfg, const DLBlockSet *body, int header_idx, int jpf_idx)
+{
   int back_edges = 0;
   for (int i = 0; i < ir->next_instruction_index; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE) {
-      /* Targets are not in the dest operand, so they cannot be checked. */
-      if (!dl_instr_in_loop(loop, i))
+      if (!dl_instr_in_body(cfg, body, i))
         return 0;
       continue;
     }
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
-    int target = (int)tcc_ir_op_dest_imm(ir, q);
-    if (target == loop->header_idx) {
-      if (i >= loop->header_idx) {
-        back_edges++;
-        if (i != jpf_idx)
-          return 0;
-      }
+    if ((int)tcc_ir_op_dest_imm(ir, q) != header_idx)
       continue;
-    }
-    /* A jump from outside into the body proper re-enters past the header. */
-    if (target > loop->start_idx && target <= loop->end_idx && !dl_instr_in_loop(loop, i))
-      return 0;
-  }
-  if (back_edges != 1)
-    return 0;
-
-  /* The latch's fall-through is the only way out.  An early exit (a search
-   * loop's `found = 1; break` or `return`) taken on a later trip leaves with
-   * a per-edge constant the back-edge kill would turn into iteration 1's. */
-  int latch_block = cfg->instr_to_block[jpf_idx];
-  int fallthru_block = cfg->instr_to_block[jpf_idx + 1];
-  for (int b = 0; b < cfg->num_blocks; b++) {
-    if (!dl_block_in_loop(cfg, loop, b))
-      continue;
-    IRBasicBlock *bb = &cfg->blocks[b];
-    for (int s = 0; s < bb->num_succs; s++) {
-      int sb = bb->succs[s];
-      if (dl_block_in_loop(cfg, loop, sb))
-        continue;
-      if (b != latch_block || sb != fallthru_block)
-        return 0;
-    }
-    /* A jump to the epilogue (target == instruction count) has no CFG edge. */
-    for (int i = bb->start_idx; i < bb->end_idx; i++) {
-      IRQuadCompact *q = &ir->compact_instructions[i];
-      if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
-        return 0;
-      if ((q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) && i != jpf_idx &&
-          !dl_instr_in_loop(loop, (int)tcc_ir_op_dest_imm(ir, q)))
+    if (i >= header_idx || dl_instr_in_body(cfg, body, i)) {
+      back_edges++;
+      if (i != jpf_idx)
         return 0;
     }
   }
-
-  int header_block = cfg->instr_to_block[loop->header_idx];
-  for (int b = 0; b < cfg->num_blocks; b++) {
-    if (b == header_block || !dl_block_in_loop(cfg, loop, b))
-      continue;
-    for (int p = 0; p < cfg->blocks[b].num_preds; p++)
-      if (!dl_block_in_loop(cfg, loop, cfg->blocks[b].preds[p]))
-        return 0;
-  }
-  return 1;
+  return back_edges == 1;
 }
 
 /* Values the body defines that are not compile-time constants.  Collected by
  * direct scan rather than off the use lists, which under-report once a pass
  * has NOP'd an instruction without unlinking its uses — here that would read
  * as "nothing escapes" and delete a loop whose result is still wanted. */
-/* Every way out of the body lands on the latch's fall-through.  An exit
- * anywhere else (`if (a[i] == x) goto found;`) fires on whichever trip its
- * condition first holds, so dropping the back-edge would make it depend on
- * the first element alone even when nothing the body computes is read
- * outside. */
-static int dl_exits_only_to_fallthru(IRSSAOptCtx *ctx, IRLoop *loop, int fallthru_block)
-{
-  TCCIRState *ir = ctx->ir;
-  IRCFG *cfg = ctx->cfg;
-
-  for (int i = loop->start_idx; i <= loop->end_idx && i < ir->next_instruction_index; i++) {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_RETURNVOID ||
-        q->op == TCCIR_OP_RETURNVALUE)
-      return 0;
-    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
-      continue;
-    int target = (int)tcc_ir_op_dest_imm(ir, q);
-    if (dl_instr_in_loop(loop, target))
-      continue;
-    if (target < 0 || target >= cfg->num_instrs || cfg->instr_to_block[target] != fallthru_block)
-      return 0;
-  }
-  return 1;
-}
-
-static int dl_collect_varying_defs(IRSSAOptCtx *ctx, IRLoop *loop,
+static int dl_collect_varying_defs(IRSSAOptCtx *ctx, const DLBlockSet *body,
                                    int32_t *cands, int *num_cands)
 {
   TCCIRState *ir = ctx->ir;
   IRCFG *cfg = ctx->cfg;
 
-  for (int idx = loop->start_idx; idx <= loop->end_idx; idx++) {
-    IRQuadCompact *q = &ir->compact_instructions[idx];
-    if (q->op == TCCIR_OP_NOP || q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
-      continue;
-    if (!irop_config[q->op].has_dest)
-      continue;
-    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
-    if (vr < 0)
-      continue;
-    /* Non-TEMP defs inside a loop body imply observable state. */
-    if (tcc_ir_op_dest_is_lval(ir, q) || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
-      return 0;
-
-    int64_t cv;
-    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
-    if (vi && ssa_opt_def_total(vi) == 1 && resolve_const_through_copies(ctx, vr, &cv))
-      continue;
-    if (*num_cands >= DL_MAX_ESCAPE_CANDS)
-      return 0;
-    cands[(*num_cands)++] = vr;
-  }
-
   for (int b = 0; b < cfg->num_blocks; b++) {
-    if (!dl_block_in_loop(cfg, loop, b))
+    if (!dl_block_in_body(cfg, body, b))
       continue;
+    for (int idx = cfg->blocks[b].start_idx; idx < cfg->blocks[b].end_idx; idx++) {
+      IRQuadCompact *q = &ir->compact_instructions[idx];
+      if (q->op == TCCIR_OP_NOP || q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+        continue;
+      if (!irop_config[q->op].has_dest)
+        continue;
+      int32_t vr = tcc_ir_op_dest_vreg(ir, q);
+      if (vr < 0)
+        continue;
+      /* Non-TEMP defs inside a loop body imply observable state. */
+      if (tcc_ir_op_dest_is_lval(ir, q) || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+        return 0;
+
+      int64_t cv;
+      IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
+      if (vi && ssa_opt_def_total(vi) == 1 && resolve_const_through_copies(ctx, vr, &cv))
+        continue;
+      if (*num_cands >= DL_MAX_ESCAPE_CANDS)
+        return 0;
+      cands[(*num_cands)++] = vr;
+    }
     for (IRPhiNode *p = ctx->ssa->block_phis[b]; p; p = p->next) {
       if (*num_cands >= DL_MAX_ESCAPE_CANDS)
         return 0;
@@ -1125,14 +1143,14 @@ static int dl_in_cands(const int32_t *cands, int num_cands, int32_t vr)
   return 0;
 }
 
-static int dl_any_cand_read_outside(IRSSAOptCtx *ctx, IRLoop *loop,
+static int dl_any_cand_read_outside(IRSSAOptCtx *ctx, const DLBlockSet *body,
                                     const int32_t *cands, int num_cands)
 {
   TCCIRState *ir = ctx->ir;
   IRCFG *cfg = ctx->cfg;
 
   for (int i = 0; i < ir->next_instruction_index; i++) {
-    if (dl_instr_in_loop(loop, i))
+    if (dl_instr_in_body(cfg, body, i))
       continue;
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
@@ -1152,7 +1170,7 @@ static int dl_any_cand_read_outside(IRSSAOptCtx *ctx, IRLoop *loop,
   }
 
   for (int b = 0; b < cfg->num_blocks; b++) {
-    if (dl_block_in_loop(cfg, loop, b))
+    if (dl_block_in_body(cfg, body, b))
       continue;
     for (IRPhiNode *p = ctx->ssa->block_phis[b]; p; p = p->next)
       for (int o = 0; o < p->num_operands; o++)
@@ -1162,53 +1180,16 @@ static int dl_any_cand_read_outside(IRSSAOptCtx *ctx, IRLoop *loop,
   return 0;
 }
 
-/* Every way out of the body is the latch's fall-through.  A pure body can
- * still decide WHERE control goes: a search loop's `return` / `goto` on a hit
- * leaves by its own edge, and killing the back-edge would only ever test the
- * first element.  A break to the fall-through block itself is harmless. */
-static int dl_rotated_exits_only_to_fallthru(TCCIRState *ir, IRCFG *cfg, IRLoop *loop, int fallthru_block)
-{
-  for (int b = 0; b < cfg->num_blocks; b++) {
-    if (!dl_block_in_loop(cfg, loop, b))
-      continue;
-    IRBasicBlock *bb = &cfg->blocks[b];
-    for (int s = 0; s < bb->num_succs; s++)
-      if (!dl_block_in_loop(cfg, loop, bb->succs[s]) && bb->succs[s] != fallthru_block)
-        return 0;
-    /* No CFG successor is not no exit: a return, a computed jump or a jump to
-     * the epilogue (target == instruction count, no block) leaves too. */
-    for (int i = bb->start_idx; i < bb->end_idx; i++) {
-      IRQuadCompact *q = &ir->compact_instructions[i];
-      int op = q->op;
-      if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF) {
-        int t = (int)tcc_ir_op_dest_imm(ir, q);
-        if (!dl_instr_in_loop(loop, t) &&
-            (t < 0 || t >= cfg->num_instrs || cfg->instr_to_block[t] != fallthru_block))
-          return 0;
-      }
-      if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE || op == TCCIR_OP_SWITCH_LOAD ||
-          op == TCCIR_OP_RETURNVALUE || op == TCCIR_OP_RETURNVOID)
-        return 0;
-    }
-  }
-  return 1;
-}
-
 static int try_kill_rotated_loop(IRSSAOptCtx *ctx, IRLoop *loop)
 {
   TCCIRState *ir = ctx->ir;
   IRSSAState *ssa = ctx->ssa;
   IRCFG *cfg = ctx->cfg;
 
-  /* Body must end at the back-edge; a forward-jumped tail past it would become
-   * the fall-through target once the JUMPIF goes away. */
-  if (loop_max_idx(loop) != loop->end_idx)
-    return 0;
-
   int jpf_idx = loop->end_idx;
   if (jpf_idx + 1 >= ir->next_instruction_index)
     return 0;
-  if (jpf_idx >= cfg->num_instrs || loop->header_idx >= cfg->num_instrs)
+  if (jpf_idx + 1 >= cfg->num_instrs || loop->header_idx >= cfg->num_instrs)
     return 0;
   if (!ssa->block_phis)
     return 0;
@@ -1219,23 +1200,31 @@ static int try_kill_rotated_loop(IRSSAOptCtx *ctx, IRLoop *loop)
   if ((int)tcc_ir_op_dest_imm(ir, jpf) != loop->header_idx)
     return 0;
 
-  int cmp_idx = jpf_idx - 1;
-  while (cmp_idx >= loop->start_idx && ir->compact_instructions[cmp_idx].op == TCCIR_OP_NOP)
-    cmp_idx--;
-  if (cmp_idx < loop->start_idx)
-    return 0;
-  IRQuadCompact *cmp = &ir->compact_instructions[cmp_idx];
-  if (cmp->op != TCCIR_OP_CMP)
-    return 0;
-
   int header_block = cfg->instr_to_block[loop->header_idx];
   int latch_block = cfg->instr_to_block[jpf_idx];
   int fallthru_block = cfg->instr_to_block[jpf_idx + 1];
   if (header_block < 0 || latch_block < 0 || fallthru_block < 0)
     return 0;
-  if (fallthru_block == header_block || dl_block_in_loop(cfg, loop, fallthru_block))
+  if (cfg->blocks[header_block].start_idx != loop->header_idx)
     return 0;
-  if (!dl_rotated_exits_only_to_fallthru(ir, cfg, loop, fallthru_block))
+
+  int cmp_idx = jpf_idx - 1;
+  while (cmp_idx >= cfg->blocks[latch_block].start_idx && ir->compact_instructions[cmp_idx].op == TCCIR_OP_NOP)
+    cmp_idx--;
+  if (cmp_idx < cfg->blocks[latch_block].start_idx)
+    return 0;
+  IRQuadCompact *cmp = &ir->compact_instructions[cmp_idx];
+  if (cmp->op != TCCIR_OP_CMP)
+    return 0;
+
+  dynamic_bitset(DLBlockSet) body = {0};
+  if (!dl_collect_body(cfg, header_block, latch_block, &body))
+    return 0;
+  if (dl_block_in_body(cfg, &body, fallthru_block))
+    return 0;
+  if (!dl_only_latch_exits(ir, cfg, &body, jpf_idx))
+    return 0;
+  if (dl_body_has_side_effects(ir, cfg, &body))
     return 0;
 
   /* --- the compare drives a monotone induction variable ------------------ */
@@ -1249,7 +1238,7 @@ static int try_kill_rotated_loop(IRSSAOptCtx *ctx, IRLoop *loop)
   int32_t next_vr = irop_get_vreg(c1);
   if (next_vr < 0)
     return 0;
-  if (!irop_is_immediate(c2) && !dl_vreg_untouched_in_loop(ctx, loop, irop_get_vreg(c2)))
+  if (!irop_is_immediate(c2) && !dl_vreg_untouched_in_body(ctx, &body, irop_get_vreg(c2)))
     return 0;
 
   int32_t next_base = dl_skip_copies(ctx, next_vr);
@@ -1269,7 +1258,7 @@ static int try_kill_rotated_loop(IRSSAOptCtx *ctx, IRLoop *loop)
     IRSSAVregInfo *bvi = ssa_opt_vinfo(ctx, next_base);
     if (!bvi || bvi->def_instr < 0 || ssa_opt_def_total(bvi) != 1)
       continue;
-    if (!dl_instr_in_loop(loop, bvi->def_instr))
+    if (!dl_instr_in_body(cfg, &body, bvi->def_instr))
       continue;
     IRQuadCompact *dq = &ir->compact_instructions[bvi->def_instr];
     if (dq->op != TCCIR_OP_ADD && dq->op != TCCIR_OP_SUB)
@@ -1299,17 +1288,15 @@ static int try_kill_rotated_loop(IRSSAOptCtx *ctx, IRLoop *loop)
 
   /* Whole-IR scans last: by here the loop is known to be a pure counting one,
    * which is a handful of loops per translation unit rather than every one. */
-  if (!dl_single_entry_single_latch(ctx, loop, jpf_idx))
-    return 0;
-  if (!dl_exits_only_to_fallthru(ctx, loop, fallthru_block))
+  if (!dl_single_latch(ir, cfg, &body, loop->header_idx, jpf_idx))
     return 0;
 
   /* --- nothing the body computes may differ between iteration 1 and N ---- */
   int32_t cands[DL_MAX_ESCAPE_CANDS];
   int num_cands = 0;
-  if (!dl_collect_varying_defs(ctx, loop, cands, &num_cands))
+  if (!dl_collect_varying_defs(ctx, &body, cands, &num_cands))
     return 0;
-  if (dl_any_cand_read_outside(ctx, loop, cands, num_cands))
+  if (dl_any_cand_read_outside(ctx, &body, cands, num_cands))
     return 0;
 
   /* Back-edge dies, fall-through survives — the same rewrite as folding the

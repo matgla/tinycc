@@ -195,6 +195,20 @@ def test_r9_spill_around_calls():
 # -----------------------------------------------------------------------------
 # Forward conditional branch narrowing
 # -----------------------------------------------------------------------------
+def test_pad_keeps_loop_latch_narrow():
+    """A word-alignment pad right after a loop's conditional back-edge runs once,
+    on loop exit; the pad must not widen that branch instead, which costs a
+    cycle every taken trip (bench_bubble_sort +7.6% on the board)."""
+    out = subprocess.run([OBJDUMP, "-d", "--no-show-raw-insn", str(_compile("latch_branch_narrow"))],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace").stdout
+    wide_back = []
+    for line in out.splitlines():
+        m = re.match(r"^\s*([0-9a-f]+):\s+(b(?:eq|ne|cs|cc|hs|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le))\.w\s+([0-9a-f]+)\b", line)
+        if m and int(m.group(3), 16) < int(m.group(1), 16):
+            wide_back.append(line.strip())
+    assert not wide_back, f"loop back-edges widened: {wide_back}"
+
+
 def test_forward_branch_conditional_narrows():
     obj = _compile("forward_branch_narrow")
     funcs = _disassemble(obj)
@@ -235,6 +249,34 @@ def test_cbz_fusion_fires():
 # -----------------------------------------------------------------------------
 # Struct by-value 9-byte packed operand
 # -----------------------------------------------------------------------------
+def _funcs_with_env(case, env_extra):
+    """{function: [(mnemonic, operands)]} for asm/<case>.c at -O2 with extra environment."""
+    import os
+
+    tag = hashlib.sha1(f"{case}|{sorted(env_extra.items())}".encode()).hexdigest()[:8]
+    obj = BUILD_DIR / f"{case}.env.{tag}.o"
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    cmd = [str(TCC), *INCLUDE_FLAGS, "-O2", "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb",
+           "-mfloat-abi=soft", "-ffunction-sections", "-c", str(ASM_DIR / f"{case}.c"), "-o", str(obj)]
+    env = dict(os.environ)
+    env.pop("TCC_DISABLE_PASS", None)
+    env.update(env_extra)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", env=env)
+    assert result.returncode == 0, f"compile failed: {cmd}\n{result.stderr}"
+    return _disassemble(obj)
+
+
+def test_loop_header_dup_profitability():
+    """ssa:loop_header_dup leaves alone the loops whose bottom test the board
+    measured slower -- a call in the body, a straight-line body, a second exit
+    -- and still rewrites a body that branches onto the back-edge."""
+    on = _funcs_with_env("header_dup_policy", {})
+    off = _funcs_with_env("header_dup_policy", {"TCC_DISABLE_PASS": "ssa:loop_header_dup"})
+    for name in ("dispatch", "expand", "search"):
+        assert on[name] == off[name], f"{name} was rewritten: {on[name]}"
+    assert on["relax"] != off["relax"], "relax lost its bottom test"
+
+
 def test_struct_packed_9byte_by_value():
     obj = _compile("struct_packed_9byte")
     funcs = _disassemble(obj)
@@ -280,6 +322,17 @@ def test_wide_string_literals_merged():
 # -----------------------------------------------------------------------------
 # Arithmetic: immediate and register operand shapes
 # -----------------------------------------------------------------------------
+def test_mla_imm_multiplier_is_shift_add():
+    """`x * m + c` with m = 2^k +/- 1 or 2^k and c an immediate: no MLA and no
+    constant moved into a register (bench_linked_list's init loop loaded #3
+    and #7 for an MLA on every trip)."""
+    funcs = _disassemble(_compile("mla_imm_shift_add"))
+    for name in ("a3", "a7", "a8", "fill"):
+        fn = funcs[name]
+        assert _count_mnem_regex(fn, r"^(mla|mul)") == 0, f"{name} still multiplies: {fn}"
+    assert len(funcs["a3"]) <= 3, f"a3 should be a shift-add, an add and bx lr: {funcs['a3']}"
+
+
 def test_arith_imm_reg_shapes():
     obj = _compile("arith_imm_reg")
     funcs = _disassemble(obj)
@@ -382,12 +435,12 @@ def test_control_branch_conditional_and_loop():
     funcs = _disassemble(obj)
 
     count = funcs["count"]
-    # `while (i < n) i++` is bottom-tested (ssa:loop_header_dup): a forward
-    # zero-trip guard and a narrow conditional back-edge, no unconditional `b`.
-    assert _count_mnem(count, "cmp") >= 1, "count missing comparison"
-    assert _count_mnem_regex(count, r"^ble\.[wn]") >= 1, "count missing forward zero-trip guard"
-    assert _count_mnem(count, "blt.n") >= 1, "count missing narrow conditional back-edge"
-    assert _count_mnem(count, "b.n") == 0, "count kept an unconditional back-edge"
+    # `while (i < n) i++` keeps its top test: bottom-tested, the M33 ran such
+    # a counting loop at 5 cycles a trip against 4 (bench_conditionals at -O1),
+    # so ssa:loop_header_dup leaves a prefix-free straight-line body alone.
+    assert _count_mnem(count, "cmp") == 1, "count should test once, at the top"
+    assert _count_mnem_regex(count, r"^bge\.[wn]") == 1, "count missing its top exit test"
+    assert _count_mnem(count, "b.n") == 1, "count missing its back-edge"
 
     ifte = funcs["if_then_else"]
     # Chained if/else should use conditional execution or branches, not UDF.
@@ -416,6 +469,50 @@ def test_size_flags_alias_o2():
     assert os_ != o0, "-Os is still a silent -O0"
 
 
+def _backward_targets(name, flags, funcs):
+    """Addresses (section offsets: one function per section) of the targets of
+    backward branches in `funcs` of asm/<name>.c."""
+    out = subprocess.run([OBJDUMP, "-d", "--no-show-raw-insn", str(_compile(name, extra_cflags=flags))],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace").stdout
+    targets, cur = [], None
+    for line in out.splitlines():
+        h = re.match(r"^[0-9a-f]+ <([^>]+)>:$", line)
+        if h:
+            cur = h.group(1)
+            continue
+        m = re.match(r"^\s*([0-9a-f]+):\s+(\S+)\s+([0-9a-f]+)\s+<", line)
+        if cur in funcs and m and int(m.group(3), 16) < int(m.group(1), 16) and \
+                re.match(r"^b(eq|ne|cs|cc|hs|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le|al)?(\.[nw])?$", m.group(2)):
+            targets.append(int(m.group(3), 16))
+    return targets
+
+
+def test_join_pad_widens_ahead_not_nop():
+    """An in-loop `if` join that -O2 word-aligns must not cost a NOP on the path
+    falling into it.  bench_bubble_sort's swap block ends in `str.w`, which the
+    pad cannot widen, so a NOP ran on every swap (+15% cycles on the board);
+    the block's first 16-bit instruction is now emitted wide instead."""
+    out = subprocess.run([OBJDUMP, "-d", "--no-show-raw-insn", str(_compile("join_pad_widen"))],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace").stdout
+    insns = []
+    for line in out.splitlines():
+        m = re.match(r"^\s*([0-9a-f]+):\s+(\S+)(?:\s+(.*))?$", line)
+        if m:
+            insns.append((int(m.group(1), 16), m.group(2), m.group(3) or ""))
+    loops = []
+    for addr, mnem, ops in insns:
+        t = re.match(r"([0-9a-f]+)\b", ops)
+        if re.match(r"^b(eq|ne|cs|cc|hs|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le|al)?(\.[nw])?$", mnem) and t and \
+                int(t.group(1), 16) < addr:
+            loops.append((int(t.group(1), 16), addr))
+    assert loops, "bubble lost its loops"
+    # Innermost loops: a NOP after an inner loop's back-edge sits in the outer
+    # loop and runs once per inner loop exit, which is where it belongs.
+    inner = [(lo, hi) for lo, hi in loops if not any((l2, h2) != (lo, hi) and lo <= l2 and h2 <= hi for l2, h2 in loops)]
+    nops = [hex(a) for a, m, _ in insns if m == "nop" and any(lo <= a <= hi for lo, hi in inner)]
+    assert not nops, f"NOP executed inside an innermost loop at {nops}: {insns}"
+
+
 def test_size_tier():
     """-Os: where a choice trades code size for speed, the smaller code.
 
@@ -428,9 +525,15 @@ def test_size_tier():
     o2 = _disassemble(_compile("size_tier", extra_cflags=["-O2"]))
     os_ = _disassemble(_compile("size_tier", extra_cflags=["-Os"]))
 
-    pads_o2 = sum(_count_mnem_regex(fn, r"^nop") for fn in o2.values())
+    # -O2 aligns every IR loop head, with a NOP or by widening an instruction
+    # before it; -Os leaves some at 2 mod 4 (else the case aligns by luck).
+    # copy_big's copy loop is the backend's own, which nothing aligns.
+    loops = ("sum_pos", "count_eq", "mix", "mix_label_addr")
+    heads_o2 = _backward_targets("size_tier", ["-O2"], loops)
+    heads_os = _backward_targets("size_tier", ["-Os"], loops)
+    assert heads_o2 and all(t % 4 == 0 for t in heads_o2), f"-O2 left a loop head unaligned: {heads_o2}"
+    assert any(t % 4 for t in heads_os), "no -Os loop head lands at 2 mod 4 (case no longer exercises alignment)"
     pads_os = sum(_count_mnem_regex(fn, r"^nop") for fn in os_.values())
-    assert pads_o2 > 0, "the -O2 build should pad some loop head (case no longer exercises alignment)"
     assert pads_os == 0, f"-Os padded {pads_os} branch targets"
 
     assert _count_mnem_regex(o2["copy_big"], r"^ldmia") > 0, "-O2 should copy 160 bytes inline"
@@ -588,6 +691,15 @@ def test_switch_const_selector_folds():
     )
 
 
+def test_loop_rotate_keeps_iv_init_visible():
+    """ssa:loop_rotate must not leave the guard CMP marked as a jump target once
+    the back-edge has left it: the IV analysis reads the mark as a join and
+    loses `i = 0`, so `sum += i * 7 + 13` multiplied every trip
+    (bench_integer_math, +22% cycles) instead of stepping by 7."""
+    fn = _disassemble(_compile("rotate_iv_init"))["sum_iv"]
+    assert _count_mnem_regex(fn, r"^(mul|mla)") == 0, f"sum_iv still multiplies the IV: {fn}"
+
+
 def test_dead_loop_rotated_kills_back_edge():
     """ssa:dead_loop, rotated arm: a pure counting loop whose exit value is a
     constant must lose its back-edge entirely, leaving only the entry guard.
@@ -612,6 +724,12 @@ def test_dead_loop_rotated_kills_back_edge():
         f"{_count_mnem_regex(kept, branch)} branches"
     )
 
+    # The body's folded else-if arm sits past the latch; the guard may be an ITE.
+    arm = funcs["outlined_arm"]
+    assert _count_mnem(arm, "cmp") <= 1 and _count_mnem_regex(arm, branch) <= 1, (
+        f"outlined_arm still has a back-edge: {arm}"
+    )
+
     for name, why in (
         ("mangle", "exit value depends on the trip count"),
         ("counter_escapes", "the counter is read after the loop"),
@@ -622,6 +740,20 @@ def test_dead_loop_rotated_kills_back_edge():
         assert _count_mnem_regex(fn, branch) >= 2, (
             f"{name} lost its back-edge but {why}"
         )
+
+
+def test_rotate_fusion_var_source():
+    """gens rotate fusion: `(v << 3) | (v >> 29)` on a local that lives in its
+    stack slot is still one ror (bench_bitwise_mix lost it to a blanket lvalue
+    ban), and a v written between the shifts and the OR is not fused."""
+    funcs = _disassemble(_compile("rotate_var_source"))
+
+    mix = funcs["mix_loop"]
+    assert any("ror" in ops for _, ops in mix), f"mix_loop lost its ror: {mix}"
+    assert _count_mnem_regex(mix, r"^orr") == 0, f"mix_loop still ORs the two shifts: {mix}"
+
+    redef = funcs["redef"]
+    assert not any("ror" in ops for _, ops in redef), f"redef rotated the redefined v: {redef}"
 
 
 def test_cmp_common_base_offset_fold_fires():
@@ -1583,17 +1715,19 @@ def _backward_unconditional_branches(obj):
     return back
 
 
-HEADER_DUP_FUNCS = ["hd_move_bwd", "hd_find", "hd_fill", "hd_outer"]
+HEADER_DUP_FUNCS = ["hd_move_bwd", "hd_fill", "hd_outer"]
 
 
 @pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
 def test_loop_header_dup_no_unconditional_back_edge(opt):
     """Loops whose exit test follows header instructions (`n--`, a bound read
-    from memory), carry a call, or hold an inner loop are bottom-tested: no
-    unconditional branch jumps backwards."""
+    from memory) or that hold an inner loop are bottom-tested: no unconditional
+    branch jumps backwards.  A loop that calls keeps its top test (the board
+    measured the bottom test slower; test_loop_header_dup_profitability)."""
     back = _backward_unconditional_branches(_compile("loop_header_dup", extra_cflags=[opt]))
     failures = [f"{name}: {back.get(name)}" for name in HEADER_DUP_FUNCS if back.get(name) is None or back.get(name)]
     assert not failures, f"unconditional back-edges remain at {opt}:\n  " + "\n  ".join(failures)
+    assert back.get("hd_find"), f"hd_find was bottom-tested at {opt}"
 
 
 @pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
@@ -1675,6 +1809,54 @@ def _loop_carrier_reloads(obj, name):
         bad += [(hex(a), m, op) for a, m, op in body
                 if m.startswith("ldr") and any(o not in stored for o in slots(m, op))]
     return bad
+
+
+def _loop_bodies(obj, name):
+    """The instructions of every backward-branch span in `name`: [target, branch]."""
+    out = subprocess.run([OBJDUMP, "-d", "--no-show-raw-insn", str(obj)], stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, errors="replace").stdout
+    insns, cur = [], None
+    for line in out.splitlines():
+        h = re.match(r"^\s*[0-9a-f]+\s+<([^>]+)>:$", line)
+        if h:
+            cur = h.group(1)
+            continue
+        m = re.match(r"^\s*([0-9a-f]+):\s+(\S+)(?:\s+(.*))?$", line)
+        if m and cur == name:
+            insns.append((int(m.group(1), 16), m.group(2), m.group(3) or ""))
+    assert insns, f"{name} not found in {obj}"
+    bodies = []
+    for addr, mnem, ops in insns:
+        t = re.match(r"([0-9a-f]+)\b", ops)
+        is_branch = re.match(r"^b(eq|ne|cs|cc|hs|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le|al)?(\.[nw])?$", mnem)
+        if is_branch and t and int(t.group(1), 16) < addr:
+            bodies.append([(m, o) for a, m, o in insns if int(t.group(1), 16) <= a <= addr])
+    return bodies
+
+
+def test_o1_hoists_loop_invariants():
+    """-O1 runs LICM, as gcc -O1 does: loop rotation runs at -O1 too, and a
+    rotated loop without it kept `mov r1, #1234`-style constants and a constant
+    table's literal-pool address load inside the loop (bench_conditionals +25%,
+    bench_indirect_calls +15% cycles at -O1 on the board)."""
+    # A plain -O1: `_compile`'s -O2 would leave the -O2 tier's flags set.
+    obj = BUILD_DIR / "o1_licm.O1.o"
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    cmd = [str(TCC), *INCLUDE_FLAGS, "-O1", "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb",
+           "-mfloat-abi=soft", "-ffunction-sections", "-c", str(ASM_DIR / "o1_licm.c"), "-o", str(obj)]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+    assert result.returncode == 0, f"compile failed: {cmd}\n{result.stderr}"
+    for name in ("const_body", "table_dispatch"):
+        bodies = _loop_bodies(obj, name)
+        assert bodies, f"{name}: no loop left"
+        for body in bodies:
+            # A top-tested loop may run zero times, so a constant it assigns to
+            # a value read after the loop (const_body's `r`) stays in it; only a
+            # bottom-tested one has the zero-trip guard to hoist past.
+            top_tested = body[-1][0] in ("b", "b.n", "b.w")
+            bad = [(m, o) for m, o in body
+                   if (m.startswith("mov") and "#" in o and not top_tested) or (m.startswith("ldr") and "[pc" in o)]
+            assert not bad, f"{name} keeps an invariant in its loop: {bad} in {body}"
 
 
 def test_ra_loop_split_rescan_carriers():

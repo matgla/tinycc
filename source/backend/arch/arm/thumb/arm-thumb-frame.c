@@ -249,6 +249,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   thumb_gen_state.generating_function = 1;
   thumb_gen_state.code_size = 0;
   th_last_insn.end = -1; /* no instruction of this function to widen yet */
+  th_dry_last_insn.end = -1;
   th_widened_reset();
   th_func_code_start = ind;
   /* Clear global symbol cache at function start */

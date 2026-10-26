@@ -1036,6 +1036,7 @@ int align_pad_max;
 
 /* The last instruction ot() wrote in the real pass, for th_widen_last_insn. */
 ThumbLastInsn th_last_insn = {-1, -1, 0, 0, 0};
+ThumbLastInsn th_dry_last_insn = {-1, -1, 0, 0, 0};
 /* Where the current function's code (its prolog) starts. */
 int th_func_code_start = -1;
 
@@ -1252,8 +1253,9 @@ static int th_branch_in_range_targets(int from, int end, int target)
   return 0;
 }
 
-/* Positions of the instructions th_widen_last_insn widened in the current
- * function (ascending), so a late backpatch landing inside one ICEs instead
+/* Positions of the instructions widened in place of an alignment pad
+ * (th_widen_last_insn, th_widen_armed_apply) in the current function
+ * (ascending), so a late backpatch landing inside one ICEs instead
  * of miscompiling. */
 static int *th_widened_pos;
 static int th_widened_count, th_widened_cap;
@@ -1361,6 +1363,64 @@ ST_FUNC void tcc_gen_machine_align_branch_target(int align, int widen_from)
       continue;
     o(0xbf00);
   }
+}
+
+/* An estimate: the real widening checks more (no relocation, no raw IT, no
+ * branch landing there). */
+ST_FUNC int tcc_gen_machine_pad_could_widen(void)
+{
+  const ThumbLastInsn *last = dry_run_state.active ? &th_dry_last_insn : &th_last_insn;
+  return last->end == ind && last->size == 2 && !last->conditional;
+}
+
+int th_widen_armed;
+static int th_widen_done;
+
+ST_FUNC void tcc_gen_machine_widen_next_op(void)
+{
+  th_widen_armed = 1;
+  th_widen_done = 0;
+}
+
+ST_FUNC int tcc_gen_machine_widen_next_op_done(void)
+{
+  th_widen_armed = 0;
+  return th_widen_done;
+}
+
+/* The first instruction of an armed op, before ot() emits it: its 32-bit form
+ * when th_t16_to_t32 has one and nothing makes it unsafe -- inside an IT block
+ * the 16-bit forms set no flags, and a branch placeholder is patched later as
+ * 16 bits.  Only an op's first instruction: an op's own skips over the code it
+ * emits after that are measured from where that code really lands. */
+void th_widen_armed_apply(thumb_opcode *op)
+{
+  th_widen_armed = 0;
+  if (dry_run_state.active || nocode_wanted || !thumb_gen_state.generating_function || !cur_text_section ||
+      op->size != 2)
+    return;
+  if (tcc_gen_machine_outline_suppressing())
+    return;
+  if (mov_equiv_it_pending != 0 || pool_flush_it_pending != 0 || mov_equiv_it_block_length(*op) > 0)
+    return;
+  const uint16_t hw = (uint16_t)op->opcode;
+  if ((hw >> 12) == 0xd || (hw >> 11) == 0x1c)
+    return;
+  /* An IT written with raw o() is invisible to ot()'s tracking, as in
+   * th_widen_last_insn. */
+  for (int back = ind - 2; back >= ind - 16 && back >= 0; back -= 2)
+  {
+    const uint16_t prev = *(uint16_t *)(cur_text_section->data + back);
+    if ((prev & 0xff00) == 0xbf00 && (prev & 0xf))
+      return;
+  }
+  uint16_t w1, w2;
+  if (!th_t16_to_t32(hw, &w1, &w2))
+    return;
+  th_widened_record(ind);
+  op->opcode = ((uint32_t)w1 << 16) | w2;
+  op->size = 4;
+  th_widen_done = 1;
 }
 int dry_run_literal_pool_size = 0;
 TCCChainedHash literal_pool_hash;
@@ -1664,6 +1724,7 @@ ST_FUNC void tcc_gen_machine_mov_equiv_reset(void)
 ST_FUNC void tcc_gen_machine_dry_run_init(void)
 {
   dry_run_init();
+  th_dry_last_insn = th_last_insn; /* the prolog, emitted once before the passes */
 }
 
 ST_FUNC void tcc_gen_machine_dry_run_start(void)
