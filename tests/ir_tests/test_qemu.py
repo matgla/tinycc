@@ -120,6 +120,7 @@ TEST_FILES = [
     ("909_const_local_table_symref_indexed.c", 0),
     ("bug_const_local_table_direct_frame_reads.c", 0),
     ("bug_const_local_table_var_dest.c", 0),
+    ("bug_const_local_table_join_store.c", 0),
     ("bug_guarded_field_reuse.c", 0),
     ("897_shifted_address_shared_use.c", 0),
     ("896_licm_promoted.c", 0),
