@@ -851,7 +851,7 @@ static int lhd_try_backedge(TCCIRState *ir, int be)
         continue;
       body_branches++;
       const int t = (int)tcc_ir_op_dest_imm(ir, q);
-      if ((t < hi || t > be) && lbt_skip_nops(ir, t) != exit_land)
+      if (t < 0 || ((t < hi || t > be) && lbt_skip_nops(ir, t) != exit_land))
         second_exit = 1;
     }
     if (ncost == 0 && (!body_branches || second_exit))
