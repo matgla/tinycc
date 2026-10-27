@@ -666,6 +666,39 @@ static int ra_split_lt_point(TCCIRState *ir, int start, int term, int *land)
   return at;
 }
 
+/* member[] = the natural loop of header h: h and every block that reaches one
+ * of its back edges without passing h.  All back edges, not one: a loop with
+ * several latches (`continue`) holds the blocks of each, and a split that saw
+ * only one latch's blocks would miss a def on another latch's path.  Returns
+ * the block count. */
+static int ra_loop_members(IRCFG *cfg, int h, uint8_t *member, int *walk)
+{
+  const int nb = cfg->num_blocks;
+  int sp = 0, cnt = 1;
+  memset(member, 0, (size_t)nb);
+  member[h] = 1;
+  for (int pi = 0; pi < cfg->blocks[h].num_preds; pi++) {
+    int p = cfg->blocks[h].preds[pi];
+    if (p >= 0 && p < nb && !member[p] && tcc_ir_cfg_dominates(cfg, h, p)) {
+      member[p] = 1;
+      walk[sp++] = p;
+      cnt++;
+    }
+  }
+  while (sp > 0) {
+    IRBasicBlock *pb = &cfg->blocks[walk[--sp]];
+    for (int pi = 0; pi < pb->num_preds; pi++) {
+      int p = pb->preds[pi];
+      if (p >= 0 && p < nb && !member[p]) {
+        member[p] = 1;
+        walk[sp++] = p;
+        cnt++;
+      }
+    }
+  }
+  return cnt;
+}
+
 /* Most uses a live-through split may rename: with the store at the split
  * point they cost one block execution each, against at least one reload per
  * iteration of the loop (4x weight, see ra_build_intervals). */
@@ -1029,7 +1062,7 @@ static int ra_split_spilled(TCCIRState *ir, IRCFG *cfg, SSAInterval *intervals, 
   if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("ra:loop_split")) {
     const int nb = cfg->num_blocks;
     loop_reads = tcc_mallocz((size_t)ncand);
-    typedef struct { int header, latch, count; } RaLoopEntry;
+    typedef struct { int header, count; } RaLoopEntry;
     RaLoopEntry *loops = tcc_malloc(sizeof(RaLoopEntry) * (nb > 0 ? nb : 1));
     uint8_t *member = tcc_mallocz((size_t)nb);
     int *walk = tcc_malloc(sizeof(int) * (nb > 0 ? nb : 1));
@@ -1037,36 +1070,19 @@ static int ra_split_spilled(TCCIRState *ir, IRCFG *cfg, SSAInterval *intervals, 
     uint8_t *ltdone = tcc_mallocz((size_t)ncand);
     typedef struct { int c, cost, ncd, at, land; uint32_t span; } RaLtPick;
     RaLtPick *picks = tcc_malloc(sizeof(RaLtPick) * (ncand > nspilled ? ncand - nspilled : 1));
+    /* one loop per header: a back edge's target, whichever latches reach it */
     int nloops = 0;
-    for (int b = 0; b < nb && nloops < nb; b++) {
-      for (int si = 0; si < cfg->blocks[b].num_succs; si++) {
-        int h = cfg->blocks[b].succs[si];
-        if (h < 0 || h >= nb || !tcc_ir_cfg_dominates(cfg, h, b))
-          continue; /* not a back edge */
-        int sp = 0, cnt = 0;
-        memset(member, 0, (size_t)nb);
-        member[h] = 1;
-        if (b != h) {
-          member[b] = 1;
-          walk[sp++] = b;
-        }
-        while (sp > 0) {
-          IRBasicBlock *pb = &cfg->blocks[walk[--sp]];
-          for (int pi = 0; pi < pb->num_preds; pi++) {
-            int p = pb->preds[pi];
-            if (p >= 0 && p < nb && !member[p]) {
-              member[p] = 1;
-              walk[sp++] = p;
-            }
-          }
-        }
-        for (int bi = 0; bi < nb; bi++)
-          cnt += member[bi];
-        loops[nloops].header = h;
-        loops[nloops].latch = b;
-        loops[nloops].count = cnt;
-        nloops++;
+    for (int h = 0; h < nb; h++) {
+      int is_header = 0;
+      for (int pi = 0; pi < cfg->blocks[h].num_preds && !is_header; pi++) {
+        int p = cfg->blocks[h].preds[pi];
+        is_header = p >= 0 && p < nb && tcc_ir_cfg_dominates(cfg, h, p);
       }
+      if (!is_header)
+        continue;
+      loops[nloops].header = h;
+      loops[nloops].count = ra_loop_members(cfg, h, member, walk);
+      nloops++;
     }
     /* innermost first: an inner loop claims its uses before an enclosing one */
     for (int i = 1; i < nloops; i++) {
@@ -1086,23 +1102,7 @@ static int ra_split_spilled(TCCIRState *ir, IRCFG *cfg, SSAInterval *intervals, 
       for (int b = 0; b < nb; b++)
         lt_inner[b] = -1;
       for (int li = 0; li < nloops; li++) {
-        int sp = 0;
-        memset(member, 0, (size_t)nb);
-        member[loops[li].header] = 1;
-        if (loops[li].latch != loops[li].header) {
-          member[loops[li].latch] = 1;
-          walk[sp++] = loops[li].latch;
-        }
-        while (sp > 0) {
-          IRBasicBlock *pb = &cfg->blocks[walk[--sp]];
-          for (int pi = 0; pi < pb->num_preds; pi++) {
-            int p = pb->preds[pi];
-            if (p >= 0 && p < nb && !member[p]) {
-              member[p] = 1;
-              walk[sp++] = p;
-            }
-          }
-        }
+        ra_loop_members(cfg, loops[li].header, member, walk);
         for (int b = 0; b < nb; b++)
           if (member[b] && lt_inner[b] < 0)
             lt_inner[b] = li;
@@ -1110,23 +1110,7 @@ static int ra_split_spilled(TCCIRState *ir, IRCFG *cfg, SSAInterval *intervals, 
     }
     for (int li = 0; li < nloops; li++) {
       int hb = loops[li].header;
-      int sp = 0;
-      memset(member, 0, (size_t)nb);
-      member[hb] = 1;
-      if (loops[li].latch != hb) {
-        member[loops[li].latch] = 1;
-        walk[sp++] = loops[li].latch;
-      }
-      while (sp > 0) {
-        IRBasicBlock *pb = &cfg->blocks[walk[--sp]];
-        for (int pi = 0; pi < pb->num_preds; pi++) {
-          int p = pb->preds[pi];
-          if (p >= 0 && p < nb && !member[p]) {
-            member[p] = 1;
-            walk[sp++] = p;
-          }
-        }
-      }
+      ra_loop_members(cfg, hb, member, walk);
       /* every outside->member edge must enter at the header; a side entry
        * would reach renamed uses without passing any copy */
       int reducible = 1;

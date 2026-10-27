@@ -1,0 +1,5 @@
+v: r=0 verbose=1 out=0 a=0 b=0 sum=21 files=0
+c-o: r=3 verbose=0 out=1 a=0 b=0 sum=100 files=2 x.c x.o
+vvv: r=5 verbose=3 out=0 a=1 b=1 sum=1176 files=2 inc N
+tool: r=4 verbose=2 out=0 a=0 b=0 sum=0 files=0
+list: r=0 verbose=0 out=0 a=0 b=0 sum=0 files=0

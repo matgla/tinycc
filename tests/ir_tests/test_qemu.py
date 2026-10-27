@@ -454,6 +454,10 @@ TEST_FILES = [
     # ra:loop_split skipped graph-coalesced carriers and ran only before the
     # rescan, so the yasld replay loops' carriers reloaded every iteration
     ("bug_ra_loop_split_rescan_carriers.c", 0),
+    # ra:loop_split took a loop as one latch's blocks, so a counter bumped on
+    # another `continue` path counted as loop-invariant: tcc_parse_args never
+    # advanced optind (native tcc hung, -O1 and up)
+    ("bug_ra_loop_split_param_counter.c", 0),
     ("bug_ra_coalesce_contained_iv_copy.c", 0),
     # a value live through a loop but unused in it kept its register for the
     # whole loop while the loop's own values reloaded every iteration
