@@ -43,6 +43,7 @@
 #include "opt.h"
 #include "opt_engine.h"
 #include "opt_alias.h"
+#include "opt_range.h"
 #include "opt_utils.h"
 #include "opt_xform.h"
 
@@ -325,9 +326,12 @@ static int clt_store_for_load(TCCIRState *ir, const CltObj *objs, int nobj, int 
     if (sw && so < off + lw && so + sw > off)
       return 0;
   }
-  /* The store must reach the load without a path around either of them. */
+  /* The store must reach the load without a path around either of them: no
+   * branch between, and no join between or at the load (another path's store
+   * reaches it there; ir_xform_same_block does not look at joins). */
   const int li = (int)(lq - ir->compact_instructions);
-  if (found_j >= li || !ir_xform_same_block(ir, found_j, li))
+  if (found_j >= li || !ir_xform_same_block(ir, found_j, li) ||
+      !ir_range_safe(ir, found_j, li, IR_HZ_JOIN | IR_HZ_JOIN_END))
     return 0;
   *val = found_v;
   return 1;

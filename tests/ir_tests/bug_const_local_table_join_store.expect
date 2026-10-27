@@ -1,0 +1,7 @@
+count_list("a,a,a;"): n=3 tok_i=5 fields=406
+count_list("a,a;"): n=2 tok_i=3 fields=812
+count_list("a;"): n=1 tok_i=1 fields=812
+count_list_rev("a,a,a;"): n=3 tok_i=5 fields=406
+count_list_rev("a;"): n=1 tok_i=1 fields=1218
+eat_payload("="): n=0 tok_i=1 fields=406
+eat_payload(";"): n=-1 tok_i=0 fields=406
