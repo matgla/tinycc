@@ -16,6 +16,31 @@
 #include "opt_xform.h"
 #include "opt_gens_fusion.h"
 
+/* The ROR replacing `(v << a) | (v >> b)` reads v once, at the OR.  A TEMP
+ * is that value wherever it is read; a VAR or PARAM is only when nothing
+ * writes it from the first shift to the OR, and an lvalue read of one is its
+ * own slot (not a deref) whose address must not escape. */
+static int rot_source_stable(TCCIRState *ir, IROperand v, int from, int to)
+{
+  int32_t vr = irop_get_vreg(v);
+  int kind = TCCIR_DECODE_VREG_TYPE(vr);
+  if (kind != TCCIR_VREG_TYPE_VAR && kind != TCCIR_VREG_TYPE_PARAM)
+    return !v.is_lval;
+  if (v.is_lval) {
+    if (!v.is_local || v.is_llocal)
+      return 0;
+    IRLiveInterval *li = tcc_ir_get_live_interval(ir, vr);
+    if (!li || li->addrtaken || li->is_volatile)
+      return 0;
+  }
+  for (int k = from; k < to; k++) {
+    IRQuadCompact *kq = &ir->compact_instructions[k];
+    if (kq->op != TCCIR_OP_NOP && irop_config[kq->op].has_dest && tcc_ir_op_dest_vreg(ir, kq) == vr)
+      return 0;
+  }
+  return 1;
+}
+
 static int ir_gen_rotate_fusion(IROptCtx *ctx, int i)
 {
   TCCIRState *ir = ctx->ir;
@@ -77,8 +102,11 @@ static int ir_gen_rotate_fusion(IROptCtx *ctx, int i)
   /* a + b == 32 is a rotate only for 32-bit values, and only if both shifts
    * read the same value (not one a deref of it). */
   IROperand shl_src1 = tcc_ir_op_get_src1(ir, shl_q);
-  if (shl_src1.is_lval || shr_src1.is_lval || shl_src1.is_local != shr_src1.is_local ||
+  if (shl_src1.is_lval != shr_src1.is_lval || shl_src1.is_local != shr_src1.is_local ||
       shl_src1.is_llocal != shr_src1.is_llocal)
+    return 0;
+  int min_idx = shl_idx < shr_idx ? shl_idx : shr_idx;
+  if (!rot_source_stable(ir, shl_src1, min_idx, i))
     return 0;
   {
     IROperand or_d = tcc_ir_op_get_dest(ir, q);
@@ -89,7 +117,6 @@ static int ir_gen_rotate_fusion(IROptCtx *ctx, int i)
       return 0;
   }
 
-  int min_idx = shl_idx < shr_idx ? shl_idx : shr_idx;
   if (!ir_xform_same_block(ir, min_idx, i))
     return 0;
 

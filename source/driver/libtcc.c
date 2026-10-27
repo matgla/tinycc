@@ -2571,11 +2571,16 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->opt_inline_small = 1;    /* Inline tiny static/inline functions (≤30 words) */
         s->opt_inline_called_once = 1; /* Inline static functions called from one place, bodies deferred to TU end */
         s->opt_drop_unused_statics = 1; /* Emit only the statics something live refers to */
+        /* Loop-invariant code motion is gcc -O1 (-ftree-loop-im,
+         * -fmove-loop-invariants).  ssa:loop_rotate runs at -O1 too, and a
+         * rotated loop without it keeps its invariants inside: a constant, a
+         * const table's address (bench_conditionals +25%, indirect_calls +15%). */
+        s->opt_licm = 1;
         if (!TCC_OPT(s, opt_inline_limit_user))
           s->opt_inline_limit = 30;
       }
       /* -O2: everything in -O1 plus the heavy tier — loop unrolling / IV
-       * strength reduction / LICM / re-rolling, MUL+ADD→MLA fusion,
+       * strength reduction / re-rolling, MUL+ADD→MLA fusion,
        * interprocedural constant propagation, and full small-function
        * inlining. */
       if (TCC_OPT(s, optimize) >= 2)
@@ -2584,7 +2589,6 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         /* fp-offset-cache disabled: miscompiles loops when combined with
            iv-strength-red (e.g. SHA-1 sha_transform).  Can still be
            enabled manually with -ffp-offset-cache for debugging. */
-        s->opt_licm = 1;            /* Loop-invariant code motion */
         s->opt_ipc = 1;             /* Interprocedural constant propagation */
         s->opt_iv_strength_red = 1; /* IV strength reduction for array loops */
         s->opt_loop_unroll = 1;     /* Full-unroll small constant-trip-count loops */

@@ -137,6 +137,7 @@ TEST_FILES = [
     ("bug_dead_loop_rotated_early_exit.c", 0),
     ("bug_dead_loop_rotated_side_exit.c", 0),
     ("bug_dead_loop_rotated_mid_exit.c", 0),
+    ("bug_dead_loop_rotated_outlined_arm.c", 0),
     ("bug_dead_trail_addrvar_ptr_copy.c", 0),
     ("bug_dead_trail_volatile_access.c", 0),  # dead_trail_addrvar keeps writes that access volatile memory
     ("bug_narrow_volatile_load_dead_local.c", 0),  # a volatile load into a dead char/short local stays
@@ -210,6 +211,7 @@ TEST_FILES = [
     ("test_fp_offset_cache.c", 0),
     ("test_ge_operator.c", 0),
     ("test_mla_fusion.c", 0),
+    ("bug_mla_imm_shift_add.c", 0),
     ("test_offset_addressing.c", 0),
     ("97_void_call_noargs.c", 0),
     ("98_call_over32_args.c", 0),
@@ -274,6 +276,7 @@ TEST_FILES = [
 
     # 64-bit (x << 8) | (x >> 24) must not fuse into a 32-bit ROR
     ("bug_rotate_fusion_64bit.c", 0),
+    ("bug_rotate_fusion_source_redefined.c", 0),
 
     # __real__/__imag__ of call results and of non-complex operands
     ("bug_real_imag_rvalue.c", 0),
@@ -2007,6 +2010,8 @@ TEST_FILES = [
     # blacklist as pure and deleted __builtin_apply / __builtin_setjmp whose
     # result was unused
     ("730_dse_keeps_builtin_apply.c", 0),
+    # The __builtin_apply_args block was left below SP at -O1+.
+    ("bug_apply_args_block_below_sp.c", 0),
     ("731_dse_keeps_builtin_setjmp.c", 0),
 
     # docs/bugs ssa-store family (2026-10-07): dead_overwrite_stores ignored
@@ -2124,6 +2129,7 @@ TEST_FILES = [
     ("878_setif_remat_barrel_shift.c", 0),
     # ssa:loop_rotate copying a barrel-shift-fused header CMP to the latch
     ("bug_loop_rotate_latch_cmp_barrel_shift.c", 0),
+    ("bug_loop_rotate_stale_header_target.c", 0),
     # frame_dfe: copies of never-written bytes and of vregs nothing defines
     # (zig tagged-value temporaries) are dropped; every byte written on some
     # path, through a pointer, by a callee, or volatile still arrives

@@ -2674,6 +2674,76 @@ ST_FUNC int tcc_gen_machine_subs_eq_select_01(MachineOperand src1, MachineOperan
  *
  * Note: th_mla(rd, rn, rm, ra) → rd = rn * rm + ra
  */
+/* `rd = rn * m` as one shift-add when m is 2^k, 2^k + 1 or 2^k - 1, else an
+ * empty opcode.  RSB's shifted operand is the minuend: (rn << k) - rn. */
+static thumb_opcode mla_imm_mul_as_shift(int rd, int rn, uint32_t m)
+{
+  const thumb_opcode none = {0};
+  for (uint32_t k = 1; k < 31; k++)
+  {
+    const thumb_shift lsl = (thumb_shift){THUMB_SHIFT_LSL, (uint16_t)k, THUMB_SHIFT_IMMEDIATE};
+    if (m == (1u << k))
+      return th_mov_reg((uint32_t)rd, (uint32_t)rn, flags_safe(), lsl, ENFORCE_ENCODING_NONE, false);
+    if (m == (1u << k) + 1)
+      return th_add_reg((uint32_t)rd, (uint32_t)rn, (uint32_t)rn, flags_safe(), lsl, ENFORCE_ENCODING_NONE);
+    if (k >= 2 && m == (1u << k) - 1)
+      return th_rsb_reg((uint32_t)rd, (uint32_t)rn, (uint32_t)rn, flags_safe(), lsl, ENFORCE_ENCODING_NONE);
+  }
+  return none;
+}
+
+/* `x * m + a` with m an immediate 2^k, 2^k + 1 or 2^k - 1: the shift-add and
+ * an add of the accumulator -- its immediate when it encodes as one -- and no
+ * constant moved into a register.  An MLA had to load m (and an immediate
+ * accumulator) on every evaluation; bench_linked_list's `i * 3 + 7` did so on
+ * every trip of its init loop.  0 when the shape does not fit; nothing has
+ * been emitted then. */
+static int mla_imm_as_shift_add(MachineOperand *src1, MachineOperand *src2, MachineOperand *dest,
+                                MachineOperand *accum, uint32_t live_regs)
+{
+  if (src2->kind != MACH_OP_IMM || src2->needs_deref || src2->is_64bit || src1->is_64bit || dest->is_64bit ||
+      accum->is_64bit)
+    return 0;
+  const uint32_t m = (uint32_t)src2->u.imm.val;
+  if (mla_imm_mul_as_shift(0, 1, m).size == 0)
+    return 0;
+  const int accum_imm = accum->kind == MACH_OP_IMM && !accum->needs_deref;
+  const uint32_t c = accum_imm ? (uint32_t)accum->u.imm.val : 0;
+  /* The imm12 and modified-immediate forms take any register but SP/PC, so
+   * r0 stands in for whatever rd turns out to be. */
+  if (accum_imm && c != 0 && th_add_imm(0, 0, c, flags_safe(), ENFORCE_ENCODING_NONE).size == 0 &&
+      th_sub_imm(0, 0, (uint32_t)-c, flags_safe(), ENFORCE_ENCODING_NONE).size == 0)
+    return 0;
+  /* rd must not be the accumulator's register, which the shift-add writes
+   * before the add reads it. */
+  if (!accum_imm && accum->kind == MACH_OP_REG && dest->kind == MACH_OP_REG && dest->u.reg.r0 == accum->u.reg.r0)
+    return 0;
+
+  MachineCodegenContext ctx = {0};
+  const int rn = mach_ensure_in_reg(&ctx, src1, live_regs);
+  uint32_t excl = live_regs | (thumb_is_hw_reg(rn) ? (1u << (uint32_t)rn) : 0u);
+  int ra = -1;
+  if (!accum_imm)
+  {
+    ra = mach_ensure_in_reg(&ctx, accum, excl);
+    if (thumb_is_hw_reg(ra))
+      excl |= (1u << (uint32_t)ra);
+  }
+  const int rd = mach_get_dest_reg(&ctx, dest, excl);
+  ot_check(mla_imm_mul_as_shift(rd, rn, m));
+  if (!accum_imm)
+    ot_check(th_add_reg((uint32_t)rd, (uint32_t)rd, (uint32_t)ra, flags_safe(), THUMB_SHIFT_DEFAULT,
+                        ENFORCE_ENCODING_NONE));
+  else if (c != 0)
+  {
+    thumb_opcode add = th_add_imm((uint32_t)rd, (uint32_t)rd, c, flags_safe(), ENFORCE_ENCODING_NONE);
+    ot_check(add.size ? add : th_sub_imm((uint32_t)rd, (uint32_t)rd, (uint32_t)-c, flags_safe(), ENFORCE_ENCODING_NONE));
+  }
+  mach_writeback_dest(dest, rd);
+  mach_release_all(&ctx);
+  return 1;
+}
+
 ST_FUNC void tcc_gen_machine_mla_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest,
                                      MachineOperand accum)
 {
@@ -2699,6 +2769,9 @@ ST_FUNC void tcc_gen_machine_mla_mop(MachineOperand src1, MachineOperand src2, M
   if (dest.kind == MACH_OP_REG &&
       dest.u.reg.r0 != (int)PREG_REG_NONE && dest.u.reg.r0 >= 0 && dest.u.reg.r0 < 16)
     live_regs |= (1u << (uint32_t)dest.u.reg.r0);
+
+  if (mla_imm_as_shift_add(&src1, &src2, &dest, &accum, live_regs))
+    return;
 
   int src1_reg = mach_ensure_in_reg(&ctx, &src1, live_regs);
   uint32_t excl = live_regs;

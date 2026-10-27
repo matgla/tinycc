@@ -1046,7 +1046,9 @@ void gen_function(Sym *sym)
   const int pcopy = ir_split_param_copy_ops(ir, NULL);
   const int slots = ir ? ir->next_instruction_index - pcopy : 0;
 
-  if (TCC_OPT(tcc_state, opt_licm) && ir && body_is_final)
+  /* The cache also steers the inliner and call folding, so it stays the -O2
+   * tier it always was; -O1's LICM simply hoists no calls. */
+  if (TCC_OPT(tcc_state, opt_licm) && TCC_OPT(tcc_state, optimize) >= 2 && ir && body_is_final)
   {
     /* Forward declare the inference function */
     extern TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState * ir, Sym * func_sym);

@@ -79,6 +79,34 @@ static int rot_lval_is_indirect(IROperand op)
  * is one value and needs no phi.  Measured on the memclr chain, where the
  * liveness veto used to block every loop that shares `i`. */
 
+/* Drops target's is_jump_target once no branch reaches it.  A computed jump
+ * (IJUMP, asm goto) can land anywhere, so with one in the function the mark
+ * stays. */
+static void rot_refresh_jump_target(TCCIRState *ir, int target)
+{
+  int n = ir->next_instruction_index;
+  if (target < 0 || target >= n || ir->func_has_asm_goto)
+    return;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_IJUMP)
+      return;
+    if ((q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) && (int)tcc_ir_op_dest_imm(ir, q) == target)
+      return;
+  }
+  for (int t = 0; t < ir->num_switch_tables; t++)
+  {
+    TCCIRSwitchTable *table = &ir->switch_tables[t];
+    if (table->default_target == target)
+      return;
+    for (int j = 0; j < table->num_entries; j++)
+      if (table->targets[j] == target)
+        return;
+  }
+  ir->compact_instructions[target].is_jump_target = 0;
+}
+
 /* 1 when the header's exit branch is provably untaken on loop entry: the IV
  * enters from a known constant and the CMP's other side is a literal.  A later
  * const fold (or, for the carried case, ssa:loop_guard_elim) then deletes the
@@ -940,7 +968,11 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
 
   ir->compact_instructions[body_target].is_jump_target = 1;
 
-  /* the header CMP and exit_target keep their is_jump_target flags: gotos and the guard JUMPIF may still target them */
+  /* exit_target keeps its is_jump_target: the guard JUMPIF still lands there.
+   * The header CMP keeps it only while a branch does -- the back-edge that
+   * made it a target now goes to body_target, and a stale mark is a phantom
+   * join that hides the IV's initial ASSIGN from ssa:iv_strength_reduction. */
+  rot_refresh_jump_target(ir, hi);
 
   LOG_IR_GEN("[LOOP-ROTATE] Rotated loop header=%d body=[%d..%d] latch=[%d..%d] → bottom-tested at %d", hi, body_start,
              body_end, latch_start, latch_end, body_target);

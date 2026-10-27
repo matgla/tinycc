@@ -616,26 +616,38 @@ static void thumb_emit_dcp_addsub_mop(MachineOperand src1, MachineOperand src2, 
 /* Get a float operand into a single-precision register: use it directly when it
  * already lives in one (MACH_OP_VFP_REG), else materialize it through a GPR into
  * the caller-provided scratch s-register. */
-static int vfp_operand_to_sreg(MachineCodegenContext *ctx, const MachineOperand *op, int scratch_s)
+static int vfp_operand_to_sreg(MachineCodegenContext *ctx, const MachineOperand *op, int scratch_s, uint32_t excl)
 {
   if (op->kind == MACH_OP_VFP_REG)
     return op->u.reg.r0;
-  int gpr = mach_ensure_in_reg(ctx, op, 0);
+  int gpr = mach_ensure_in_reg(ctx, op, excl);
   ot_check(th_vmov_gp_sp((uint16_t)gpr, (uint16_t)scratch_s, 0)); /* scratch_s = gpr */
   return scratch_s;
+}
+
+/* GPRs the operands still read: a scratch taken for one operand must not be the
+ * other's value or deref base.  Saving it is not enough -- the scratch is loaded
+ * before the other operand is read (pr28982a: `result += *ptr` with ptr in r0
+ * and result spilled reloaded result into r0, then dereferenced it). */
+static uint32_t vfp_operand_regs(const MachineOperand *op)
+{
+  if (op->kind != MACH_OP_REG || op->u.reg.r0 == (int)PREG_REG_NONE || !thumb_is_hw_reg(op->u.reg.r0))
+    return 0;
+  return 1u << (uint32_t)op->u.reg.r0;
 }
 
 static void thumb_emit_vfp_arith_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op)
 {
   MachineCodegenContext ctx = {0};
+  const uint32_t src_regs = vfp_operand_regs(&src1) | vfp_operand_regs(&src2);
 
   /* Hard-float: operate on real single-precision registers.  VFP-resident
    * operands/dest are used directly (v<op>.f32 sd, sn, sm); GPR/imm/spill
    * endpoints are materialized through the reserved s14/s15 scratch. */
   if (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT)
   {
-    int sn = vfp_operand_to_sreg(&ctx, &src1, VFP_SCRATCH0);
-    int sm = vfp_operand_to_sreg(&ctx, &src2, VFP_SCRATCH1);
+    int sn = vfp_operand_to_sreg(&ctx, &src1, VFP_SCRATCH0, src_regs);
+    int sm = vfp_operand_to_sreg(&ctx, &src2, VFP_SCRATCH1, src_regs);
     int sd = (dest.kind == MACH_OP_VFP_REG) ? dest.u.reg.r0 : VFP_SCRATCH0;
     switch (op)
     {
@@ -657,8 +669,8 @@ static void thumb_emit_vfp_arith_mop(MachineOperand src1, MachineOperand src2, M
 
   /* Softfp: no float ever lives in a VFP register, so s0/s1 are free fixed
    * scratch.  Values move through GPRs on both sides — kept byte-identical. */
-  int rd = mach_get_dest_reg(&ctx, &dest, 0);
-  uint32_t excl = (1u << (uint32_t)rd);
+  int rd = mach_get_dest_reg(&ctx, &dest, src_regs);
+  uint32_t excl = src_regs | (1u << (uint32_t)rd);
   int rn = mach_ensure_in_reg(&ctx, &src1, excl);
   if (thumb_is_hw_reg(rn))
     excl |= (1u << (uint32_t)rn);

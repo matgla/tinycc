@@ -826,6 +826,38 @@ static int lhd_try_backedge(TCCIRState *ir, int be)
   if (body_start >= be)
     return 0;
 
+  /* Where the bottom test does not pay on the M33 (board cycles), for a header
+   * with nothing ahead of its CMP -- the loops loop_rotate itself could have
+   * taken and declined: a body with no branch of its own (sha_transform's
+   * rounds +3.6%, bench_conditionals' counting loop: 5 cycles a trip against
+   * 4) and a loop that also leaves somewhere other than the header's exit
+   * (bench_binary_search's search).  It does pay for one that branches within
+   * the loop -- onto the back-edge, round an arm (mibench_dijkstra's
+   * relaxation loop, -7%).  The board measured no loop with a header prefix
+   * (the Zig-CBE and `n--` shapes this pass exists for), which keep the
+   * rewrite.  Nor a loop that calls, at any header: loop_rotate declines those
+   * too (bench_indirect_calls, +8%). */
+  {
+    const int exit_land = lbt_skip_nops(ir, exit_target);
+    int body_branches = 0, second_exit = 0;
+    for (int k = hi; k < be; k++)
+    {
+      const IRQuadCompact *q = &ir->compact_instructions[k];
+      if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+        return 0;
+      if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
+        second_exit = 1;
+      if (k <= jif || (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF))
+        continue;
+      body_branches++;
+      const int t = (int)tcc_ir_op_dest_imm(ir, q);
+      if (t < 0 || ((t < hi || t > be) && lbt_skip_nops(ir, t) != exit_land))
+        second_exit = 1;
+    }
+    if (ncost == 0 && (!body_branches || second_exit))
+      return 0;
+  }
+
   IRQuadCompact *cmp_q = &ir->compact_instructions[cmp];
   IROperand cmp_src1 = tcc_ir_op_get_src1(ir, cmp_q);
   IROperand cmp_src2 = tcc_ir_op_get_src2(ir, cmp_q);

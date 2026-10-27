@@ -158,6 +158,28 @@ static int unroll_const_symbol_temp(TCCIRState *ir, IROperand op, IROperand *sym
   return 1;
 }
 
+/* Something between the IV's init and the loop reads the IV -- `int i = 1;
+ * int s = i + c; for (; i < 4; i++)` -- other than the pre-loop guard
+ * `CMP iv; JUMPIF` that the unroll deletes with it. */
+static int unroll_init_read_before_loop(TCCIRState *ir, const InductionVar *iv, int start)
+{
+  for (int k = iv->init_idx + 1; k < start; k++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[k];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (q->op == TCCIR_OP_CMP && tcc_ir_op_src1_vreg(ir, q) == iv->vreg && k + 1 < start &&
+        ir->compact_instructions[k + 1].op == TCCIR_OP_JUMPIF)
+      continue;
+    if ((irop_config[q->op].has_src1 && tcc_ir_op_src1_vreg(ir, q) == iv->vreg) ||
+        (irop_config[q->op].has_src2 && tcc_ir_op_src2_vreg(ir, q) == iv->vreg) ||
+        (q->op == TCCIR_OP_MLA && tcc_ir_op_accum_vreg(ir, q) == iv->vreg) ||
+        (irop_config[q->op].has_dest && tcc_ir_op_dest_is_lval(ir, q) && tcc_ir_op_dest_vreg(ir, q) == iv->vreg))
+      return 1;
+  }
+  return 0;
+}
+
 /* loops/loop_idx let sibling loop records be patched when the IR grows; NULL/0 if unused. */
 int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_idx)
 {
@@ -393,7 +415,7 @@ int try_unroll_loop_ivs(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_i
   for (int i = loop->start_idx; i <= loop_end; i++)
     ir->compact_instructions[i].op = TCCIR_OP_NOP;
 
-  if (iv->init_idx >= 0)
+  if (iv->init_idx >= 0 && !unroll_init_read_before_loop(ir, iv, loop->start_idx))
     ir->compact_instructions[iv->init_idx].op = TCCIR_OP_NOP;
 
   /* Rotated loops have a dead pre-loop guard CMP+JUMPIF; NOP it since the IV init is now gone. */

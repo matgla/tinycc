@@ -3329,6 +3329,14 @@ ST_FUNC int tcc_gen_machine_pool_entries_total(void);
  * has), or -1 when the pad must stay NOPs. */
 #define TCC_ALIGN_WIDEN_FROM_PROLOG (-2)
 ST_FUNC void tcc_gen_machine_align_branch_target(int align, int widen_from);
+/* Whether a pad here could replace itself by widening the instruction just
+ * before it (dry passes too, from what they laid out). */
+ST_FUNC int tcc_gen_machine_pad_could_widen(void);
+/* Real pass: emit the first instruction of the next IR op in its 32-bit form
+ * when it has one, so an aligned join lands aligned with no NOP on the path
+ * falling into it.  _done disarms and says whether it happened. */
+ST_FUNC void tcc_gen_machine_widen_next_op(void);
+ST_FUNC int tcc_gen_machine_widen_next_op_done(void);
 ST_FUNC int tcc_gen_machine_const_needs_pool(int32_t value);
 ST_FUNC int tcc_gen_machine_pending_pool_size(void);
 ST_FUNC int tcc_gen_machine_cbz_jump_mop(int rn, int nonzero, int32_t target_ir, int ir_idx);

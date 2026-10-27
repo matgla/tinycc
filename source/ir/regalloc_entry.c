@@ -1987,7 +1987,7 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   /* ssa:licm — hoist loop invariants (arithmetic + pure/const calls) to the
    * preheader before the other loop transforms and ssa:iv_strength_reduction,
    * preserving the legacy "LICM before IV-SR" order now that both left tccgen.
-   * Reuses the proven licm.c engine; gated opt_licm (-O2); knob
+   * Reuses the proven licm.c engine; gated opt_licm (-O1); knob
    * TCC_DISABLE_PASS=ssa:licm. */
   RA_FLAT_PASS(ra_ch, "ssa:licm", TCC_OPT(tcc_state, opt_licm), ssa_opt_licm(ir));
 
@@ -2012,7 +2012,7 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
    * (`p->bitmap[i>>5]` reloads p->bitmap every iteration; the kernel's pool
    * mark/mark_free family).  Needs rotation's shape like the global-load
    * hoist above, and the C11 6.5p7 alias-class marks tcc_ir_put records on
-   * pointer-object reads / non-pointer-object writes.  Gated opt_licm (-O2);
+   * pointer-object reads / non-pointer-object writes.  Gated opt_licm (-O1);
    * knob TCC_DISABLE_PASS=licm_field_ptr. */
   RA_FLAT_PASS(ra_ch, "ssa:licm_field_ptr", TCC_OPT(tcc_state, opt_licm),
                ssa_opt_licm_field_ptr_load(ir));
@@ -2624,30 +2624,33 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
    * call-separated use.  Runs here — after phi resolution de-SSA'd the IR — so
    * prepending entry materializations can't desync phi resolution; block_phis
    * is emptied, so rebuilding the CFG (which the inserts invalidate) is safe.
-   * -O2 only (GCC likewise only parks globals at -O2).
+   * -O2 only (GCC likewise only parks globals at -O2); the loop variant is
+   * LICM and runs with it from -O1.
    * docs/plans/gap_a_ssa_var_index_addr_prop.md (gap ②). */
-  if (tcc_state && TCC_OPT(tcc_state, optimize) >= 2) {
+  if (tcc_state && (TCC_OPT(tcc_state, optimize) >= 2 || TCC_OPT(tcc_state, opt_licm))) {
+    const int park = TCC_OPT(tcc_state, optimize) >= 2;
     int addr_changes = 0;
     /* Before the address hoists, so it matches operands the frontend built
      * (which carry IROP_AUX_NONVOLATILE) rather than bases synthesized by a
      * pass.  Here rather than in the flat pipeline because the two reads it
      * collapses only name the same address temp once GVN has run — see the
      * header of source/opt/flat/memory/deref_operand_cse.c. */
-    addr_changes += tcc_ir_opt_deref_operand_cse(ir);
-    if (!tcc_ir_opt_pass_disabled("ssa:global_addr_hoist"))
+    if (park)
+      addr_changes += tcc_ir_opt_deref_operand_cse(ir);
+    if (park && !tcc_ir_opt_pass_disabled("ssa:global_addr_hoist"))
       addr_changes += tcc_ir_ssa_opt_global_addr_hoist(ir);
-    if (!tcc_ir_opt_pass_disabled("ssa:loop_addr_hoist"))
+    if (TCC_OPT(tcc_state, opt_licm) && !tcc_ir_opt_pass_disabled("ssa:loop_addr_hoist"))
       addr_changes += tcc_ir_ssa_opt_loop_addr_hoist(ir);
-    if (!tcc_ir_opt_pass_disabled("ssa:local_addr_cse"))
+    if (park && !tcc_ir_opt_pass_disabled("ssa:local_addr_cse"))
       addr_changes += tcc_ir_ssa_opt_local_addr_cse(ir);
     /* Same reason these three run here: an indexed access's STACKOFF base is a
      * DIRECT frame reference that slot-based alias analysis reads precisely, so
      * parking it in a register may only happen once every alias-sensitive pass
      * is done (early it miscompiles gcc.c-torture pr51466). */
-    if (!tcc_ir_opt_pass_disabled("ssa:stackoff_indexed_base_cse"))
+    if (park && !tcc_ir_opt_pass_disabled("ssa:stackoff_indexed_base_cse"))
       addr_changes += tcc_ir_opt_stackoff_indexed_base_cse(ir);
     /* After the hoists above: the constants they parked are vregs now. */
-    if (tcc_state->optimize_size && !tcc_ir_opt_pass_disabled("ssa:os_const_share"))
+    if (park && tcc_state->optimize_size && !tcc_ir_opt_pass_disabled("ssa:os_const_share"))
       addr_changes += tcc_ir_ssa_opt_os_const_share(ir);
     if (addr_changes > 0) {
       tcc_ir_cfg_free(cfg);

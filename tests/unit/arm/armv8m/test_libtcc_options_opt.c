@@ -112,10 +112,11 @@ UT_TEST(test_tcc_set_options_o1_enables_pass_batch)
   UT_ASSERT_EQ(s->opt_float_narrow, 1);
   UT_ASSERT_EQ(s->opt_jump_threading, 1);
   UT_ASSERT_EQ(s->opt_inline_small, 1);
+  /* Loop-invariant code motion is -O1, as in gcc (-ftree-loop-im). */
+  UT_ASSERT_EQ(s->opt_licm, 1);
 
   /* -O2-only knobs must NOT be enabled yet. */
   UT_ASSERT_EQ(s->opt_mla_fusion, 0);
-  UT_ASSERT_EQ(s->opt_licm, 0);
   UT_ASSERT_EQ(s->opt_ipc, 0);
   UT_ASSERT_EQ(s->opt_iv_strength_red, 0);
   UT_ASSERT_EQ(s->opt_loop_unroll, 0);

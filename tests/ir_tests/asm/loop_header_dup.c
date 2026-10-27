@@ -2,9 +2,11 @@
  * instructions (or loop_rotate declined the loop), which kept both the
  * top-test branch and an unconditional back-edge `b` in every iteration.
  * After the pass the only backward branch of each loop is the conditional
- * bottom test.
+ * bottom test -- except hd_find's, which the pass leaves alone.
  *   hd_move_bwd -- `while (n-- != 0)`: copy + decrement ahead of the test
- *   hd_find     -- a call in the body (through a pointer: no relocation)
+ *   hd_find     -- a call in the body (through a pointer: no relocation);
+ *                  bottom-tested it ran slower on the board, so it keeps its
+ *                  top test
  *   hd_fill     -- the bound is re-read from memory every iteration
  *   hd_outer    -- the outer loop of a nest (its body holds the inner loop) */
 

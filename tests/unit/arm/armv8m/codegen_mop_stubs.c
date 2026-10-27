@@ -538,6 +538,20 @@ void tcc_gen_machine_align_branch_target(int align, int widen_from)
   /* No instruction stream here, so nothing to pad. */
 }
 
+int tcc_gen_machine_pad_could_widen(void)
+{
+  return 0;
+}
+
+void tcc_gen_machine_widen_next_op(void)
+{
+}
+
+int tcc_gen_machine_widen_next_op_done(void)
+{
+  return 0;
+}
+
 int tcc_gen_machine_cbz_forward_ok(int32_t target_ir, int current_ir_idx)
 {
   (void)target_ir;
