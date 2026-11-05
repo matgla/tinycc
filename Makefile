@@ -23,6 +23,13 @@ endif
 # to make programs for the machine doing the building.  configure sets it.
 HOSTCC ?= gcc
 
+# On YasOS the target is built by this make, not by the second one the %-tcc
+# rule below starts: both stayed resident through the link, and on the board
+# that link ran out of memory where one started on its own did not.
+ifeq ($(BUILDOS),YasOS)
+ CROSS_TARGET ?= armv8m
+endif
+
 ifeq (-$(GCC_MAJOR)-$(findstring $(GCC_MINOR),56789)-,-4--)
  CFLAGS += -D_FORTIFY_SOURCE=0
 endif
