@@ -141,7 +141,14 @@ static int tcc_output_elf(TCCState *s1, FILE *f, int phnum, ElfW(Phdr) * phdr)
       size = s->sh_size;
       if (size)
       {
-        if (s->lazy && !s->materialized)
+        if (s->spill)
+        {
+          const unsigned long to_write = size < s->data_offset ? size : s->data_offset;
+          if (section_spill_write(s1, s, f, to_write) < 0)
+            return -1;
+          offset += to_write;
+        }
+        else if (s->lazy && !s->materialized)
         {
           /* Stream directly from source files without loading into memory */
           section_write_streaming(s1, s, f);
@@ -177,7 +184,12 @@ static int tcc_output_binary(TCCState *s1, FILE *f)
         offset++;
       }
       size = s->sh_size;
-      if (s->lazy && !s->materialized)
+      if (s->spill)
+      {
+        if (section_spill_write(s1, s, f, size) < 0)
+          return -1;
+      }
+      else if (s->lazy && !s->materialized)
       {
         /* Stream directly from source files without loading into memory */
         section_write_streaming(s1, s, f);
@@ -800,6 +812,8 @@ static int coalesce_split_sections(TCCState *s1)
   int nb_sections = s1->nb_sections;
   int pass, nb_hot_names = 0;
   char **hot_names = NULL;
+  SectionSpill *sp = NULL;
+  unsigned long text_tail = 0;
 
   for (i = 1; i < nb_sections && !have_split; i++)
   {
@@ -1011,16 +1025,58 @@ static int coalesce_split_sections(TCCState *s1)
 
   dynarray_reset(&hot_names, &nb_hot_names);
 #ifdef TCC_TARGET_ARM
+  text_tail = arm_hot_text_veneer_bytes(s1) + 8; /* +8: the block's alignment */
   for (i = 0; i < nb_grow; i++)
     if (grow[i].target == text_section)
-      grow[i].bytes += arm_hot_text_veneer_bytes(s1) + 8; /* +8: the block's alignment */
+      grow[i].bytes += text_tail;
 #endif
+  /* .text in a file (see "Spilled sections" in tccelf.c): what it had before
+   * is its first piece, and only what is added after the last one, the veneers,
+   * is in memory. */
+  if (s1->spill_path && text_section->sh_type != SHT_NOBITS && !text_section->spill)
+  {
+    for (g = 0; g < nb_grow && grow[g].target != text_section; g++)
+      ;
+    if (g < nb_grow)
+    {
+      sp = tcc_mallocz(sizeof *sp);
+      sp->fd = sp->src_fd = -1;
+      sp->cur = -1;
+      sp->path = tcc_strdup(s1->spill_path);
+      sp->alloc_pieces = nb_inputs + 1;
+      sp->pieces = tcc_malloc(sizeof *sp->pieces * sp->alloc_pieces);
+      if (text_section->data_offset)
+      {
+        SpillPiece *p = &sp->pieces[sp->nb_pieces++];
+        p->base = 0;
+        p->size = text_section->data_offset;
+        p->data = text_section->data;
+        p->chunks = NULL;
+      }
+      text_section->data = NULL;
+      text_section->data_allocated = 0;
+    }
+  }
   for (i = 0; i < nb_grow; i++)
-    if (grow[i].target->sh_type != SHT_NOBITS)
+    if (grow[i].target->sh_type != SHT_NOBITS && !(sp && grow[i].target == text_section))
       section_reserve_exact(grow[i].target, grow[i].bytes);
   for (in = inputs; in < inputs + nb_inputs; in++)
   {
     Section *t = in->target;
+    if (sp && t == text_section)
+    {
+      if (in->size)
+      {
+        SpillPiece *p = &sp->pieces[sp->nb_pieces++];
+        p->base = in->base;
+        p->size = in->size;
+        p->data = in->data;
+        p->chunks = in->chunks;
+      }
+      else
+        tcc_free(in->data);
+      continue;
+    }
     t->data_offset = in->base;
     if (in->size && t->sh_type == SHT_NOBITS)
       t->data_offset += in->size;
@@ -1042,6 +1098,15 @@ static int coalesce_split_sections(TCCState *s1)
   }
   for (i = 0; ret == 0 && i < nb_grow; i++)
     grow[i].target->data_offset = grow[i].end;
+  if (sp)
+  {
+    for (g = 0; grow[g].target != text_section; g++)
+      ;
+    sp->written = tcc_mallocz(sp->nb_pieces + 1);
+    text_section->spill = sp;
+    text_section->data_base = text_section->data_offset = grow[g].end;
+    section_reserve_exact(text_section, grow[g].end + text_tail);
+  }
   if (fd >= 0)
     close(fd);
   tcc_free(inputs);
@@ -1137,6 +1202,14 @@ static int elf_output_file(TCCState *s1, const char *filename)
    * --gc-sections) must be folded back into their canonical sections before
    * build_got/layout -- see the comment on coalesce_split_sections.  Runs
    * unconditionally: it is a no-op when no split input exists. */
+  /* A .text is written to a file beside the output while it is relocated, not
+   * held in memory: see "Spilled sections" in tccelf.c. */
+  if (file_type != TCC_OUTPUT_MEMORY)
+  {
+    s1->spill_path = tcc_malloc(strlen(filename) + 10);
+    strcpy(s1->spill_path, filename);
+    strcat(s1->spill_path, ".text.tmp");
+  }
   if (coalesce_split_sections(s1) < 0)
     goto the_end;
 
@@ -1388,6 +1461,9 @@ static int elf_output_file(TCCState *s1, const char *filename)
       s1->bench_output_write_us += tcc_getclock_us() - t;
   }
 the_end:
+  section_spill_free(text_section);
+  tcc_free(s1->spill_path);
+  s1->spill_path = NULL;
   tcc_free(sec_order);
   tcc_free(dyninf.phdr);
   return ret;

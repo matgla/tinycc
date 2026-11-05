@@ -853,12 +853,38 @@ typedef struct DeferredChunk
   int materialized; /* 1 if this chunk has been loaded */
 } DeferredChunk;
 
+/* A section kept in a file rather than in memory (see tccelf.c, "spilled
+ * sections"): one piece per input section folded into it, read where it lies
+ * and written, relocated, to a temporary file next to the output. */
+typedef struct SpillPiece
+{
+  unsigned long base, size; /* where it goes in the section */
+  unsigned char *data;      /* its bytes, if they were in memory */
+  DeferredChunk *chunks;    /* else where they are on disk */
+} SpillPiece;
+
+typedef struct SectionSpill
+{
+  SpillPiece *pieces; /* by base, which is the order they were added in */
+  int nb_pieces, alloc_pieces;
+  unsigned char *written;    /* per piece: its bytes are in the file */
+  unsigned long written_end; /* the file holds [0, written_end) */
+  int cur;                   /* the piece in buf, or -1 */
+  unsigned char *buf;
+  unsigned long buf_size;
+  int fd, src_fd;
+  const char *src_path;
+  char *path;
+} SectionSpill;
+
 /* section definition */
 typedef struct Section
 {
   unsigned long data_offset;    /* current data offset */
-  unsigned char *data;          /* section data */
+  unsigned char *data;          /* section data: offsets [data_base, data_base + data_allocated) */
   unsigned long data_allocated; /* used for realloc() handling */
+  unsigned long data_base;      /* 0, except in a spilled section: its pieces are below */
+  struct SectionSpill *spill;   /* NULL, or where the bytes below data_base are */
   TCCState *s1;
   int sh_name;             /* elf section name (only used during output) */
   int sh_num;              /* elf section number */
@@ -1879,6 +1905,7 @@ struct TCCState
   int nb_files;            /* number thereof */
   int nb_libraries;        /* number of libs thereof */
   char *outfile;           /* output filename */
+  char *spill_path;        /* during a link: where a spilled .text goes, see tccelf.c */
   char *deps_outfile;      /* option -MF */
   int argc;
   char **argv;
@@ -2876,6 +2903,10 @@ ST_FUNC void section_materialize(TCCState *s1, Section *sec);
 ST_FUNC int deferred_chunks_read(TCCState *s1, DeferredChunk **chunks, unsigned char *dest, int *fd, const char **fd_path);
 ST_FUNC void section_reserve_exact(Section *sec, unsigned long size);
 ST_FUNC void section_release(Section *sec);
+ST_FUNC unsigned char *section_spill_ptr(TCCState *s1, Section *s, unsigned long off);
+ST_FUNC int section_spill_flush(TCCState *s1, Section *s);
+ST_FUNC int section_spill_write(TCCState *s1, Section *s, FILE *f, unsigned long size);
+ST_FUNC void section_spill_free(Section *s);
 ST_FUNC void *link_arena_alloc(TCCState *s1, unsigned long size);
 ST_FUNC int link_arena_owns(const TCCState *s1, const void *p);
 ST_FUNC char **tcc_name_list_read(TCCState *s1, const char *path, const char *option, int *count);

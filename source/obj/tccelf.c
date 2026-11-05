@@ -193,6 +193,240 @@ ST_FUNC int deferred_chunks_read(TCCState *s1, DeferredChunk **chunks, unsigned 
   return 0;
 }
 
+/* ---- Spilled sections --------------------------------------------------
+ *
+ * The bytes of a linked .text are its functions' bytes, which sit in the
+ * object files until then; held in memory they were the largest block of a
+ * link, and on a part without an MMU the largest block is what fails first
+ * (the heap has the room, in pieces).  So coalesce_split_sections records
+ * where each function's bytes are instead of copying them (SpillPiece), and
+ * the section keeps in memory only what is added after it (veneers), from
+ * data_base on.  relocate_section asks section_spill_ptr for the bytes under
+ * each relocation: the piece they are in is read, patched in a buffer and
+ * written to a file next to the output, and the writers copy the file.
+ *
+ * The file only ever grows at its end: a piece is written after every piece
+ * before it (and the alignment between them, as zeros), so nothing depends on
+ * how a filesystem fills a hole.  A piece relocated a second time, out of
+ * order, is read back from the file. */
+
+static int spill_read_piece(TCCState *s1, SectionSpill *sp, int k, unsigned char *dest)
+{
+  SpillPiece *p = &sp->pieces[k];
+  if (sp->written[k])
+  {
+    lseek(sp->fd, p->base, SEEK_SET);
+    if (full_read(sp->fd, dest, p->size) != p->size)
+      return tcc_error_noabort("short read from '%s'", sp->path);
+    return 0;
+  }
+  if (p->chunks)
+  {
+    /* Chunks need not cover it all: an object's .text has alignment between
+     * its functions, and the buffer is the last piece's. */
+    memset(dest, 0, p->size);
+    return deferred_chunks_read(s1, &p->chunks, dest, &sp->src_fd, &sp->src_path);
+  }
+  if (p->data)
+    memcpy(dest, p->data, p->size);
+  else
+    memset(dest, 0, p->size);
+  return 0;
+}
+
+static int spill_write(TCCState *s1, SectionSpill *sp, unsigned long at, const unsigned char *data, unsigned long size)
+{
+  lseek(sp->fd, at, SEEK_SET);
+  if (write(sp->fd, data, size) != (ssize_t)size)
+    return tcc_error_noabort("cannot write '%s'", sp->path);
+  if (at + size > sp->written_end)
+    sp->written_end = at + size;
+  return 0;
+}
+
+static int spill_buffer(SectionSpill *sp, unsigned long size)
+{
+  if (size > sp->buf_size)
+  {
+    tcc_free(sp->buf);
+    sp->buf = tcc_malloc(size);
+    sp->buf_size = size;
+  }
+  return 0;
+}
+
+/* Write everything before piece k that is not in the file yet: earlier pieces
+ * from where they are, and the gaps between them as zeros. */
+static int spill_fill_to(TCCState *s1, SectionSpill *sp, int k)
+{
+  static const unsigned char zeros[64];
+  int j;
+  for (j = 0; j < k; j++)
+    if (!sp->written[j])
+    {
+      SpillPiece *p = &sp->pieces[j];
+      unsigned char *tmp = tcc_malloc(p->size ? p->size : 1);
+      int r;
+      while (sp->written_end < p->base)
+      {
+        unsigned long n = p->base - sp->written_end;
+        if (spill_write(s1, sp, sp->written_end, zeros, n < sizeof zeros ? n : sizeof zeros) < 0)
+          return tcc_free(tmp), -1;
+      }
+      r = spill_read_piece(s1, sp, j, tmp);
+      if (r == 0)
+        r = spill_write(s1, sp, p->base, tmp, p->size);
+      tcc_free(tmp);
+      if (r < 0)
+        return -1;
+      sp->written[j] = 1;
+      tcc_free(p->data);
+      p->data = NULL;
+    }
+  if (k < sp->nb_pieces)
+    while (sp->written_end < sp->pieces[k].base)
+    {
+      unsigned long n = sp->pieces[k].base - sp->written_end;
+      if (spill_write(s1, sp, sp->written_end, zeros, n < sizeof zeros ? n : sizeof zeros) < 0)
+        return -1;
+    }
+  return 0;
+}
+
+static int spill_open(TCCState *s1, SectionSpill *sp)
+{
+  if (sp->fd >= 0)
+    return 0;
+  sp->fd = open(sp->path, O_RDWR | O_CREAT | O_TRUNC | O_BINARY, 0600);
+  if (sp->fd < 0)
+    return tcc_error_noabort("cannot create '%s'", sp->path);
+  return 0;
+}
+
+/* Put the piece in the buffer back into the file. */
+ST_FUNC int section_spill_flush(TCCState *s1, Section *s)
+{
+  SectionSpill *sp = s->spill;
+  int k;
+  if (!sp || sp->cur < 0)
+    return 0;
+  k = sp->cur;
+  sp->cur = -1;
+  if (spill_fill_to(s1, sp, k) < 0 || spill_write(s1, sp, sp->pieces[k].base, sp->buf, sp->pieces[k].size) < 0)
+    return -1;
+  sp->written[k] = 1;
+  tcc_free(sp->pieces[k].data);
+  sp->pieces[k].data = NULL;
+  return 0;
+}
+
+/* The bytes at section offset `off`, to be read and written in place until the
+ * next call.  NULL with the error reported if they cannot be had. */
+ST_FUNC unsigned char *section_spill_ptr(TCCState *s1, Section *s, unsigned long off)
+{
+  SectionSpill *sp = s->spill;
+  int lo, hi, k;
+  if (off >= s->data_base)
+    return s->data + off - s->data_base;
+  if (sp->cur >= 0 && off - sp->pieces[sp->cur].base < sp->pieces[sp->cur].size)
+    return sp->buf + off - sp->pieces[sp->cur].base;
+  if (spill_open(s1, sp) < 0 || section_spill_flush(s1, s) < 0)
+    return NULL;
+  for (lo = 0, hi = sp->nb_pieces - 1; lo < hi;)
+  {
+    int mid = (lo + hi + 1) / 2;
+    if (sp->pieces[mid].base <= off)
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  k = lo;
+  if (k >= sp->nb_pieces || off - sp->pieces[k].base >= sp->pieces[k].size)
+  {
+    tcc_error_noabort("relocation at 0x%lx of '%s' is outside its code", off, s->name);
+    return NULL;
+  }
+  spill_buffer(sp, sp->pieces[k].size);
+  if (spill_read_piece(s1, sp, k, sp->buf) < 0)
+    return NULL;
+  sp->cur = k;
+  return sp->buf + off - sp->pieces[k].base;
+}
+
+/* Write `size` bytes of the section to f: the file, the bytes from data_base,
+ * zeros after data_offset. */
+ST_FUNC int section_spill_write(TCCState *s1, Section *s, FILE *f, unsigned long size)
+{
+  SectionSpill *sp = s->spill;
+  unsigned char buf[4096];
+  unsigned long pos = 0, n, end = s->data_base;
+  if (spill_open(s1, sp) < 0 || section_spill_flush(s1, s) < 0 || spill_fill_to(s1, sp, sp->nb_pieces) < 0)
+    return -1;
+  /* the gap between the last piece and data_base */
+  while (sp->written_end < end)
+  {
+    memset(buf, 0, sizeof buf);
+    n = end - sp->written_end;
+    if (spill_write(s1, sp, sp->written_end, buf, n < sizeof buf ? n : sizeof buf) < 0)
+      return -1;
+  }
+  lseek(sp->fd, 0, SEEK_SET);
+  while (pos < end && pos < size)
+  {
+    n = end - pos;
+    if (n > sizeof buf)
+      n = sizeof buf;
+    if (n > size - pos)
+      n = size - pos;
+    if (full_read(sp->fd, buf, n) != n)
+      return tcc_error_noabort("short read from '%s'", sp->path);
+    fwrite(buf, 1, n, f);
+    pos += n;
+  }
+  if (pos < size && s->data_offset > end)
+  {
+    n = s->data_offset - end;
+    if (n > size - pos)
+      n = size - pos;
+    fwrite(s->data, 1, n, f);
+    pos += n;
+  }
+  for (; pos < size; pos++)
+    fputc(0, f);
+  return 0;
+}
+
+ST_FUNC void section_spill_free(Section *s)
+{
+  SectionSpill *sp = s->spill;
+  int k;
+  if (!sp)
+    return;
+  for (k = 0; k < sp->nb_pieces; k++)
+  {
+    DeferredChunk *c = sp->pieces[k].chunks, *next;
+    for (; c; c = next)
+    {
+      next = c->next;
+      tcc_free(c);
+    }
+    tcc_free(sp->pieces[k].data);
+  }
+  if (sp->fd >= 0)
+  {
+    close(sp->fd);
+    unlink(sp->path);
+  }
+  if (sp->src_fd >= 0)
+    close(sp->src_fd);
+  tcc_free(sp->pieces);
+  tcc_free(sp->written);
+  tcc_free(sp->buf);
+  tcc_free(sp->path);
+  tcc_free(sp);
+  s->spill = NULL;
+}
+
 /* Load all deferred data for a section */
 ST_FUNC void section_materialize(TCCState *s1, Section *sec)
 {
@@ -955,6 +1189,7 @@ ST_FUNC void free_section(Section *s)
   if (!s)
     return;
   free_deferred_chunks(s);     /* Clean up lazy loading metadata */
+  section_spill_free(s);
   free_reloc_patches(s);       /* Clean up relocation patches */
   tcc_free(s->str_hash);       /* Clean up string hash table */
   tcc_free(s->hash_val_cache); /* Clean up hash value cache */

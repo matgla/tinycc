@@ -222,6 +222,7 @@ ST_FUNC void section_realloc(Section *sec, unsigned long new_size)
   unsigned long size;
   unsigned char *data;
 
+  new_size -= sec->data_base;
   size = sec->data_allocated;
   if (size == 0)
   {
@@ -249,6 +250,7 @@ ST_FUNC void section_reserve_exact(Section *sec, unsigned long size)
 {
   unsigned char *data;
 
+  size -= sec->data_base;
   if (size <= sec->data_allocated)
     return;
   /* An input section's relocations, freed together with the arena. */
@@ -282,7 +284,7 @@ ST_FUNC size_t section_add(Section *sec, addr_t size, int align)
 
   offset = (sec->data_offset + align - 1) & -align;
   offset1 = offset + size;
-  if (sec->sh_type != SHT_NOBITS && offset1 > sec->data_allocated)
+  if (sec->sh_type != SHT_NOBITS && offset1 > sec->data_base + sec->data_allocated)
     section_realloc(sec, offset1);
   sec->data_offset = offset1;
   if (align > sec->sh_addralign)
@@ -295,7 +297,7 @@ ST_FUNC size_t section_add(Section *sec, addr_t size, int align)
 ST_FUNC void *section_ptr_add(Section *sec, addr_t size)
 {
   size_t offset = section_add(sec, size, 1);
-  return sec->data + offset;
+  return sec->data + offset - sec->data_base;
 }
 
 /* Pre-allocate section capacity without changing data_offset.

@@ -176,7 +176,13 @@ static void relocate_section(TCCState *s1, Section *s, Section *sr)
 
   for_each_elem(sr, 0, rel, ElfW_Rel)
   {
-    ptr = s->data + rel->r_offset;
+    if (s->spill)
+    {
+      if (!(ptr = section_spill_ptr(s1, s, rel->r_offset)))
+        return;
+    }
+    else
+      ptr = s->data + rel->r_offset;
     sym_index = ELFW(R_SYM)(rel->r_info);
     sym = &((ElfW(Sym) *)symtab_section->data)[sym_index];
     type = ELFW(R_TYPE)(rel->r_info);
@@ -193,6 +199,8 @@ static void relocate_section(TCCState *s1, Section *s, Section *sr)
     addr = s->sh_addr + rel->r_offset;
     relocate(s1, rel, type, ptr, addr, tgt);
   }
+  if (s->spill)
+    section_spill_flush(s1, s);
 #ifndef ELF_OBJ_ONLY
   /* if the relocation is allocated, we change its symbol table */
   if (sr->sh_flags & SHF_ALLOC)
