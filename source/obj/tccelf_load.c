@@ -312,7 +312,8 @@ ST_FUNC void tcc_link_arena_prepare(TCCState *s1)
         for (i = 1; i < ehdr.e_shnum; i++)
         {
           /* The name is a guess: the string table is not worth reading for it. */
-          if (shdr[i].sh_type == SHT_RELX)
+          if (shdr[i].sh_type == SHT_RELX && !(shdr[i].sh_info < ehdr.e_shnum &&
+                                                 (shdr[shdr[i].sh_info].sh_flags & SHF_EXECINSTR)))
             total += sizeof(Section) + 40 + ((shdr[i].sh_size + 7) & ~7ul);
           else if (shdr[i].sh_type == SHT_PROGBITS && (shdr[i].sh_flags & SHF_EXECINSTR))
             total += sizeof(Section) + 40;
@@ -340,6 +341,8 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
   (void)stab_index;
   (void)stabstr_index;
   int *old_to_new_syms;
+  LazyRels **lazy = NULL; /* this object's relocations left on disk, for their remap */
+  int nb_lazy = 0;
   char *sh_name, *name;
   SectionMergeInfo *sm_table, *sm;
   ElfW(Sym) * sym, *symtab;
@@ -458,6 +461,30 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
     sh_name = strsec + sh->sh_name;
     if (sh->sh_addralign < 1)
       sh->sh_addralign = 1;
+    /* The relocations of a function whose bytes stay in this file stay here
+     * too, read back when needed: "relocations left on disk" in tccelf.c.
+     * Only when the function is already loaded, which tcc's own objects
+     * always have (a section's relocations follow it). */
+    if (sh->sh_type == SHT_RELX && sh->sh_info < ehdr.e_shnum && sm_table[sh->sh_info].s &&
+        !sm_table[sh->sh_info].link_once && sh->sh_size % sizeof(ElfW_Rel) == 0 && !s1->gc_sections_aggressive &&
+        sm_table[sh->sh_info].s->has_deferred_chunks &&
+        defer_split_text(s1, sm_table[sh->sh_info].s, &shdr[sh->sh_info]))
+    {
+      Section *t = sm_table[sh->sh_info].s;
+      LazyRels *lr = tcc_mallocz(sizeof *lr), **tail = &t->lazy_rels;
+      const char *source_path = s1->current_archive_path ? s1->current_archive_path : s1->current_filename;
+      lr->path = deferred_path(s1, source_path);
+      lr->file_offset = s1->current_archive_offset ? s1->current_archive_offset + sh->sh_offset
+                                                   : file_offset + sh->sh_offset;
+      lr->count = sh->sh_size / sizeof(ElfW_Rel);
+      lr->offset = sm_table[sh->sh_info].offset;
+      lr->nb_syms = nb_syms;
+      while (*tail)
+        tail = &(*tail)->next;
+      *tail = lr;
+      dynarray_add(&lazy, &nb_lazy, lr);
+      continue;
+    }
     /* find corresponding section, if any */
     /* Use merged name for .text.*, .rodata.*, .data.*, .bss.* sections */
     if (gc_private_input_section(s1, sh_name))
@@ -634,6 +661,10 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
         set_elf_sym(symtab_section, sym->st_value, sym->st_size, sym->st_info, sym->st_other, sym->st_shndx, name);
     old_to_new_syms[i] = sym_index;
   }
+  /* What relocations left on disk need to be read: the remap outlives this
+   * function (handed over at the end, the passes below still use it). */
+  for (i = 0; i < nb_lazy; i++)
+    lazy[i]->remap = old_to_new_syms;
 
   /* third pass to patch relocation entries */
   for (i = 1; i < ehdr.e_shnum; i++)
@@ -698,7 +729,11 @@ the_end:
   }
   tcc_free(symtab);
   tcc_free(strtab);
-  tcc_free(old_to_new_syms);
+  if (nb_lazy && old_to_new_syms)
+    dynarray_add(&s1->reloc_remaps, &s1->nb_reloc_remaps, old_to_new_syms);
+  else
+    tcc_free(old_to_new_syms);
+  tcc_free(lazy);
   tcc_free(sm_table);
   tcc_free(strsec);
   tcc_free(shdr);

@@ -126,7 +126,7 @@ void free_deferred_chunks(Section *sec)
 
 /* One copy of a path per run of chunks from that file: there can be a chunk for
  * every function of a program, and a copy each costs as much as the chunk. */
-static const char *deferred_path(TCCState *s1, const char *path)
+ST_FUNC const char *deferred_path(TCCState *s1, const char *path)
 {
   if (!path)
     return NULL;
@@ -191,6 +191,103 @@ ST_FUNC int deferred_chunks_read(TCCState *s1, DeferredChunk **chunks, unsigned 
   }
   *chunks = NULL;
   return 0;
+}
+
+/* ---- Relocations left on disk --------------------------------------------
+ *
+ * A function's relocations are read three times in a link -- by --gc-sections,
+ * by its check for symbols only dead code wanted, and when coalesce_split_sections
+ * moves them into .text's -- and held in between they were a third of the
+ * memory a link needed: one Section and one buffer per function.  For a
+ * function whose bytes stay in its object (defer_split_text), the loader now
+ * records where the relocations are instead (LazyRels, on the function's
+ * Section) and keeps the object's symbol remap, a word per symbol; this reads
+ * them back the way the loader would have left them. */
+
+ST_FUNC int lazy_rels_count(Section *s)
+{
+  LazyRels *lr;
+  int n = 0;
+  for (lr = s->lazy_rels; lr; lr = lr->next)
+    n += lr->count;
+  return n;
+}
+
+ST_FUNC void lazy_rels_free(Section *s)
+{
+  LazyRels *lr = s->lazy_rels, *next;
+  for (; lr; lr = next)
+  {
+    next = lr->next;
+    tcc_free(lr);
+  }
+  s->lazy_rels = NULL;
+}
+
+/* All of s's relocations, symbols global and offsets in s, in a block the
+ * caller frees.  NULL with the error reported if they cannot be read. */
+ST_FUNC ElfW_Rel *lazy_rels_read(TCCState *s1, Section *s, int *count)
+{
+  LazyRels *lr;
+  ElfW_Rel *rels, *rel;
+  const char *open_path = NULL;
+  int fd = -1, n = lazy_rels_count(s);
+
+  *count = n;
+  rels = tcc_malloc(n ? n * sizeof(ElfW_Rel) : 1);
+  rel = rels;
+  for (lr = s->lazy_rels; lr; lr = lr->next)
+  {
+    uint32_t k;
+    if (open_path != lr->path)
+    {
+      if (fd >= 0)
+        close(fd);
+      open_path = lr->path;
+      fd = open(lr->path, O_RDONLY | O_BINARY);
+      if (fd < 0)
+      {
+        tcc_error_noabort("cannot reopen '%s'", lr->path);
+        goto fail;
+      }
+    }
+    lseek(fd, lr->file_offset, SEEK_SET);
+    if (!lr->remap || full_read(fd, rel, lr->count * sizeof(ElfW_Rel)) != lr->count * sizeof(ElfW_Rel))
+    {
+      tcc_error_noabort("short read from '%s'", lr->path);
+      goto fail;
+    }
+    for (k = 0; k < lr->count; k++, rel++)
+    {
+      int type = ELFW(R_TYPE)(rel->r_info);
+      unsigned sym_index = ELFW(R_SYM)(rel->r_info);
+      if (sym_index >= lr->nb_syms)
+        goto invalid;
+      sym_index = lr->remap[sym_index];
+      if (!sym_index
+#ifdef TCC_TARGET_ARM
+          && type != R_ARM_V4BX
+#elif defined TCC_TARGET_RISCV64
+          && type != R_RISCV_ALIGN && type != R_RISCV_RELAX
+#endif
+      )
+      {
+      invalid:
+        tcc_error_noabort("Invalid relocation entry in '%s' @ %.8x", s->name, (int)rel->r_offset);
+        goto fail;
+      }
+      rel->r_info = ELFW(R_INFO)(sym_index, type);
+      rel->r_offset += lr->offset;
+    }
+  }
+  if (fd >= 0)
+    close(fd);
+  return rels;
+fail:
+  if (fd >= 0)
+    close(fd);
+  tcc_free(rels);
+  return NULL;
 }
 
 /* ---- Spilled sections --------------------------------------------------
@@ -1190,6 +1287,7 @@ ST_FUNC void free_section(Section *s)
     return;
   free_deferred_chunks(s);     /* Clean up lazy loading metadata */
   section_spill_free(s);
+  lazy_rels_free(s);
   free_reloc_patches(s);       /* Clean up relocation patches */
   tcc_free(s->str_hash);       /* Clean up string hash table */
   tcc_free(s->hash_val_cache); /* Clean up hash value cache */
@@ -1230,6 +1328,7 @@ ST_FUNC void tccelf_delete(TCCState *s1)
   }
   dynarray_reset(&s1->sections, &s1->nb_sections);
   dynarray_reset(&s1->deferred_paths, &s1->nb_deferred_paths);
+  dynarray_reset(&s1->reloc_remaps, &s1->nb_reloc_remaps);
   tcc_free(s1->section_ht);
   s1->section_ht = NULL;
   s1->section_ht_mask = 0;

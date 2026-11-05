@@ -877,6 +877,19 @@ typedef struct SectionSpill
   char *path;
 } SectionSpill;
 
+/* Where one object's relocations for a function are, and how to read them
+ * (see tccelf.c, "relocations left on disk"). */
+typedef struct LazyRels
+{
+  struct LazyRels *next;
+  const char *path;    /* owned by s1->deferred_paths */
+  uint32_t file_offset;
+  uint32_t count;
+  uint32_t offset;     /* of that object's bytes in the section */
+  uint32_t nb_syms;
+  const int *remap;    /* the object's symbol -> symtab_section index, s1->reloc_remaps */
+} LazyRels;
+
 /* section definition */
 typedef struct Section
 {
@@ -885,6 +898,7 @@ typedef struct Section
   unsigned long data_allocated; /* used for realloc() handling */
   unsigned long data_base;      /* 0, except in a spilled section: its pieces are below */
   struct SectionSpill *spill;   /* NULL, or where the bytes below data_base are */
+  LazyRels *lazy_rels;          /* relocations still in the object files, in load order */
   TCCState *s1;
   int sh_name;             /* elf section name (only used during output) */
   int sh_num;              /* elf section number */
@@ -1891,6 +1905,8 @@ struct TCCState
   /* Paths of files with deferred section chunks, shared by those chunks. */
   char **deferred_paths;
   int nb_deferred_paths;
+  int **reloc_remaps; /* per object with LazyRels: its symbol remap, until coalesce */
+  int nb_reloc_remaps;
   /* Cached archive symbol tables for --start-group rescan avoidance */
   ArchiveSymbolCache *archive_sym_caches;
   int nb_archive_sym_caches;
@@ -2907,6 +2923,10 @@ ST_FUNC unsigned char *section_spill_ptr(TCCState *s1, Section *s, unsigned long
 ST_FUNC int section_spill_flush(TCCState *s1, Section *s);
 ST_FUNC int section_spill_write(TCCState *s1, Section *s, FILE *f, unsigned long size);
 ST_FUNC void section_spill_free(Section *s);
+ST_FUNC const char *deferred_path(TCCState *s1, const char *path);
+ST_FUNC ElfW_Rel *lazy_rels_read(TCCState *s1, Section *s, int *count);
+ST_FUNC int lazy_rels_count(Section *s);
+ST_FUNC void lazy_rels_free(Section *s);
 ST_FUNC void *link_arena_alloc(TCCState *s1, unsigned long size);
 ST_FUNC int link_arena_owns(const TCCState *s1, const void *p);
 ST_FUNC char **tcc_name_list_read(TCCState *s1, const char *path, const char *option, int *count);

@@ -591,6 +591,27 @@ void gc_sections(TCCState *s1)
           }
         }
       }
+      if (s->lazy_rels)
+      {
+        int n, k;
+        ElfW_Rel *rels = lazy_rels_read(s1, s, &n);
+        for (k = 0; rels && k < n; k++)
+        {
+          int shndx;
+          sym_index = ELFW(R_SYM)(rels[k].r_info);
+          if (sym_index == 0 || sym_index >= nb_syms)
+            continue;
+          shndx = symtab[sym_index].st_shndx;
+          if (shndx == SHN_UNDEF || shndx >= SHN_LORESERVE || shndx >= nb)
+            continue;
+          if (!sec_used[shndx])
+          {
+            sec_used[shndx] = 1;
+            work[top++] = shndx;
+          }
+        }
+        tcc_free(rels);
+      }
     }
     tcc_free(rel_head);
     tcc_free(rel_next);
@@ -643,6 +664,7 @@ void gc_sections(TCCState *s1)
           section_release(s->reloc);
           s->reloc->sh_size = 0;
         }
+        lazy_rels_free(s);
         /* Free deferred chunks for lazy sections to save memory */
         if (s->lazy && s->has_deferred_chunks)
         {
@@ -684,6 +706,18 @@ void gc_sections(TCCState *s1)
       for (i = 1; i < s1->nb_sections; i++)
       {
         sr = s1->sections[i];
+        if (sr && sr->lazy_rels)
+        {
+          int n, k;
+          ElfW_Rel *rels = lazy_rels_read(s1, sr, &n);
+          for (k = 0; rels && k < n; k++)
+          {
+            sym_index = ELFW(R_SYM)(rels[k].r_info);
+            if (sym_index > 0 && sym_index < nb_syms)
+              referenced[sym_index] = 1;
+          }
+          tcc_free(rels);
+        }
         if (!sr || sr->sh_type != SHT_RELX || !sr->data_offset)
           continue;
         for_each_elem(sr, 0, rel, ElfW_Rel)
@@ -846,12 +880,14 @@ static int coalesce_split_sections(TCCState *s1)
       grow[nb_grow++].rels = 0;
     }
     grow[g].bytes += s->data_offset + (s->sh_addralign > 4 ? s->sh_addralign : 4);
-    if (s->reloc && s->reloc->data_offset)
+    if ((s->reloc && s->reloc->data_offset) || s->lazy_rels)
     {
       /* Created here, in the order the merge below first needs them. */
       if (!grow[g].rels)
         grow[g].rels = section_reloc(symtab_section, t)->data_offset;
-      grow[g].rels += s->reloc->data_offset;
+      if (s->reloc)
+        grow[g].rels += s->reloc->data_offset;
+      grow[g].rels += lazy_rels_count(s) * sizeof(ElfW_Rel);
     }
   }
   for (i = 0; i < nb_grow; i++)
@@ -933,6 +969,18 @@ static int coalesce_split_sections(TCCState *s1)
       free_section(sr);
       if (!link_arena_owns(s1, sr))
         tcc_free(sr);
+    }
+    if (s->lazy_rels)
+    {
+      int nb, r;
+      ElfW_Rel *rel = lazy_rels_read(s1, s, &nb);
+      if (!rel)
+        ret = -1;
+      for (r = 0; rel && r < nb; r++)
+        put_elf_reloc(symtab_section, t, rel[r].r_offset + base_of[i], ELFW(R_TYPE)(rel[r].r_info),
+                      ELFW(R_SYM)(rel[r].r_info));
+      tcc_free(rel);
+      lazy_rels_free(s);
     }
 
     in->target = t;
@@ -1024,6 +1072,8 @@ static int coalesce_split_sections(TCCState *s1)
   }
 
   dynarray_reset(&hot_names, &nb_hot_names);
+  /* Every relocation left on disk has been read for the last time. */
+  dynarray_reset(&s1->reloc_remaps, &s1->nb_reloc_remaps);
 #ifdef TCC_TARGET_ARM
   text_tail = arm_hot_text_veneer_bytes(s1) + 8; /* +8: the block's alignment */
   for (i = 0; i < nb_grow; i++)
