@@ -102,29 +102,33 @@ ST_FUNC void relocate_syms(TCCState *s1, Section *symtab, int do_resolve)
  * Each patch is 8 bytes (2 x uint32_t) vs 24 bytes with linked list. */
 static void add_reloc_patch(Section *s, uint32_t offset, uint32_t value)
 {
+  SectionAux *a = section_aux(s);
   /* Ensure capacity */
-  if (s->nb_reloc_patches >= s->alloc_reloc_patches)
+  if (a->nb_reloc_patches >= a->alloc_reloc_patches)
   {
-    int new_alloc = s->alloc_reloc_patches ? s->alloc_reloc_patches * 2 : 16;
-    s->reloc_patch_offsets = tcc_realloc(s->reloc_patch_offsets, new_alloc * sizeof(uint32_t));
-    s->reloc_patch_values = tcc_realloc(s->reloc_patch_values, new_alloc * sizeof(uint32_t));
-    s->alloc_reloc_patches = new_alloc;
+    int new_alloc = a->alloc_reloc_patches ? a->alloc_reloc_patches * 2 : 16;
+    a->reloc_patch_offsets = tcc_realloc(a->reloc_patch_offsets, new_alloc * sizeof(uint32_t));
+    a->reloc_patch_values = tcc_realloc(a->reloc_patch_values, new_alloc * sizeof(uint32_t));
+    a->alloc_reloc_patches = new_alloc;
   }
   /* Append patch */
-  s->reloc_patch_offsets[s->nb_reloc_patches] = offset;
-  s->reloc_patch_values[s->nb_reloc_patches] = value;
-  s->nb_reloc_patches++;
+  a->reloc_patch_offsets[a->nb_reloc_patches] = offset;
+  a->reloc_patch_values[a->nb_reloc_patches] = value;
+  a->nb_reloc_patches++;
 }
 
 /* Free all relocation patches for a section */
 void free_reloc_patches(Section *s)
 {
-  tcc_free(s->reloc_patch_offsets);
-  tcc_free(s->reloc_patch_values);
-  s->reloc_patch_offsets = NULL;
-  s->reloc_patch_values = NULL;
-  s->nb_reloc_patches = 0;
-  s->alloc_reloc_patches = 0;
+  SectionAux *a = s->aux;
+  if (!a)
+    return;
+  tcc_free(a->reloc_patch_offsets);
+  tcc_free(a->reloc_patch_values);
+  a->reloc_patch_offsets = NULL;
+  a->reloc_patch_values = NULL;
+  a->nb_reloc_patches = 0;
+  a->alloc_reloc_patches = 0;
 }
 
 /* relocate a given section (CPU dependent) by applying the relocations

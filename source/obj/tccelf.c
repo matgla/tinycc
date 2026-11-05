@@ -573,7 +573,7 @@ ST_FUNC void section_materialize(TCCState *s1, Section *sec)
   }
 
   /* Apply any relocation patches */
-  if (sec->nb_reloc_patches > 0)
+  if (SECTION_NB_PATCHES(sec) > 0)
   {
     /* Applying relocation patches */
     apply_reloc_patches(sec, sec->data, sec->data_offset);
@@ -613,9 +613,9 @@ ST_FUNC void section_ensure_loaded(TCCState *s1, Section *sec)
 static void sort_patches_by_offset(Section *sec)
 {
   int i, j;
-  int n = sec->nb_reloc_patches;
-  uint32_t *offsets = sec->reloc_patch_offsets;
-  uint32_t *values = sec->reloc_patch_values;
+  int n = SECTION_NB_PATCHES(sec);
+  uint32_t *offsets = sec->aux->reloc_patch_offsets;
+  uint32_t *values = sec->aux->reloc_patch_values;
 
   for (i = 1; i < n; i++)
   {
@@ -637,12 +637,12 @@ static void sort_patches_by_offset(Section *sec)
 static void apply_reloc_patches(Section *sec, unsigned char *data, size_t size)
 {
   int i;
-  for (i = 0; i < sec->nb_reloc_patches; i++)
+  for (i = 0; i < SECTION_NB_PATCHES(sec); i++)
   {
-    uint32_t offset = sec->reloc_patch_offsets[i];
+    uint32_t offset = sec->aux->reloc_patch_offsets[i];
     if (offset + 4 <= size)
     {
-      add32le(data + offset, sec->reloc_patch_values[i]);
+      add32le(data + offset, sec->aux->reloc_patch_values[i]);
     }
   }
 }
@@ -656,15 +656,15 @@ static int apply_patches_to_buffer(Section *sec, int *patch_idx, uint32_t buf_st
   int applied = 0;
   int i = *patch_idx;
 
-  while (i < sec->nb_reloc_patches && sec->reloc_patch_offsets[i] < buf_end)
+  while (i < SECTION_NB_PATCHES(sec) && sec->aux->reloc_patch_offsets[i] < buf_end)
   {
-    uint32_t offset = sec->reloc_patch_offsets[i];
+    uint32_t offset = sec->aux->reloc_patch_offsets[i];
     if (offset >= buf_start)
     {
       uint32_t buf_offset = offset - buf_start;
       if (buf_offset + 4 <= buf_size)
       {
-        add32le(buffer + buf_offset, sec->reloc_patch_values[i]);
+        add32le(buffer + buf_offset, sec->aux->reloc_patch_values[i]);
         applied++;
       }
     }
@@ -682,9 +682,9 @@ static size_t patch_safe_prefix(Section *sec, int patch_idx, uint32_t buf_start,
 {
   uint32_t buf_end = buf_start + n;
   int i;
-  for (i = patch_idx; i < sec->nb_reloc_patches && sec->reloc_patch_offsets[i] < buf_end; i++)
+  for (i = patch_idx; i < SECTION_NB_PATCHES(sec) && sec->aux->reloc_patch_offsets[i] < buf_end; i++)
   {
-    uint32_t offset = sec->reloc_patch_offsets[i];
+    uint32_t offset = sec->aux->reloc_patch_offsets[i];
     if (offset >= buf_start && offset + 4 > buf_end)
     {
       size_t cut = offset - buf_start;
@@ -718,7 +718,7 @@ int section_write_streaming(TCCState *s1, Section *sec, FILE *f)
   }
 
   /* If there are relocation patches, sort them by offset for efficient streaming */
-  if (sec->nb_reloc_patches > 0)
+  if (SECTION_NB_PATCHES(sec) > 0)
   {
     sort_patches_by_offset(sec);
   }
@@ -743,10 +743,10 @@ int section_write_streaming(TCCState *s1, Section *sec, FILE *f)
         while (from_data > 0)
         {
           n = from_data < sizeof(buffer) ? from_data : sizeof(buffer);
-          if (patch_idx < sec->nb_reloc_patches)
+          if (patch_idx < SECTION_NB_PATCHES(sec))
             n = patch_safe_prefix(sec, patch_idx, output_pos, n);
           memcpy(buffer, sec->data + output_pos, n);
-          if (patch_idx < sec->nb_reloc_patches)
+          if (patch_idx < SECTION_NB_PATCHES(sec))
             apply_patches_to_buffer(sec, &patch_idx, output_pos, output_pos + n, buffer, n);
           fwrite(buffer, 1, n, f);
           output_pos += n;
@@ -788,7 +788,7 @@ int section_write_streaming(TCCState *s1, Section *sec, FILE *f)
 
       /* Do not let the buffer end inside a patch: give the tail back to the
          next read so all four bytes are in memory when it is applied */
-      if (patch_idx < sec->nb_reloc_patches)
+      if (patch_idx < SECTION_NB_PATCHES(sec))
       {
         size_t keep = patch_safe_prefix(sec, patch_idx, c->dest_offset + chunk_written, n);
         if (keep < n)
@@ -799,7 +799,7 @@ int section_write_streaming(TCCState *s1, Section *sec, FILE *f)
       }
 
       /* Apply any patches that fall within this buffer */
-      if (patch_idx < sec->nb_reloc_patches)
+      if (patch_idx < SECTION_NB_PATCHES(sec))
       {
         uint32_t buf_start = c->dest_offset + chunk_written;
         uint32_t buf_end = buf_start + n;
@@ -1289,19 +1289,14 @@ ST_FUNC void free_section(Section *s)
   section_spill_free(s);
   lazy_rels_free(s);
   free_reloc_patches(s);       /* Clean up relocation patches */
-  tcc_free(s->str_hash);       /* Clean up string hash table */
-  tcc_free(s->hash_val_cache); /* Clean up hash value cache */
+  if (s->aux)
+    tcc_free(s->aux->hash_val_cache);
+  tcc_free(s->aux);
+  s->aux = NULL;
   if (!link_arena_owns(s->s1, s->data))
     tcc_free(s->data);
   s->data = NULL;
   s->data_allocated = s->data_offset = 0;
-  s->str_hash = NULL;
-  s->str_hash_size = 0;
-  s->str_hash_count = 0;
-  s->hash_val_cache = NULL;
-  s->hash_val_alloc = 0;
-  s->nb_reloc_patches = 0;
-  s->alloc_reloc_patches = 0;
 }
 
 ST_FUNC void tccelf_delete(TCCState *s1)

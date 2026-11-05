@@ -127,6 +127,13 @@ ST_FUNC Section *new_section(TCCState *s1, const char *name, int sh_type, int sh
 }
 
 /* A section coalesce_split_sections will free: from the arena if it has room. */
+ST_FUNC SectionAux *section_aux(Section *s)
+{
+  if (!s->aux)
+    s->aux = tcc_mallocz(sizeof(SectionAux));
+  return s->aux;
+}
+
 ST_FUNC Section *new_input_section(TCCState *s1, const char *name, int sh_type, int sh_flags)
 {
   Section *sec = link_arena_alloc(s1, sizeof(Section) + strlen(name));
@@ -412,9 +419,12 @@ static void rebuild_hash(Section *s, unsigned int nb_buckets)
   ptr += nb_buckets + 1;
 
   /* Rebuild hash value cache */
-  s->hash->hash_val_cache = tcc_realloc(s->hash->hash_val_cache, nb_syms * sizeof(unsigned int));
-  s->hash->hash_val_alloc = nb_syms;
-  hcache = s->hash->hash_val_cache;
+  {
+    SectionAux *a = section_aux(s->hash);
+    a->hash_val_cache = tcc_realloc(a->hash_val_cache, nb_syms * sizeof(unsigned int));
+    a->hash_val_alloc = nb_syms;
+    hcache = a->hash_val_cache;
+  }
   hcache[0] = 0;
 
   sym = (ElfW(Sym) *)s->data + 1;
@@ -489,22 +499,22 @@ ST_FUNC int put_elf_sym(Section *s, addr_t value, unsigned long size, int info, 
       base[2 + h] = sym_index;
       base[1]++;
       /* we resize the hash table */
-      hs->nb_hashed_syms++;
-      if (hs->nb_hashed_syms > 2 * nbuckets)
+      if (++section_aux(hs)->nb_hashed_syms > 2 * nbuckets)
       {
         rebuild_hash(s, 2 * nbuckets);
       }
       else
       {
         /* Store cached hash value (rebuild_hash handles this when triggered) */
-        if (sym_index >= hs->hash_val_alloc)
+        SectionAux *a = section_aux(hs);
+        if (sym_index >= a->hash_val_alloc)
         {
           int new_alloc = (sym_index + 16) & ~15;
-          hs->hash_val_cache = tcc_realloc(hs->hash_val_cache, new_alloc * sizeof(unsigned int));
-          memset(hs->hash_val_cache + hs->hash_val_alloc, 0, (new_alloc - hs->hash_val_alloc) * sizeof(unsigned int));
-          hs->hash_val_alloc = new_alloc;
+          a->hash_val_cache = tcc_realloc(a->hash_val_cache, new_alloc * sizeof(unsigned int));
+          memset(a->hash_val_cache + a->hash_val_alloc, 0, (new_alloc - a->hash_val_alloc) * sizeof(unsigned int));
+          a->hash_val_alloc = new_alloc;
         }
-        hs->hash_val_cache[sym_index] = full_hash;
+        a->hash_val_cache[sym_index] = full_hash;
       }
     }
     else
@@ -545,7 +555,7 @@ static int find_elf_sym_with_hash(Section *s, const char *name, unsigned int ful
     return 0;
   nbuckets = ((int *)hs->data)[0];
   sym_index = ((int *)hs->data)[2 + full_hash % nbuckets];
-  hcache = hs->hash_val_cache;
+  hcache = hs->aux ? hs->aux->hash_val_cache : NULL;
 
   while (sym_index != 0)
   {

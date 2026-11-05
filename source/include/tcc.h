@@ -910,33 +910,36 @@ typedef struct Section
   unsigned long sh_size;   /* section size (only used during output) */
   addr_t sh_addr;          /* address at which the section is relocated */
   unsigned long sh_offset; /* file offset */
-  int nb_hashed_syms;      /* used to resize the hash table */
   struct Section *link;    /* link to another section */
   struct Section *reloc;   /* corresponding section for relocation, if any */
   struct Section *hash;    /* hash table for symbols */
   struct Section *prev;    /* previous section on section stack */
-  /* Lazy loading support - use int instead of bit fields to avoid padding issues */
-  int lazy;                     /* 1 = section uses lazy loading */
-  int materialized;             /* 1 = data has been loaded (legacy) */
-  int has_deferred_chunks;      /* 1 = has chunks not yet materialized */
-  int fully_materialized;       /* 1 = all chunks materialized */
-  DeferredChunk *deferred_head; /* List of chunks to load */
-  DeferredChunk *deferred_tail; /* For O(1) append */
-  /* Relocation patches - stored as dynamic array for memory efficiency
-   * Each patch is 8 bytes (offset+value) vs 24 bytes with linked list */
-  uint32_t *reloc_patch_offsets; /* Array of patch offsets */
-  uint32_t *reloc_patch_values;  /* Array of patch values */
-  int nb_reloc_patches;          /* Number of patches */
-  int alloc_reloc_patches;       /* Allocated size of arrays */
-  /* String table deduplication - hash table for quick lookup */
-  uint32_t *str_hash; /* Hash table: hash -> offset in data */
-  int str_hash_size;  /* Size of hash table */
-  int str_hash_count; /* Number of entries in hash */
-  /* Hash value cache for fast find_elf_sym - avoids strcmp on mismatches */
-  unsigned int *hash_val_cache; /* full hash values indexed by sym_index */
-  int hash_val_alloc;           /* allocated size of cache */
-  char name[1];                 /* section name */
+  /* Lazy loading support */
+  unsigned char lazy;                /* 1 = section uses lazy loading */
+  unsigned char materialized;        /* 1 = data has been loaded (legacy) */
+  unsigned char has_deferred_chunks; /* 1 = has chunks not yet materialized */
+  DeferredChunk *deferred_head;      /* List of chunks to load */
+  DeferredChunk *deferred_tail;      /* For O(1) append */
+  struct SectionAux *aux;            /* what few sections need: section_aux() */
+  char name[1];                      /* section name */
 } Section;
+
+/* What only a few kinds of section need, out of the Section every function of
+ * a link has (a link holds thousands, see "relocations left on disk"). */
+typedef struct SectionAux
+{
+  /* A lazy debug section: relocation patches, 8 bytes each */
+  uint32_t *reloc_patch_offsets;
+  uint32_t *reloc_patch_values;
+  int nb_reloc_patches;
+  int alloc_reloc_patches;
+  /* A symbol table's hash section: full hash values by symbol, for find_elf_sym */
+  unsigned int *hash_val_cache;
+  int hash_val_alloc;
+  int nb_hashed_syms;
+} SectionAux;
+
+#define SECTION_NB_PATCHES(s) ((s)->aux ? (s)->aux->nb_reloc_patches : 0)
 
 /* -------------------------------------------------- */
 /* Garbage Collection During Loading (Phase 2) - Lazy Section Info */
@@ -2923,6 +2926,7 @@ ST_FUNC unsigned char *section_spill_ptr(TCCState *s1, Section *s, unsigned long
 ST_FUNC int section_spill_flush(TCCState *s1, Section *s);
 ST_FUNC int section_spill_write(TCCState *s1, Section *s, FILE *f, unsigned long size);
 ST_FUNC void section_spill_free(Section *s);
+ST_FUNC SectionAux *section_aux(Section *s);
 ST_FUNC const char *deferred_path(TCCState *s1, const char *path);
 ST_FUNC ElfW_Rel *lazy_rels_read(TCCState *s1, Section *s, int *count);
 ST_FUNC int lazy_rels_count(Section *s);
