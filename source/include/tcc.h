@@ -450,14 +450,11 @@ typedef struct Sym Sym;
 
 /* -------------------------------------------- */
 
-/* CONFIG_TCC_LOW_MEM: size the compiler's fixed tables and first arenas for
- * a part whose processes live in a few hundred KB of SRAM (the Pico 2, no
- * PSRAM).  Growable structures start small and grow in equal steps; fixed
- * ones are just smaller.  An O0-only compiler is built for exactly such a part,
- * so it implies this. */
-#if defined CONFIG_TCC_O0_ONLY && !defined CONFIG_TCC_LOW_MEM
-#define CONFIG_TCC_LOW_MEM 1
-#endif
+/* CONFIG_TCC_LOW_MEM (./configure --enable-low-mem): size the compiler's fixed
+ * tables and first arenas for a part whose processes live in a few hundred KB
+ * of SRAM (the Pico 2, no PSRAM).  Growable structures start small and grow in
+ * equal steps; fixed ones are just smaller.  CONFIG_TCC_O0_ONLY is separate: a
+ * board with PSRAM can want a small compiler without these limits. */
 
 #define INCLUDE_STACK_SIZE 32
 #define IFDEF_STACK_SIZE 64
@@ -2007,8 +2004,8 @@ struct TCCState
 };
 
 /* Reads of the optimization level and the -f<opt> flags.  A compiler built
- * with CONFIG_TCC_O0_ONLY (the native tcc for a part with no PSRAM, where only
- * -O0 fits in memory anyway) sees them all as constant 0: every pass gated on
+ * with CONFIG_TCC_O0_ONLY (./configure --disable-optimizer: a native tcc where
+ * its own size matters more than optimizing) sees them all as constant 0: every pass gated on
  * them folds out of its build and --gc-sections drops the optimizer.  -O0
  * output is unchanged, since every one of them is 0 at -O0 already. */
 #ifdef CONFIG_TCC_O0_ONLY

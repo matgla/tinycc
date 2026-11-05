@@ -28,6 +28,8 @@ infodir=""
 sysroot=""
 cross_prefix=""
 cc="gcc"
+cc_set=
+hostcc="gcc"
 ar="ar"
 bigendian="no"
 mingw32="no"
@@ -55,7 +57,7 @@ build_cross=
 opt_level=
 
 # use CC/AR from environment when set
-test -n "$CC" && cc="$CC"
+test -n "$CC" && cc="$CC" && cc_set=yes
 test -n "$AR" && ar="$AR"
 
 # set default CFLAGS if unset in environment
@@ -79,9 +81,10 @@ good_split() {
 
 # $1: NAME[=VALUE]  succeed if confvars has NAME or NAME=* element
 confvars_has() {
-  ! case " $confvars " in *" ${1%%=*} "* | *" ${1%%=*}="*)
-    false
+  case " $confvars " in *" ${1%%=*} "* | *" ${1%%=*}="*)
+    return 0
   esac
+  return 1
 }
 
 # [multiple] NAME or NAME=VAL
@@ -124,7 +127,9 @@ for opt do
   ;;
   --cross-prefix=*) assign_opt "$opt" cross_prefix
   ;;
-  --cc=*) assign_opt "$opt"
+  --cc=*) assign_opt "$opt" ; cc_set=yes
+  ;;
+  --hostcc=*) assign_opt "$opt"
   ;;
   --ar=*) assign_opt "$opt" ; ar_set="yes"
   ;;
@@ -159,6 +164,10 @@ for opt do
   --enable-Os) opt_level=s
   ;;
   --enable-Og) opt_level=g
+  ;;
+  --disable-optimizer) confvars_set optimizer=no
+  ;;
+  --enable-low-mem) confvars_set low_mem
   ;;
   --enable-cross) confvars_set cross
   ;;
@@ -235,6 +244,10 @@ Advanced options (experts only):
   --extra-ldflags=         specify linker options [$LDFLAGS]
 
   --debug                  include debug info with resulting binaries
+  --disable-optimizer      build a compiler that only does -O0: about half the size,
+                           the same -O0 code; -O1 and up are accepted and ignored
+  --enable-low-mem         smaller limits and tables for a part without external RAM;
+                           independent of --disable-optimizer
   --enable-asan            enable AddressSanitizer (ASan)
   --disable-asan           disable AddressSanitizer (ASan) [default]
   --enable-ubsan           enable UndefinedBehaviorSanitizer (UBSan)
@@ -276,6 +289,7 @@ Cross build options (experimental):
   --cpu=CPU                target CPU [$cpu]
   --targetos=...           target OS (Darwin,WIN32,Android/Termux) [$targetos]
   --cross-prefix=PREFIX    use PREFIX for compile tools [$cross_prefix]
+  --hostcc=CC              compiler for the generators run during the build [$hostcc]
 EOF
 exit 1
 }
@@ -290,7 +304,9 @@ default_conf() # add one config to confvars unless already present
     confvars_has "$1" || confvars_set "$1"
 }
 
-if test -z "${source_path#.}" ; then
+# $0 may spell the current directory out: linking "out of tree" then replaces
+# the Makefile with a link to itself.
+if test -z "${source_path#.}" || test "$source_path" = "$(pwd)" ; then
   source_path=$(pwd)
   source_path_used="no"
 else
@@ -300,6 +316,34 @@ fi
 # OS specific
 buildos=$(uname)
 cpu_sys=$(uname -m)
+
+# Built on YasOS itself: tcc is the only compiler there, and what it builds is
+# this system's compiler, so `./configure && make` needs no options.  The
+# running compiler says which FPU and FP runtime its replacement should default
+# to, because that depends on the board the rootfs was built for.
+if test "$buildos" = "YasOS"; then
+  test -n "$cc_set" || cc="tcc"
+  hostcc="tcc"
+  default cpu armv8m
+  default prefix /usr
+  default sysroot /
+  default tcc_libpaths "/usr/lib:{B}:/lib"
+  default tcc_crtprefix /usr/lib
+  default tcc_sysincludepaths "/usr/include:{B}/include"
+  default_conf cross
+  default_conf asm=yes
+  default_conf bcheck=no
+  default_conf pie=yes
+  default_conf pic=yes
+  default_conf ldl=no
+  default_conf pthread=no
+  CFLAGS="$CFLAGS -DTCC_DEBUG=0 -DCONFIG_TCC_DEBUG -DCONFIG_TCC_DEBUG_ENV=0 $($cc -dumpdefaults)"
+  CFLAGS="$CFLAGS -DTCC_ARM_VFP -DTCC_ARM_EABI=1 -DCONFIG_TCC_BCHECK=0 -DTCC_ARM_HARDFLOAT"
+  CFLAGS="$CFLAGS -DTCC_TARGET_ARM_ARCHV8M -DTARGETOS_YasOS=1 -DTCC_TARGET_ARM_THUMB -DTCC_TARGET_ARM"
+  CFLAGS="$CFLAGS -DTCC_IS_NATIVE -fpie -fPIE -mcpu=cortex-m33 -fvisibility=hidden -ffunction-sections"
+  LDFLAGS="$LDFLAGS -fpie -fPIE -fvisibility=hidden -stack-size=32768 -Wl,--gc-sections"
+  LDFLAGS="$LDFLAGS -Wl,-Ttext=0x0 -Wl,-section-alignment=0x4"
+fi
 
 case $buildos in
   Windows_NT|MINGW*|MSYS*|CYGWIN*)
@@ -650,6 +694,7 @@ mandir=\$(DESTDIR)$mandir
 infodir=\$(DESTDIR)$infodir
 docdir=\$(DESTDIR)$docdir
 CC=$cc
+HOSTCC=$hostcc
 CC_NAME=$cc_name
 GCC_MAJOR=$gcc_major
 GCC_MINOR=$gcc_minor
@@ -763,6 +808,8 @@ for v in $cpu $confvars ; do
     CONFIG_codesign=yes)    print_num CONFIG_CODESIGN 1 ;;
     CONFIG_new_macho=no)    print_num CONFIG_NEW_MACHO 0 ;;
     CONFIG_bcheck=no)       print_num CONFIG_TCC_BCHECK 0 ;;
+    CONFIG_optimizer=no)    print_num CONFIG_TCC_O0_ONLY 1 ;;
+    CONFIG_low_mem)         print_num CONFIG_TCC_LOW_MEM 1 ;;
     CONFIG_backtrace=no)    print_num CONFIG_TCC_BACKTRACE 0 ;;
     CONFIG_dwarf=*)         print_num CONFIG_DWARF_VERSION ${R#*=} ;;
     CONFIG_semlock=*)       print_num CONFIG_TCC_SEMLOCK ${R#*=} ;;

@@ -1261,11 +1261,11 @@ LIBTCCAPI TCCState *tcc_new(void)
   /* Calls to undefined functions that no library in the library paths exports
    * keep R9 (no reload after the call); -fno-module-local-calls restores the
    * reload after every call out of the translation unit. */
-#ifdef CONFIG_TCC_O0_ONLY
+#ifdef CONFIG_TCC_LOW_MEM
   /* The r9-reload elision reads every library's export table into the heap
-   * (tens of KB for libc.so) to decide which callees bind locally; an
-   * O0-only compiler reloads r9 after every external call instead.
-   * -fmodule-local-calls still turns it on. */
+   * (tens of KB for libc.so) to decide which callees bind locally; a low-memory
+   * compiler reloads r9 after every external call instead, which makes code
+   * about 5% bigger.  -fmodule-local-calls still turns it on. */
   s->module_local_calls = 0;
 #else
   s->module_local_calls = 1;
@@ -2004,6 +2004,7 @@ enum
   TCC_OPTION_ba,
   TCC_OPTION_g,
   TCC_OPTION_c,
+  TCC_OPTION_dumpdefaults,
   TCC_OPTION_dumpmachine,
   TCC_OPTION_dumpversion,
   TCC_OPTION_d,
@@ -2091,6 +2092,7 @@ static const TCCOption tcc_options[] = {
     {"bench", TCC_OPTION_bench, 0},
     {"g", TCC_OPTION_g, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"c", TCC_OPTION_c, 0},
+    {"dumpdefaults", TCC_OPTION_dumpdefaults, 0},
     {"dumpmachine", TCC_OPTION_dumpmachine, 0},
     {"dumpversion", TCC_OPTION_dumpversion, 0},
 #ifdef CONFIG_TCC_DEBUG
@@ -2274,6 +2276,19 @@ static int set_flag(TCCState *s, const FlagDef *flags, const char *name)
   }
   return ret;
 }
+
+#define TCC_STR_(x) #x
+#define TCC_STR(x) TCC_STR_(x)
+/* The flags that give a rebuilt compiler this one's defaults: configure asks
+ * for them on YasOS, where they depend on the board the rootfs was built for. */
+static const char dumpdefaults_str[] = ""
+#ifdef CONFIG_TCC_DEFAULT_FPU
+    "-DCONFIG_TCC_DEFAULT_FPU=" TCC_STR(CONFIG_TCC_DEFAULT_FPU) " "
+#endif
+#ifdef CONFIG_TCC_DEFAULT_FP_LIB
+    "-DCONFIG_TCC_DEFAULT_FP_LIB=" TCC_STR(CONFIG_TCC_DEFAULT_FP_LIB) " "
+#endif
+    ;
 
 static const char dumpmachine_str[] =
 /* this is a best guess, please refine as necessary */
@@ -2801,6 +2816,9 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
     case TCC_OPTION_MP:
       s->gen_phony_deps = 1;
       break;
+    case TCC_OPTION_dumpdefaults:
+      printf("%s\n", dumpdefaults_str);
+      exit(0);
     case TCC_OPTION_dumpmachine:
       printf("%s\n", dumpmachine_str);
       exit(0);
@@ -2843,6 +2861,11 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->optimize = atoi(optarg);
         s->optimize_size = 0;
       }
+#ifdef CONFIG_TCC_O0_ONLY
+      /* A note, not a warning: a Makefile's -O2 -Werror still has to build. */
+      if (s->optimize)
+        fprintf(stderr, "tcc: note: built with --disable-optimizer, -O%s has no effect\n", optarg);
+#endif
       /* -O1: scalar cleanup, cheap ARM addressing-mode fusion, constant/range
        * folding, loop rotation, and light inlining of explicitly-inline / tiny
        * functions — the same class of work GCC does at -O1.  The heavy tier

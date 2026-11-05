@@ -40,6 +40,10 @@ all: $(LIB)
 $(LIB): $(OBJS)
 	$(AR) rcs $@ $^
 
+# What arch/arm/Makefile puts into libarm.a, in the order of this archive.
+list-objs:
+	@echo $(OBJS)
+
 $(BUILD_DIR)/%.o: %.c $(CORE_HDRS)
 	@mkdir -p $(dir $@)
 	$(CC) -o $@ -c $< $(CFLAGS) $(DEFINES) -I$(TOP) -I$(TOP)/source/ir
