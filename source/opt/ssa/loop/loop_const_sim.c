@@ -25,13 +25,13 @@
  * through.  Both keep the region out. */
 static int lcs_operand_is_memory(IROperand op)
 {
-  if (op.is_sym || op.is_llocal)
-    return op.is_lval || op.is_local;
+  if (irop_is_sym(op) || irop_is_llocal(op))
+    return op.is_lval || irop_is_local(op);
   int32_t vr = irop_get_vreg(op);
   int is_var = (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR);
   if (op.is_lval)
-    return !(op.is_local && is_var);
-  return op.is_local;
+    return !(irop_is_local(op) && is_var);
+  return irop_is_local(op);
 }
 
 /* A volatile VAR is not a register-resident scalar: every read and write of it

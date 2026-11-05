@@ -223,7 +223,7 @@ static int dfe_frame_off(IROperand op, int *off)
   if (irop_is_none(op) || irop_get_vreg(op) >= 0 || op.is_param)
     return 0;
   int tag = irop_get_tag(op);
-  if (tag != IROP_TAG_STACKOFF && !(tag == IROP_TAG_VREG && (op.is_local || op.is_llocal)))
+  if (tag != IROP_TAG_STACKOFF && !(tag == IROP_TAG_VREG && (irop_is_local(op) || irop_is_llocal(op))))
     return 0;
   *off = irop_get_stack_offset(op);
   return *off < 0;
@@ -578,7 +578,7 @@ static int dfe_scan(Dfe *d)
         if ((o = dfe_find(d, off)) < 0)
           continue;
         const int rel = off - d->obj[o].start;
-        if (a.is_llocal || (a.is_lval && tcc_ir_access_is_volatile(ir, a)))
+        if (irop_is_llocal(a) || (a.is_lval && tcc_ir_access_is_volatile(ir, a)))
         {
           dfe_escape(d, o);
           continue;
@@ -732,7 +732,7 @@ static int dfe_scan(Dfe *d)
       {
         /* through the pointer: *T */
         int w = dfe_width(a);
-        if (tcc_ir_access_is_volatile(ir, a) || irop_get_tag(a) != IROP_TAG_VREG || a.is_llocal ||
+        if (tcc_ir_access_is_volatile(ir, a) || irop_get_tag(a) != IROP_TAG_VREG || irop_is_llocal(a) ||
             op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_LOAD_POSTINC ||
             op == TCCIR_OP_STORE_POSTINC)
           dfe_escape(d, o);
@@ -1073,7 +1073,7 @@ static int dfe_lower_cmp(const void *a, const void *b)
 
 static IROperand dfe_frame_word(int off)
 {
-  IROperand o = irop_make_stackoff(-1, off, 1, 0, 0, IROP_BTYPE_INT32);
+  IROperand o = irop_make_stackoff(-1, off, 1, 0, IROP_BTYPE_INT32);
   o.aux |= IROP_AUX_NONVOLATILE;
   return o;
 }
@@ -1086,7 +1086,7 @@ static IRQuadCompact dfe_new_quad(TCCIRState *ir, int op, int line)
   IRQuadCompact q = {0};
   q.op = op;
   q.line_num = line;
-  q.orig_index = ++ir->max_orig_index;
+  q.orig_index = tcc_ir_fresh_orig_index(ir);
   return q;
 }
 
@@ -1665,8 +1665,8 @@ static int dfe_undef_stores(TCCIRState *ir)
       int t = TCCIR_DECODE_VREG_POSITION(vr);
       if (t >= ntemp)
         continue;
-      if (q->op == TCCIR_OP_STORE && k == 1 && irop_get_tag(op) == IROP_TAG_VREG && !op.is_lval && !op.is_llocal &&
-          !op.is_local && op.btype != IROP_BTYPE_STRUCT)
+      if (q->op == TCCIR_OP_STORE && k == 1 && irop_get_tag(op) == IROP_TAG_VREG && !op.is_lval && !irop_is_llocal(op) &&
+          !irop_is_local(op) && op.btype != IROP_BTYPE_STRUCT)
         stores[t] = 1;
       else
         other[t] = 1;
@@ -1681,10 +1681,10 @@ static int dfe_undef_stores(TCCIRState *ir)
     IROperand val = tcc_ir_op_get_src1(ir, q), dst = tcc_ir_op_get_dest(ir, q);
     int32_t vr = irop_get_vreg(val);
     if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP || irop_get_tag(val) != IROP_TAG_VREG ||
-        val.is_lval || val.is_llocal || val.is_local || val.btype == IROP_BTYPE_STRUCT)
+        val.is_lval || irop_is_llocal(val) || irop_is_local(val) || val.btype == IROP_BTYPE_STRUCT)
       continue;
     int t = TCCIR_DECODE_VREG_POSITION(vr);
-    if (t >= ntemp || other[t] || !stores[t] || dst.is_llocal || tcc_ir_access_is_volatile(ir, dst))
+    if (t >= ntemp || other[t] || !stores[t] || irop_is_llocal(dst) || tcc_ir_access_is_volatile(ir, dst))
       continue;
     q->op = TCCIR_OP_NOP;
     deleted++;
@@ -1754,8 +1754,8 @@ static int dfe_undef_loads(Dfe *d)
         int t = dfe_temp_index(d, irop_get_vreg(op));
         if (t < 0)
           continue;
-        if (q->op == TCCIR_OP_STORE && k == 1 && irop_get_tag(op) == IROP_TAG_VREG && !op.is_lval && !op.is_llocal &&
-            !op.is_local && op.btype != IROP_BTYPE_STRUCT)
+        if (q->op == TCCIR_OP_STORE && k == 1 && irop_get_tag(op) == IROP_TAG_VREG && !op.is_lval && !irop_is_llocal(op) &&
+            !irop_is_local(op) && op.btype != IROP_BTYPE_STRUCT)
           stores[t] = 1;
         else
           other[t]++;

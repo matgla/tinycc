@@ -626,7 +626,7 @@ UT_TEST(test_unroll_body_with_call_skips)
   utb_pools_init(ir);
   static Sym foo;
   uint32_t sidx = tcc_ir_pool_add_symref(ir, &foo, 0, 0);
-  IROperand callee = irop_make_symref(0, sidx, 0, 0, 0, I32);
+  IROperand callee = irop_make_symref(0, sidx, 0, I32);
 
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE); /* 0 */
   utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(3, I32));   /* 1 */
@@ -1991,7 +1991,7 @@ static IRLoop emit_call_body_loop(TCCIRState *ir, IROperand bound)
 {
   static Sym foo;
   uint32_t sidx = tcc_ir_pool_add_symref(ir, &foo, 0, 0);
-  IROperand callee = irop_make_symref(0, sidx, 0, 0, 0, I32);
+  IROperand callee = irop_make_symref(0, sidx, 0, I32);
 
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);     /* 0 */
   utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), bound);                  /* 1 */

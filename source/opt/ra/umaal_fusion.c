@@ -326,7 +326,7 @@ static int umaal_try(UmaalCtx *c, int i)
 /* `op` is a 64-bit literal; its value in *v. */
 static int umaal_imm64(TCCIRState *ir, IROperand op, uint64_t *v)
 {
-  if (!irop_is_immediate(op) || op.is_lval || op.is_sym || irop_get_btype(op) != IROP_BTYPE_INT64)
+  if (!irop_is_immediate(op) || op.is_lval || irop_is_sym(op) || irop_get_btype(op) != IROP_BTYPE_INT64)
     return 0;
   *v = (uint64_t)irop_get_imm64_ex(ir, op);
   return 1;

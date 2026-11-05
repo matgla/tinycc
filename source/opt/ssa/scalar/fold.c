@@ -43,7 +43,7 @@ static int fold_read_imm32(const TCCIRState *ir, IROperand op, int32_t *out)
  * information (the bug_switch_goto_or pattern; see cprop_imm in ssa_opt_cprop.c). */
 static IRQuadCompact *fold_single_dom_def(IRSSAOptCtx *ctx, IROperand op, int use_idx)
 {
-  if (op.is_lval || op.is_local || op.is_llocal || op.is_sym)
+  if (op.is_lval || irop_is_local(op) || irop_is_llocal(op) || irop_is_sym(op))
     return NULL;
   if (op.tag != IROP_TAG_VREG)
     return NULL;
@@ -192,7 +192,7 @@ static uint32_t fold_maybe_set_bits(IRSSAOptCtx *ctx, IROperand op, int at_idx,
   case TCCIR_OP_STORE:
     /* A non-lval STORE into a TEMP is a register copy of the source (MOV, or
      * a word store of the extended value when spilled): the same bits. */
-    if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(dd)) == TCCIR_VREG_TYPE_TEMP && !dd.is_local &&
+    if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(dd)) == TCCIR_VREG_TYPE_TEMP && !irop_is_local(dd) &&
         !s1.is_lval && !irop_is_64bit(s1))
       return fold_maybe_set_bits(ctx, s1, d_idx, depth - 1, budget);
     return 0xFFFFFFFFu;
@@ -287,7 +287,7 @@ OPT_GEN_SSA(fold_symref_addend, -1) {
     return 0;
   int32_t na = (q->op == TCCIR_OP_ADD) ? sr->addend + off : sr->addend - off;
   uint32_t nidx = tcc_ir_pool_add_symref(ir, sr->sym, na, sr->flags);
-  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1(irop_make_symref(0, nidx, 0, src1.is_local, src1.is_const, irop_get_btype(src1))));
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1(irop_make_symref(0, nidx, 0, irop_get_btype(src1))));
 }
 
 /* Division/modulo by constant 0 is UB (C11 6.5.5p5): rewrite to TRAP and NOP
@@ -321,7 +321,7 @@ OPT_GEN_SSA(fold_select_equal, TCCIR_OP_SELECT) {
   GUARD(
     when(irop_get_vreg(src1) < 0 && irop_get_vreg(src2) < 0);
     and(irop_is_immediate(src1) && irop_is_immediate(src2) &&
-        !src1.is_sym && !src2.is_sym &&
+        !irop_is_sym(src1) && !irop_is_sym(src2) &&
         irop_get_btype(src1) == irop_get_btype(src2) &&
         irop_get_imm64_ex(ir, src1) == irop_get_imm64_ex(ir, src2)));
   IROperand cond = tcc_ir_op_get_cond(ir, q);
@@ -518,7 +518,7 @@ OPT_GEN_SSA(fold_divmod_self_symref, -1) {
   GUARD(
     when(q->op == TCCIR_OP_DIV || q->op == TCCIR_OP_UDIV ||
          q->op == TCCIR_OP_IMOD || q->op == TCCIR_OP_UMOD);
-    and(src1.is_sym && src1.is_lval && src2.is_sym && src2.is_lval));
+    and(irop_is_sym(src1) && src1.is_lval && irop_is_sym(src2) && src2.is_lval));
   IRPoolSymref *a_ref = irop_get_symref_ex(ir, src1);
   IRPoolSymref *b_ref = irop_get_symref_ex(ir, src2);
   if (!a_ref || !b_ref || a_ref->sym != b_ref->sym ||
@@ -1103,7 +1103,7 @@ static int fbt_def_dominates(IRSSAOptCtx *ctx, int def, int at)
 static int fbt_value_available(IRSSAOptCtx *ctx, IROperand x, int at)
 {
   TCCIRState *ir = ctx->ir;
-  if (x.is_lval || x.is_local || x.is_llocal || x.is_sym || x.tag != IROP_TAG_VREG)
+  if (x.is_lval || irop_is_local(x) || irop_is_llocal(x) || irop_is_sym(x) || x.tag != IROP_TAG_VREG)
     return 0;
   int32_t vr = irop_get_vreg(x);
   if (vr < 0)
@@ -1133,7 +1133,7 @@ static int fbt_value_available(IRSSAOptCtx *ctx, IROperand x, int at)
 static int fbt_load_movable(IRSSAOptCtx *ctx, IROperand x, int at, int use)
 {
   TCCIRState *ir = ctx->ir;
-  if (!x.is_lval || x.is_local || x.is_llocal || x.is_sym || x.tag != IROP_TAG_VREG)
+  if (!x.is_lval || irop_is_local(x) || irop_is_llocal(x) || irop_is_sym(x) || x.tag != IROP_TAG_VREG)
     return 0;
   if (tcc_ir_instr_access_is_volatile(ir, &ir->compact_instructions[use]))
     return 0;
@@ -1423,7 +1423,7 @@ static int fold_param_unwritten(IRSSAOptCtx *ctx, IROperand w)
  * is visible: a single-def TEMP, an unwritten PARAM or an inline constant. */
 static int fold_word_stable(IRSSAOptCtx *ctx, IROperand w)
 {
-  if (w.is_lval || w.is_local || w.is_llocal || w.is_sym || irop_is_64bit(w))
+  if (w.is_lval || irop_is_local(w) || irop_is_llocal(w) || irop_is_sym(w) || irop_is_64bit(w))
     return 0;
   return w.tag == IROP_TAG_IMM32 || fold_single_def_temp(ctx, w) || fold_param_unwritten(ctx, w);
 }
@@ -1640,7 +1640,7 @@ static FoldKB64 fold_kb64_result(IRSSAOptCtx *ctx, IRQuadCompact *q, int at, int
 static FoldKB64 fold_kb64(IRSSAOptCtx *ctx, IROperand op, int at, int depth, int *budget)
 {
   TCCIRState *ir = ctx->ir;
-  if (op.is_lval || op.is_sym)
+  if (op.is_lval || irop_is_sym(op))
     return FOLD_KB64_NONE;
   if (!irop_is_64bit(op))
     return fold_kb64_word(ctx, op, at, 0xFFFFFFFFu, 0, depth, budget);

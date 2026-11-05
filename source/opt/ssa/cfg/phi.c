@@ -64,7 +64,7 @@ static int32_t phi_copy_root(IRSSAOptCtx *ctx, int32_t vr, int *btype)
       return vr;
     IROperand dest = tcc_ir_op_get_dest(ir, q), src = tcc_ir_op_get_src1(ir, q);
     int32_t svr = irop_get_vreg(src);
-    if (src.tag != IROP_TAG_VREG || src.is_lval || src.is_llocal || src.is_local || src.is_sym ||
+    if (src.tag != IROP_TAG_VREG || src.is_lval || irop_is_llocal(src) || irop_is_local(src) || irop_is_sym(src) ||
         svr < 0 || irop_get_btype(dest) != irop_get_btype(src) || dest.is_unsigned != src.is_unsigned)
       return vr;
     int ty = TCCIR_DECODE_VREG_TYPE(svr);

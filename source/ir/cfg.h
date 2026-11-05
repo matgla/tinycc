@@ -12,20 +12,22 @@ struct IRQuadCompact;
  * device, where each small block also pays allocator overhead), and two are
  * alive at once through register allocation.  The CFG is read-only once
  * built: nothing outside cfg.c adds an edge. */
+#include "small_ir.h"
+
 typedef struct IRBasicBlock
 {
-  int start_idx;
-  int end_idx;
+  ir_insn_idx_t start_idx;
+  ir_insn_idx_t end_idx;
+  ir_block_idx_t num_succs;
+  ir_block_idx_t num_preds;
+  ir_block_idx_t idom;
+  ir_block_idx_t rpo_number;
+  ir_block_idx_t num_df;
+  ir_block_idx_t num_dom_children;
   int *succs;
   int *preds;
-  int num_succs;
-  int num_preds;
-  int idom;
-  int rpo_number;
   int *dom_frontier;
   int *dom_children;
-  int num_df;
-  int num_dom_children;
 } IRBasicBlock;
 
 typedef struct IRCFG
@@ -34,7 +36,7 @@ typedef struct IRCFG
   int num_blocks;
   int *rpo_order;
   int rpo_count;
-  int *instr_to_block;
+  ir_block_idx_t *instr_to_block;
   int num_instrs;
   int *edge_store;         /* every block's succs, then every block's preds */
   int *df_store;           /* every block's dom_frontier */

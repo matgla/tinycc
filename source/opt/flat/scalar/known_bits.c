@@ -154,7 +154,7 @@ static int vreg_addr_lookup(int32_t vr, const TmpKB *tmp_kb,
 
 static int kb_is_direct_stackoff(IROperand op, int is_lval)
 {
-  return op.is_local && op.is_lval == is_lval &&
+  return irop_is_local(op) && op.is_lval == is_lval &&
          op.tag == IROP_TAG_STACKOFF && irop_get_vreg(op) < 0;
 }
 
@@ -174,7 +174,7 @@ static int kb_lval_stack_off(const TCCIRState *ir, IROperand op,
    * slot V7 points at, so the copy became that slot's contents (the vfmt
    * argument slice got the value 2048 where its element address belonged).
    * A real dereference is a VREG-tagged lval, or is_llocal. */
-  if (op.tag == IROP_TAG_STACKOFF && irop_get_vreg(op) >= 0 && op.is_lval && !op.is_llocal)
+  if (op.tag == IROP_TAG_STACKOFF && irop_get_vreg(op) >= 0 && op.is_lval && !irop_is_llocal(op))
     return 0;
   if (op.is_lval)
   {
@@ -191,11 +191,11 @@ static int kb_lval_stack_off(const TCCIRState *ir, IROperand op,
 static int32_t kb_vreg_value_of(IROperand op)
 {
   int32_t vr = irop_get_vreg(op);
-  if (vr < 0 || op.is_sym)
+  if (vr < 0 || irop_is_sym(op))
     return -1;
   if (!op.is_lval)
     return vr;
-  if (op.tag == IROP_TAG_STACKOFF && !op.is_llocal &&
+  if (op.tag == IROP_TAG_STACKOFF && !irop_is_llocal(op) &&
       TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
     return vr;
   return -1;
@@ -355,12 +355,11 @@ static int stack_kb_const32(const StackKB *slots, int n_slots, int current_gen,
   return 1;
 }
 
-/* btype/is_unsigned are scalars, not a by-value IROperand: passing a 9-byte
- * __attribute__((packed)) IROperand by value miscompiles on the self-hosted ARM
- * cross (the 9th flags byte — is_unsigned/is_static/is_sym/is_param — is dropped
- * in the caller's argument marshalling), so an unsigned sub-word value would be
- * read as signed and sign-extended (uint8_t 200 -> -56).  Same hazard as
- * kb_apply_load_width; callers read the flags by direct field access. */
+/* btype/is_unsigned are scalars, not a by-value IROperand: passing the cross's
+ * 9-byte packed IROperand by value miscompiled on the self-hosted ARM cross (the
+ * 9th flags byte was dropped in the caller's argument marshalling), so an unsigned
+ * sub-word value was read as signed and sign-extended (uint8_t 200 -> -56).  Same
+ * hazard as kb_apply_load_width; callers read the flags by direct field access. */
 static uint64_t kb_apply_const_width(uint64_t v, int btype, int is_unsigned)
 {
   switch (btype)
@@ -398,7 +397,7 @@ static int kb_operand_const_u64(const TCCIRState *ir, const IROperand *op,
                                 uint64_t *out)
 {
   int btype = irop_get_btype(*op);
-  if (irop_is_immediate(*op) && !op->is_sym && !op->is_lval)
+  if (irop_is_immediate(*op) && !irop_is_sym(*op) && !op->is_lval)
   {
     /* FLOAT immediates encode a pool index in u.imm32 rather than the bit
      * pattern of the value, so reading them as integers would yield the
@@ -506,46 +505,23 @@ static int kb_const_compute(TccIrOp op, int dest_btype, int src1_btype,
     break;
   }
   case TCCIR_OP_ADD:
-    *out = a + b;
-    break;
   case TCCIR_OP_SUB:
-    *out = a - b;
-    break;
   case TCCIR_OP_MUL:
-    /* Low `width` bits of a product depend only on the low bits of the
-     * operands, so the sign/zero-extended inputs give the correct result once
-     * masked to width below. */
-    *out = a * b;
-    break;
   case TCCIR_OP_AND:
-    *out = a & b;
-    break;
   case TCCIR_OP_OR:
-    *out = a | b;
-    break;
   case TCCIR_OP_XOR:
-    *out = a ^ b;
-    break;
   case TCCIR_OP_SHL:
-    if (b >= (uint64_t)width)
-      return 0;
-    *out = a << b;
-    break;
   case TCCIR_OP_SHR:
-    if (b >= (uint64_t)width)
-      return 0;
-    /* Logical shift: mask the source to the operation width first so the
-     * sign-extended high bits (for a 32-bit op) are not shifted in. */
-    *out = (a & mask) >> b;
-    break;
   case TCCIR_OP_SAR:
-    if (b >= (uint64_t)width)
+  {
+    /* The sign/zero-extended inputs give the right low `width` bits once
+     * masked below; the shared fold refuses a shift count outside [0, width). */
+    int64_t r;
+    if (!ir_opt_const_binop(op, width == 64, (int64_t)a, (int64_t)b, &r))
       return 0;
-    if (width == 64)
-      *out = (uint64_t)((int64_t)a >> b);
-    else
-      *out = (uint64_t)(uint32_t)((int32_t)(uint32_t)a >> b);
+    *out = (uint64_t)r;
     break;
+  }
   default:
     return 0;
   }
@@ -623,7 +599,7 @@ static int kb_operand(const TCCIRState *ir, IROperand op,
   }
 
   /* Immediate constant operand. */
-  if (irop_is_immediate(op) && !op.is_sym && !op.is_lval)
+  if (irop_is_immediate(op) && !irop_is_sym(op) && !op.is_lval)
   {
     int btype = irop_get_btype(op);
     if (btype == IROP_BTYPE_INT64 || btype == IROP_BTYPE_FLOAT32 ||
@@ -977,7 +953,7 @@ static int kb_dest_track_tmp_addr(KBState *st, TCCIRState *ir, int op, int dpos,
     }
   }
   if ((op == TCCIR_OP_ADD || op == TCCIR_OP_SUB) &&
-      irop_is_immediate(s2_raw) && !s2_raw.is_sym && !s2_raw.is_lval)
+      irop_is_immediate(s2_raw) && !irop_is_sym(s2_raw) && !s2_raw.is_lval)
   {
     int32_t off;
     if (vreg_addr_lookup(kb_vreg_value_of(s1_raw), st->tmp_kb, st->max_tmp_pos,
@@ -1027,7 +1003,7 @@ static int kb_dest_try_const_fold(KBState *st, TCCIRState *ir, int i, int op,
   IROperand imm = kb_make_const_operand(ir, cres, dest_btype);
   imm.is_unsigned = dest.is_unsigned;
   int already_folded = (op == TCCIR_OP_ASSIGN &&
-                        irop_is_immediate(s1) && !s1.is_sym &&
+                        irop_is_immediate(s1) && !irop_is_sym(s1) &&
                         !s1.is_lval &&
                         irop_get_imm64_ex(ir, s1) == (int64_t)cres);
   int suppress_rewrite = 0;
@@ -1066,7 +1042,7 @@ static int kb_dest_try_const_fold(KBState *st, TCCIRState *ir, int i, int op,
 static int kb_low32_of(const KBState *st, TCCIRState *ir, const IROperand *op,
                        uint32_t *kz, uint32_t *ko)
 {
-  if (irop_is_immediate(*op) && !op->is_sym && !op->is_lval)
+  if (irop_is_immediate(*op) && !irop_is_sym(*op) && !op->is_lval)
   {
     uint32_t v = (uint32_t)irop_get_imm64_ex(ir, *op);
     *kz = ~v; *ko = v;
@@ -1098,7 +1074,7 @@ static int kb_dest_track_wide_dest(KBState *st, TCCIRState *ir, int op, int dpos
 {
   if (dest_btype == IROP_BTYPE_INT64)
   {
-    if (op == TCCIR_OP_SHL && irop_is_immediate(s2) && !s2.is_sym && !s2.is_lval)
+    if (op == TCCIR_OP_SHL && irop_is_immediate(s2) && !irop_is_sym(s2) && !s2.is_lval)
     {
       int64_t amt = irop_get_imm64_ex(ir, s2);
       if (amt >= 32)
@@ -1297,13 +1273,13 @@ static int kb_dest_scalar_compute(KBState *st, TCCIRState *ir, int i, int op,
     {
       int keep_pos = -1;
       uint32_t mask = 0, kz = 0;
-      if (h1 && irop_is_immediate(s2) && !s2.is_sym && !s2.is_lval && irop_has_vreg(s1))
+      if (h1 && irop_is_immediate(s2) && !irop_is_sym(s2) && !s2.is_lval && irop_has_vreg(s1))
       {
         keep_pos = 1;
         mask = (uint32_t)irop_get_imm64_ex(ir, s2);
         kz = a_kz;
       }
-      else if (h2 && irop_is_immediate(s1) && !s1.is_sym && !s1.is_lval && irop_has_vreg(s2))
+      else if (h2 && irop_is_immediate(s1) && !irop_is_sym(s1) && !s1.is_lval && irop_has_vreg(s2))
       {
         keep_pos = 2;
         mask = (uint32_t)irop_get_imm64_ex(ir, s1);
@@ -1345,7 +1321,7 @@ static int kb_dest_scalar_compute(KBState *st, TCCIRState *ir, int i, int op,
   }
   else if (op == TCCIR_OP_SHL || op == TCCIR_OP_SHR || op == TCCIR_OP_SAR)
   {
-    if (irop_is_immediate(s2) && !s2.is_sym && !s2.is_lval)
+    if (irop_is_immediate(s2) && !irop_is_sym(s2) && !s2.is_lval)
     {
       int64_t amt = irop_get_imm64_ex(ir, s2);
       if (amt >= 32 && dest_btype != IROP_BTYPE_INT64 &&
@@ -1610,8 +1586,8 @@ OPT_GEN_FLAT(kb_store_indexed, TCCIR_OP_STORE_INDEXED)
 
   if (kb_base_stack_off(ir, base, st->tmp_kb, st->max_tmp_pos, st->var_addr,
                         st->max_var_pos, st->current_gen, &base_off) &&
-      irop_is_immediate(idx) && !idx.is_sym &&
-      irop_is_immediate(sc) && !sc.is_sym)
+      irop_is_immediate(idx) && !irop_is_sym(idx) &&
+      irop_is_immediate(sc) && !irop_is_sym(sc))
   {
     int shift = (int)irop_get_imm64_ex(ir, sc) & 3;
     int32_t off = base_off + ((int32_t)irop_get_imm64_ex(ir, idx) << shift);
@@ -1837,7 +1813,7 @@ static int kb_cmp_fold_const_eq_neq(KBState *st, TCCIRState *ir, int i,
   uint32_t kz, ko;
   if (!(irop_get_btype(cmp_src1) == IROP_BTYPE_INT32 &&
         irop_get_btype(cmp_src2) == IROP_BTYPE_INT32 &&
-        irop_is_immediate(cmp_src2) && !cmp_src2.is_sym &&
+        irop_is_immediate(cmp_src2) && !irop_is_sym(cmp_src2) &&
         kb_operand(ir, cmp_src1, st->tmp_kb, st->max_tmp_pos, st->current_gen,
                    st->var_addr, st->max_var_pos,
                    st->stack_slots, st->n_stack_slots, &kz, &ko)))

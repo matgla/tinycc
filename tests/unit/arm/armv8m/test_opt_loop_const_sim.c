@@ -77,7 +77,7 @@ static void utb_alloc_var_intervals(TCCIRState *ir, int count)
 /* Build a direct StackLoc[off] lvalue operand (is_lval=1, no vreg). */
 static IROperand lcs_stack_lval(int32_t off, int btype)
 {
-  return irop_make_stackoff(-1, off, /*is_lval*/ 1, /*is_llocal*/ 0,
+  return irop_make_stackoff(-1, off, /*is_lval*/ 1,
                             /*is_param*/ 0, btype);
 }
 
@@ -479,7 +479,7 @@ UT_TEST(test_lcs_unknown_call_blocks_fold)
    * (mirrors test_unroll_body_with_call_skips's unregistered-symbol pattern). */
   static Sym unknown_fn;
   uint32_t sidx = tcc_ir_pool_add_symref(ir, &unknown_fn, 0, 0);
-  IROperand callee = irop_make_symref(0, sidx, 0, 0, 0, I32);
+  IROperand callee = irop_make_symref(0, sidx, 0, I32);
 
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);  /* 0 i=0 */
   utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(3, I32));     /* 1 header */
@@ -711,7 +711,7 @@ UT_TEST(test_lcs_lea_indirect_store_blocks_fold)
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);  /* 0 i=0 */
   /* T0 = &StackLoc[64] (a LEA-style stack address, preheader). */
   utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32),
-           irop_make_stackoff(0, 64, /*is_lval*/ 0, 0, 0, I32), UTB_NONE);    /* 1 */
+           irop_make_stackoff(0, 64, /*is_lval*/ 0, 0, I32), UTB_NONE);    /* 1 */
   utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(3, I32));     /* 2 header */
   utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(8, I32), utb_imm(TOK_GE, I32), UTB_NONE); /* 3 exit=8 */
   /* *T0 = i  (indirect STORE through the tracked address temp) */

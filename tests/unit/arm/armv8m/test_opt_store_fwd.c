@@ -46,14 +46,14 @@ int tcc_ir_opt_global_base_share(TCCIRState *ir);
 /* A direct stack-slot lvalue: `StackLoc[off]` used as a memory reference. */
 static IROperand utb_slot_lval(int32_t off, int btype)
 {
-  return irop_make_stackoff(0, off, /*is_lval*/ 1, /*is_llocal*/ 0, /*is_param*/ 0, btype);
+  return irop_make_stackoff(0, off, /*is_lval*/ 1, /*is_param*/ 0, btype);
 }
 
 /* The address of a stack slot (what a LEA computes into a TEMP): not an
  * lvalue, just a value. */
 static IROperand utb_slot_addr(int32_t off, int btype)
 {
-  return irop_make_stackoff(0, off, /*is_lval*/ 0, /*is_llocal*/ 0, /*is_param*/ 0, btype);
+  return irop_make_stackoff(0, off, /*is_lval*/ 0, /*is_param*/ 0, btype);
 }
 
 /* A TEMP_LOCAL slot operand (anonymous compiler-generated stack temp),
@@ -61,7 +61,7 @@ static IROperand utb_slot_addr(int32_t off, int btype)
  * tccir_operand.h: irop_set_vreg round-trips negative sentinels unchanged. */
 static IROperand utb_templocal(int32_t vreg, int32_t off, int is_lval, int btype)
 {
-  return irop_make_stackoff(vreg, off, is_lval, /*is_llocal*/ 0, /*is_param*/ 0, btype);
+  return irop_make_stackoff(vreg, off, is_lval, /*is_param*/ 0, btype);
 }
 
 static IROperand utb_deref_temp(int pos, int btype)
@@ -80,7 +80,7 @@ static IROperand utb_global(TCCIRState *ir, Sym *sym, int is_lval, int btype)
 static IROperand utb_global_off(TCCIRState *ir, Sym *sym, int32_t addend, int is_lval, int btype)
 {
   uint32_t sidx = tcc_ir_pool_add_symref(ir, sym, addend, 0);
-  return irop_make_symref(0, sidx, is_lval, /*is_local*/ 0, /*is_const*/ 0, btype);
+  return irop_make_symref(0, sidx, is_lval, btype);
 }
 
 /* =============================================================== entry_store */

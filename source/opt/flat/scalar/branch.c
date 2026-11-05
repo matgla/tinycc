@@ -414,7 +414,7 @@ OPT_GEN_FLAT(setif_branch_remat, TCCIR_OP_CMP)
     if (irop_is_plain_imm(o))
       continue;
     int32_t vr = irop_get_vreg(o);
-    if (vr < 0 || o.is_lval || o.is_local || o.is_sym)
+    if (vr < 0 || o.is_lval || irop_is_local(o) || irop_is_sym(o))
       return 0;
     /* A TEMP and nothing else.  Its address is never taken, so no callee and
      * no store through a pointer can change it behind this scan -- and unlike
@@ -448,6 +448,19 @@ OPT_GEN_FLAT(setif_branch_remat, TCCIR_OP_CMP)
     IRQuadCompact *uq = &ir->compact_instructions[u];
     if (uq->op == TCCIR_OP_NOP)
       continue;
+    {
+      /* Most instructions mention none of the three. */
+      const IROperand *words = ir->iroperand_pool + uq->operand_base;
+      const int nw = tcc_ir_quad_operand_words(ir, uq);
+      int mentioned = 0;
+      for (int w = 0; w < nw; w++)
+      {
+        const uint32_t bits = IROP_VREG_BITS(words[w]);
+        mentioned |= bits == (uint32_t)sv || bits == (uint32_t)reg_vr[0] || bits == (uint32_t)reg_vr[1];
+      }
+      if (!mentioned)
+        continue;
+    }
     if (irop_config[uq->op].has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, uq)) == reg_vr[0])
       reg_defs[0]++;
     if (nregs == 2 && irop_config[uq->op].has_dest &&
@@ -995,7 +1008,7 @@ static int setif_window_fuse(TCCIRState *ir)
           if (!irop_is_plain_imm(s2) || irop_get_imm64_ex(ir, s2) != 0)
             break;
         }
-        if (irop_get_vreg(s1) != vrs[nlinks] || s1.is_lval || s1.is_llocal ||
+        if (irop_get_vreg(s1) != vrs[nlinks] || s1.is_lval || irop_is_llocal(s1) ||
             irop_get_btype(s1) == IROP_BTYPE_INT64)
           break;
         ti = k;
@@ -1005,7 +1018,7 @@ static int setif_window_fuse(TCCIRState *ir)
       {
         IROperand s1 = tcc_ir_op_get_src1(ir, q);
         IROperand d = tcc_ir_op_get_dest(ir, q);
-        if (irop_get_vreg(s1) == vrs[nlinks] && !s1.is_lval && !s1.is_llocal &&
+        if (irop_get_vreg(s1) == vrs[nlinks] && !s1.is_lval && !irop_is_llocal(s1) &&
             irop_get_btype(s1) != IROP_BTYPE_INT64 && irop_dest_defines_vreg(d) &&
             irop_get_vreg(d) >= 0 && irop_get_vreg(d) != vrs[nlinks] &&
             irop_get_btype(d) != IROP_BTYPE_INT64)
@@ -1101,11 +1114,8 @@ static int ir_branch_zero_return(TCCIRState *ir)
 {
   const int n = ir->next_instruction_index;
   int changes = 0;
-  for (int i = 0; i < n; i++) {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE || ir_op_has(q->op, IROP_A_MAY_BRANCH))
-      return 0;
-  }
+  if (ir_opt_fn_features(ir) & (IR_FN_IJUMP | IR_FN_SWITCH_TABLE | IR_FN_MAY_BRANCH))
+    return 0;
   for (int i = 0; i < n; i++) {
     IRQuadCompact *test = &ir->compact_instructions[i];
     if (test->op != TCCIR_OP_CMP && test->op != TCCIR_OP_TEST_ZERO)

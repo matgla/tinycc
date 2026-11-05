@@ -33,8 +33,9 @@
 void tcc_ls_initialize(LSLiveIntervalState *ls)
 {
   LS_DBG("Initializing linear scan allocator");
+  ls->caller_save_idx = NULL;
   ls->intervals_size = LS_LIVE_INTERVAL_INIT_SIZE;
-  ls->intervals = (LSLiveInterval *)tcc_malloc(sizeof(LSLiveInterval) * ls->intervals_size);
+  ls->intervals = (LSLiveInterval *)tcc_hot_mallocz(sizeof(LSLiveInterval) * ls->intervals_size);
   ls->next_interval_index = 0;
   ls->dirty_registers = 0;
   ls->spare_scratch_regs = 0;
@@ -54,7 +55,9 @@ void tcc_ls_initialize(LSLiveIntervalState *ls)
 
 void tcc_ls_deinitialize(LSLiveIntervalState *ls)
 {
-  tcc_free(ls->intervals);
+  tcc_free(ls->caller_save_idx);
+  ls->caller_save_idx = NULL;
+  tcc_hot_free(ls->intervals);
 
   if (ls->live_regs_by_instruction)
   {
@@ -80,6 +83,8 @@ void tcc_ls_clear_live_intervals(LSLiveIntervalState *ls)
 {
   ls->next_interval_index = 0;
   ls->caller_save_count = 0;
+  tcc_free(ls->caller_save_idx);
+  ls->caller_save_idx = NULL;
   ls->live_sweep_valid = 0;
 
   if (ls->live_regs_by_instruction)
@@ -100,7 +105,7 @@ void tcc_ls_reserve(LSLiveIntervalState *ls, int count)
   if (count <= ls->intervals_size)
     return;
   ls->intervals_size = count;
-  ls->intervals = (LSLiveInterval *)tcc_realloc(ls->intervals, sizeof(LSLiveInterval) * ls->intervals_size);
+  ls->intervals = (LSLiveInterval *)tcc_hot_realloc(ls->intervals, sizeof(LSLiveInterval) * ls->intervals_size);
 }
 
 void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int end, int crosses_call, int addrtaken,

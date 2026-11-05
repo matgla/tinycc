@@ -42,7 +42,7 @@ static IROperand utb_callee(TCCIRState *ir, Sym *sym, int tok)
 {
   sym->v = tok;
   uint32_t sidx = tcc_ir_pool_add_symref(ir, sym, 0, 0);
-  return irop_make_symref(0, sidx, 0, 0, 0, I32);
+  return irop_make_symref(0, sidx, 0, I32);
 }
 
 /* Emit a 3-arg memcpy/memmove FUNCCALLVOID; returns the call index. */
@@ -73,7 +73,7 @@ static uint64_t utb_range_coverage(TCCIRState *ir, int base, int total)
     if (q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED)
       continue;
     IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_tag(d) != IROP_TAG_STACKOFF || !d.is_local)
+    if (irop_get_tag(d) != IROP_TAG_STACKOFF || !irop_is_local(d))
       continue;
     int off = (int)irop_get_imm64_ex(ir, d);
     int sz = ir_opt_store_btype_size_bytes(irop_get_btype(d));

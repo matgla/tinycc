@@ -654,7 +654,7 @@ static int frame_operand_concrete(IROperand op, int *off)
   if (irop_is_none(op) || irop_get_vreg(op) >= 0 || op.is_param)
     return 0;
   int tag = irop_get_tag(op);
-  if (tag != IROP_TAG_STACKOFF && !(tag == IROP_TAG_VREG && (op.is_local || op.is_llocal)))
+  if (tag != IROP_TAG_STACKOFF && !(tag == IROP_TAG_VREG && (irop_is_local(op) || irop_is_llocal(op))))
     return 0;
   *off = irop_get_stack_offset(op);
   return 1;
@@ -827,7 +827,7 @@ static int frame_classify(FrameLive *fl, IROperand op, int *id)
     if (!frame_operand_offset(op, fl->bottom, &off) || (s = frame_seg_find(fl->seg, fl->nseg, off)) < 0)
       return FOP_NONE;
     *id = s;
-    return (op.is_lval || op.is_llocal) ? FOP_MEM : FOP_ADDR;
+    return (op.is_lval || irop_is_llocal(op)) ? FOP_MEM : FOP_ADDR;
   }
   int type = TCCIR_DECODE_VREG_TYPE(vr), pos = TCCIR_DECODE_VREG_POSITION(vr);
   if (type < 1 || type > 3 || pos >= fl->taint_size[type])
@@ -841,7 +841,7 @@ static int frame_classify(FrameLive *fl, IROperand op, int *id)
     return op.is_lval ? FOP_DEREF : FOP_VAL;
   if (tag == IROP_TAG_STACKOFF)
   {
-    if (op.is_llocal)
+    if (irop_is_llocal(op))
       return FOP_DEREF;
     return op.is_lval ? FOP_VAL : FOP_VAR_ADDR;
   }

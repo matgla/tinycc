@@ -143,7 +143,7 @@ static int param_seen_at(TCCIRState *ir, int32_t penc, int i, int *is_dest,
     seen = 1;
     int bt = irop_get_btype(s);
     /* is_lval|is_local on a stack param = load its value from home (cacheable); only is_llocal derefs memory that may change. */
-    if (s.is_llocal || tcc_ir_access_is_volatile(ir, s) ||
+    if (irop_is_llocal(s) || tcc_ir_access_is_volatile(ir, s) ||
         (bt != IROP_BTYPE_INT32 && bt != IROP_BTYPE_INT16 && bt != IROP_BTYPE_INT8))
       *is_deref = 1;
     else if (*rep_bt >= 0 && *rep_bt != bt)
@@ -165,9 +165,8 @@ int tcc_ir_promote_loop_stack_params(TCCIRState *ir)
     return 0;
 
   int n = ir->next_instruction_index;
-  for (int i = 0; i < n; i++)
-    if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
-      return 0; /* computed goto: insertion index shifts are unsafe */
+  if (ir_opt_fn_features(ir) & IR_FN_IJUMP)
+    return 0; /* computed goto: insertion index shifts are unsafe */
 
   IRLoops *loops = tcc_ir_detect_loops(ir);
   if (!loops || loops->num_loops == 0) {

@@ -35,14 +35,14 @@ int tcc_ir_opt_var_tmp_fwd(TCCIRState *ir);
  * lvalue, just a value. */
 static IROperand utb_slot_addr(int32_t off, int btype)
 {
-  return irop_make_stackoff(0, off, /*is_lval*/ 0, /*is_llocal*/ 0, /*is_param*/ 0, btype);
+  return irop_make_stackoff(0, off, /*is_lval*/ 0, /*is_param*/ 0, btype);
 }
 
 /* A direct stack-slot value reference (STORE dest / TEST_ZERO src / OR src):
  * the anonymous compiler-temp slot itself, not addressed through a vreg. */
 static IROperand utb_slot_lval(int32_t off, int btype)
 {
-  return irop_make_stackoff(0, off, /*is_lval*/ 1, /*is_llocal*/ 0, /*is_param*/ 0, btype);
+  return irop_make_stackoff(0, off, /*is_lval*/ 1, /*is_param*/ 0, btype);
 }
 
 static void utb_alloc_var_intervals(TCCIRState *ir, int count)

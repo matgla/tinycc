@@ -2413,8 +2413,18 @@ void tcc_ir_spill_cache_clear(SpillCache *cache)
   cache->last_emit_offset = 0;
 }
 
+/* cg_peep in tcc_ir_codegen_generate: the caches below keep nothing without it. */
+static int peepholes_enabled = 1;
+
+ST_FUNC void tcc_gen_machine_peepholes_set_enabled(int enabled)
+{
+  peepholes_enabled = enabled;
+}
+
 void tcc_ir_spill_cache_record(SpillCache *cache, int reg, int offset)
 {
+  if (!peepholes_enabled)
+    return;
   /* First invalidate any existing entry for this register or offset */
   tcc_ir_spill_cache_invalidate_reg(cache, reg);
   tcc_ir_spill_cache_invalidate_offset(cache, offset);
@@ -2574,7 +2584,7 @@ int try_scratch_reg_for_sym_addr(Sym *raw_sym, int64_t imm, uint32_t exclude_reg
     /* 1) Reuse a free register that already holds &sym+imm. */
     for (int r = 0; r < 16; r++)
     {
-      if (!(live & (1u << r)) && imm_cache[r].valid && imm_cache[r].sym == vsym &&
+      if (peepholes_enabled && !(live & (1u << r)) && imm_cache[r].valid && imm_cache[r].sym == vsym &&
           imm_cache[r].value == imm)
       {
         ScratchRegAlloc res = {0};
@@ -2649,7 +2659,7 @@ static ScratchRegAlloc get_scratch_reg_for_const(int64_t value, uint32_t exclude
     }
     for (int r = 0; r < 16; r++)
     {
-      if (!(live & (1u << r)) && imm_cache[r].valid && imm_cache[r].sym == NULL &&
+      if (peepholes_enabled && !(live & (1u << r)) && imm_cache[r].valid && imm_cache[r].sym == NULL &&
           imm_cache[r].value == value)
       {
         ScratchRegAlloc res = {0};
@@ -2692,6 +2702,8 @@ int mov_equiv_it_block_length(thumb_opcode op)
 }
 void mov_equiv_invalidate_reg(int reg)
 {
+  if (!peepholes_enabled)
+    return;
   if (reg < 0 || reg >= 16)
     return;
   /* Any other register whose representative was `reg` becomes independent
@@ -2706,6 +2718,8 @@ void mov_equiv_invalidate_reg(int reg)
 }
 void mov_equiv_record_mov(int rd, int rm)
 {
+  if (!peepholes_enabled)
+    return;
   if (rd < 0 || rd >= 16 || rm < 0 || rm >= 16)
   {
     mov_equiv_reset_all();

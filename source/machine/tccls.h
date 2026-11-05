@@ -68,6 +68,7 @@ typedef struct LSLiveIntervalState
    * saved by the prologue (dirty_registers keeps them). */
   uint32_t spare_scratch_regs;
   int caller_save_count; /* intervals with caller_save set (most functions: none) */
+  int *caller_save_idx;  /* which ones, listed on first need (tcc_ir_caller_save_mask_at) */
   uint64_t float_registers_map;
   uint64_t dirty_float_registers;
 

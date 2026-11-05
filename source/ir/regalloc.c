@@ -240,6 +240,10 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
 {
   int n = ir->next_instruction_index;
   int nb = cfg->num_blocks;
+  /* What crosses a block goes to memory, in a slot of its own (ra_o0_direct), so
+   * nothing below that keeps a register or a shared slot valid across control
+   * flow has a job at -O0. */
+  const int o0 = ra_o0_direct(ir);
   int local_count = ir->next_local_variable;
   int temp_count = ir->next_temporary_variable;
   int param_count = ir->next_parameter;
@@ -425,7 +429,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
        * six of them starved std.HashMap's probe loop into stack slots. */
       else if (q->op == TCCIR_OP_STORE && vr >= 0 && tcc_ir_vreg_is_valid(ir, vr) &&
                TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP &&
-               !d.is_lval && !d.is_local &&
+               !d.is_lval && !irop_is_local(d) &&
                (d.btype == IROP_BTYPE_INT8 || d.btype == IROP_BTYPE_INT16 ||
                 d.btype == IROP_BTYPE_INT32 || d.btype == IROP_BTYPE_FLOAT32 ||
                 d.btype == IROP_BTYPE_INT64 || d.btype == IROP_BTYPE_FLOAT64)) {
@@ -684,6 +688,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
    * arithmetic).  Pointer escape via STORE to memory or PHI is conservatively
    * handled by extending the root V to function end.  C semantics make
    * post-scope access via stored pointers UB; we don't try to optimize that. */
+  if (!o0 || tcc_state->nb_nested_funcs)
   {
     int *taint_root = tcc_malloc(sizeof(int) * table_size);
     for (int i = 0; i < table_size; i++) taint_root[i] = -1;
@@ -753,7 +758,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
           /* Direct: src is &V where V is addrtaken VAR.
            * The is_local flag plus !is_lval distinguishes address-of from
            * load-from-stack-slot. */
-          if (irop_get_tag(s) == IROP_TAG_STACKOFF && !s.is_lval && s.is_local) {
+          if (irop_get_tag(s) == IROP_TAG_STACKOFF && !s.is_lval && irop_is_local(s)) {
             int32_t v_vr = irop_get_vreg(s);
             if (v_vr >= 0 && tcc_ir_vreg_is_valid(ir, v_vr)) {
               IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, v_vr);
@@ -799,7 +804,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
         v = tcc_ir_op_get_src1(ir, q);
       else
         continue;
-      if (v.is_lval || v.is_llocal)
+      if (v.is_lval || irop_is_llocal(v))
         continue; /* the value read through it, not the address */
       int32_t v_vr = irop_get_vreg(v);
       if (v_vr < 0 || !tcc_ir_vreg_is_valid(ir, v_vr))
@@ -808,7 +813,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
       if (vidx >= table_size)
         continue;
       int root = -1;
-      if (irop_get_tag(v) == IROP_TAG_STACKOFF && v.is_local) {
+      if (irop_get_tag(v) == IROP_TAG_STACKOFF && irop_is_local(v)) {
         IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, v_vr);
         if (li && li->addrtaken)
           root = vidx;
@@ -855,7 +860,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   uint8_t *vreg_has_assign = NULL;
   {
     int bitset_bytes = (table_size + 7) / 8;
-    if (bitset_bytes > 0) {
+    if (!o0 && bitset_bytes > 0) {
       vreg_has_assign = tcc_mallocz(bitset_bytes);
       for (int i = 0; i < n; i++) {
         IRQuadCompact *q = &ir->compact_instructions[i];
@@ -884,12 +889,19 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
       found_;                                                                  \
     })
 
+  /* A third of the table has no interval: each back edge walked past them. */
+  int *started = tcc_malloc(sizeof(int) * (table_size + 1));
+  int nstarted = 0;
+  for (int idx = 0; !o0 && idx < table_size; idx++)
+    if (starts[idx] != INTERVAL_NOT_STARTED)
+      started[nstarted++] = idx;
+
   #define RA_EXTEND_BACKEDGE(i, target, broad)                                  \
     do {                                                                        \
       RA_DBG("  back-edge i=%d -> target=%d%s", (i), (target),                 \
              (broad) ? " (broad)" : "");                                        \
-      for (int idx_ = 0; idx_ < table_size; idx_++) {                           \
-        if (starts[idx_] == INTERVAL_NOT_STARTED) continue;                     \
+      for (int st_ = 0; st_ < nstarted; st_++) {                                \
+        const int idx_ = started[st_];                                          \
         int32_t vr_ = ra_vidx_vreg(&vx, idx_);                                  \
         int type_ = TCCIR_DECODE_VREG_TYPE(vr_);                                \
         int live_at_target_;                                                     \
@@ -959,7 +971,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
       }                                                                         \
     } while (0)
 
-  for (int i = 0; i < n; i++) {
+  for (int i = 0; !o0 && i < n; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
       int target = (int)tcc_ir_op_dest_u_imm32(ir, q);
@@ -989,13 +1001,15 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   }
 
   #undef RA_EXTEND_BACKEDGE
+  tcc_free(started);
   #undef RA_VREG_HAS_ASSIGN_IN_RANGE
   tcc_free(vreg_has_assign);
 
   /* The linear rules above cannot see a value that leaves its range by a
    * forward jump and returns by a backward one; real liveness can. */
   uint8_t *live_in_at_start = tcc_mallocz(table_size > 0 ? table_size : 1);
-  ra_widen_intervals_by_liveness(ir, &vx, starts, ends, live_in_at_start);
+  if (!ra_o0_direct(ir))
+    ra_widen_intervals_by_liveness(ir, &vx, starts, ends, live_in_at_start);
 
   if (TCC_LOG_LS) {
     RA_DBG("SSA ra_build_intervals: after backward jump extension");
@@ -1018,7 +1032,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
                    !tcc_ir_opt_pass_disabled("ra:caller_save");
   cs_cost_prefix[0] = 0;
   cs_bad_prefix[0] = 0;
-  for (int i = 0; i < n; i++) {
+  for (int i = 0; cs_func_ok && i < n; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
     TccIrOp op = q->op;
     uint32_t c = 0;

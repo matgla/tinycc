@@ -55,7 +55,7 @@ static int pca_nops(int op)
  * parameter). */
 static int pca_is_local_slot(IROperand op, int32_t *off)
 {
-  if (irop_is_none(op) || irop_get_tag(op) != IROP_TAG_STACKOFF || !op.is_local || op.is_param ||
+  if (irop_is_none(op) || irop_get_tag(op) != IROP_TAG_STACKOFF || !irop_is_local(op) || op.is_param ||
       irop_get_vreg(op) >= 0)
     return 0;
   *off = irop_get_stack_offset(op);
@@ -168,7 +168,7 @@ static int pca_match_chain(TCCIRState *ir, PcaUses *u, int i, int limit, PcaCopy
     IROperand s = tcc_ir_op_get_src1(ir, lq), t = tcc_ir_op_get_dest(ir, lq);
     IROperand d = tcc_ir_op_get_dest(ir, sq), v = tcc_ir_op_get_src1(ir, sq);
     int32_t doff;
-    if (irop_get_tag(s) != IROP_TAG_STACKOFF || !s.is_local || !s.is_lval || s.is_llocal || !pca_word_btype(s))
+    if (irop_get_tag(s) != IROP_TAG_STACKOFF || !irop_is_local(s) || !s.is_lval || irop_is_llocal(s) || !pca_word_btype(s))
       break;
     if (!pca_is_local_slot(d, &doff) || !d.is_lval || !pca_word_btype(d))
       break;
@@ -211,7 +211,7 @@ static int pca_addr_temp(TCCIRState *ir, int k, int32_t tv, IROperand *slot)
   if ((q->op != TCCIR_OP_LEA && q->op != TCCIR_OP_ASSIGN) || tcc_ir_op_dest_vreg(ir, q) != tv)
     return 0;
   IROperand a = tcc_ir_op_get_src1(ir, q);
-  if (irop_get_tag(a) != IROP_TAG_STACKOFF || !a.is_local || a.is_lval || a.is_llocal)
+  if (irop_get_tag(a) != IROP_TAG_STACKOFF || !irop_is_local(a) || a.is_lval || irop_is_llocal(a))
     return 0;
   *slot = a;
   return 1;
@@ -294,7 +294,7 @@ static int pca_is_src_ref(IROperand op, const PcaCopy *c)
   int32_t svr = irop_get_vreg(c->tmpl);
   if (svr >= 0 && irop_get_vreg(op) == svr)
     return 1;
-  if (irop_get_tag(op) != IROP_TAG_STACKOFF || !op.is_local || op.is_param != c->tmpl.is_param)
+  if (irop_get_tag(op) != IROP_TAG_STACKOFF || !irop_is_local(op) || op.is_param != c->tmpl.is_param)
     return 0;
   if (!c->tmpl.is_param && irop_get_vreg(op) >= 0)
     return 0;
@@ -319,7 +319,7 @@ static int pca_is_copy_ins(const PcaCopy *c, int i)
  * address as not escaping). */
 static int pca_is_sret_buffer_arg(TCCIRState *ir, IRQuadCompact *q, int k, IROperand op, const PcaCopy *c)
 {
-  if (q->op != TCCIR_OP_FUNCPARAMVAL || k != 0 || op.is_lval || op.is_llocal)
+  if (q->op != TCCIR_OP_FUNCPARAMVAL || k != 0 || op.is_lval || irop_is_llocal(op))
     return 0;
   if (irop_get_stack_offset(op) != c->src)
     return 0;
@@ -439,13 +439,13 @@ static int pca_try(TCCIRState *ir, PcaUses *u, PcaCopy *c)
       }
       /* A vreg-backed operand's offset is only the frontend's watermark (see
        * compute_stack_layout); concrete slots are what can name the local. */
-      if (irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_local && !op.is_param && irop_get_vreg(op) < 0 &&
+      if (irop_get_tag(op) == IROP_TAG_STACKOFF && irop_is_local(op) && !op.is_param && irop_get_vreg(op) < 0 &&
           pca_in(irop_get_stack_offset(op), c->dst, c->size))
       {
         /* The destination: only as a plain slot, and -- unless the source is
          * the call's own buffer, where the two agree from the copy onwards
          * whatever the control flow -- only after the copy. */
-        if ((i < c->first && !sret_src) || !pca_is_local_slot(op, &off) || op.is_llocal)
+        if ((i < c->first && !sret_src) || !pca_is_local_slot(op, &off) || irop_is_llocal(op))
           return 0;
         /* A volatile destination (the memmove form carries no volatile
          * operand of its own) keeps its own storage and its copy. */

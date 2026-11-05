@@ -121,7 +121,7 @@ TCCIRState *tcc_ir_alloc(void)
 
   /* Initialize compact instructions array */
   block->compact_instructions_size = QUADRUPLE_INIT_SIZE;
-  block->compact_instructions = (IRQuadCompact *)tcc_mallocz(sizeof(IRQuadCompact) * QUADRUPLE_INIT_SIZE);
+  block->compact_instructions = (IRQuadCompact *)tcc_hot_mallocz(sizeof(IRQuadCompact) * QUADRUPLE_INIT_SIZE);
   if (!block->compact_instructions)
   {
     fprintf(stderr, "tcc_ir_allocate_block: out of memory (compact_instructions)\n");
@@ -163,6 +163,7 @@ void tcc_ir_free(TCCIRState *ir)
 
   tcc_free(ir->param_forms);
   ir->param_forms = NULL;
+  ir_opt_frame_ptr_free(ir);
   if (ir->frame_objs)
   {
     tcc_free(ir->frame_objs);
@@ -216,7 +217,7 @@ void tcc_ir_free(TCCIRState *ir)
   /* Free compact instructions array */
   if (ir->compact_instructions)
   {
-    tcc_free(ir->compact_instructions);
+    tcc_hot_free(ir->compact_instructions);
     ir->compact_instructions = NULL;
     ir->compact_instructions_size = 0;
   }

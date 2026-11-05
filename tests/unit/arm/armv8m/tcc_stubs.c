@@ -186,3 +186,8 @@ void tcc_init_stamp(const char *label)
 void tcc_init_stamps_dump(void)
 {
 }
+
+void tcc_link_arena_prepare(struct TCCState *s1)
+{
+  (void)s1;
+}

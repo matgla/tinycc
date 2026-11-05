@@ -139,7 +139,7 @@ static IROperand utb_callee_named(TCCIRState *ir, Sym *sym, int tok)
 {
   sym->v = tok;
   uint32_t sidx = tcc_ir_pool_add_symref(ir, sym, 0, 0);
-  return irop_make_symref(0, sidx, 0, 0, 0, I32);
+  return irop_make_symref(0, sidx, 0, I32);
 }
 
 /* ================================================================== redundant_loop_check */

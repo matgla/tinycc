@@ -73,12 +73,10 @@ FLAT_OPT_SRC = \
 	source/opt/flat/cfg/if_convert.c \
 	source/opt/flat/dce/body_essential.c \
 	source/opt/flat/dce/noreturn_collapse.c \
-	source/opt/flat/dce/infinite_loop_simplify.c \
 	source/opt/flat/dce/trap_only_body_suppress.c \
 	source/opt/flat/dce/infinite_self_recursion.c \
 	source/opt/flat/dce/noreturn_call_epilogue.c \
 	source/opt/flat/dce/dead_addrvar_elim.c \
-	source/opt/flat/dce/dead_trailing_addrvar_store.c \
 	source/opt/flat/dce/uninit_ub.c \
 	source/opt/flat/dce/ub_only_body_elide.c \
 	source/opt/flat/dce/const_return_uninit_elide.c \
@@ -138,7 +136,6 @@ FLAT_OPT_SRC = \
 	source/opt/flat/memory/small_memset_to_store.c \
 	source/opt/flat/memory/small_global_memset_to_store.c \
 	source/opt/flat/memory/mem_init.c \
-	source/opt/flat/memory/addrof_var_fwd.c \
 	source/opt/flat/memory/ptr_local_fwd.c \
 	source/opt/flat/memory/param_copy_alias.c \
 	source/opt/flat/memory/struct_arg_split.c \

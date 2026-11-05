@@ -49,7 +49,7 @@ static IROperand utb_callee_named(TCCIRState *ir, Sym *sym, int tok)
 {
   sym->v = tok;
   uint32_t sidx = tcc_ir_pool_add_symref(ir, sym, 0, 0);
-  return irop_make_symref(0, sidx, 0, 0, 0, I32);
+  return irop_make_symref(0, sidx, 0, I32);
 }
 
 /* Build a SYMREF operand carrying a freshly-pooled callee Sym.  By default the
@@ -443,7 +443,7 @@ UT_TEST(test_self_copy_elim_idempotent)
 static IROperand utb_local_vreg(int32_t vreg, int btype)
 {
   IROperand op = irop_make_vreg(vreg, btype);
-  op.is_local = 1;
+  op.tag = IROP_TAG_STACKOFF;
   return op;
 }
 
@@ -452,7 +452,7 @@ static IROperand utb_local_vreg(int32_t vreg, int btype)
  * "value at the spill slot" read form). */
 static IROperand utb_slot_lval(int32_t vreg, int32_t offset, int btype)
 {
-  return irop_make_stackoff(vreg, offset, 1 /* is_lval */, 0 /* is_llocal */, 0 /* is_param */, btype);
+  return irop_make_stackoff(vreg, offset, 1 /* is_lval */, 0 /* is_param */, btype);
 }
 
 /* Reset the shared tcc_state IPC caches between tests (they live on the global

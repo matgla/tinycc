@@ -218,7 +218,7 @@ static int cpt_try_switch_table_fold(CPTCtx *c, int i)
 static int cpt_operand_reads_through(IROperand op)
 {
   if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(op)) == TCCIR_VREG_TYPE_VAR)
-    return op.is_llocal;
+    return irop_is_llocal(op);
   return op.is_lval;
 }
 
@@ -229,7 +229,7 @@ static int cpt_propagate_src1(CPTCtx *c, int i)
   if (!irop_config[q->op].has_src1 || q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_IJUMP)
     return 0;
   IROperand src1 = tcc_ir_op_get_src1(ir, q);
-  if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(src1)) == TCCIR_VREG_TYPE_VAR && src1.is_local && !src1.is_lval)
+  if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(src1)) == TCCIR_VREG_TYPE_VAR && irop_is_local(src1) && !src1.is_lval)
     return 0;
   if (cpt_operand_reads_through(src1))
     return 0;
@@ -254,7 +254,6 @@ static int cpt_propagate_src1(CPTCtx *c, int i)
   prop_val = ir_opt_fit_const_to_operand(prop_val, src1);
   IROperand new_src1 = cpt_make_const(ir, prop_val, btype);
   new_src1.is_unsigned = src1.is_unsigned;
-  new_src1.is_static = src1.is_static;
   tcc_ir_set_src1(ir, i, new_src1);
   return 1;
 }
@@ -291,7 +290,6 @@ static int cpt_propagate_src2(CPTCtx *c, int i)
   }
   IROperand new_src2 = cpt_make_const(ir, val, btype);
   new_src2.is_unsigned = src2.is_unsigned;
-  new_src2.is_static = src2.is_static;
   tcc_ir_set_src2(ir, i, new_src2);
   return 1;
 }
@@ -313,111 +311,9 @@ static int cpt_try_fold_binop(CPTCtx *c, int i)
   int64_t v2 = irop_get_imm64_ex(ir, fs2);
   int btype = irop_get_btype(fs1);
   int64_t res = 0;
-  int ok = 1;
-  switch (q->op)
-  {
-  case TCCIR_OP_ADD:
-    res = (int64_t)((uint64_t)v1 + (uint64_t)v2);
-    break;
-  case TCCIR_OP_SUB:
-    res = (int64_t)((uint64_t)v1 - (uint64_t)v2);
-    break;
-  case TCCIR_OP_AND:
-    res = v1 & v2;
-    break;
-  case TCCIR_OP_OR:
-    res = v1 | v2;
-    break;
-  case TCCIR_OP_XOR:
-    res = v1 ^ v2;
-    break;
-  case TCCIR_OP_SHL:
-  case TCCIR_OP_SHR:
-  case TCCIR_OP_SAR:
-    /* A count outside [0, width) is the program's UB, and folding it is UB in
-     * the compiler too (x86 masks the count; the ARM shift it replaces does
-     * not): leave the shift to run as it does at -O0. */
-    if (v2 < 0 || v2 >= (btype == IROP_BTYPE_INT64 ? 64 : 32))
-      ok = 0;
-    else if (q->op == TCCIR_OP_SHL)
-      res = (int64_t)((uint64_t)v1 << v2);
-    else if (q->op == TCCIR_OP_SHR)
-      res = btype == IROP_BTYPE_INT64 ? (int64_t)((uint64_t)v1 >> v2) : (int64_t)((uint32_t)v1 >> v2);
-    else
-      res = v1 >> v2;
-    break;
-  case TCCIR_OP_ROR:
-  {
-    uint32_t v = (uint32_t)v1;
-    uint32_t sh = (uint32_t)v2 & 31;
-    res = (int64_t)(int32_t)((v >> sh) | (v << (32 - sh)));
-    break;
-  }
-  case TCCIR_OP_MUL:
-    res = (int64_t)((uint64_t)v1 * (uint64_t)v2);
-    break;
-  case TCCIR_OP_UMULL:
-    res = (int64_t)((uint64_t)(uint32_t)v1 * (uint64_t)(uint32_t)v2);
+  int ok = ir_opt_const_binop(q->op, btype == IROP_BTYPE_INT64, v1, v2, &res);
+  if (ok && (q->op == TCCIR_OP_UMULL || q->op == TCCIR_OP_SMULL))
     btype = IROP_BTYPE_INT64;
-    break;
-  case TCCIR_OP_SMULL:
-    res = (int64_t)(int32_t)v1 * (int64_t)(int32_t)v2;
-    btype = IROP_BTYPE_INT64;
-    break;
-  case TCCIR_OP_UBFX:
-  {
-    int lsb = (int)v2 & 0x1F;
-    int width = ((int)v2 >> 5) & 0x1F;
-    if (width > 0 && width <= 32)
-      res = ((uint32_t)v1 >> lsb) & ((1u << width) - 1);
-    else
-      ok = 0;
-    break;
-  }
-  case TCCIR_OP_DIV:
-  case TCCIR_OP_PDIV:
-    /* INT_MIN / -1 traps; width-specific since a 32-bit v1 arrives sign-extended in this i64 slot */
-    if (v2 == 0)
-      ok = 0;
-    else if (v2 == -1 && ((btype == IROP_BTYPE_INT64 && v1 == INT64_MIN) ||
-                          (btype != IROP_BTYPE_INT64 && (int32_t)v1 == INT32_MIN)))
-      ok = 0;
-    else if (btype == IROP_BTYPE_INT64)
-      res = v1 / v2;
-    else
-      res = (int64_t)((int32_t)v1 / (int32_t)v2);
-    break;
-  case TCCIR_OP_UDIV:
-    if (v2 == 0)
-      ok = 0;
-    else if (btype == IROP_BTYPE_INT64)
-      res = (int64_t)((uint64_t)v1 / (uint64_t)v2);
-    else
-      res = (int64_t)((uint32_t)v1 / (uint32_t)v2);
-    break;
-  case TCCIR_OP_IMOD:
-    if (v2 == 0)
-      ok = 0;
-    else if (v2 == -1 && ((btype == IROP_BTYPE_INT64 && v1 == INT64_MIN) ||
-                          (btype != IROP_BTYPE_INT64 && (int32_t)v1 == INT32_MIN)))
-      ok = 0;
-    else if (btype == IROP_BTYPE_INT64)
-      res = v1 % v2;
-    else
-      res = (int64_t)((int32_t)v1 % (int32_t)v2);
-    break;
-  case TCCIR_OP_UMOD:
-    if (v2 == 0)
-      ok = 0;
-    else if (btype == IROP_BTYPE_INT64)
-      res = (int64_t)((uint64_t)v1 % (uint64_t)v2);
-    else
-      res = (int64_t)((uint32_t)v1 % (uint32_t)v2);
-    break;
-  default:
-    ok = 0;
-    break;
-  }
   if (ok && btype != IROP_BTYPE_INT64 && btype != IROP_BTYPE_FLOAT64)
   {
     if (q->op == TCCIR_OP_SHL && v2 >= 32)
@@ -455,16 +351,16 @@ static int cpt_try_fold_identity(CPTCtx *c, int i)
   IROperand s1 = tcc_ir_op_get_src1(ir, q);
   IROperand s2 = tcc_ir_op_get_src2(ir, q);
   IROperand keep;
-  if (irop_is_immediate(s2) && !s2.is_sym && irop_get_imm64_ex(ir, s2) == 0)
+  if (irop_is_immediate(s2) && !irop_is_sym(s2) && irop_get_imm64_ex(ir, s2) == 0)
     keep = s1;
-  else if (irop_is_immediate(s1) && !s1.is_sym && irop_get_imm64_ex(ir, s1) == 0 &&
+  else if (irop_is_immediate(s1) && !irop_is_sym(s1) && irop_get_imm64_ex(ir, s1) == 0 &&
            (op == TCCIR_OP_OR || op == TCCIR_OP_XOR || op == TCCIR_OP_ADD))
     keep = s2;
   else
     return 0;
   /* A plain register read of the result's own width: no memory operand, no
    * extension or truncation hiding in the copy. */
-  if (irop_is_immediate(keep) || keep.is_lval || keep.is_sym || keep.is_local || keep.is_llocal ||
+  if (irop_is_immediate(keep) || keep.is_lval || irop_is_sym(keep) || irop_is_local(keep) || irop_is_llocal(keep) ||
       irop_get_vreg(keep) < 0 || dest.is_lval || irop_get_btype(keep) != IROP_BTYPE_INT32 ||
       irop_get_btype(dest) != IROP_BTYPE_INT32)
     return 0;
@@ -611,7 +507,7 @@ static void cpt_track_var_def(CPTCtx *c, int i)
   if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_STORE) && !dest.is_lval)
   {
     IROperand cur_src1 = tcc_ir_op_get_src1(ir, q);
-    if (irop_is_immediate(cur_src1) && !cur_src1.is_sym &&
+    if (irop_is_immediate(cur_src1) && !irop_is_sym(cur_src1) &&
         cpt_const_survives_operand(irop_get_imm64_ex(ir, cur_src1), dest))
     {
       c->var_info[pos].gen = c->current_gen;

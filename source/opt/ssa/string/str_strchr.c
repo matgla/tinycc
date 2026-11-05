@@ -82,7 +82,7 @@ static int search_fold(StrFoldCtx *c, int last)
     if (!sr)
       return 0;
     pidx = tcc_ir_pool_add_symref(c->ir, sr->sym, sr->addend + off, sr->flags);
-    res = irop_make_symref(irop_get_vreg(sym), pidx, sym.is_lval, sym.is_local, sym.is_const, irop_get_btype(sym));
+    res = irop_make_symref(irop_get_vreg(sym), pidx, sym.is_lval, irop_get_btype(sym));
   }
 
   ir_opt_nop_call_params(c->ir, c->call_idx);

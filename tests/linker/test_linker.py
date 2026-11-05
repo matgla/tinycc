@@ -831,7 +831,7 @@ def test_yaff_output_structure(tinycc_root):
         # tccyaff.h) instead of the "this is ARM" constant format 1 wrote, and
         # backs it with the YaffArchSection at arch_section_offset.
         assert arch == 4  # YAFF_ARCH_ARMV8_M
-        assert yaff_version == 4
+        assert yaff_version == 5
 
         # YaffArchSection sits at arch_section_offset (u32 at 72 since format
         # 3) and starts with its own size, so a loader can read the prefix it
@@ -1060,6 +1060,25 @@ def test_gc_sections_per_object_data(tinycc_root):
     names = _readelf_section_names(out)
     assert not [n for n in names if ".." in n], f"per-object input sections leaked into the image: {names}"
     assert names.count(".data") == 1, names
+
+
+@pytest.mark.linker
+@pytest.mark.linker_yaff
+@pytest.mark.parametrize("flags, expected", [((), 0), (("-slow-memory",), 1)])
+def test_yaff_memory_flags(tinycc_root, flags, expected):
+    src = BUILD_DIR / "yaff" / "memory_flags.c"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text("int f(void) { return 1; }\n")
+    out = BUILD_DIR / "yaff" / f"memory_flags_{expected}.yaff"
+    cmd = [
+        str(TCC), "-nostdlib", "-nodefaultlibs", "-shared", "-Wl,-oformat=yaff",
+        *flags, str(src), "-o", str(out),
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+    assert result.returncode == 0, f"{' '.join(cmd)}\n{result.stderr}"
+    data = out.read_bytes()
+    assert data[:4] == b"YAFF"
+    assert unpack_from("<I", data, 132)[0] == expected
 
 
 @pytest.mark.linker

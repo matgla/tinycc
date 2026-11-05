@@ -312,7 +312,7 @@ int collect_body_instructions(TCCIRState *ir, IRLoop *loop, int iv_vreg, int cmp
     {
       IROperand d = tcc_ir_op_get_dest(ir, q);
       int32_t dvr = irop_get_vreg(d);
-      if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR && !d.is_llocal &&
+      if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR && !irop_is_llocal(d) &&
           ir_xform_operand_reads_memory(tcc_ir_op_get_src1(ir, q)))
       {
         LOG_LOOP_OPT("collect_body: REJECTED at [%d] memory load bound to a VAR by STORE", i);
@@ -371,7 +371,7 @@ int find_loop_exit_condition_op(TCCIRState *ir, IRLoop *loop, int iv_vreg, int *
       /* Accept either immediate OR a plain vreg (no DEREF/sym/complex). */
       int src2_is_imm = irop_is_immediate(cmp_src2);
       int src2_is_simple_vreg =
-          (!cmp_src2.is_lval && !cmp_src2.is_sym && !cmp_src2.is_complex && irop_get_vreg(cmp_src2) >= 0);
+          (!cmp_src2.is_lval && !irop_is_sym(cmp_src2) && !cmp_src2.is_complex && irop_get_vreg(cmp_src2) >= 0);
       if (!src2_is_imm && !src2_is_simple_vreg)
         continue;
       IRQuadCompact *jq = &ir->compact_instructions[i + 1];

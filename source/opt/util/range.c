@@ -16,7 +16,7 @@
 
 static int ir_q_reads_through(IROperand op)
 {
-  return op.is_lval || op.is_llocal;
+  return op.is_lval || irop_is_llocal(op);
 }
 
 static uint32_t ir_q_instr_hazards(TCCIRState *ir, const IRQuadCompact *q, uint32_t mask)

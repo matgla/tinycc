@@ -79,7 +79,7 @@ int tcc_ir_opt_sdiv_pow2(TCCIRState *ir)
     /* The dividend is read three times, so it must be a plain register value:
      * a deref would turn one load into three, and a stack lvalue names memory
      * an intervening pass may still rewrite. */
-    if (!irop_has_vreg(src1) || src1.is_lval || src1.is_local || src1.is_llocal)
+    if (!irop_has_vreg(src1) || src1.is_lval || irop_is_local(src1) || irop_is_llocal(src1))
       continue;
     if (tcc_ir_barrel_shift_at(ir, q))
       continue;

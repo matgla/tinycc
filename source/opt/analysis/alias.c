@@ -71,19 +71,19 @@ int stackoff_same_slot(IROperand a, IROperand b)
 {
   if (irop_get_tag(a) != IROP_TAG_STACKOFF || irop_get_tag(b) != IROP_TAG_STACKOFF)
     return 0;
-  return a.u.imm32 == b.u.imm32 && a.is_local == b.is_local && a.is_llocal == b.is_llocal;
+  return a.u.imm32 == b.u.imm32 && irop_is_local(a) == irop_is_local(b) && irop_is_llocal(a) == irop_is_llocal(b);
 }
 
 int operand_references_slot(IROperand op, IROperand slot)
 {
   if (irop_get_tag(op) != IROP_TAG_STACKOFF)
     return 0;
-  return op.u.imm32 == slot.u.imm32 && op.is_local == slot.is_local && op.is_llocal == slot.is_llocal;
+  return op.u.imm32 == slot.u.imm32 && irop_is_local(op) == irop_is_local(slot) && irop_is_llocal(op) == irop_is_llocal(slot);
 }
 
 int is_stack_address_operand(IROperand op)
 {
-  return op.is_local && !op.is_lval && irop_get_tag(op) == IROP_TAG_STACKOFF;
+  return irop_is_local(op) && !op.is_lval && irop_get_tag(op) == IROP_TAG_STACKOFF;
 }
 
 int find_deref_use_operand(TCCIRState *ir, int consumer_idx, int32_t vreg, int *which_out)
@@ -121,4 +121,72 @@ int find_deref_use_operand(TCCIRState *ir, int consumer_idx, int32_t vreg, int *
     return 0;
   *which_out = which;
   return 1;
+}
+
+int ir_opt_addr_walk(TCCIRState *ir, int32_t vr, int before_idx, const IRAddrWalk *w, IRAddrKey *out)
+{
+  int64_t acc = 0;
+  for (int hop = 0; hop < w->max_hops; hop++)
+  {
+    if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+      return 0;
+    int p = TCCIR_DECODE_VREG_POSITION(vr);
+    if (p >= w->n_temps)
+      return 0;
+    int d;
+    if (w->flags & IR_AW_LATEST_DEF)
+    {
+      if (w->def_count && w->def_count[p] != 1)
+        return 0;
+      d = tcc_ir_find_defining_instruction(ir, vr, before_idx);
+    }
+    else
+      d = w->def_at ? w->def_at[p] : -1;
+    if (d < 0)
+      return 0;
+    IRQuadCompact *dq = &ir->compact_instructions[d];
+    int sub = dq->op == TCCIR_OP_SUB && (w->flags & IR_AW_SUB);
+    if (dq->op != TCCIR_OP_ADD && dq->op != TCCIR_OP_LEA && dq->op != TCCIR_OP_ASSIGN && !sub)
+      return 0;
+    if (dq->op == TCCIR_OP_ADD || sub)
+    {
+      if (!tcc_ir_op_src2_is_imm(ir, dq))
+        return 0;
+      int64_t c = tcc_ir_op_src2_imm(ir, dq);
+      acc += sub ? -c : c;
+    }
+    IROperand s1 = tcc_ir_op_get_src1(ir, dq);
+    if ((w->flags & IR_AW_SYMREF) && irop_is_sym(s1) && !s1.is_lval)
+    {
+      IRPoolSymref *sr = irop_get_symref_ex(ir, s1);
+      if (!sr || !sr->sym)
+        return 0;
+      out->sym = sr->sym;
+      out->off = (int64_t)sr->addend + acc;
+      out->def_idx = d;
+      return 1;
+    }
+    /* A direct frame slot: no vreg, or (IR_AW_TEMP_SLOT) a frontend temporary's
+     * negative one.  One with a VAR's vreg is `&VAR`, stepped through below and
+     * refused there as a non-TEMP. */
+    int s1vr = irop_get_tag(s1) == IROP_TAG_STACKOFF ? irop_get_vreg(s1) : 0;
+    if (irop_get_tag(s1) == IROP_TAG_STACKOFF && irop_is_local(s1) && !s1.is_lval &&
+        (s1vr == -1 || (s1vr < 0 && (w->flags & IR_AW_TEMP_SLOT))))
+    {
+      out->sym = NULL;
+      out->off = (int64_t)irop_get_stack_offset(s1) + acc;
+      out->def_idx = d;
+      return 1;
+    }
+    if (s1.is_lval)
+      return 0;
+    if (!(w->flags & IR_AW_ANY_VREG) && irop_get_tag(s1) != IROP_TAG_VREG)
+      return 0;
+    int32_t nv = irop_get_vreg(s1);
+    if (nv < 0)
+      return 0;
+    vr = nv;
+    before_idx = d;
+  }
+  return 0;
 }

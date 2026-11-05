@@ -108,12 +108,12 @@ static int sas_nops(int op)
  * extent is unknown, 0 = not a frame reference. */
 static int sas_frame_ref(IROperand op, int *off, int *w)
 {
-  if (irop_get_tag(op) != IROP_TAG_STACKOFF || irop_get_vreg(op) >= 0 || op.is_param || !op.is_local)
+  if (irop_get_tag(op) != IROP_TAG_STACKOFF || irop_get_vreg(op) >= 0 || op.is_param || !irop_is_local(op))
     return 0;
   *off = irop_get_stack_offset(op);
   if (!op.is_lval)
     return 2;
-  if (op.is_llocal)
+  if (irop_is_llocal(op))
   {
     *w = 4;
     return 1;
@@ -187,7 +187,7 @@ static int sas_is_cand_param(Sas *s, int i, int *off, int *size, int *words)
     return 0;
   IROperand a = tcc_ir_op_get_src1(ir, q);
   int w;
-  if (irop_get_btype(a) != IROP_BTYPE_STRUCT || a.is_complex || sas_frame_ref(a, off, &w) != 1 || a.is_llocal)
+  if (irop_get_btype(a) != IROP_BTYPE_STRUCT || a.is_complex || sas_frame_ref(a, off, &w) != 1 || irop_is_llocal(a))
     return 0;
   if (tcc_ir_access_is_volatile(ir, a))
     return 0;
@@ -243,19 +243,19 @@ static int sas_writes(TCCIRState *ir, IRQuadCompact *q, int lo, int hi, int *exa
   if (off >= hi || off + w <= lo)
     return 0;
   if (op == TCCIR_OP_STORE && off == lo && w == hi - lo && w == 4 && irop_get_btype(d) == IROP_BTYPE_INT32 &&
-      !d.is_complex && !d.is_llocal)
+      !d.is_complex && !irop_is_llocal(d))
     *exact_word = 1;
   return 1;
 }
 
 static int sas_value_ok(IROperand v)
 {
-  if (v.is_lval || v.is_llocal || v.is_complex || irop_get_btype(v) != IROP_BTYPE_INT32)
+  if (v.is_lval || irop_is_llocal(v) || v.is_complex || irop_get_btype(v) != IROP_BTYPE_INT32)
     return 0;
   /* A symbol's address (a string literal's pointer) is as good an argument as a constant. */
   if (irop_get_tag(v) == IROP_TAG_SYMREF)
     return 1;
-  if (v.is_sym)
+  if (irop_is_sym(v))
     return 0;
   if (irop_get_tag(v) == IROP_TAG_IMM32)
     return 1;
@@ -562,7 +562,7 @@ int tcc_ir_opt_struct_arg_split(TCCIRState *ir)
     {
       pq = &ir->compact_instructions[p];
       IRQuadCompact nq = *pq;
-      nq.orig_index = ++ir->max_orig_index;
+      nq.orig_index = tcc_ir_fresh_orig_index(ir);
       nq.is_jump_target = 0;
       nq.operand_base = tcc_ir_pool_add(ir, c->val[w]);
       tcc_ir_pool_add(ir, irop_make_imm32(-1, (int32_t)TCCIR_ENCODE_PARAM(cid, pidx + w), IROP_BTYPE_INT32));

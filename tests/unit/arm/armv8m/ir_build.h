@@ -93,7 +93,7 @@ static inline IROperand utb_imm(int32_t val, int btype)
  * default (offset=0, no flags) is enough. */
 static inline IROperand utb_stackoff(int32_t offset, int is_lval, int is_llocal, int is_param, int btype)
 {
-  return irop_make_stackoff(0, offset, is_lval, is_llocal, is_param, btype);
+  return irop_make_stackoff(0, offset, is_lval, is_param, btype);
 }
 
 /* Symbol-reference operand.  The caller must have called utb_pools_init(ir)
@@ -101,7 +101,7 @@ static inline IROperand utb_stackoff(int32_t offset, int is_lval, int is_llocal,
 static inline IROperand utb_symref(TCCIRState *ir, Sym *sym, int is_lval, int is_local, int is_const, int btype)
 {
   uint32_t sidx = tcc_ir_pool_add_symref(ir, sym, 0, 0);
-  return irop_make_symref(0, sidx, is_lval, is_local, is_const, btype);
+  return irop_make_symref(0, sidx, is_lval, btype);
 }
 
 /* ---- flag helpers (return modified copies) ---- */
@@ -109,12 +109,6 @@ static inline IROperand utb_symref(TCCIRState *ir, Sym *sym, int is_lval, int is
 static inline IROperand utb_lval(IROperand op)
 {
   op.is_lval = 1;
-  return op;
-}
-
-static inline IROperand utb_llocal(IROperand op)
-{
-  op.is_llocal = 1;
   return op;
 }
 

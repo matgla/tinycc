@@ -16,15 +16,29 @@ typedef struct TccSort
   char *base;
   size_t size;
   int (*cmp)(const void *, const void *);
+  int indirect; /* base holds pointers to the elements */
 } TccSort;
 
 static int tcc_sort_less(const TccSort *s, size_t i, size_t j)
 {
+  if (s->indirect)
+    return s->cmp(((void **)s->base)[i], ((void **)s->base)[j]) < 0;
   return s->cmp(s->base + i * s->size, s->base + j * s->size) < 0;
 }
 
 static void tcc_sort_swap_range(const TccSort *s, size_t a, size_t b, size_t n)
 {
+  if (s->indirect)
+  {
+    void **p = (void **)s->base;
+    for (size_t k = 0; k < n; k++)
+    {
+      void *t = p[a + k];
+      p[a + k] = p[b + k];
+      p[b + k] = t;
+    }
+    return;
+  }
   char tmp[64];
   size_t bytes = n * s->size;
   char *x = s->base + a * s->size, *y = s->base + b * s->size;
@@ -129,8 +143,21 @@ static void tcc_sort_insertion(const TccSort *s, size_t a, size_t b)
 ST_FUNC void tcc_qsort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *))
 {
   enum { BLOCK = 20 };
-  TccSort s = {(char *)base, size, cmp};
+  TccSort s = {(char *)base, size, cmp, 0};
   size_t a, b, block;
+  /* Large elements: sort pointers, the same comparisons in the same order, and move
+   * each element once at the end.  A sort of live intervals spent most of its time
+   * copying them around. */
+  void **order = NULL;
+  if (size > 2 * sizeof(void *) && n > 1)
+  {
+    order = tcc_malloc(n * sizeof(void *));
+    for (a = 0; a < n; a++)
+      order[a] = (char *)base + a * size;
+    s.base = (char *)order;
+    s.size = sizeof(void *);
+    s.indirect = 1;
+  }
   for (a = 0; a + BLOCK <= n; a += BLOCK)
     tcc_sort_insertion(&s, a, a + BLOCK);
   if (a < n)
@@ -141,5 +168,31 @@ ST_FUNC void tcc_qsort(void *base, size_t n, size_t size, int (*cmp)(const void 
       tcc_sort_sym_merge(&s, a, a + block, b);
     if (a + block < n)
       tcc_sort_sym_merge(&s, a, a + block, n);
+  }
+  if (order)
+  {
+    /* Follow each cycle of the permutation, with one element held out. */
+    char *hold = tcc_malloc(size);
+    for (a = 0; a < n; a++)
+    {
+      char *const home = (char *)base + a * size;
+      if (order[a] == home)
+        continue;
+      memcpy(hold, home, size);
+      for (b = a;;)
+      {
+        char *const to = (char *)base + b * size, *const from = order[b];
+        order[b] = to;
+        if (from == home)
+        {
+          memcpy(to, hold, size);
+          break;
+        }
+        memcpy(to, from, size);
+        b = (size_t)(from - (char *)base) / size;
+      }
+    }
+    tcc_free(hold);
+    tcc_free(order);
   }
 }

@@ -322,24 +322,23 @@ int tcc_ir_is_in_loop(IRLoop *loop, int instr_idx)
   }
   return 0;
 }
-int tcc_ir_insert_instruction_before(TCCIRState *ir, int before_idx, IRQuadCompact *new_q)
+/* `count` instructions before before_idx, in the order given: what that many
+ * single insertions do, for one walk of the function. */
+int tcc_ir_insert_instructions_before(TCCIRState *ir, int before_idx, IRQuadCompact *new_q, int count)
 {
-  if (ir->next_instruction_index + 1 >= ir->compact_instructions_size)
+  while (ir->next_instruction_index + count >= ir->compact_instructions_size)
   {
     int new_size = ir->compact_instructions_size << 1;
-    ir->compact_instructions = (IRQuadCompact *)tcc_realloc(ir->compact_instructions, sizeof(IRQuadCompact) * new_size);
+    ir->compact_instructions = (IRQuadCompact *)tcc_hot_realloc(ir->compact_instructions, sizeof(IRQuadCompact) * new_size);
     if (!ir->compact_instructions)
       tcc_ice("failed to resize compact_instructions");
     ir->compact_instructions_size = new_size;
   }
 
-  for (int i = ir->next_instruction_index; i > before_idx; i--)
-  {
-    ir->compact_instructions[i] = ir->compact_instructions[i - 1];
-  }
-
-  ir->compact_instructions[before_idx] = *new_q;
-  ir->next_instruction_index++;
+  memmove(&ir->compact_instructions[before_idx + count], &ir->compact_instructions[before_idx],
+          sizeof(IRQuadCompact) * (ir->next_instruction_index - before_idx));
+  memcpy(&ir->compact_instructions[before_idx], new_q, sizeof(IRQuadCompact) * count);
+  ir->next_instruction_index += count;
 
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
@@ -350,7 +349,7 @@ int tcc_ir_insert_instruction_before(TCCIRState *ir, int before_idx, IRQuadCompa
       int target = (int)dest_imm;
       if (target >= before_idx)
       {
-        IROperand new_dest = irop_make_imm32(-1, target + 1, IROP_BTYPE_INT32);
+        IROperand new_dest = irop_make_imm32(-1, target + count, IROP_BTYPE_INT32);
         tcc_ir_op_set_dest(ir, q, new_dest);
       }
     }
@@ -361,18 +360,24 @@ int tcc_ir_insert_instruction_before(TCCIRState *ir, int before_idx, IRQuadCompa
   {
     TCCIRSwitchTable *table = &ir->switch_tables[t];
     if (table->default_target >= before_idx)
-      table->default_target += 1;
+      table->default_target += count;
     if (table->targets)
     {
       for (int j = 0; j < table->num_entries; j++)
       {
         if (table->targets[j] >= before_idx)
-          table->targets[j] += 1;
+          table->targets[j] += count;
       }
     }
   }
 
-  tcc_ir_frame_scope_insert(ir, before_idx);
+  for (int k = 0; k < count; k++)
+    tcc_ir_frame_scope_insert(ir, before_idx);
 
   return before_idx;
+}
+
+int tcc_ir_insert_instruction_before(TCCIRState *ir, int before_idx, IRQuadCompact *new_q)
+{
+  return tcc_ir_insert_instructions_before(ir, before_idx, new_q, 1);
 }

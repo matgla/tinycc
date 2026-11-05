@@ -32,13 +32,16 @@ typedef struct
   int def_count;     /* counts ALL defs (cap 2 — single-def required) */
 } TmpAddr;
 
-/* Resolve a deref (lval) operand to the StackLoc offset it reads or writes:
+/* The table is filled from ir_opt_frame_ptr (opt_alias.h): single-def LEA
+ * temps only, no ADD chain, no TEMP copy -- what this pass can range-check.
+ *
+ * Resolve a deref (lval) operand to the StackLoc offset it reads or writes:
  * directly, or through a single-def LEA temp; *slot_off is set only on success. */
 static int dlea_resolve_lval_slot(const TmpAddr *tmp_addr, int max_tmp, const IROperand *op, int *slot_off)
 {
   if (!op->is_lval)
     return 0;
-  if (irop_get_tag(*op) == IROP_TAG_STACKOFF && op->is_local && irop_get_vreg(*op) == -1)
+  if (irop_get_tag(*op) == IROP_TAG_STACKOFF && irop_is_local(*op) && irop_get_vreg(*op) == -1)
   {
     *slot_off = irop_get_stack_offset(*op);
     return 1;
@@ -54,6 +57,16 @@ static int dlea_resolve_lval_slot(const TmpAddr *tmp_addr, int max_tmp, const IR
     }
   }
   return 0;
+}
+
+static int dlea_read_width(const IROperand *op)
+{
+  int w = ir_opt_store_btype_size_bytes(irop_get_btype(*op));
+  if (w <= 0)
+    w = irop_is_64bit(*op) ? 8 : 4;
+  if (op->is_complex)
+    w *= 2;
+  return w;
 }
 
 static int is_recognized_mem_call(TCCIRState *ir, IRQuadCompact *q,
@@ -91,19 +104,14 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
 
   /* Bail on opcodes whose memory effects / control flow we don't model.
    * SWITCH_TABLE has indirect targets we can't range-check for back-edges. */
-  for (int i = 0; i < n; i++)
-  {
-    int op = ir->compact_instructions[i].op;
-    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SETJMP || op == TCCIR_OP_LONGJMP ||
-        op == TCCIR_OP_INLINE_ASM || op == TCCIR_OP_VLA_ALLOC ||
-        op == TCCIR_OP_SET_CHAIN || op == TCCIR_OP_INIT_CHAIN_SLOT ||
-        op == TCCIR_OP_SWITCH_TABLE)
-      return 0;
-  }
+  const uint32_t feat = ir_opt_fn_features(ir);
+  if (feat & (IR_FN_IJUMP | IR_FN_SETJMP | IR_FN_LONGJMP | IR_FN_INLINE_ASM | IR_FN_VLA_ALLOC |
+              IR_FN_SET_CHAIN | IR_FN_INIT_CHAIN_SLOT | IR_FN_SWITCH_TABLE))
+    return 0;
 
   /* Bail on calls to anything but recognized mem* helpers — a generic call
    * may dereference any escaped address. */
-  for (int i = 0; i < n; i++)
+  for (int i = 0; (feat & IR_FN_CALL) && i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_FUNCCALLVOID && q->op != TCCIR_OP_FUNCCALLVAL)
@@ -113,24 +121,33 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
       return 0;
   }
 
-  /* Find max temp position. */
-  int max_tmp = 0;
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
-      continue;
-    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
-    if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
-      continue;
-    int pos = TCCIR_DECODE_VREG_POSITION(vr);
-    if (pos > max_tmp)
-      max_tmp = pos;
-  }
-  if (max_tmp == 0)
+  /* The single-def TEMPs that hold Addr[StackLoc[off]] come from the shared
+   * frame facts: an anonymous object whose TEMP has exactly one definition,
+   * takes no other value, and was materialised by a plain ASSIGN/LEA of a
+   * bare StackLoc (vreg -1: a SYMREF-based or frontend-temporary slot has no
+   * offset this pass could range-check). */
+  const IRFramePtr *fp = ir_opt_frame_ptr(ir);
+  int max_tmp = fp->ntmp - 1;
+  if (max_tmp <= 0)
     return 0;
-
   TmpAddr *tmp_addr = tcc_mallocz(sizeof(TmpAddr) * (max_tmp + 1));
+  for (int pos = 0; pos <= max_tmp; pos++)
+  {
+    int o = fp->tmp_anon_obj[pos];
+    if (o < 0)
+      continue;
+    tmp_addr[pos].def_count = fp->node_defs[pos];
+    if (fp->node_defs[pos] != 1 || fp->node_inexact[pos])
+      continue;
+    IRQuadCompact *dq = &ir->compact_instructions[fp->objs[o].def_idx];
+    if (dq->op != TCCIR_OP_ASSIGN && dq->op != TCCIR_OP_LEA)
+      continue;
+    IROperand s1 = tcc_ir_op_get_src1(ir, dq);
+    if (irop_get_tag(s1) != IROP_TAG_STACKOFF || irop_get_vreg(s1) != -1)
+      continue;
+    tmp_addr[pos].has_off = 1;
+    tmp_addr[pos].off = irop_get_stack_offset(s1);
+  }
 
   /* Collect loop back-edges (JUMP/JUMPIF to an earlier-or-equal position).
    * Pass 3's liveness is position-based (`read.pos > store.pos`), sound only in
@@ -157,38 +174,6 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
       backedges[be_n].b = i;
       be_n++;
     }
-  }
-
-  /* Pass 1: identify single-def TEMPs holding Addr[StackLoc[off]].
-   * STOREs and other lval-dest ops use the dest as the memory address —
-   * they don't redefine the temp's value, so they don't count as defs. */
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
-      continue;
-    if (tcc_ir_op_dest_is_lval(ir, q))
-      continue; /* address-of use, not a temp def */
-    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
-    if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
-      continue;
-    int pos = TCCIR_DECODE_VREG_POSITION(vr);
-    if (pos > max_tmp)
-      continue;
-    tmp_addr[pos].def_count++;
-    if (tmp_addr[pos].def_count > 1)
-    {
-      tmp_addr[pos].has_off = 0;
-      continue;
-    }
-    if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LEA)
-      continue;
-    IROperand s1 = tcc_ir_op_get_src1(ir, q);
-    if (irop_get_tag(s1) != IROP_TAG_STACKOFF || !s1.is_local || s1.is_lval ||
-        irop_get_vreg(s1) != -1)
-      continue;
-    tmp_addr[pos].has_off = 1;
-    tmp_addr[pos].off = irop_get_stack_offset(s1);
   }
 
   /* Helper closure: resolve an lval operand to a stack-slot offset, either
@@ -292,7 +277,7 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
       /* Resolve the source operand to a stack slot, if it is one. */
       int32_t off;
       int got_off = 0;
-      if (s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF &&
+      if (irop_is_local(s1) && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF &&
           irop_get_vreg(s1) == -1)
       {
         off = irop_get_stack_offset(s1);
@@ -313,7 +298,7 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
       }
       if (got_off)
         ADD_READ(off, read_size, call_pos);
-      else if (!s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_SYMREF)
+      else if (!irop_is_local(s1) && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_SYMREF)
       {
         /* mem* source is a global/static symbol address: it reads that object,
          * never a tracked stack slot, so it is not a read of any local (the
@@ -331,10 +316,16 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
 
     if (q->op == TCCIR_OP_STORE)
     {
-      /* STOREs are eliminated in Pass 3; here only bail if src1 (the value) is
-       * an address being stored into memory, which would escape it. */
+      /* STOREs are eliminated in Pass 3; here only a value read from a slot
+       * counts (`V3 <-- StackLoc[-12] [STORE]`), and an address being stored
+       * into memory, which would escape it, bails. */
       IROperand s1 = tcc_ir_op_get_src1(ir, q);
-      if (s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF)
+      if (dlea_resolve_lval_slot(tmp_addr, max_tmp, &s1, &slot_off))
+      {
+        ADD_READ(slot_off, dlea_read_width(&s1), i);
+        continue;
+      }
+      if (irop_is_local(s1) && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF)
       {
         /* Address-of-local being stored into memory: it's escaping. */
         bail = 1;
@@ -376,14 +367,7 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
       if (op.is_lval && dlea_resolve_lval_slot(tmp_addr, max_tmp, &op, &slot_off))
       {
         if (k != 0)
-        {
-          int w = ir_opt_store_btype_size_bytes(irop_get_btype(op));
-          if (w <= 0)
-            w = irop_is_64bit(op) ? 8 : 4;
-          if (op.is_complex)
-            w *= 2;
-          ADD_READ(slot_off, w, i);
-        }
+          ADD_READ(slot_off, dlea_read_width(&op), i);
         continue;
       }
 
@@ -412,7 +396,7 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
        * with the same off (Pass 1 propagation), CMP either operand, mem* PARAM
        * (handled above). Anything else lets the address escape — bail. */
       int is_direct_addr =
-          (irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_local && !op.is_lval &&
+          (irop_get_tag(op) == IROP_TAG_STACKOFF && irop_is_local(op) && !op.is_lval &&
            irop_get_vreg(op) == -1);
       int addr_off = 0;
       int has_addr = 0;

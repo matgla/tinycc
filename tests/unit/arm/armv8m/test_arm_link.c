@@ -98,22 +98,30 @@ void tcc_enter_state(TCCState *s1)
  * pointer, so this needs to be functionally faithful, not a fixed stub. */
 struct sym_attr *get_sym_attr(TCCState *s1, int index, int alloc)
 {
-  int n;
-  struct sym_attr *tab;
+  int chunk = index >> 10;
 
-  if (index >= s1->nb_sym_attrs)
+  if (chunk >= s1->nb_sym_attr_chunks || !s1->sym_attr_chunks[chunk])
   {
     if (!alloc)
-      return s1->sym_attrs;
-    n = 1;
-    while (index >= n)
-      n *= 2;
-    tab = tcc_realloc(s1->sym_attrs, n * sizeof(*s1->sym_attrs));
-    s1->sym_attrs = tab;
-    memset(s1->sym_attrs + s1->nb_sym_attrs, 0, (n - s1->nb_sym_attrs) * sizeof(*s1->sym_attrs));
-    s1->nb_sym_attrs = n;
+      return s1->sym_attr_chunks[0];
+    if (chunk >= s1->nb_sym_attr_chunks)
+    {
+      s1->sym_attr_chunks = tcc_realloc(s1->sym_attr_chunks, (chunk + 1) * sizeof(*s1->sym_attr_chunks));
+      memset(s1->sym_attr_chunks + s1->nb_sym_attr_chunks, 0,
+             (chunk + 1 - s1->nb_sym_attr_chunks) * sizeof(*s1->sym_attr_chunks));
+      s1->nb_sym_attr_chunks = chunk + 1;
+    }
+    s1->sym_attr_chunks[chunk] = tcc_mallocz(sizeof(struct sym_attr) << 10);
   }
-  return &s1->sym_attrs[index];
+  return &s1->sym_attr_chunks[chunk][index & 1023];
+}
+
+static void free_sym_attrs(TCCState *s1)
+{
+  int i;
+  for (i = 0; i < s1->nb_sym_attr_chunks; i++)
+    tcc_free(s1->sym_attr_chunks[i]);
+  tcc_free(s1->sym_attr_chunks);
 }
 
 /* write_thumb_instruction() has no tcc.h declaration (only defined in
@@ -785,7 +793,7 @@ UT_TEST(test_relocate_got32_writes_sym_got_offset)
   relocate(s1, &rel, R_ARM_GOT32, buf, 0, 0);
 
   UT_ASSERT_EQ(read32le(buf), 0x18u);
-  tcc_free(s1->sym_attrs);
+  free_sym_attrs(s1);
   return 0;
 }
 
@@ -813,7 +821,7 @@ UT_TEST(test_relocate_got_prel_writes_pc_relative_got_offset)
   /* got->sh_addr + got_offset - addr - 8 */
   uint32_t expect = (uint32_t)(0x6000 + 0x20 - 0x6100 - 8);
   UT_ASSERT_EQ(read32le(buf), expect);
-  tcc_free(s1->sym_attrs);
+  free_sym_attrs(s1);
   return 0;
 }
 

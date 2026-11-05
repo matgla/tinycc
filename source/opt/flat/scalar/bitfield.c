@@ -29,7 +29,7 @@
 
 static int bf_const_u32(TCCIRState *ir, IROperand op, uint32_t *out)
 {
-  if (irop_is_immediate(op) && !op.is_sym)
+  if (irop_is_immediate(op) && !irop_is_sym(op))
   {
     *out = (uint32_t)irop_get_imm64_ex(ir, op);
     return 1;
@@ -133,7 +133,7 @@ static int bf_value_fits_unsigned(TCCIRState *ir, IROperand op, int bits, int be
 
 static int bf_make_copy_src(IROperand v, int dest_btype, IROperand *src)
 {
-  if (irop_is_immediate(v) && !v.is_sym)
+  if (irop_is_immediate(v) && !irop_is_sym(v))
   {
     *src = v;
     return 1;

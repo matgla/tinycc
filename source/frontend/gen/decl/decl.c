@@ -132,10 +132,20 @@ static void define_global_function(Sym *sym, Section *ad_section)
        * path (longer bodies trip an IR coalescing bug on narrowed locals). */
       if (sig == 2)
         thr = 15;
-      if (sig && fn->func_str->len <= thr && !inline_body_has_apply_args(fn->func_str) &&
+      /* The body compiles after its call sites have decided, so the class a plain
+       * static gets from what it compiled to has to be judged from its tokens. */
+      int small_leaf = 0;
+      if (sig == 1 && fn->func_str->len > thr && fn->func_str->len <= STATIC_INLINE_LEAF_TOKENS &&
+          !tcc_ir_opt_pass_disabled("inline:static_inline_leaf"))
+      {
+        const int ops = inline_body_leaf_ops(fn->func_str, 0);
+        small_leaf = ops >= 0 && ops <= STATIC_INLINE_LEAF_EST_OPS;
+      }
+      if (sig && (fn->func_str->len <= thr || small_leaf) && !inline_body_has_apply_args(fn->func_str) &&
           !inline_body_has_unsafe_loops(fn->func_str) && !inline_body_has_static_local(fn->func_str))
       {
         sym->type.ref->f.func_auto_inline = 1;
+        sym->type.ref->f.func_small_leaf = small_leaf;
         /* Body is still owed to gen_inline_functions, unlike the auto
          * path below which compiles the standalone copy right here. */
         sym->type.ref->f.func_deferred_inline = 1;

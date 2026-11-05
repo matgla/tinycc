@@ -59,7 +59,7 @@ static int psd_resolve(IRSSAOptCtx *ctx, const uint8_t *param_redef, int hops, i
     IROperand s1 = IROP_NONE;
     if (!stop) {
       s1 = tcc_ir_op_get_src1(ir, dq);
-      stop = irop_get_tag(s1) != IROP_TAG_VREG || s1.is_lval || s1.is_local || s1.is_llocal || s1.is_sym ||
+      stop = irop_get_tag(s1) != IROP_TAG_VREG || s1.is_lval || irop_is_local(s1) || irop_is_llocal(s1) || irop_is_sym(s1) ||
              irop_get_vreg(s1) < 0 || tcc_ir_barrel_shift_at(ir, dq);
     }
     if (!stop && dq->op == TCCIR_OP_ADD)
@@ -83,7 +83,7 @@ static int psd_store_range(IRSSAOptCtx *ctx, const uint8_t *param_redef, int aff
 {
   TCCIRState *ir = ctx->ir;
   IROperand dest = tcc_ir_op_get_dest(ir, q);
-  if (dest.is_local || dest.is_llocal || dest.is_sym)
+  if (irop_is_local(dest) || irop_is_llocal(dest) || irop_is_sym(dest))
     return 0;
   const int32_t pvr = irop_get_vreg(dest);
   if (pvr < 0 || irop_get_tag(dest) != IROP_TAG_VREG)
@@ -251,15 +251,15 @@ static int pss_addr(TCCIRState *ir, IRQuadCompact *q, int is_store, PSSAddr *a, 
     *value = is_store ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_dest(ir, q);
     a->index = tcc_ir_op_get_src2(ir, q);
     IROperand sc = tcc_ir_op_get_scale(ir, q);
-    if (a->base.is_lval || irop_get_tag(sc) != IROP_TAG_IMM32 || a->index.is_lval || a->index.is_sym ||
+    if (a->base.is_lval || irop_get_tag(sc) != IROP_TAG_IMM32 || a->index.is_lval || irop_is_sym(a->index) ||
         (irop_get_tag(a->index) != IROP_TAG_VREG && irop_get_tag(a->index) != IROP_TAG_IMM32))
       return 0;
     a->scale = irop_get_imm32(sc);
     a->btype = irop_get_btype(*value);
   }
   /* A pointer held in a vreg, read as a value. */
-  return irop_get_tag(a->base) == IROP_TAG_VREG && irop_get_vreg(a->base) >= 0 && !a->base.is_local &&
-         !a->base.is_llocal && !a->base.is_sym && !value->is_lval && !tcc_ir_barrel_shift_at(ir, q) &&
+  return irop_get_tag(a->base) == IROP_TAG_VREG && irop_get_vreg(a->base) >= 0 && !irop_is_local(a->base) &&
+         !irop_is_llocal(a->base) && !irop_is_sym(a->base) && !value->is_lval && !tcc_ir_barrel_shift_at(ir, q) &&
          !tcc_ir_shift64_dead_half_at(ir, q) && !tcc_ir_zero_half64_at(ir, q);
 }
 

@@ -100,99 +100,6 @@ static int vreg_addr_taken_anywhere(TCCIRState *ir, int32_t vreg)
   return 0;
 }
 
-static int loop_body_may_clobber_memory(TCCIRState *ir, IRLoop *loop);
-
-static int is_operand_loop_invariant_ex(TCCIRState *ir, IROperand op, IRLoop *loop, int32_t *hoisted_vregs,
-                                        int num_hoisted_vregs)
-{
-  /* Constants are always loop-invariant */
-  if (irop_is_immediate(op))
-    return 1;
-
-  /* Check vreg - if defined inside loop, not invariant */
-  int32_t vreg = irop_get_vreg(op);
-  if (vreg < 0)
-  {
-    /* No vreg.  Only treat as invariant if it's a true constant (IMM32/I64).
-     * Stack locals, symbols, and other non-constant operands without vregs
-     * may be modified inside the loop and must be treated conservatively. */
-    if (irop_is_immediate(op) && !op.is_sym && !op.is_lval && !op.is_local)
-      return 1;
-    return 0;
-  }
-
-  /* Check if this vreg was already hoisted AND has no other definitions
-   * inside the loop.  A vreg defined by a hoisted call but ALSO redefined
-   * by other instructions in the loop is NOT invariant. */
-  {
-    int is_hoisted = 0;
-    for (int h = 0; h < num_hoisted_vregs; h++)
-    {
-      if (hoisted_vregs[h] == vreg)
-      { is_hoisted = 1; break; }
-    }
-    if (is_hoisted)
-    {
-      int def_count = 0;
-      for (int di = 0; di < loop->num_body_instrs; di++)
-      {
-        int didx = loop->body_instrs[di];
-        IRQuadCompact *dq = &ir->compact_instructions[didx];
-        if (dq->op == TCCIR_OP_NOP || !irop_config[dq->op].has_dest)
-          continue;
-        if (tcc_ir_op_dest_vreg(ir, dq) == vreg)
-          def_count++;
-      }
-      if (def_count <= 1)
-        return 1; /* Single def from hoisted call — invariant */
-      /* Multiple defs — not invariant despite hoisted vreg */
-    }
-  }
-
-  /* Find where this vreg is defined */
-  for (int i = 0; i < loop->num_body_instrs; i++)
-  {
-    int instr_idx = loop->body_instrs[i];
-    IRQuadCompact *q = &ir->compact_instructions[instr_idx];
-
-    if (!irop_config[q->op].has_dest)
-      continue;
-
-    int32_t dest_vr = tcc_ir_op_dest_vreg(ir, q);
-    if (dest_vr == vreg)
-    {
-      /* This vreg is defined inside the loop.
-       * Check if it's an ASSIGN from a hoisted vreg (transitively invariant) */
-      if (q->op == TCCIR_OP_ASSIGN)
-      {
-        int32_t src_vreg = tcc_ir_op_src1_vreg(ir, q);
-        if (src_vreg >= 0)
-        {
-          for (int h = 0; h < num_hoisted_vregs; h++)
-          {
-            if (hoisted_vregs[h] == src_vreg)
-              return 1; /* Assigned from hoisted vreg - loop invariant */
-          }
-        }
-      }
-      /* Otherwise not invariant */
-      return 0;
-    }
-  }
-
-  /* No direct def in the loop.  The value can STILL change across iterations
-   * if the variable's address has been taken: any store through a pointer or
-   * any non-CONST call inside the loop may then mutate its stack slot without
-   * a visible def of the vreg (docs/bugs.md #7, ptr seeds 500/517).  Only
-   * accept an address-taken variable when the loop provably cannot write
-   * memory at all. */
-  if (vreg_addr_taken_anywhere(ir, vreg) && loop_body_may_clobber_memory(ir, loop))
-    return 0;
-
-  /* Vreg not defined in loop - it's loop-invariant */
-  return 1;
-}
-
 /* Does the loop body contain anything that could modify memory a PURE function
  * might read?  PR20100: a PURE function (as opposed to CONST) reads global/heap
  * memory, so its result is only loop-invariant if that memory is unchanged
@@ -224,8 +131,9 @@ static int licm_q_may_clobber_memory(TCCIRState *ir, IRQuadCompact *q)
                                                TCCIR_OP_INIT_CHAIN_SLOT)) != 0;
 }
 
-/* CFG-block flavour of loop_body_may_clobber_memory, for the dominance-based
- * LICM below (which works on an `in_loop[]` block mask, not an IRLoop). */
+
+/* The same over a CFG block mask, for the dominance-based LICM below (which
+ * works on an `in_loop[]` block mask, not an IRLoop). */
 static int cfg_loop_may_clobber_memory(TCCIRState *ir, IRCFG *cfg, const uint8_t *in_loop)
 {
   for (int bi = 0; bi < cfg->num_blocks; bi++)
@@ -239,115 +147,6 @@ static int cfg_loop_may_clobber_memory(TCCIRState *ir, IRCFG *cfg, const uint8_t
   return 0;
 }
 
-static int loop_body_may_clobber_memory(TCCIRState *ir, IRLoop *loop)
-{
-  for (int i = 0; i < loop->num_body_instrs; i++)
-    if (licm_q_may_clobber_memory(ir, &ir->compact_instructions[loop->body_instrs[i]]))
-      return 1;
-  return 0;
-}
-
-/* Check if a function call instruction can be hoisted
- * Requirements:
- * 1. Function is pure or const
- * 2. All arguments are loop-invariant (considering already-hoisted vregs)
- * 3. If the function is PURE (reads memory) rather than CONST, the loop must
- *    not modify any memory it could read (PR20100)
- */
-static int tcc_ir_is_hoistable_call_ex(TCCIRState *ir, int instr_idx, IRLoop *loop, int32_t *hoisted_vregs,
-                                       int num_hoisted_vregs)
-{
-  IRQuadCompact *q = &ir->compact_instructions[instr_idx];
-
-  if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
-    return 0; /* Not a function call */
-
-  /* For FUNCCALLVAL, the destination must be a vreg (not a memory location).
-   * If the result is stored directly to a global/local variable, we can't
-   * simply hoist it because we'd need to also handle the store operation.
-   * This fixes a bug where hoisting a call with memory destination corrupted
-   * the IR by treating the memory operand as a vreg. */
-  if (q->op == TCCIR_OP_FUNCCALLVAL)
-  {
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_tag(dest) != IROP_TAG_VREG)
-    {
-      LOG_LICM("Call at %d: destination is not a vreg, can't hoist", instr_idx);
-      return 0;
-    }
-    /* A pair-returning call (soft-double / long long result in r0:r1):
-     * hoisting stretches the pair's live range across every call in the loop
-     * body, and regalloc only parks the LOW half in a callee-saved register —
-     * the loop-tail phi copy then reads the high half from a clobbered r1
-     * (fuzz seed float:118, test 387).  Bail until hoisted-pair live ranges
-     * are modeled. */
-    if (irop_is_64bit(dest))
-    {
-      LOG_LICM("Call at %d: pair-returning result, can't hoist", instr_idx);
-      return 0;
-    }
-  }
-
-  /* Get function symbol from src1 */
-  Sym *func_sym = tcc_ir_op_src1_sym(ir, q);
-
-  if (!func_sym)
-  {
-    /* Indirect call - can't determine purity */
-    LOG_LICM("Call at %d: indirect call, can't hoist", instr_idx);
-    return 0;
-  }
-
-  /* Check function purity */
-  int purity = tcc_ir_get_func_purity(ir, func_sym);
-  if (purity < TCC_FUNC_PURITY_PURE)
-  {
-    /* Function has side effects or is unknown - can't hoist */
-    return 0;
-  }
-
-  /* A merely-PURE function reads memory; hoisting it is only safe if the loop
-   * cannot change what it reads.  A CONST function reads nothing and is always
-   * safe (PR20100 / docs/bugs.md #7). */
-  if (purity < TCC_FUNC_PURITY_CONST && loop_body_may_clobber_memory(ir, loop))
-  {
-    LOG_LICM("Call at %d: PURE (not CONST) and loop clobbers memory — not hoistable", instr_idx);
-    return 0;
-  }
-
-  LOG_LICM("Call at %d: function is pure (purity=%d), checking args...", instr_idx, purity);
-
-  /* Find all FUNCPARAMVAL instructions for this call */
-  int64_t call_src2_imm = tcc_ir_op_src2_imm(ir, q);
-  int call_id = TCCIR_DECODE_CALL_ID(call_src2_imm);
-
-  for (int i = 0; i < loop->num_body_instrs; i++)
-  {
-    int param_idx = loop->body_instrs[i];
-    IRQuadCompact *param_q = &ir->compact_instructions[param_idx];
-
-    if (param_q->op != TCCIR_OP_FUNCPARAMVAL)
-      continue;
-
-    int64_t param_src2_imm = tcc_ir_op_src2_imm(ir, param_q);
-    int param_call_id = TCCIR_DECODE_CALL_ID(param_src2_imm);
-    if (param_call_id != call_id)
-      continue; /* Parameter for a different call */
-
-    /* Check if the parameter value is loop-invariant (considering hoisted vregs) */
-    IROperand param_src = tcc_ir_op_get_src1(ir, param_q);
-    if (!is_operand_loop_invariant_ex(ir, param_src, loop, hoisted_vregs, num_hoisted_vregs))
-    {
-      return 0; /* Argument not loop-invariant */
-    }
-  }
-
-  /* Function is pure and all arguments are loop-invariant - can hoist */
-  return 1;
-}
-
-/* Maximum number of pure calls to hoist per loop */
-#define MAX_HOISTABLE_CALLS 16
 
 typedef struct
 {
@@ -355,535 +154,6 @@ typedef struct
   int32_t hoisted_vreg; /* New vreg for hoisted result (if VAL) */
   int is_hoisted;
 } HoistableCallInfo;
-
-/* Collect all param markers belonging to a call.  BOTH FUNCPARAMVAL (a value
- * argument) and FUNCPARAMVOID (the marker a zero-argument or void call still
- * carries, and which the backend pairs with the CALL by call_id) must be
- * collected — otherwise hoisting the CALL but leaving its FUNCPARAMVOID behind
- * orphans the marker ("no call site found for call_id=N") and the hoisted call
- * loses its marker ("missing FUNCPARAMVAL").  See docs/bugs.md #7. */
-static int collect_call_params(TCCIRState *ir, int call_idx, int *param_indices, int max_params)
-{
-  IRQuadCompact *call_q = &ir->compact_instructions[call_idx];
-  int64_t call_src2_imm = tcc_ir_op_src2_imm(ir, call_q);
-  int call_id = TCCIR_DECODE_CALL_ID(call_src2_imm);
-  int num_params = 0;
-
-  /* Scan all instructions for params/markers with matching call_id */
-  for (int i = 0; i < ir->next_instruction_index && num_params < max_params; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID)
-    {
-      int64_t src2_imm = tcc_ir_op_src2_imm(ir, q);
-      int param_call_id = TCCIR_DECODE_CALL_ID(src2_imm);
-      if (param_call_id == call_id)
-      {
-        param_indices[num_params++] = i;
-      }
-    }
-  }
-
-  return num_params;
-}
-
-/* Hoist pure function calls from loops
- * This is Phase 1 of FUNCTION_CALLS_OPTIMIZATION_PLAN
- */
-int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
-{
-  if (!ir || !loops)
-    return 0;
-
-  /* Re-enabled 2026-07-02 after the ninth (and final) defect fix: the
-   * combo-profile residue (seeds 52/80/187/311/333/392/460) was
-   * tcc_ir_insert_instruction_before desynchronizing SWITCH_TABLE side-table
-   * targets — not the linear-index call bookkeeping suspected earlier.
-   * Full history in docs/bugs.md #7 (resolved). */
-
-  /* Kill-switch for bisection: TCC_DISABLE_PASS=pure_call_hoist. */
-  if (tcc_ir_opt_pass_disabled("pure_call_hoist"))
-    return 0;
-
-  int total_hoisted = 0;
-
-  for (int loop_idx = 0; loop_idx < loops->num_loops; loop_idx++)
-  {
-    IRLoop *loop = &loops->loops[loop_idx];
-
-    /* total_hoisted accumulates across ALL loops; the post-loop index fix-up
-     * below must shift by only THIS loop's insertions, otherwise a later loop
-     * (already shifted by an earlier loop's insertions) is over-shifted.
-     * Snapshot the running total to recover the per-loop delta. */
-    int total_hoisted_at_loop_start = total_hoisted;
-
-    if (loop->preheader_idx < 0)
-      continue; /* No preheader - can't hoist */
-
-    /* Skip loops whose preheader is inside another loop's body.
-     * This prevents hoisting INTO an enclosing loop instead of BEFORE it.
-     *
-     * Example of problematic pattern (for loop with body after increment):
-     *   3: CMP i,5         <- outer loop header
-     *   4: JMPIF exit
-     *   5: JMP body (9)
-     *   6: NOP             <- "inner loop" header (fake)
-     *   7: i++
-     *   8: JMP 3           <- outer loop back edge
-     *   9: strlen()        <- loop body (hoistable)
-     *  12: JMP 6           <- back edge detected as "inner loop"
-     *
-     * The "inner loop" (6-12) has preheader=3, but 3 is the OUTER loop's header!
-     * Hoisting to preheader+1=4 places code INSIDE the outer loop.
-     */
-    int preheader_in_other_loop = 0;
-    for (int other_idx = 0; other_idx < loops->num_loops; other_idx++)
-    {
-      if (other_idx == loop_idx)
-        continue;
-      IRLoop *other = &loops->loops[other_idx];
-      /* Check if this loop's preheader is inside another loop's range */
-      if (loop->preheader_idx >= other->start_idx && loop->preheader_idx <= other->end_idx)
-      {
-        preheader_in_other_loop = 1;
-        break;
-      }
-    }
-    if (preheader_in_other_loop)
-      continue;
-
-    /* The hoist inserts at preheader_idx+1 and relies on control FALLING
-     * THROUGH from the preheader into the loop header.  tcc_ir_detect_loops'
-     * preheader walk skips backward over JUMP/JUMPIF, so preheader_idx may
-     * belong to a block that never reaches this loop.  docs/bugs.md #7,
-     * combo fuzz seed 18: the hoisted call landed on a bypass path just
-     * ahead of an unconditional JMP while the loop itself was entered by a
-     * jump straight to the header — the loop then read the hoisted result
-     * vreg UNDEFINED (wrong checksum; an undefined loop bound turns into an
-     * infinite loop).  Two requirements make the insertion point sound:
-     *   1. the preheader is the header's immediate predecessor (nothing was
-     *      skipped — control genuinely falls from it into the header), and
-     *   2. no jump from OUTSIDE the loop targets the header (such an entry
-     *      edge would bypass the inserted preheader code).  Back-edges and
-     *      `continue`-style jumps from inside are fine: on any path that
-     *      reaches them, the hoisted call has already executed. */
-    if (loop->preheader_idx != loop->header_idx - 1)
-    {
-      LOG_LICM("Skipping loop %d: preheader %d is not the header %d's immediate predecessor", loop_idx,
-               loop->preheader_idx, loop->header_idx);
-      continue;
-    }
-    {
-      /* Reject any entry edge from outside the loop's linear range into ANY
-       * instruction of [header, end] — not just the header.  An edge into
-       * the header bypasses the inserted preheader code (docs/bugs.md #7,
-       * combo seed 18); an edge into the middle of the range would break the
-       * header's dominance over the call sites we rewrite (the hoisted
-       * result vreg could be read on a path that never ran the preheader).
-       * Note this also skips increment-trampoline rotated loops, whose
-       * physical body jumps back into [header, end] from linearly outside —
-       * their linear range holds only guard/increment code, so nothing
-       * hoistable is lost. */
-      int external_entry = 0;
-      for (int j = 0; j < ir->next_instruction_index && !external_entry; j++)
-      {
-        if (j >= loop->start_idx && j <= loop->end_idx)
-          continue; /* jumps from inside the loop are fine */
-        IRQuadCompact *jq = &ir->compact_instructions[j];
-        if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF)
-        {
-          int jt = (int)tcc_ir_op_dest_imm(ir, jq);
-          if (jt >= loop->header_idx && jt <= loop->end_idx)
-            external_entry = 1;
-        }
-        else if (jq->op == TCCIR_OP_SWITCH_TABLE)
-        {
-          /* A switch outside the loop with a case/default target in the
-           * range is an entry edge, same as a plain JUMP. */
-          int table_id = (int)tcc_ir_op_src2_imm(ir, jq);
-          if (table_id >= 0 && table_id < ir->num_switch_tables)
-          {
-            TCCIRSwitchTable *table = &ir->switch_tables[table_id];
-            if (table->default_target >= loop->header_idx && table->default_target <= loop->end_idx)
-              external_entry = 1;
-            for (int ti = 0; table->targets && ti < table->num_entries && !external_entry; ti++)
-            {
-              if (table->targets[ti] >= loop->header_idx && table->targets[ti] <= loop->end_idx)
-                external_entry = 1;
-            }
-          }
-        }
-        else if (jq->op == TCCIR_OP_IJUMP)
-        {
-          /* Indirect jump: target unknowable — conservatively treat it as a
-           * possible entry edge into the loop. */
-          external_entry = 1;
-        }
-      }
-      if (external_entry)
-      {
-        LOG_LICM("Skipping loop %d: header %d is entered by a jump from outside the loop", loop_idx,
-                 loop->header_idx);
-        continue;
-      }
-    }
-
-    /* Skip loops containing VLA allocations.
-     * VLAs have special stack semantics - the size is computed at runtime
-     * and SP is adjusted dynamically. Hoisting a pure function call that
-     * computes the VLA size (e.g., strlen() in "char buf[strlen(s)+1]")
-     * breaks the VLA stack management because the call must execute at
-     * the point of VLA_ALLOC, not in the preheader.
-     *
-     * Test case: 123_vla_bug.c - has VLA inside switch/case in a for loop.
-     */
-    if (loop_contains_vla(ir, loop))
-    {
-      LOG_LICM("Skipping loop %d with VLA allocations", loop_idx);
-      continue;
-    }
-
-    /* Iterative pure call hoisting:
-     * Some calls may become hoistable after we hoist earlier calls in the chain.
-     * For example: result = func_a(100); result = func_b(result);
-     * Initially only func_a(100) is hoistable. After hoisting it, func_b(result)
-     * becomes hoistable because 'result' is now defined outside the loop.
-     *
-     * We iterate until no more calls can be hoisted.
-     */
-
-    /* Collect ALL pure function calls in this loop (for iterative checking) */
-    int all_call_indices[MAX_HOISTABLE_CALLS];
-    int num_all_calls = 0;
-
-    LOG_LICM("Scanning loop %d with %d body instructions for pure calls", loop_idx, loop->num_body_instrs);
-
-    for (int i = 0; i < loop->num_body_instrs && num_all_calls < MAX_HOISTABLE_CALLS; i++)
-    {
-      int instr_idx = loop->body_instrs[i];
-
-      /* body_instrs is an OVER-approximation: tcc_ir_detect_loops' forward-
-       * jump "extension" (any jump out of [start,end] whose target is within
-       * +50 of the header extends the body, with no path-back-to-header
-       * check) can swallow post-loop code.  volatile fuzz seeds 3583/6116: a
-       * rotated for-loop's exit jump pulled the else arm of the enclosing
-       * if/else into body_instrs, and the two else-arm calls were "hoisted"
-       * above the loop — onto the then-path — while the else path entered at
-       * its own label and read both result vregs UNDEFINED.  The over-
-       * approximation is conservative (correct) for the clobber/invariance
-       * scans, but calls may only be hoisted from the certain linear range:
-       * with the preheader fall-through + no-external-entry guards above,
-       * every instruction in [start,end] is dominated by the header, so the
-       * preheader insertion point dominates the rewritten call site. */
-      if (instr_idx < loop->start_idx || instr_idx > loop->end_idx)
-        continue;
-
-      IRQuadCompact *q = &ir->compact_instructions[instr_idx];
-
-      if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
-      {
-        /* Check basic requirements (pure function, vreg dest) but NOT argument invariance yet */
-        Sym *func_sym = tcc_ir_op_src1_sym(ir, q);
-        if (func_sym && tcc_ir_get_func_purity(ir, func_sym) >= TCC_FUNC_PURITY_PURE)
-        {
-          if (q->op == TCCIR_OP_FUNCCALLVOID ||
-              (q->op == TCCIR_OP_FUNCCALLVAL && irop_get_tag(tcc_ir_op_get_dest(ir, q)) == IROP_TAG_VREG))
-          {
-            all_call_indices[num_all_calls++] = instr_idx;
-          }
-        }
-      }
-    }
-
-    if (num_all_calls == 0)
-    {
-      LOG_LICM("No pure calls found in loop %d", loop_idx);
-      continue;
-    }
-
-    /* Track hoisted vregs for iterative detection.
-     * This maps hoisted_vreg -> original_vreg so we can detect transitively invariant operands.
-     * We store both the hoisted vreg (defined in preheader) and the original vreg (now assigned
-     * from hoisted vreg in loop body). */
-    int32_t hoisted_vregs[MAX_HOISTABLE_CALLS];
-    int num_hoisted_vregs = 0;
-    int hoisted_call_flags[MAX_HOISTABLE_CALLS] = {0}; /* Track which calls have been hoisted */
-
-    /* Iterative hoisting loop */
-    int hoisted_this_iteration;
-    do
-    {
-      hoisted_this_iteration = 0;
-
-      LOG_LICM("Iteration: checking %d pure calls", num_all_calls);
-
-      /* Find hoistable function calls in this loop */
-      HoistableCallInfo hoistable[MAX_HOISTABLE_CALLS];
-      int num_hoistable = 0;
-
-      for (int i = 0; i < num_all_calls && num_hoistable < MAX_HOISTABLE_CALLS; i++)
-      {
-        if (hoisted_call_flags[i])
-          continue; /* Already hoisted */
-
-        int instr_idx = all_call_indices[i];
-        IRQuadCompact *q = &ir->compact_instructions[instr_idx];
-
-        /* Skip if already NOP'd (from previous hoisting) */
-        if (q->op == TCCIR_OP_NOP || q->op == TCCIR_OP_ASSIGN)
-          continue;
-
-        LOG_LICM("Found call at instruction %d, checking hoistability...", instr_idx);
-        if (tcc_ir_is_hoistable_call_ex(ir, instr_idx, loop, hoisted_vregs, num_hoisted_vregs))
-        {
-          hoistable[num_hoistable].instr_idx = instr_idx;
-          hoistable[num_hoistable].hoisted_vreg = -1;
-          hoistable[num_hoistable].is_hoisted = 0;
-          num_hoistable++;
-          hoisted_call_flags[i] = 1; /* Mark as will-be-hoisted */
-        }
-      }
-
-      if (num_hoistable == 0)
-      {
-        LOG_LICM("No more hoistable pure calls found in loop %d", loop_idx);
-        break;
-      }
-
-      LOG_LICM("Found %d hoistable pure call(s) in loop %d", num_hoistable, loop_idx);
-
-      /* For each hoistable call, we need to:
-       * 1. Allocate a NEW call_id for the hoisted call (critical!)
-       * 2. Create new vregs for results (if FUNCCALLVAL)
-       * 3. Copy PARAM instructions to preheader with NEW call_id
-       * 4. Copy CALL instruction to preheader with NEW call_id
-       * 5. Replace original call with ASSIGN from hoisted vreg (or NOP for void)
-       * 6. NOP out original parameters
-       */
-
-      /* Allocate vregs for results */
-      for (int i = 0; i < num_hoistable; i++)
-      {
-        IRQuadCompact *call_q = &ir->compact_instructions[hoistable[i].instr_idx];
-        if (call_q->op == TCCIR_OP_FUNCCALLVAL)
-        {
-          hoistable[i].hoisted_vreg = tcc_ir_vreg_alloc_temp(ir);
-        }
-      }
-
-      /* Process each hoistable call */
-      for (int i = 0; i < num_hoistable; i++)
-      {
-        int call_idx = hoistable[i].instr_idx;
-
-        /* Get old call_id and argc from the original call */
-        IRQuadCompact *orig_call_q = &ir->compact_instructions[call_idx];
-        int64_t orig_call_src2_imm = tcc_ir_op_src2_imm(ir, orig_call_q);
-        int64_t orig_encoded = orig_call_src2_imm;
-        int argc = TCCIR_DECODE_CALL_ARGC(orig_encoded);
-
-        /* Allocate a NEW call_id for the hoisted call */
-        int new_call_id = ir->next_call_id++;
-
-        /* Collect all parameters for this call BEFORE any insertions */
-        int param_indices[16];
-        int num_params = collect_call_params(ir, call_idx, param_indices, 16);
-
-        /* Count insertions for this call to track index shifts */
-        int insertions_this_call = 0;
-
-        /* Copy and modify the call instruction */
-        IRQuadCompact call_copy = *orig_call_q;
-
-        /* Copy parameter instructions */
-        IRQuadCompact param_copies[16];
-        for (int p = 0; p < num_params; p++)
-        {
-          param_copies[p] = ir->compact_instructions[param_indices[p]];
-        }
-
-        /* We insert instructions at preheader+1, and each insertion shifts
-         * subsequent instructions. To get the correct order (PARAM, PARAM, ..., CALL),
-         * we insert in REVERSE order: first CALL, then params from last to first.
-         * This way:
-         *   Insert CALL at preheader+1 -> [CALL]
-         *   Insert PARAM[n-1] at preheader+1 -> [PARAM[n-1], CALL]
-         *   Insert PARAM[0] at preheader+1 -> [PARAM[0], ..., PARAM[n-1], CALL]
-         */
-
-        /* First, insert the CALL instruction (it will end up LAST) */
-        int64_t new_call_encoded = TCCIR_ENCODE_CALL(new_call_id, argc);
-        IROperand new_call_src2 = irop_make_imm32(-1, (int32_t)new_call_encoded, IROP_BTYPE_INT32);
-
-        /* Reallocate operand pool for the call copy with the updated call_id.
-         * The operand layout is [dest?, src1, src2] where the dest slot exists
-         * ONLY when irop_config[op].has_dest is set (FUNCCALLVAL).  A
-         * FUNCCALLVOID has no dest, so it must be laid out as [src1, src2];
-         * emitting a spurious dest operand for it shifts src1/src2 down by one
-         * and makes the accessors read the call_id/argc encoding out of the
-         * callee-symref slot instead (decoding to a bogus argc -> the backend
-         * then reports "missing FUNCPARAMVAL for call_id=N").  See bugs.md #7. */
-        IROperand call_src1 = tcc_ir_op_get_src1(ir, &call_copy);
-        int call_has_dest = irop_config[call_copy.op].has_dest;
-
-        if (call_has_dest)
-        {
-          IROperand call_dest = tcc_ir_op_get_dest(ir, &call_copy);
-          if (hoistable[i].hoisted_vreg >= 0)
-            call_dest = irop_make_vreg(hoistable[i].hoisted_vreg, IROP_BTYPE_INT32);
-          call_copy.operand_base = tcc_ir_pool_add(ir, call_dest);
-          tcc_ir_pool_add(ir, call_src1);
-        }
-        else
-        {
-          call_copy.operand_base = tcc_ir_pool_add(ir, call_src1);
-        }
-        tcc_ir_pool_add(ir, new_call_src2);
-
-        tcc_ir_insert_instruction_before(ir, loop->preheader_idx + 1, &call_copy);
-        insertions_this_call++;
-        total_hoisted++;
-
-        /* Now insert parameters from LAST to FIRST (they will end up in correct order) */
-        for (int p = num_params - 1; p >= 0; p--)
-        {
-          /* Get param_idx from the original encoding */
-          int64_t orig_param_src2_imm = tcc_ir_op_src2_imm(ir, &param_copies[p]);
-          int64_t orig_param_encoded = orig_param_src2_imm;
-          int param_idx = TCCIR_DECODE_PARAM_IDX(orig_param_encoded);
-
-          /* Create new encoding with new_call_id but same param_idx */
-          int64_t new_param_encoded = TCCIR_ENCODE_PARAM(new_call_id, param_idx);
-          IROperand new_param_src2 = irop_make_imm32(-1, (int32_t)new_param_encoded, IROP_BTYPE_INT32);
-
-          /* Allocate operands per the marker's own irop_config (both have
-           * has_dest=0, has_src2=1).  FUNCPARAMVAL has has_src1=1 (the value):
-           * layout [src1, src2].  FUNCPARAMVOID has has_src1=0: layout [src2]
-           * only — writing a spurious src1 for it would push src2 down a slot
-           * and misdecode the call_id (docs/bugs.md #7). */
-          int new_operand_base;
-          if (irop_config[param_copies[p].op].has_src1)
-          {
-            new_operand_base = tcc_ir_pool_add(ir, tcc_ir_op_get_src1(ir, &param_copies[p]));
-            tcc_ir_pool_add(ir, new_param_src2);
-          }
-          else
-          {
-            new_operand_base = tcc_ir_pool_add(ir, new_param_src2);
-          }
-          param_copies[p].operand_base = new_operand_base;
-
-          tcc_ir_insert_instruction_before(ir, loop->preheader_idx + 1, &param_copies[p]);
-          insertions_this_call++;
-          total_hoisted++;
-        }
-
-        /* Update indices to account for inserted instructions */
-        int adjusted_call_idx = call_idx + insertions_this_call;
-
-        /* Replace original call with ASSIGN from hoisted vreg or NOP */
-        IRQuadCompact *call_q = &ir->compact_instructions[adjusted_call_idx];
-        if (hoistable[i].hoisted_vreg >= 0)
-        {
-          /* Get original destination from the adjusted position */
-          int32_t orig_vreg = tcc_ir_op_dest_vreg(ir, call_q);
-
-          call_q->op = TCCIR_OP_ASSIGN;
-          IROperand hoisted_src = irop_make_vreg(hoistable[i].hoisted_vreg, IROP_BTYPE_INT32);
-          tcc_ir_set_src1(ir, adjusted_call_idx, hoisted_src);
-          tcc_ir_set_src2_none(ir, adjusted_call_idx);
-          /* Keep original destination */
-          tcc_ir_op_set_dest(ir, call_q, irop_make_vreg(orig_vreg, IROP_BTYPE_INT32));
-
-          /* Track the hoisted vreg for iterative detection.
-           * Store the hoisted vreg so that subsequent calls using it as argument
-           * can see that it's loop-invariant. */
-          if (num_hoisted_vregs < MAX_HOISTABLE_CALLS)
-          {
-            hoisted_vregs[num_hoisted_vregs++] = hoistable[i].hoisted_vreg;
-          }
-          hoisted_this_iteration++;
-        }
-        else
-        {
-          /* VOID call - just mark as NOP */
-          call_q->op = TCCIR_OP_NOP;
-          hoisted_this_iteration++;
-        }
-
-        /* Mark original parameters as NOP (indices are shifted by insertions_this_call) */
-        for (int p = 0; p < num_params; p++)
-        {
-          int adjusted_param_idx = param_indices[p] + insertions_this_call;
-          ir->compact_instructions[adjusted_param_idx].op = TCCIR_OP_NOP;
-        }
-
-        /* Update hoistable indices for remaining calls in this loop */
-        for (int j = i + 1; j < num_hoistable; j++)
-        {
-          if (hoistable[j].instr_idx >= loop->preheader_idx + 1)
-          {
-            hoistable[j].instr_idx += insertions_this_call;
-          }
-        }
-
-        hoistable[i].is_hoisted = 1;
-
-        LOG_LICM("Hoisted pure call at instruction %d (new call_id=%d)", call_idx, new_call_id);
-
-        /* Update all_call_indices for remaining calls - they shifted by insertions_this_call */
-        for (int j = 0; j < num_all_calls; j++)
-        {
-          if (!hoisted_call_flags[j] && all_call_indices[j] > call_idx)
-          {
-            all_call_indices[j] += insertions_this_call;
-          }
-        }
-      }
-
-      /* Single pass only: transitive-invariance chaining (hoisting a call
-       * whose argument is the RESULT of another call just hoisted in this same
-       * loop) is deliberately NOT performed.  That path required rewriting the
-       * copied FUNCPARAMVAL's operand from the loop-body result vreg to the
-       * hoisted temp AND inserting the dependent call after its producer;
-       * the copy-verbatim / insert-at-preheader+1 logic below does neither, so
-       * a second iteration produced a preheader call reading an undefined vreg
-       * (or one defined by a later-in-preheader call), corrupting argument
-       * linkage (docs/bugs.md #7).  A single pass with num_hoisted_vregs left
-       * at 0 during the hoistability checks only hoists calls whose arguments
-       * are loop-invariant in the strict sense, which is correct by
-       * construction.  (void)hoisted_this_iteration keeps the counter live for
-       * the trace logging above without re-looping.) */
-    } while (0);
-    (void)hoisted_this_iteration;
-
-    /* Update loop indices for subsequent loops, shifting by ONLY the number of
-     * instructions inserted while processing THIS loop (see snapshot above). */
-    int hoisted_this_loop = total_hoisted - total_hoisted_at_loop_start;
-    if (hoisted_this_loop > 0)
-    {
-      for (int j = loop_idx + 1; j < loops->num_loops; j++)
-      {
-        IRLoop *later_loop = &loops->loops[j];
-        if (later_loop->start_idx >= loop->preheader_idx)
-          later_loop->start_idx += hoisted_this_loop;
-        if (later_loop->end_idx >= loop->preheader_idx)
-          later_loop->end_idx += hoisted_this_loop;
-        if (later_loop->preheader_idx >= loop->preheader_idx)
-          later_loop->preheader_idx += hoisted_this_loop;
-      }
-
-      /* Update this loop's indices too.  Its body entries all lie past the
-       * preheader, so one shift of entries >= preheader covers it and the
-       * later loops, each shared entry once. */
-      tcc_ir_loops_shift_bodies(loops, loop_idx, -1, loop->preheader_idx, hoisted_this_loop);
-      loop->header_idx += hoisted_this_loop;
-      loop->start_idx += hoisted_this_loop;
-    }
-  }
-
-  return total_hoisted;
-}
 
 /* Loop-invariant global-load hoisting.  A non-volatile global value read (a
  * SYMREF-deref operand consumed by an ALU op) is loop-invariant when the loop
@@ -925,12 +195,12 @@ typedef struct {
  * (VAR vreg) or a direct stack slot.  A global (is_sym) or a pointer deref can. */
 static int glh_dest_is_local_slot(IROperand d)
 {
-  if (d.is_sym)
+  if (irop_is_sym(d))
     return 0;
   int32_t vr = irop_get_vreg(d);
   if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
     return 1;
-  if (irop_get_tag(d) == IROP_TAG_STACKOFF && d.is_local)
+  if (irop_get_tag(d) == IROP_TAG_STACKOFF && irop_is_local(d))
     return 1;
   return 0;
 }
@@ -972,7 +242,7 @@ static int glh_single_def_of(TCCIRState *ir, int32_t vr)
  * one: it can be interposed onto another definition. */
 static Sym *glh_addr_confined_sym(TCCIRState *ir, IROperand addr, int saw_var, int depth)
 {
-  if (irop_get_tag(addr) == IROP_TAG_SYMREF && !addr.is_lval && !addr.is_local) {
+  if (irop_get_tag(addr) == IROP_TAG_SYMREF && !addr.is_lval && !irop_is_local(addr)) {
     if (!saw_var)
       return NULL;
     IRPoolSymref *sr = irop_get_symref_ex(ir, addr);
@@ -1106,7 +376,7 @@ static int glh_writes_sym(const GLHWrites *w, const Sym *sym)
  * PARAM) names the struct's address, which no single load produces. */
 static int glh_operand_is_global_value(IROperand op)
 {
-  return op.is_lval && op.is_sym && !op.is_llocal && !op.is_local && irop_get_btype(op) != IROP_BTYPE_STRUCT;
+  return op.is_lval && irop_is_sym(op) && !irop_is_llocal(op) && !irop_is_local(op) && irop_get_btype(op) != IROP_BTYPE_STRUCT;
 }
 
 /* Shift the still-unprocessed loops' indices by `delta` for entries >= pos,
@@ -1351,15 +621,15 @@ static void licm_move_jump_target_off_nop(TCCIRState *ir, int nop_pos)
  * variables have their address taken anywhere, which vregs are written outside
  * the loop.  Each was a walk of the function per candidate -- 1.7 G
  * instructions of address-taken scans on Zig's zig.c at -O2.  A set is built
- * on first use for a loop and dropped with it; the hoisting that follows
- * detection is what changes the IR. */
+ * on first use and lasts the run: a hoist moves an instruction, whose operands
+ * and dest stay as they were. */
 typedef struct LicmVregSet
 {
   uint8_t *bits; /* NULL until built */
   int stride;    /* positions per type */
 } LicmVregSet;
 
-/* Index of an ordinary (type << 28 | position) vreg in a set of `stride`, or
+/* Index of an ordinary (type, position) vreg in a set of `stride`, or
  * -1 for any other encoding, which the caller answers the slow way. */
 static int licm_vset_key(int32_t vr, int stride)
 {
@@ -1375,35 +645,52 @@ static int licm_vset_key(int32_t vr, int stride)
 static int licm_quad_operands(TCCIRState *ir, int idx, IROperand *out)
 {
   IRQuadCompact *q = &ir->compact_instructions[idx];
+  const IROperand *pool = ir->iroperand_pool;
+  const uint32_t count = (uint32_t)ir->iroperand_pool_count;
+  uint32_t slot = q->operand_base;
   int n = 0;
+  /* Every LICM query walks the loop through here, so read the slots directly:
+   * one call per operand was the largest part of LICM's time on the board. */
   if (irop_config[q->op].has_dest)
-    out[n++] = tcc_ir_op_get_dest(ir, q);
+  {
+    out[n++] = slot < count ? pool[slot] : IROP_NONE;
+    slot++;
+  }
   if (irop_config[q->op].has_src1)
-    out[n++] = tcc_ir_op_get_src1(ir, q);
+  {
+    out[n++] = slot < count ? pool[slot] : IROP_NONE;
+    slot++;
+  }
   if (irop_config[q->op].has_src2)
-    out[n++] = tcc_ir_op_get_src2(ir, q);
+    out[n++] = slot < count ? pool[slot] : IROP_NONE;
   if (q->op == TCCIR_OP_MLA)
     out[n++] = tcc_ir_op_get_accum(ir, q);
   return n;
 }
 
+/* An upper bound, from the counters: walking the function for the exact maximum
+ * was a third of LICM's operand reads.  licm_vset_key sends anything past it to the
+ * slow path, so being wrong only costs time. */
 static int licm_max_vreg_pos(TCCIRState *ir)
 {
-  int max = -1;
-  for (int i = 0; i < ir->next_instruction_index; i++)
-  {
-    IROperand ops[4];
-    if (ir->compact_instructions[i].op == TCCIR_OP_NOP)
-      continue;
-    int m = licm_quad_operands(ir, i, ops);
-    for (int k = 0; k < m; k++)
-    {
-      int32_t vr = irop_get_vreg(ops[k]);
-      if (vr >= 0 && TCCIR_DECODE_VREG_POSITION(vr) > max)
-        max = TCCIR_DECODE_VREG_POSITION(vr);
-    }
-  }
+  int max = ir->next_local_variable;
+  if (ir->next_temporary_variable > max)
+    max = ir->next_temporary_variable;
+  if (ir->next_parameter > max)
+    max = ir->next_parameter;
   return max;
+}
+
+/* Does q read or write vr, a real vreg?  LICM asks this for every instruction of a
+ * loop, for every candidate. */
+static int licm_quad_mentions_vr(TCCIRState *ir, const IRQuadCompact *q, int32_t vr)
+{
+  const IROperand *pool = ir->iroperand_pool + q->operand_base;
+  const int n = tcc_ir_quad_operand_words(ir, q);
+  for (int k = 0; k < n; k++)
+    if (IROP_VREG_BITS(pool[k]) == (uint32_t)vr)
+      return 1;
+  return 0;
 }
 
 /* vreg_addr_taken_anywhere() for every vreg at once. */
@@ -1443,7 +730,7 @@ static int licm_addr_taken(TCCIRState *ir, LicmVregSet *set, int32_t vr)
 static int licm_is_direct_var_read(TCCIRState *ir, LicmVregSet *addr_taken, IROperand op)
 {
   int32_t vr = irop_get_vreg(op);
-  if (vr < 0 || !op.is_local || op.is_llocal)
+  if (vr < 0 || !irop_is_local(op) || irop_is_llocal(op))
     return 0;
   if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
     return 0;
@@ -1452,25 +739,92 @@ static int licm_is_direct_var_read(TCCIRState *ir, LicmVregSet *addr_taken, IROp
   return !licm_addr_taken(ir, addr_taken, vr);
 }
 
-/* The dests of every instruction in the blocks outside the loop. */
-static void licm_outside_defs_build(TCCIRState *ir, IRCFG *cfg, const uint8_t *in_loop, LicmVregSet *set)
+/* How many instructions write each vreg.  The ones outside a loop are this less
+ * the loop's own, without walking the rest of the function per loop. */
+static ir_insn_idx_t *licm_def_totals_build(TCCIRState *ir, IRCFG *cfg, int *stride)
 {
-  set->stride = licm_max_vreg_pos(ir) + 1;
-  set->bits = tcc_mallocz((size_t)4 * set->stride + 1);
-  for (int obi = 0; obi < cfg->num_blocks; obi++)
+  *stride = licm_max_vreg_pos(ir) + 1;
+  ir_insn_idx_t *totals = tcc_mallocz(sizeof(ir_insn_idx_t) * ((size_t)4 * *stride + 1));
+  for (int bi = 0; bi < cfg->num_blocks; bi++)
   {
-    if (in_loop[obi])
-      continue;
-    for (int oi2 = cfg->blocks[obi].start_idx; oi2 < cfg->blocks[obi].end_idx; oi2++)
+    for (int i = cfg->blocks[bi].start_idx; i < cfg->blocks[bi].end_idx; i++)
     {
-      IRQuadCompact *oq = &ir->compact_instructions[oi2];
-      if (oq->op == TCCIR_OP_NOP || !irop_config[oq->op].has_dest)
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
         continue;
-      int key = licm_vset_key(tcc_ir_op_dest_vreg(ir, oq), set->stride);
+      int key = licm_vset_key(tcc_ir_op_dest_vreg(ir, q), *stride);
       if (key >= 0)
-        set->bits[key] = 1;
+        totals[key]++;
     }
   }
+  return totals;
+}
+
+/* What one loop knows about the vregs it writes.  A table per vreg of the function
+ * was zeroed for every loop, and its size is that of the function; this one is the
+ * size of the loop. */
+typedef struct LicmVInfo
+{
+  int32_t vr; /* 0: free */
+  int def_count;
+  int use_count;
+  int def_at;       /* first def, in block order */
+  int inv_mentions; /* invariant instructions mentioning it */
+  uint8_t other_mention; /* a variant instruction mentions it */
+  uint8_t hoisted;
+} LicmVInfo;
+
+typedef struct LicmVTab
+{
+  LicmVInfo *e;
+  uint32_t mask;
+  uint32_t capacity;
+} LicmVTab;
+
+static inline uint32_t licm_vt_home(const LicmVTab *t, int32_t vr)
+{
+  return (((uint32_t)vr * 0x9E3779B1u) >> 12) & t->mask;
+}
+
+static void licm_vt_reset(LicmVTab *t, int entries)
+{
+  uint32_t size = 16;
+  while (size < (uint32_t)entries * 2)
+    size *= 2;
+  if (size > t->capacity)
+  {
+    tcc_free(t->e);
+    t->e = tcc_malloc(size * sizeof(LicmVInfo));
+    t->capacity = size;
+  }
+  t->mask = size - 1;
+  memset(t->e, 0, size * sizeof(LicmVInfo));
+}
+
+static inline LicmVInfo *licm_vt_find(const LicmVTab *t, int32_t vr)
+{
+  if (vr <= 0)
+    return NULL;
+  for (uint32_t i = licm_vt_home(t, vr);; i = (i + 1) & t->mask)
+  {
+    if (t->e[i].vr == vr)
+      return &t->e[i];
+    if (!t->e[i].vr)
+      return NULL;
+  }
+}
+
+static LicmVInfo *licm_vt_add(LicmVTab *t, int32_t vr)
+{
+  uint32_t i = licm_vt_home(t, vr);
+  while (t->e[i].vr && t->e[i].vr != vr)
+    i = (i + 1) & t->mask;
+  if (!t->e[i].vr)
+  {
+    t->e[i].vr = vr;
+    t->e[i].def_at = -1;
+  }
+  return &t->e[i];
 }
 
 /* A direct read of a named local's slot.  `Addr[StackLoc[off]]` (is_lval == 0)
@@ -1478,8 +832,8 @@ static void licm_outside_defs_build(TCCIRState *ir, IRCFG *cfg, const uint8_t *i
  * forms are VARs, which the ordinary def-count machinery handles. */
 static int licm_is_direct_slot_read(IROperand op)
 {
-  return irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_lval && op.is_local &&
-         !op.is_llocal && irop_get_vreg(op) == -1;
+  return irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_lval && irop_is_local(op) &&
+         !irop_is_llocal(op) && irop_get_vreg(op) == -1;
 }
 
 /* Callees that touch only the bytes their pointer arguments name and neither
@@ -1521,14 +875,8 @@ static int licm_vreg_touched_elsewhere(TCCIRState *ir, int32_t vr, int def_idx)
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
-    IROperand ops[4];
-    int n;
-    if (i == def_idx || q->op == TCCIR_OP_NOP)
-      continue;
-    n = licm_quad_operands(ir, i, ops);
-    for (int k = 0; k < n; k++)
-      if (irop_get_vreg(ops[k]) == vr)
-        return 1;
+    if (i != def_idx && q->op != TCCIR_OP_NOP && licm_quad_mentions_vr(ir, q, vr))
+      return 1;
   }
   return 0;
 }
@@ -1574,7 +922,7 @@ static int licm_slot_addr_escapes(TCCIRState *ir, IRCFG *cfg, const uint8_t *in_
        * name the same slot yet share no field (this is why
        * operand_references_slot cannot be used here).  A VT_LLOCAL slot holds
        * a pointer to somewhere else entirely — always assume it aliases. */
-      if (!ops[k].is_llocal &&
+      if (!irop_is_llocal(ops[k]) &&
           ir_opt_stack_slot_range_for_offset(ir, irop_get_stack_offset(ops[k]), &ab, &ae) &&
           (slot_end <= ab || slot_base >= ae))
         continue;
@@ -1861,6 +1209,7 @@ static void fph_note_read_type(FPHLoc *l, IROperand v)
 static int fph_loop_def(TCCIRState *ir, IRLoop *loop, int32_t vr, int *def_idx)
 {
   int n = 0;
+  const int real = tcc_ir_vreg_is_real(vr);
   *def_idx = -1;
   for (int i = 0; i < loop->num_body_instrs; i++)
   {
@@ -1870,9 +1219,10 @@ static int fph_loop_def(TCCIRState *ir, IRLoop *loop, int32_t vr, int *def_idx)
     IRQuadCompact *q = &ir->compact_instructions[idx];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
+    if (!IR_SLOT_HOLDS(dest, ir, q, vr, real))
+      continue;
     if (tcc_ir_op_dest_is_lval(ir, q))
       continue;
-    if (tcc_ir_op_dest_vreg(ir, q) == vr)
     {
       *def_idx = idx;
       if (++n > 1)
@@ -1920,13 +1270,13 @@ static int fph_strip_ex(TCCIRState *ir, IRLoop *loop, int32_t vr, int depth, int
     IROperand s1 = tcc_ir_op_get_src1(ir, q), s2 = tcc_ir_op_get_src2(ir, q);
     int64_t delta;
     int32_t base_vr;
-    if (irop_get_tag(s2) == IROP_TAG_IMM32 && !s2.is_sym && !s2.is_lval && irop_get_tag(s1) == IROP_TAG_VREG &&
+    if (irop_get_tag(s2) == IROP_TAG_IMM32 && !irop_is_sym(s2) && !s2.is_lval && irop_get_tag(s1) == IROP_TAG_VREG &&
         !s1.is_lval)
     {
       delta = tcc_ir_op_src2_imm(ir, q);
       base_vr = irop_get_vreg(s1);
     }
-    else if (q->op == TCCIR_OP_ADD && irop_get_tag(s1) == IROP_TAG_IMM32 && !s1.is_sym && !s1.is_lval &&
+    else if (q->op == TCCIR_OP_ADD && irop_get_tag(s1) == IROP_TAG_IMM32 && !irop_is_sym(s1) && !s1.is_lval &&
              irop_get_tag(s2) == IROP_TAG_VREG && !s2.is_lval)
     {
       delta = tcc_ir_op_src1_imm(ir, q);
@@ -2086,11 +1436,11 @@ static int fph_guard_operand_ok(TCCIRState *ir, IROperand op)
   if (irop_is_immediate(op))
     return !op.is_lval;
   int32_t vr = irop_get_vreg(op);
-  if (vr < 0 || op.is_sym || op.is_llocal)
+  if (vr < 0 || irop_is_sym(op) || irop_is_llocal(op))
     return 0;
   if (!op.is_lval)
     return 1;
-  return TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && op.is_local &&
+  return TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && irop_is_local(op) &&
          !tcc_ir_access_is_volatile(ir, op) && !tcc_ir_operand_names_volatile_var(ir, op);
 }
 
@@ -2361,7 +1711,7 @@ static int tcc_ir_hoist_invariant_field_ptr_loads(TCCIRState *ir, IRLoops *loops
         IROperand base = tcc_ir_op_get_src1(ir, q);
         IROperand s2 = tcc_ir_op_get_src2(ir, q);
         IROperand dest = tcc_ir_op_get_dest(ir, q);
-        if (irop_get_tag(s2) != IROP_TAG_IMM32 || s2.is_sym || s2.is_lval)
+        if (irop_get_tag(s2) != IROP_TAG_IMM32 || irop_is_sym(s2) || s2.is_lval)
           continue;
         if (irop_get_tag(base) != IROP_TAG_VREG || base.is_lval || irop_get_vreg(base) < 0)
           continue;
@@ -2415,7 +1765,7 @@ static int tcc_ir_hoist_invariant_field_ptr_loads(TCCIRState *ir, IRLoops *loops
           if (side == 1 && !irop_config[q->op].has_src2)
             continue;
           IROperand s = tcc_ir_op_get_src1_or_2(ir, q, side != 0);
-          if (irop_get_tag(s) != IROP_TAG_VREG || !s.is_lval || s.is_local || s.is_llocal || s.is_sym)
+          if (irop_get_tag(s) != IROP_TAG_VREG || !s.is_lval || irop_is_local(s) || irop_is_llocal(s) || irop_is_sym(s))
             continue;
           /* A STRUCT lvalue (a by-value PARAM) is the struct's address. */
           if (irop_get_btype(s) == IROP_BTYPE_STRUCT)
@@ -2620,76 +1970,60 @@ int ssa_opt_licm_field_ptr_load(TCCIRState *ir)
  * predicates below recognise a chain from either end — the producer (all its
  * in-loop uses leave with it, so it costs nothing) and the consumer (it retires
  * a single-use invariant producer, so two ops go for one register). */
-static int licm_all_uses_invariant(TCCIRState *ir, IRCFG *cfg, const uint8_t *in_loop,
-                                   const uint8_t *is_invariant, int idx, int32_t vr)
+/* Which instructions of the loop mention each vreg it writes, for the two questions
+ * below.  Asking per candidate walked the loop per candidate. */
+static void licm_note_mentions(TCCIRState *ir, IRCFG *cfg, const int *blocks, int nblocks, LicmVTab *defs,
+                               const uint8_t *is_invariant)
 {
-  int seen = 0;
-  if (vr < 0)
-    return 0;
-  for (int bi = 0; bi < cfg->num_blocks; bi++)
+  for (int lb = 0; lb < nblocks; lb++)
   {
-    if (!in_loop[bi])
-      continue;
-    for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++)
+    const IRBasicBlock *bb = &cfg->blocks[blocks[lb]];
+    for (int ii = bb->start_idx; ii < bb->end_idx; ii++)
     {
-      IRQuadCompact *q = &ir->compact_instructions[ii];
-      IROperand ops[4];
-      int n, uses = 0;
-      if (ii == idx || q->op == TCCIR_OP_NOP)
+      const IRQuadCompact *q = &ir->compact_instructions[ii];
+      if (q->op == TCCIR_OP_NOP)
         continue;
-      n = licm_quad_operands(ir, ii, ops);
+      const IROperand *pool = ir->iroperand_pool + q->operand_base;
+      const int n = tcc_ir_quad_operand_words(ir, q);
       for (int k = 0; k < n; k++)
-        if (irop_get_vreg(ops[k]) == vr)
-          uses = 1;
-      if (!uses)
-        continue;
-      if (!is_invariant[ii])
-        return 0;
-      seen = 1;
+      {
+        const uint32_t bits = IROP_VREG_BITS(pool[k]);
+        int again = 0;
+        for (int j = 0; j < k && !again; j++)
+          again = IROP_VREG_BITS(pool[j]) == bits;
+        LicmVInfo *e = again ? NULL : licm_vt_find(defs, (int32_t)bits);
+        if (!e)
+          continue;
+        if (is_invariant[ii])
+          e->inv_mentions++;
+        else
+          e->other_mention = 1;
+      }
     }
   }
-  return seen;
 }
 
-static int licm_feeds_from_invariant_chain(TCCIRState *ir, IRCFG *cfg, const uint8_t *in_loop,
-                                           const uint8_t *is_invariant, const int *def_count,
-                                           const int *use_count, int dc_stride, int max_vr, int idx)
+/* The dest of an invariant instruction has other readers, all of them invariant:
+ * the instruction itself is one of inv_mentions. */
+static int licm_all_uses_invariant(const LicmVTab *defs, int32_t vr)
+{
+  const LicmVInfo *e = licm_vt_find(defs, vr);
+  return e && !e->other_mention && e->inv_mentions > 1;
+}
+
+static int licm_feeds_from_invariant_chain(TCCIRState *ir, const LicmVTab *defs, const uint8_t *is_invariant, int idx)
 {
   IRQuadCompact *q = &ir->compact_instructions[idx];
   for (int oi = 0; oi < 2; oi++)
   {
-    IROperand s;
-    int32_t v;
-    int p, t;
     if (oi == 0 && !irop_config[q->op].has_src1)
       continue;
     if (oi == 1 && !irop_config[q->op].has_src2)
       continue;
-    s = tcc_ir_op_get_src1_or_2(ir, q, oi != 0);
-    v = irop_get_vreg(s);
-    if (v < 0)
-      continue;
-    p = TCCIR_DECODE_VREG_POSITION(v);
-    t = TCCIR_DECODE_VREG_TYPE(v);
-    if (p > max_vr)
-      continue;
-    if (def_count[t * dc_stride + p] != 1 || use_count[t * dc_stride + p] != 1)
-      continue;
-    for (int bi = 0; bi < cfg->num_blocks; bi++)
-    {
-      if (!in_loop[bi])
-        continue;
-      for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++)
-      {
-        IRQuadCompact *dq = &ir->compact_instructions[ii];
-        if (dq->op == TCCIR_OP_NOP || !irop_config[dq->op].has_dest)
-          continue;
-        if (tcc_ir_op_dest_vreg(ir, dq) != v)
-          continue;
-        if (is_invariant[ii])
-          return 1;
-      }
-    }
+    IROperand s = tcc_ir_op_get_src1_or_2(ir, q, oi != 0);
+    const LicmVInfo *e = licm_vt_find(defs, irop_get_vreg(s));
+    if (e && e->def_count == 1 && e->use_count == 1 && is_invariant[e->def_at])
+      return 1;
   }
   return 0;
 }
@@ -2737,8 +2071,8 @@ static int licm_op_is_speculatable(int op)
 /* A plain register operand: a vreg's own value, not memory named through it. */
 static int licm_is_plain_reg(IROperand o)
 {
-  return irop_get_tag(o) == IROP_TAG_VREG && irop_get_vreg(o) >= 0 && !o.is_lval && !o.is_local &&
-         !o.is_llocal && !o.is_sym && !o.is_complex;
+  return irop_get_tag(o) == IROP_TAG_VREG && irop_get_vreg(o) >= 0 && !o.is_lval && !irop_is_local(o) &&
+         !irop_is_llocal(o) && !irop_is_sym(o) && !o.is_complex;
 }
 
 /* licm_op_is_speculatable for an instruction: also `T <- P [LOAD]` off a plain
@@ -2764,13 +2098,13 @@ static int licm_q_is_stable_load(TCCIRState *ir, IRQuadCompact *q)
   IROperand d = tcc_ir_op_get_dest(ir, q), s1 = tcc_ir_op_get_src1(ir, q);
   if (!licm_is_plain_reg(d) || irop_is_64bit(d) || tcc_ir_instr_access_is_volatile(ir, q))
     return 0;
-  if (irop_get_tag(s1) != IROP_TAG_VREG || irop_get_vreg(s1) < 0 || s1.is_local || s1.is_llocal || s1.is_sym ||
+  if (irop_get_tag(s1) != IROP_TAG_VREG || irop_get_vreg(s1) < 0 || irop_is_local(s1) || irop_is_llocal(s1) || irop_is_sym(s1) ||
       s1.is_complex)
     return 0;
   if (q->op == TCCIR_OP_LOAD)
     return s1.is_lval;
   IROperand s2 = tcc_ir_op_get_src2(ir, q);
-  return !s1.is_lval && (licm_is_plain_reg(s2) || (irop_is_immediate(s2) && !s2.is_sym && !s2.is_lval));
+  return !s1.is_lval && (licm_is_plain_reg(s2) || (irop_is_immediate(s2) && !irop_is_sym(s2) && !s2.is_lval));
 }
 
 /* Q is the only instruction anywhere that names each of its register sources:
@@ -2902,7 +2236,6 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
 
   int hoisted = 0;
   if (!late) {
-    tcc_ir_hoist_pure_calls(ir, loops);
     if (tcc_ir_hoist_invariant_global_loads(ir, loops) > 0) {
       tcc_ir_free_loops(loops);
       loops = tcc_ir_detect_loops(ir);
@@ -2916,10 +2249,28 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
   /* ── Dominance-based LICM ──
    * Uses proper CFG + dominator tree to detect natural loops and
    * verify invariant safety.  Replaces the buggy pattern-based approach. */
-  {
+  /* Skip functions containing SWITCH_TABLE: tcc_ir_insert_instruction_before
+   * doesn't update switch table target indices, so hoisting corrupts
+   * the dispatch. */
+  int has_switch = 0;
+  for (int si3 = 0; si3 < ir->next_instruction_index && !has_switch; si3++)
+    has_switch = ir->compact_instructions[si3].op == TCCIR_OP_SWITCH_TABLE;
+  if (!has_switch) {
     IRCFG *cfg = tcc_ir_cfg_build(ir);
     if (cfg && cfg->num_blocks > 1) {
       tcc_ir_cfg_compute_dominators(cfg);
+
+      /* Kept across the loops, and cleared per loop only where it wrote. */
+      uint8_t *in_loop = tcc_mallocz(cfg->num_blocks);
+      int *worklist = tcc_malloc(cfg->num_blocks * sizeof(int));
+      int *loop_blocks = tcc_malloc(cfg->num_blocks * sizeof(int));
+      int inv_capacity = ir->next_instruction_index + ir->next_instruction_index / 8 + 16;
+      uint8_t *is_invariant = tcc_mallocz(inv_capacity);
+      uint8_t *chain_ok = tcc_mallocz(inv_capacity);
+      LicmVTab defs = {0};
+      LicmVregSet addr_taken = {0};
+      ir_insn_idx_t *def_totals = NULL;
+      int def_totals_stride = 0;
 
       /* Detect natural loops via dominance-verified back-edges */
       for (int b = 0; b < cfg->num_blocks; b++) {
@@ -2932,9 +2283,7 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
             continue;
 
           /* Natural loop: header=h, latch=b.  Collect body via flood-fill. */
-          uint8_t *in_loop = tcc_mallocz(cfg->num_blocks);
           in_loop[h] = 1;
-          int *worklist = tcc_mallocz(cfg->num_blocks * sizeof(int));
           int wl_count = 0;
           if (b != h) {
             in_loop[b] = 1;
@@ -2951,6 +2300,13 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
               }
             }
           }
+
+          int nblocks = 0;
+          for (int bi = 0; bi < cfg->num_blocks; bi++)
+            if (in_loop[bi])
+              loop_blocks[nblocks++] = bi;
+          int total_hoisted_here = 0;
+          int insert_pos = 0;
 
           /* Find preheader: unique predecessor of header not in loop */
           int preheader = -1;
@@ -2992,82 +2348,64 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
                 outside_pred = 1;
             entry_header = !outside_pred;
           }
-          if (preheader < 0 && !entry_header) {
-            tcc_free(in_loop);
-            tcc_free(worklist);
-            continue;
-          }
+          if (preheader < 0 && !entry_header)
+            goto next_loop;
 
-          /* Collect loop defs: vreg → def count.
-           * Index by type*stride+position so that V2 (VAR,pos=2) and
-           * P2 (PARAM,pos=2) don't collide. */
-          int max_vr = 0;
-          for (int bi = 0; bi < cfg->num_blocks; bi++) {
-            if (!in_loop[bi])
-              continue;
-            for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++) {
+          /* Collect loop defs and, for those, their uses in the loop: a profitability
+           * signal for hoists that don't dominate the loop's exits (see the safety
+           * check).  def_at is what the invariance fixpoint asks per operand per round. */
+          int ndests = 0;
+          for (int lb = 0; lb < nblocks; lb++) {
+            const IRBasicBlock *lbb = &cfg->blocks[loop_blocks[lb]];
+            for (int ii = lbb->start_idx; ii < lbb->end_idx; ii++)
+              ndests += ir->compact_instructions[ii].op != TCCIR_OP_NOP &&
+                        irop_config[ir->compact_instructions[ii].op].has_dest;
+          }
+          licm_vt_reset(&defs, ndests);
+          for (int lb = 0; lb < nblocks; lb++) {
+            const IRBasicBlock *lbb = &cfg->blocks[loop_blocks[lb]];
+            for (int ii = lbb->start_idx; ii < lbb->end_idx; ii++) {
               IRQuadCompact *q = &ir->compact_instructions[ii];
               if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
                 continue;
               int32_t vr = tcc_ir_op_dest_vreg(ir, q);
               if (vr >= 0) {
-                int pos = TCCIR_DECODE_VREG_POSITION(vr);
-                if (pos > max_vr)
-                  max_vr = pos;
+                LicmVInfo *e = licm_vt_add(&defs, vr);
+                e->def_count++;
+                if (e->def_at < 0)
+                  e->def_at = ii;
               }
             }
           }
-          int dc_stride = max_vr + 1;
-          int *def_count = tcc_mallocz(4 * dc_stride * sizeof(int));
-          /* Per-vreg use count within the loop body — a profitability signal for
-           * hoists that don't dominate the loop's exits (see the safety check). */
-          int *use_count = tcc_mallocz(4 * dc_stride * sizeof(int));
-          /* First def of each vreg in the loop, in block order: the invariance
-           * fixpoint below asks for it per operand per round. */
-          int *def_at = tcc_malloc(4 * dc_stride * sizeof(int));
-          for (int k = 0; k < 4 * dc_stride; k++)
-            def_at[k] = -1;
-          for (int bi = 0; bi < cfg->num_blocks; bi++) {
-            if (!in_loop[bi])
-              continue;
-            for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++) {
+          for (int lb = 0; lb < nblocks; lb++) {
+            const IRBasicBlock *lbb = &cfg->blocks[loop_blocks[lb]];
+            for (int ii = lbb->start_idx; ii < lbb->end_idx; ii++) {
               IRQuadCompact *q = &ir->compact_instructions[ii];
               if (q->op == TCCIR_OP_NOP)
                 continue;
-              if (irop_config[q->op].has_dest) {
-                int32_t vr = tcc_ir_op_dest_vreg(ir, q);
-                if (vr >= 0) {
-                  int pos = TCCIR_DECODE_VREG_POSITION(vr);
-                  int typ = TCCIR_DECODE_VREG_TYPE(vr);
-                  if (pos <= max_vr) {
-                    def_count[typ * dc_stride + pos]++;
-                    if (def_at[typ * dc_stride + pos] < 0)
-                      def_at[typ * dc_stride + pos] = ii;
-                  }
-                }
-              }
               for (int side = 0; side < 2; side++) {
                 if (side == 0 && !irop_config[q->op].has_src1) continue;
                 if (side == 1 && !irop_config[q->op].has_src2) continue;
-                IROperand s = tcc_ir_op_get_src1_or_2(ir, q, side != 0);
-                int32_t vr = irop_get_vreg(s);
-                if (vr >= 0) {
-                  int pos = TCCIR_DECODE_VREG_POSITION(vr);
-                  int typ = TCCIR_DECODE_VREG_TYPE(vr);
-                  if (pos <= max_vr)
-                    use_count[typ * dc_stride + pos]++;
-                }
+                LicmVInfo *e = licm_vt_find(&defs, irop_get_vreg(tcc_ir_op_get_src1_or_2(ir, q, side != 0)));
+                if (e)
+                  e->use_count++;
               }
             }
           }
 
           /* Fixed-point invariant detection */
-          int total_loop_instrs = 0; (void)total_loop_instrs;
-          for (int bi = 0; bi < cfg->num_blocks; bi++)
-            if (in_loop[bi])
-              total_loop_instrs += cfg->blocks[bi].end_idx - cfg->blocks[bi].start_idx;
-
-          uint8_t *is_invariant = tcc_mallocz(ir->next_instruction_index);
+          if (ir->next_instruction_index > inv_capacity) {
+            int grown = ir->next_instruction_index + ir->next_instruction_index / 8 + 16;
+            is_invariant = tcc_realloc(is_invariant, grown);
+            chain_ok = tcc_realloc(chain_ok, grown);
+            memset(is_invariant + inv_capacity, 0, grown - inv_capacity);
+            memset(chain_ok + inv_capacity, 0, grown - inv_capacity);
+            inv_capacity = grown;
+          }
+          /* One answer for the loop: asked per candidate, it walked the loop each time. */
+          int may_clobber = -1;
+#define LICM_LOOP_MAY_CLOBBER() \
+  (may_clobber < 0 ? (may_clobber = cfg_loop_may_clobber_memory(ir, cfg, in_loop)) : may_clobber)
           /* Late only: a loop that writes no memory keeps every non-volatile
            * load invariant whose address is.  One latch, no inner cycle: the
            * hoist below must see every path round the loop. */
@@ -3086,7 +2424,7 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
                   inner = 1;
               }
             }
-            stable_mem = latches == 1 && !inner && !cfg_loop_may_clobber_memory(ir, cfg, in_loop);
+            stable_mem = latches == 1 && !inner && !LICM_LOOP_MAY_CLOBBER();
             /* Preheader code ahead of a zero-trip JUMPIF runs when the loop does not. */
             int pend = entry_header ? 0 : cfg->blocks[preheader].end_idx;
             if (!entry_header && pend > cfg->blocks[preheader].start_idx &&
@@ -3128,15 +2466,14 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
             }
           }
           LicmSlotCtx slot_ctx;
-          LicmVregSet addr_taken = {0}, outside_defs = {0};
           int inv_changed = 1;
+          int any_invariant = 0;
           slot_ctx.writes_frame = -1;
           slot_ctx.n = 0;
           while (inv_changed) {
             inv_changed = 0;
-            for (int bi = 0; bi < cfg->num_blocks; bi++) {
-              if (!in_loop[bi])
-                continue;
+            for (int lb = 0; lb < nblocks; lb++) {
+              const int bi = loop_blocks[lb];
               for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++) {
                 if (is_invariant[ii])
                   continue;
@@ -3157,9 +2494,9 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
                 if (irop_config[q->op].has_dest) {
                   int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
                   if (dvr >= 0) {
-                    int dp = TCCIR_DECODE_VREG_POSITION(dvr);
                     int dt = TCCIR_DECODE_VREG_TYPE(dvr);
-                    if (dp <= max_vr && def_count[dt * dc_stride + dp] > 1)
+                    const LicmVInfo *de = licm_vt_find(&defs, dvr);
+                    if (de && de->def_count > 1)
                       continue;
                     /* A PARAM has no defining instruction: its incoming argument
                      * is live into the loop, and no outside def shows that. */
@@ -3167,11 +2504,11 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
                       continue;
                     /* Check if vreg is also defined outside the loop */
                     int outside_def = 0;
-                    if (!outside_defs.bits)
-                      licm_outside_defs_build(ir, cfg, in_loop, &outside_defs);
-                    int od_key = licm_vset_key(dvr, outside_defs.stride);
+                    if (!def_totals)
+                      def_totals = licm_def_totals_build(ir, cfg, &def_totals_stride);
+                    int od_key = licm_vset_key(dvr, def_totals_stride);
                     if (od_key >= 0)
-                      outside_def = outside_defs.bits[od_key];
+                      outside_def = def_totals[od_key] > (de ? de->def_count : 0);
                     for (int obi = 0; od_key < 0 && obi < cfg->num_blocks && !outside_def; obi++) {
                       if (in_loop[obi])
                         continue;
@@ -3196,8 +2533,7 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
                      * side effect across iterations.  This mirrors the guard
                      * is_operand_loop_invariant_ex already applies on the READ
                      * side (docs/bugs.md #7). */
-                    if (licm_addr_taken(ir, &addr_taken, dvr) &&
-                        cfg_loop_may_clobber_memory(ir, cfg, in_loop))
+                    if (licm_addr_taken(ir, &addr_taken, dvr) && LICM_LOOP_MAY_CLOBBER())
                       continue;
                   }
                 }
@@ -3245,35 +2581,12 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
                     all_inv = 0;
                     continue;
                   }
-                  int vp = TCCIR_DECODE_VREG_POSITION(vr);
                   int vt = TCCIR_DECODE_VREG_TYPE(vr);
-                  if (vp <= max_vr && def_count[vt * dc_stride + vp] > 0) {
+                  const LicmVInfo *se = licm_vt_find(&defs, vr);
+                  if (se) {
                     /* Defined in loop — only invariant if single-def and that def is invariant */
-                    if (def_count[vt * dc_stride + vp] == 1) {
-                      /* Find the def instruction */
-                      int found_inv = 0, da = def_at[vt * dc_stride + vp];
-                      if (da >= 0 && tcc_ir_op_dest_vreg(ir, &ir->compact_instructions[da]) == vr)
-                        found_inv = is_invariant[da];
-                      else
-                      for (int bi2 = 0; bi2 < cfg->num_blocks && !found_inv; bi2++) {
-                        if (!in_loop[bi2])
-                          continue;
-                        for (int jj = cfg->blocks[bi2].start_idx; jj < cfg->blocks[bi2].end_idx; jj++) {
-                          IRQuadCompact *dq = &ir->compact_instructions[jj];
-                          if (!irop_config[dq->op].has_dest)
-                            continue;
-                          if (tcc_ir_op_dest_vreg(ir, dq) == vr) {
-                            found_inv = is_invariant[jj];
-                            break;
-                          }
-                        }
-                      }
-                      if (!found_inv)
-                        all_inv = 0;
-                    }
-                    else {
+                    if (se->def_count != 1 || !is_invariant[se->def_at])
                       all_inv = 0;
-                    }
                   }
                   /* Not defined in the loop: invariant -- unless the variable
                    * can change without a def this scan sees.  A local captured
@@ -3281,33 +2594,36 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
                    * the static chain (`-u5 & u6` was hoisted while the loop's
                    * call to the nested writer of u5 ran every iteration). */
                   else if ((vt == TCCIR_VREG_TYPE_VAR || vt == TCCIR_VREG_TYPE_PARAM) &&
-                           licm_addr_taken(ir, &addr_taken, vr) && cfg_loop_may_clobber_memory(ir, cfg, in_loop)) {
+                           licm_addr_taken(ir, &addr_taken, vr) && LICM_LOOP_MAY_CLOBBER()) {
                     all_inv = 0;
                   }
                 }
                 if (all_inv) {
                   is_invariant[ii] = 1;
                   inv_changed = 1;
+                  any_invariant = 1;
                   LOG_LICM("  dom-LICM: marked invariant insn %d op=%d", ii, q->op);
                 }
               }
             }
           }
 
-          tcc_free(addr_taken.bits);
-          tcc_free(outside_defs.bits);
           tcc_free(load_blk_ok);
+#undef LICM_LOOP_MAY_CLOBBER
 
-          /* Find exit blocks */
-          uint8_t *is_exit = tcc_mallocz(cfg->num_blocks);
-          for (int bi = 0; bi < cfg->num_blocks; bi++) {
-            if (!in_loop[bi])
-              continue;
-            IRBasicBlock *lb = &cfg->blocks[bi];
-            for (int si2 = 0; si2 < lb->num_succs; si2++) {
-              int s = lb->succs[si2];
+          /* Nothing to hoist, which is most loops: the rest is deciding how. */
+          if (!any_invariant)
+            goto next_loop;
+
+          /* Find exit blocks (the flood-fill is done with worklist) */
+          int *exits = worklist;
+          int nexits = 0;
+          for (int lb = 0; lb < nblocks; lb++) {
+            const IRBasicBlock *lbb = &cfg->blocks[loop_blocks[lb]];
+            for (int si2 = 0; si2 < lbb->num_succs; si2++) {
+              int s = lbb->succs[si2];
               if (s >= 0 && s < cfg->num_blocks && !in_loop[s]) {
-                is_exit[bi] = 1;
+                exits[nexits++] = loop_blocks[lb];
                 break;
               }
             }
@@ -3316,36 +2632,12 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
           LOG_LICM("dom-LICM: natural loop header=blk%d latch=blk%d preheader=blk%d", h, b, preheader);
 
           /* Hoist invariant instructions to preheader */
-          int insert_pos = entry_header ? 0 : cfg->blocks[preheader].end_idx;
+          insert_pos = entry_header ? 0 : cfg->blocks[preheader].end_idx;
           /* If preheader ends with a jump, insert before it */
           if (!entry_header && insert_pos > cfg->blocks[preheader].start_idx) {
             int lop = ir->compact_instructions[insert_pos - 1].op;
             if (lop == TCCIR_OP_JUMP || lop == TCCIR_OP_JUMPIF)
               insert_pos--;
-          }
-
-          /* Skip functions containing SWITCH_TABLE: tcc_ir_insert_instruction_before
-           * doesn't update switch table target indices, so hoisting corrupts
-           * the dispatch. */
-          {
-            int has_switch = 0;
-            for (int si3 = 0; si3 < ir->next_instruction_index; si3++) {
-              if (ir->compact_instructions[si3].op == TCCIR_OP_SWITCH_TABLE) {
-                has_switch = 1;
-                break;
-              }
-            }
-            if (has_switch) {
-              LOG_LICM("dom-LICM: skipping — function has SWITCH_TABLE");
-              tcc_free(is_invariant);
-              tcc_free(is_exit);
-              tcc_free(def_count);
-              tcc_free(use_count);
-              tcc_free(def_at);
-              tcc_free(in_loop);
-              tcc_free(worklist);
-              continue;
-            }
           }
 
           /* When the preheader ends in a jump, insert_pos lands strictly BEFORE
@@ -3371,14 +2663,7 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
             }
             if (insert_targeted) {
               LOG_LICM("dom-LICM: skipping — insert_pos %d is a branch target", insert_pos);
-              tcc_free(is_invariant);
-              tcc_free(is_exit);
-              tcc_free(def_count);
-              tcc_free(use_count);
-              tcc_free(def_at);
-              tcc_free(in_loop);
-              tcc_free(worklist);
-              continue;
+              goto next_loop;
             }
           }
 
@@ -3386,19 +2671,15 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
            * HERE, before the first insertion: is_invariant and the CFG both
            * index pre-insertion positions, while the hoist loop below reads the
            * IR at shifted ones. */
-          uint8_t *chain_ok = tcc_mallocz(ir->next_instruction_index);
-          for (int bi = 0; bi < cfg->num_blocks; bi++) {
-            if (!in_loop[bi])
-              continue;
-            for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++) {
+          licm_note_mentions(ir, cfg, loop_blocks, nblocks, &defs, is_invariant);
+          for (int lb = 0; lb < nblocks; lb++) {
+            const IRBasicBlock *lbb = &cfg->blocks[loop_blocks[lb]];
+            for (int ii = lbb->start_idx; ii < lbb->end_idx; ii++) {
               IRQuadCompact *cq = &ir->compact_instructions[ii];
-              int32_t cdv;
               if (!is_invariant[ii] || cq->op == TCCIR_OP_NOP)
                 continue;
-              cdv = irop_config[cq->op].has_dest ? tcc_ir_op_dest_vreg(ir, cq) : -1;
-              if (licm_all_uses_invariant(ir, cfg, in_loop, is_invariant, ii, cdv) ||
-                  licm_feeds_from_invariant_chain(ir, cfg, in_loop, is_invariant, def_count,
-                                                  use_count, dc_stride, max_vr, ii))
+              int32_t cdv = irop_config[cq->op].has_dest ? tcc_ir_op_dest_vreg(ir, cq) : -1;
+              if (licm_all_uses_invariant(&defs, cdv) || licm_feeds_from_invariant_chain(ir, &defs, is_invariant, ii))
                 chain_ok[ii] = 1;
             }
           }
@@ -3408,13 +2689,11 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
           int loop_end_idx = cfg->blocks[b].end_idx;
           int max_hoist = tcc_ir_estimate_hoist_budget(ir, loop_start_idx, loop_end_idx, ir->parameters_count);
 
-          int total_hoisted_here = 0;
           int register_cost = 0;
           int has_call = 0;
           if (late) {
-            for (int bi = 0; bi < cfg->num_blocks; bi++) {
-              if (!in_loop[bi])
-                continue;
+            for (int lb = 0; lb < nblocks; lb++) {
+              const int bi = loop_blocks[lb];
               for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++) {
                 IRQuadCompact *q = &ir->compact_instructions[ii];
                 if (ir_op_has(q->op, IR_HZ_CALL | IR_HZ_ASM | IR_HZ_NONLOCAL | IROP_A_FP) ||
@@ -3424,9 +2703,7 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
               }
             }
           }
-          int has_exit = 0;
-          for (int ei = 0; ei < cfg->num_blocks; ei++)
-            has_exit |= is_exit[ei];
+          int has_exit = nexits > 0;
           int insert_guarded = !entry_header && insert_pos < cfg->blocks[preheader].end_idx &&
                                ir->compact_instructions[insert_pos].op == TCCIR_OP_JUMPIF;
           int body_shift = 0;
@@ -3436,10 +2713,8 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
            * skipped dest must then stay in the loop too, or the preheader
            * computes the use before its def ever ran (fuzz seed
            * struct_byval:76, test 388). */
-          uint8_t *hoisted_dest = tcc_mallocz((size_t)4 * dc_stride);
-          for (int bi = 0; bi < cfg->num_blocks && (late || total_hoisted_here < max_hoist); bi++) {
-            if (!in_loop[bi])
-              continue;
+          for (int lb = 0; lb < nblocks && (late || total_hoisted_here < max_hoist); lb++) {
+            const int bi = loop_blocks[lb];
             for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++) {
               int adj_ii = ii + body_shift;
               if (adj_ii >= ir->next_instruction_index)
@@ -3462,12 +2737,8 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
                * ran in the original). */
               int instr_block = bi;
               int dominates_exits = 1;
-              for (int ei = 0; ei < cfg->num_blocks && dominates_exits; ei++) {
-                if (!is_exit[ei])
-                  continue;
-                if (!tcc_ir_cfg_dominates(cfg, instr_block, ei))
-                  dominates_exits = 0;
-              }
+              for (int ei = 0; ei < nexits && dominates_exits; ei++)
+                dominates_exits = tcc_ir_cfg_dominates(cfg, instr_block, exits[ei]);
               /* A load must not move onto a path that never read: its block
                * must also dominate the latch (a trip round the loop reads it),
                * the loop must have an exit, and the preheader code must run
@@ -3487,13 +2758,8 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
                 if (!licm_q_is_speculatable(ir, q))
                   continue;
                 int32_t hvr = tcc_ir_op_dest_vreg(ir, q);
-                int hu = 0;
-                if (hvr >= 0) {
-                  int hp = TCCIR_DECODE_VREG_POSITION(hvr);
-                  int ht = TCCIR_DECODE_VREG_TYPE(hvr);
-                  if (hp <= max_vr)
-                    hu = use_count[ht * dc_stride + hp];
-                }
+                const LicmVInfo *he = licm_vt_find(&defs, hvr);
+                int hu = he ? he->use_count : 0;
                 if (!(late && cost <= 0) && hu < 2 && !chain_ok[ii] && !licm_sole_reader_of_sources(ir, adj_ii))
                   continue;
               }
@@ -3508,13 +2774,8 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
                   if (oi == 1 && !irop_config[q->op].has_src2)
                     continue;
                   IROperand sop = tcc_ir_op_get_src1_or_2(ir, q, oi != 0);
-                  int32_t svr = irop_get_vreg(sop);
-                  if (svr < 0)
-                    continue;
-                  int sp2 = TCCIR_DECODE_VREG_POSITION(svr);
-                  int st2 = TCCIR_DECODE_VREG_TYPE(svr);
-                  if (sp2 <= max_vr && def_count[st2 * dc_stride + sp2] > 0 &&
-                      !hoisted_dest[st2 * dc_stride + sp2])
+                  const LicmVInfo *se = licm_vt_find(&defs, irop_get_vreg(sop));
+                  if (se && !se->hoisted)
                     src_unhoisted = 1;
                 }
                 if (src_unhoisted)
@@ -3566,20 +2827,23 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
               licm_move_jump_target_off_nop(ir, nop_pos);
               hoisted++;
               {
-                int32_t hdvr = irop_get_vreg(orig_dest);
-                if (hdvr >= 0) {
-                  int hdp = TCCIR_DECODE_VREG_POSITION(hdvr);
-                  int hdt = TCCIR_DECODE_VREG_TYPE(hdvr);
-                  if (hdp <= max_vr)
-                    hoisted_dest[hdt * dc_stride + hdp] = 1;
-                }
+                LicmVInfo *he = licm_vt_find(&defs, irop_get_vreg(orig_dest));
+                if (he)
+                  he->hoisted = 1;
               }
               LOG_LICM("dom-LICM: hoisted insn %d (adj %d) op=%d to preheader pos %d, NOP'd %d",
                        ii, adj_ii, hoist_q.op, adj_insert, nop_pos);
             }
           }
-          tcc_free(hoisted_dest);
-          tcc_free(chain_ok);
+
+next_loop:
+          /* These index positions from before the insertions. */
+          for (int lb = 0; lb < nblocks; lb++) {
+            const IRBasicBlock *lbb = &cfg->blocks[loop_blocks[lb]];
+            memset(is_invariant + lbb->start_idx, 0, lbb->end_idx - lbb->start_idx);
+            memset(chain_ok + lbb->start_idx, 0, lbb->end_idx - lbb->start_idx);
+            in_loop[loop_blocks[lb]] = 0;
+          }
 
           /* Update CFG block indices to account for inserted instructions.
            * Each tcc_ir_insert_instruction_before shifts all instructions >= insert_pos.
@@ -3593,16 +2857,16 @@ static IRLoops *licm_run(TCCIRState *ir, int late)
                 cfg->blocks[ui].end_idx += total_hoisted_here;
             }
           }
-
-          tcc_free(is_invariant);
-          tcc_free(is_exit);
-          tcc_free(def_count);
-          tcc_free(use_count);
-          tcc_free(def_at);
-          tcc_free(in_loop);
-          tcc_free(worklist);
         }
       }
+      tcc_free(in_loop);
+      tcc_free(worklist);
+      tcc_free(loop_blocks);
+      tcc_free(is_invariant);
+      tcc_free(chain_ok);
+      tcc_free(defs.e);
+      tcc_free(addr_taken.bits);
+      tcc_free(def_totals);
     }
     tcc_ir_cfg_free(cfg);
   }

@@ -192,6 +192,11 @@ names inside the DSL header (as `when/and` already are).
 
 ### D1 — unify the SSA drivers (~1.5-2 KB, one schedule to edit)
 
+**DONE 2026-11-04** on `opt/pass-merge-2026-11-03` (Phase D of
+`opt_pass_merge_and_loop_reduction.md`): `ssa_main_passes[]`, `ssa_tail_passes[]`,
+`ssa_fallback_passes[]` in driver.c, `tcc_ir_ssa_opt_run_fallback` replaces the
+clone; orders not converged; byte-identical on 5,015 objects.
+
 Table-driven runner in `ssa/engine/driver.c`:
 
 ```c

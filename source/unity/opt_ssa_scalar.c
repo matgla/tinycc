@@ -30,5 +30,3 @@
 #undef USING_GLOBALS
 #include "../opt/ssa/scalar/tmp_block_const.c"
 #undef USING_GLOBALS
-#include "../opt/ssa/scalar/var_imm_prop.c"
-#undef USING_GLOBALS

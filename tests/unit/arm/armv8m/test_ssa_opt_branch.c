@@ -596,7 +596,7 @@ UT_TEST(test_branch_cmp_var_store_immediate)
   /* STORE #7 -> V0 slot (is_local=1, is_lval=1) */
   IROperand vslot = utb_var(0, I32);
   vslot.is_lval = 1;
-  vslot.is_local = 1;
+  vslot.tag = IROP_TAG_STACKOFF;
   ssa_add_instr3(&c, TCCIR_OP_STORE, vslot, utb_imm(7, I32), UTB_NONE);
   emit_cmp_jumpif(&c, utb_var(0, I32), utb_imm(7, I32), 0x94, 4);
   ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(0, I32));

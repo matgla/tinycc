@@ -35,7 +35,9 @@ void tcc_ir_tu_propagate_noreturn_to_callers(void)
       if (!callee || !callee->type.ref)
         continue;
       int inferred_purity = tcc_ir_lookup_func_purity(tcc_state, func_cache_token(callee));
-      if (callee->type.ref->f.func_noreturn)
+      /* The first compile used what it knew: a body calling a function declared
+       * noreturn, tcc_error() above all, compiled the same twice for nothing. */
+      if (callee->type.ref->f.func_noreturn && !tu_symset_contains(&e->noreturn_known, callee))
       {
         fs->type.ref->f.func_late_reopt = 1;
         break;

@@ -423,7 +423,6 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
         /* Convert LLOCAL stack slot to a pointer in a LOCAL stack slot.
           This matches the old SValue rewrite to VT_LOCAL|VT_LVAL with VT_PTR type. */
         src = asm_operand_irop(op->vt);
-        src.is_llocal = 0;
         src.is_lval = 1;
         src.btype = IROP_BTYPE_INT32; /* pointers are 32-bit on ARMv8-M */
       }
@@ -543,7 +542,6 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
             /* Load pointer from LOCAL stack slot into out_reg.
                Change LLOCAL->LOCAL and set btype to PTR (INT32). */
             IROperand addr = ir_op;
-            addr.is_llocal = 0;
             addr.btype = IROP_BTYPE_INT32;
             MachineOperand addr_mop = machine_op_from_ir(tcc_state->ir, &addr);
             tcc_gen_mach_load_to_reg(out_reg, &addr_mop);

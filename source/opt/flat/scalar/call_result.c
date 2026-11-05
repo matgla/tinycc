@@ -143,7 +143,7 @@ OPT_GEN_FLAT(dead_sret_call, TCCIR_OP_FUNCCALLVAL)
   IROperand param0;
   if (!ir_opt_get_call_param_operand(ir, i, 0, &param0))
     return 0;
-  if (!param0.is_local || param0.is_lval)
+  if (!irop_is_local(param0) || param0.is_lval)
     return 0;
   if (irop_get_tag(param0) != IROP_TAG_STACKOFF)
     return 0;
@@ -184,7 +184,7 @@ OPT_GEN_FLAT(dead_sret_call, TCCIR_OP_FUNCCALLVAL)
     if (!irop_config[p->op].has_dest)
       continue;
     IROperand psrc1 = irop_config[p->op].has_src1 ? tcc_ir_op_get_src1(ir, p) : (IROperand){0};
-    if (!(psrc1.is_local && !psrc1.is_lval &&
+    if (!(irop_is_local(psrc1) && !psrc1.is_lval &&
           call_result_stackoff_in_range(psrc1, sret_off, sret_size)))
       continue;
     IROperand pdest = tcc_ir_op_get_dest(ir, p);
@@ -219,7 +219,7 @@ OPT_GEN_FLAT(fold_call_result_store, TCCIR_OP_FUNCCALLVAL)
   int32_t call_dest_vr = irop_get_vreg(call_dest);
   if (call_dest_vr >= 0 || call_dest_vr < -9)
     return 0;
-  if (!call_dest.is_lval || !call_dest.is_local ||
+  if (!call_dest.is_lval || !irop_is_local(call_dest) ||
       irop_get_tag(call_dest) != IROP_TAG_STACKOFF)
     return 0;
   int64_t call_dest_off = irop_get_imm64_ex(ir, call_dest);

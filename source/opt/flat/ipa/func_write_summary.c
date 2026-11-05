@@ -229,7 +229,7 @@ void tcc_ir_compute_func_write_summary(TCCIRState *ir, Sym *func_sym)
         int sbit = VR_BIT(s1_vr);
         if (sbit < 0 || sbit >= total || vp[sbit] < 0)
           continue;
-        if (!irop_is_immediate(src2) || src2.is_sym)
+        if (!irop_is_immediate(src2) || irop_is_sym(src2))
           continue;
         int64_t imm = irop_get_imm64_ex(ir, src2);
         if (imm < -65535 || imm > 65535)

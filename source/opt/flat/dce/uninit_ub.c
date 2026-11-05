@@ -23,9 +23,9 @@
 
 static int udr_store_is_observable(IROperand d)
 {
-  if (d.is_local)
+  if (irop_is_local(d))
     return 0;
-  if (!d.is_lval && !d.is_sym)
+  if (!d.is_lval && !irop_is_sym(d))
   {
     int32_t dvr = irop_get_vreg(d);
     if (dvr >= 0)
@@ -69,7 +69,7 @@ static int udr_instr_has_volatile_operand(TCCIRState *ir, IRQuadCompact *q)
     IROperand op;
     if (!udr_get_operand(ir, q, k, &op))
       continue;
-    if (op.is_sym)
+    if (irop_is_sym(op))
     {
       Sym *vs = irop_get_sym_ex(ir, op);
       if (vs && (vs->type.t & VT_VOLATILE))
@@ -84,14 +84,7 @@ static int udr_instr_has_volatile_operand(TCCIRState *ir, IRQuadCompact *q)
 
 static int udr_has_inline_asm_or_ijump(TCCIRState *ir)
 {
-  int n = ir->next_instruction_index;
-  for (int i = 0; i < n; i++)
-  {
-    TccIrOp op = ir->compact_instructions[i].op;
-    if (op == TCCIR_OP_ASM_INPUT || op == TCCIR_OP_ASM_OUTPUT || op == TCCIR_OP_INLINE_ASM || op == TCCIR_OP_IJUMP)
-      return 1;
-  }
-  return 0;
+  return (ir_opt_fn_features(ir) & (IR_FN_ASM_OPERAND | IR_FN_INLINE_ASM | IR_FN_IJUMP)) != 0;
 }
 
 /* Observable side-effect guard shared by the uninit-UB collapse passes: 1 if the
@@ -430,7 +423,7 @@ static void udr_prescan_addr_taken(TCCIRState *ir, uint8_t *addr_taken, int max_
         continue;
       if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
         continue;
-      if (op.is_local && !op.is_lval)
+      if (irop_is_local(op) && !op.is_lval)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
         if (pos >= 0 && pos < max_pos)
@@ -487,7 +480,7 @@ static int udr_entry_block_reads_uninit(TCCIRState *ir, const uint8_t *addr_take
       if (TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)
         continue;
       /* Pure address-of (is_local && !is_lval) is not a value read. */
-      if (sop.is_local && !sop.is_lval)
+      if (irop_is_local(sop) && !sop.is_lval)
         continue;
       int pos = TCCIR_DECODE_VREG_POSITION(svr);
       if (pos < 0 || pos >= UNINIT_MAX_VAR_POS)
@@ -561,170 +554,6 @@ int tcc_ir_opt_uninit_local_ub(TCCIRState *ir)
   ir_opt_set_self_jump0(ir);
 
   ir->leaffunc = 1;
-
-  return 1;
-}
-
-/* Uninit-read-dominates-return — extends uninit_local_ub from "entry block" to
- * any read of an uninit local that dominates every RETURN. Such a read makes
- * every returning execution UB, so collapse to `b .` (matching GCC -O2).
- * "Uninit" is approximated by a linear-order pre-scan: first read before any
- * write. Sound but misses conditional-uninit; address-taken VARs are excluded. */
-int tcc_ir_opt_uninit_dominates_return(TCCIRState *ir)
-{
-  int n = ir->next_instruction_index;
-  if (n == 0)
-    return 0;
-  if (!tcc_state || TCC_OPT(tcc_state, optimize) < 2)
-    return 0;
-
-  /* Guard order below is by cost, not by logic: every one of these is a pure
-   * predicate over the same unmodified IR, so they may run in any order, and
-   * the pass fires on ~0% of real functions.  The uninit-read scan is the
-   * decisive one and is two cheap operand walks; the guards it used to sit
-   * behind each walk the whole function, one of them (side effects) doing
-   * per-instruction symbol lookups for the volatile check.  Running the
-   * decisive scan first means the expensive guards are only reached by the
-   * handful of functions that could actually collapse. */
-
-#define UDR_MAX_VAR_POS 1024
-  uint8_t written[(UDR_MAX_VAR_POS + 7) / 8] = {0};
-  uint8_t addr_taken[(UDR_MAX_VAR_POS + 7) / 8] = {0};
-  udr_prescan_addr_taken(ir, addr_taken, UDR_MAX_VAR_POS);
-
-  /* Linear scan: find the FIRST instruction reading a VAR not yet written. */
-  int uninit_read_idx = -1;
-  for (int i = 0; i < n && uninit_read_idx < 0; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-
-    for (int k = 1; k <= 2; k++)
-    {
-      IROperand sop;
-      if (!udr_get_operand(ir, q, k, &sop))
-        continue;
-      int32_t svr = irop_get_vreg(sop);
-      if (svr < 0)
-        continue;
-      if (TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)
-        continue;
-      if (sop.is_local && !sop.is_lval)
-        continue;
-      int pos = TCCIR_DECODE_VREG_POSITION(svr);
-      if (pos < 0 || pos >= UDR_MAX_VAR_POS)
-        continue;
-      if (addr_taken[pos >> 3] & (uint8_t)(1u << (pos & 7)))
-        continue;
-      if (!(written[pos >> 3] & (uint8_t)(1u << (pos & 7))))
-      {
-        uninit_read_idx = i;
-        break;
-      }
-    }
-
-    if (irop_config[q->op].has_dest)
-    {
-      int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
-      if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR)
-      {
-        int pos = TCCIR_DECODE_VREG_POSITION(dvr);
-        if (pos >= 0 && pos < UDR_MAX_VAR_POS)
-          written[pos >> 3] |= (uint8_t)(1u << (pos & 7));
-      }
-    }
-  }
-#undef UDR_MAX_VAR_POS
-
-  if (uninit_read_idx < 0)
-    return 0;
-
-  /* Require an explicit or implicit return (JUMP/JUMPIF past-end == epilogue). */
-  int has_return = 0;
-  int has_implicit_return = 0;
-  for (int i = 0; i < n; i++)
-  {
-    TccIrOp op = ir->compact_instructions[i].op;
-    if (op == TCCIR_OP_RETURNVALUE || op == TCCIR_OP_RETURNVOID)
-    {
-      has_return = 1;
-      break;
-    }
-    if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF)
-    {
-      IROperand d = tcc_ir_op_get_dest(ir, &ir->compact_instructions[i]);
-      int t = (int)irop_get_imm64_ex(ir, d);
-      if (t >= n)
-        has_implicit_return = 1;
-    }
-  }
-  if (!has_return && !has_implicit_return)
-    return 0;
-
-  /* Inline asm operands aren't modeled and IJUMP targets are unknown: bail. */
-  if (udr_has_inline_asm_or_ijump(ir))
-    return 0;
-
-  /* Don't exploit the UB when the function does observable work before return. */
-  if (udr_has_observable_side_effects(ir))
-    return 0;
-
-  /* Build CFG + dominators and verify the uninit read dominates every RETURN. */
-  IRCFG *cfg = tcc_ir_cfg_build(ir);
-  if (!cfg || cfg->num_blocks == 0)
-  {
-    if (cfg)
-      tcc_ir_cfg_free(cfg);
-    return 0;
-  }
-  tcc_ir_cfg_compute_dominators(cfg);
-
-  int read_block = cfg->instr_to_block[uninit_read_idx];
-  int ok = 1;
-  for (int i = 0; i < n && ok; i++)
-  {
-    IRQuadCompact *rq = &ir->compact_instructions[i];
-    TccIrOp op = rq->op;
-    int is_ret = (op == TCCIR_OP_RETURNVALUE || op == TCCIR_OP_RETURNVOID);
-    int is_implicit_ret = 0;
-    if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF)
-    {
-      int t = (int)tcc_ir_op_dest_imm(ir, rq);
-      if (t >= n)
-        is_implicit_ret = 1;
-    }
-    if (!is_ret && !is_implicit_ret)
-      continue;
-    int ret_block = cfg->instr_to_block[i];
-    if (read_block == ret_block)
-    {
-      /* Same block: read must come before the RETURN in linear order. */
-      if (uninit_read_idx >= i)
-        ok = 0;
-    }
-    else if (!tcc_ir_cfg_dominates(cfg, read_block, ret_block))
-    {
-      ok = 0;
-    }
-  }
-  tcc_ir_cfg_free(cfg);
-
-  if (!ok)
-    return 0;
-
-  LOG_IR_GEN("UNINIT-DOM-RETURN: collapsing function body to infinite loop "
-             "(uninit VAR read at i=%d dominates all RETURNs)", uninit_read_idx);
-
-  ir_opt_nop_body(ir, n);
-
-  ir_opt_set_self_jump0(ir);
-
-  ir_opt_reset_body_regs(ir);
-  ir->noreturn = 1;
-  /* A weak body may be replaced by a strong one that returns. */
-  if (tcc_state && tcc_state->cur_func_sym && tcc_state->cur_func_sym->type.ref && !tcc_state->cur_func_sym->a.weak)
-    tcc_state->cur_func_sym->type.ref->f.func_noreturn = 1;
 
   return 1;
 }

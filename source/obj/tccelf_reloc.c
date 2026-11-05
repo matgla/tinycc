@@ -334,9 +334,9 @@ int build_got(TCCState *s1)
    * offset is a compile-time constant the codegen addresses as [R9,#24],
    * independent of the final GOT layout; the loader fills it (the YAFF writer
    * emits its relocation when -share-rodata is active). */
-  section_ptr_add(s1->got, 4 * PTR_SIZE * 2);
+  section_ptr_add(s1->got, (4 + (s1->hot_text_end ? 2 : 0)) * PTR_SIZE * 2);
 #else
-  section_ptr_add(s1->got, 3 * PTR_SIZE * 2);
+  section_ptr_add(s1->got, (s1->hot_text_end ? 6 : 3) * PTR_SIZE * 2);
 #endif
   return set_elf_sym(symtab_section, 0, 0, ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT), STV_HIDDEN, s1->got->sh_num,
                      "_GLOBAL_OFFSET_TABLE_");

@@ -17,16 +17,8 @@
 #include "../opt/flat/dce/dce.c"
 #undef USING_GLOBALS
 #include "../opt/flat/dce/dead_addrvar_elim.c"
-#undef DAV_MANY
-#undef DAV_NONE
-#undef USING_GLOBALS
-#include "../opt/flat/dce/dead_trailing_addrvar_store.c"
 #undef USING_GLOBALS
 #include "../opt/flat/dce/dead_vla.c"
-#undef CLASSIFY
-#undef USING_GLOBALS
-#include "../opt/flat/dce/infinite_loop_simplify.c"
-#undef MAX_HOIST
 #undef USING_GLOBALS
 #include "../opt/flat/dce/infinite_self_recursion.c"
 #undef USING_GLOBALS
@@ -53,7 +45,6 @@
 #undef UB_ELIDE_MAX_VAR_POS
 #undef USING_GLOBALS
 #include "../opt/flat/dce/uninit_ub.c"
-#undef UDR_MAX_VAR_POS
 #undef UDR_NOPSKIP
 #undef UDR_RR_GET
 #undef UNINIT_MAX_VAR_POS

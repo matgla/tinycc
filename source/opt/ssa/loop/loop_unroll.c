@@ -40,7 +40,7 @@ static int insn_mentions_vreg(TCCIRState *ir, IRQuadCompact *q, int32_t vr)
  * through the pointer it holds. */
 static int src_reads_vreg_value(IROperand s)
 {
-  if (irop_get_vreg(s) < 0 || s.is_llocal)
+  if (irop_get_vreg(s) < 0 || irop_is_llocal(s))
     return 0;
   int tag = irop_get_tag(s);
   return tag == IROP_TAG_VREG ? !s.is_lval : tag == IROP_TAG_STACKOFF;
@@ -348,7 +348,7 @@ int ssa_opt_loop_unroll(TCCIRState *ir)
 /* A plain full-width register value; late counters have no addressable slot. */
 static int late_unroll_value(IROperand o)
 {
-  return irop_get_tag(o) == IROP_TAG_VREG && !o.is_lval && !o.is_llocal &&
+  return irop_get_tag(o) == IROP_TAG_VREG && !o.is_lval && !irop_is_llocal(o) &&
          irop_get_btype(o) == IROP_BTYPE_INT32;
 }
 
@@ -625,7 +625,7 @@ static int mx_read(TCCIRState *ir, MxState *s, IROperand o, int32_t *out)
   {
     // Read the vreg's value, never its address or a pointer dereference.
     int tag = irop_get_tag(o);
-    if (irop_get_vreg(o) < 0 || o.is_llocal ||
+    if (irop_get_vreg(o) < 0 || irop_is_llocal(o) ||
         !(tag == IROP_TAG_VREG ? !o.is_lval : tag == IROP_TAG_STACKOFF && o.is_lval))
       return 0;
     if (mx_escaped(ir, s->esc, irop_get_vreg(o)))
@@ -702,7 +702,7 @@ static int mx_entry_state(TCCIRState *ir, int start, int end, MxState *s)
         }
         int known = 0;
         int32_t v = 0;
-        if (q->op == TCCIR_OP_ASSIGN && irop_get_btype(d) == IROP_BTYPE_INT32 && !d.is_llocal)
+        if (q->op == TCCIR_OP_ASSIGN && irop_get_btype(d) == IROP_BTYPE_INT32 && !irop_is_llocal(d))
         {
           IROperand src = tcc_ir_op_get_src1(ir, q);
           if (irop_is_immediate(src) && irop_get_btype(src) == IROP_BTYPE_INT32)
@@ -819,7 +819,7 @@ static int mx_walk(TCCIRState *ir, int start, int end, int rewrite, const MxEsc 
       {
         int known = 0;
         int32_t v = 0, a, b;
-        if (irop_get_btype(d) == IROP_BTYPE_INT32 && !d.is_llocal && !mx_has_barrel(ir, q))
+        if (irop_get_btype(d) == IROP_BTYPE_INT32 && !irop_is_llocal(d) && !mx_has_barrel(ir, q))
         {
           IROperand s1 = irop_config[q->op].has_src1 ? tcc_ir_op_get_src1(ir, q) : (IROperand){0};
           IROperand s2 = irop_config[q->op].has_src2 ? tcc_ir_op_get_src2(ir, q) : (IROperand){0};
@@ -935,7 +935,7 @@ static int mx_temp_local(TCCIRState *ir, int start, int end, int32_t vr)
 static int mx_value_read(IROperand o)
 {
   int tag = irop_get_tag(o);
-  return irop_get_vreg(o) >= 0 && !o.is_llocal && (tag == IROP_TAG_VREG ? !o.is_lval : tag == IROP_TAG_STACKOFF && o.is_lval);
+  return irop_get_vreg(o) >= 0 && !irop_is_llocal(o) && (tag == IROP_TAG_VREG ? !o.is_lval : tag == IROP_TAG_STACKOFF && o.is_lval);
 }
 
 /* Operand slot K (0 dest, 1 src1, 2 src2, 3 fourth) of Q into *O; 0 if absent. */
@@ -968,12 +968,12 @@ static int mx_narrow_store_plan(TCCIRState *ir, int s, int end, const MxEsc *esc
   IROperand d = tcc_ir_op_get_dest(ir, sq), x = tcc_ir_op_get_src1(ir, sq);
   int32_t dv = irop_get_vreg(d), xv = irop_get_vreg(x);
   int bt = irop_get_btype(d);
-  if (dv < 0 || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_VAR || !irop_dest_defines_vreg(d) || d.is_llocal ||
+  if (dv < 0 || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_VAR || !irop_dest_defines_vreg(d) || irop_is_llocal(d) ||
       (bt != IROP_BTYPE_INT8 && bt != IROP_BTYPE_INT16) || mx_escaped(ir, esc, dv))
     return 0;
   int x_imm = irop_get_tag(x) == IROP_TAG_IMM32 && !x.is_lval;
   /* A load through a pointer vreg at V's own width. */
-  int x_mem = irop_get_tag(x) == IROP_TAG_VREG && x.is_lval && !x.is_llocal && xv >= 0 && irop_get_btype(x) == bt;
+  int x_mem = irop_get_tag(x) == IROP_TAG_VREG && x.is_lval && !irop_is_llocal(x) && xv >= 0 && irop_get_btype(x) == bt;
   if (x_mem && (mx_escaped(ir, esc, xv) || tcc_ir_access_is_volatile(ir, x)))
     return 0;
   /* X read at any integer width up to a word: the STORE keeps its low
@@ -1011,7 +1011,7 @@ static int mx_narrow_store_plan(TCCIRState *ir, int s, int end, const MxEsc *esc
     if (x_mem) /* the read becomes the load itself: typed exactly like one */
       rd_ok = rd.is_unsigned && rbt == bt;
     if (!mx_value_read(r) || irop_get_btype(r) != bt || !r.is_unsigned || irop_get_vreg(rd) < 0 ||
-        !irop_dest_defines_vreg(rd) || !rd_ok || rd.is_llocal ||
+        !irop_dest_defines_vreg(rd) || !rd_ok || irop_is_llocal(rd) ||
         irop_get_vreg(rd) == dv || (!x_imm && irop_get_vreg(rd) == xv))
       return 0;
     reads[(*nreads)++] = i;

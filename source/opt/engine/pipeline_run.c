@@ -71,9 +71,17 @@ static void pipeline_apply_invalidations(IROptCtx *ctx)
   tcc_ir_opt_ctx_invalidate(ctx);
 }
 
+/* A plain pass sees the IR exactly as the generation counter describes it, so
+ * ir_opt_fn_features may serve it from the cache; a ctx pass (a cascade) runs
+ * sub-passes that mutate before the counter moves, so it scans afresh. */
 static int pipeline_call(IROptCtx *ctx, const IROptPass *pass)
 {
-  return pass->takes_ir ? pass->fn.run_ir(ctx->ir) : pass->fn.run(ctx);
+  if (!pass->takes_ir)
+    return pass->fn.run(ctx);
+  ctx->ir->opt_generation = ctx->generation;
+  int changes = pass->fn.run_ir(ctx->ir);
+  ctx->ir->opt_generation = 0;
+  return changes;
 }
 
 #if CONFIG_TCC_DEBUG_ENV

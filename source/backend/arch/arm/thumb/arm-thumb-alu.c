@@ -1785,6 +1785,13 @@ ST_FUNC int tcc_machine_has_bit_ops(void)
   return arm_target_dependent.feat.t32 && arm_target_dependent.feat.clz_rbit;
 }
 
+/* tcc_machine_has_unaligned_words: may a word LDR/STR use any address?  Thumb-2
+ * cores take it in hardware (not LDRD or LDM); baseline ones fault. */
+ST_FUNC int tcc_machine_has_unaligned_words(void)
+{
+  return arm_target_dependent.feat.t32;
+}
+
 /* tcc_gen_machine_bitop1_mop: emit a single-operand bit manipulation,
  * dest = <op>(src1), for TCCIR_OP_CLZ / RBIT / REV / REV16. */
 ST_FUNC void tcc_gen_machine_bitop1_mop(MachineOperand src1, MachineOperand dest, TccIrOp op)

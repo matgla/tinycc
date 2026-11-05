@@ -105,7 +105,7 @@ OPT_GEN_FLAT(disp, TCCIR_OP_LOAD)
 
   if (imm > 4095 || imm < -255)
     return 0;
-  if (base_op.is_local || base_op.is_llocal || base_op.is_lval)
+  if (irop_is_local(base_op) || irop_is_llocal(base_op) || base_op.is_lval)
     return 0;
   if (!ir_xform_same_block(ir, add_idx, i))
     return 0;

@@ -769,7 +769,7 @@ void agg_packed_bitfield(void)
   z = a;
 }
 /* ...while a non-volatile local's dead copies still go. */
-/*@ stack ; expect: ; O0: S8 S8 L4 S4 L4 S4 S8 S8 L4 S4 L4 S4 */
+/*@ stack ; expect: ; O0: S4 S4 S4 S4 L4 S4 L4 S4 S4 S4 S4 S4 L4 S4 L4 S4 */
 void agg_nonvolatile_dead(void)
 {
   struct agg_S z;

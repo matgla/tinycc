@@ -100,7 +100,9 @@ int tcc_ir_opt_bool_diamond_branch(TCCIRState *ir)
      * needed: only the pure TEST/JUMPIF pair is bypassed. */
     int mirrored = 0;
     int arm_idx[8], arm_count = 0;
-    for (int p = 0; p < n; p++)
+    /* Nothing jumps to a test without the flag: this was a walk of the function
+     * per test. */
+    for (int p = 0; qt->is_jump_target && p < n; p++)
     {
       IRQuadCompact *qp = &ir->compact_instructions[p];
       if (qp->op != TCCIR_OP_JUMP)

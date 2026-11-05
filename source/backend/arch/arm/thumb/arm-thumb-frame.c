@@ -580,7 +580,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
     uint32_t incoming_arg_regs_mask = 0;
     for (int vreg = 0; vreg < ir->next_parameter; ++vreg)
     {
-      const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
+      const int encoded_vreg = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_PARAM, vreg);
       IRLiveInterval *interval = tcc_ir_get_live_interval(ir, encoded_vreg);
       if (!interval)
         continue;
@@ -592,7 +592,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
 
     for (int vreg = 0; vreg < ir->next_parameter; ++vreg)
     {
-      const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
+      const int encoded_vreg = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_PARAM, vreg);
       IRLiveInterval *interval = tcc_ir_get_live_interval(ir, encoded_vreg);
 
       if (!interval)

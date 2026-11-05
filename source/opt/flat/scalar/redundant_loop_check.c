@@ -81,7 +81,7 @@ int tcc_ir_opt_redundant_loop_check(TCCIRState *ir)
         continue;
 
       IROperand s2 = tcc_ir_op_get_src2(ir, cq);
-      if (!irop_is_immediate(s2) || s2.is_sym)
+      if (!irop_is_immediate(s2) || irop_is_sym(s2))
         continue;
       int32_t vr = tcc_ir_op_src1_vreg(ir, cq);
       if (vr < 0)

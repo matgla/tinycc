@@ -23,7 +23,7 @@ static void gsd_read_reset(TCCIRState *ir, IROperand op, GSDPend *pend, int *np)
 {
   if (!op.is_lval)
     return;
-  if (op.is_sym) {
+  if (irop_is_sym(op)) {
     IRPoolSymref *ref = irop_get_symref_ex(ir, op);
     if (ref && ref->sym) {
       for (int k = 0; k < *np;) {
@@ -37,7 +37,7 @@ static void gsd_read_reset(TCCIRState *ir, IROperand op, GSDPend *pend, int *np)
     *np = 0;
     return;
   }
-  if (op.tag == IROP_TAG_STACKOFF || op.is_local || op.is_llocal)
+  if (op.tag == IROP_TAG_STACKOFF || irop_is_local(op) || irop_is_llocal(op))
     return;
   *np = 0;
 }
@@ -78,7 +78,7 @@ int ssa_opt_global_store_dse(IRSSAOptCtx *ctx)
 
     if (q->op == TCCIR_OP_STORE) {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
-      if (dest.is_sym && dest.is_lval && !tcc_ir_op_src1_is_lval(ir, q) &&
+      if (irop_is_sym(dest) && dest.is_lval && !tcc_ir_op_src1_is_lval(ir, q) &&
           irop_get_btype(dest) == IROP_BTYPE_INT32) {
         IRPoolSymref *ref = irop_get_symref_ex(ir, dest);
         if (ref && ref->sym && !(ref->sym->type.t & VT_VOLATILE) && !tcc_ir_instr_access_is_volatile(ir, q)) {

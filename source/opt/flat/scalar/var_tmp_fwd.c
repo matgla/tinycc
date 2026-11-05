@@ -231,7 +231,7 @@ OPT_GEN_FLAT(var_tmp_fwd, -1)
     if (!src1_is_address && can_rewrite_src1 && irop_config[q->op].has_src1)
     {
       IROperand s = tcc_ir_op_get_src1(ir, q);
-      if (irop_get_vreg(s) == dest_vr && irop_get_btype(s) == src_btype && !s.is_llocal)
+      if (irop_get_vreg(s) == dest_vr && irop_get_btype(s) == src_btype && !irop_is_llocal(s))
       {
         tcc_ir_set_src1(ir, j, src1);
         changes++;
@@ -241,7 +241,7 @@ OPT_GEN_FLAT(var_tmp_fwd, -1)
     if (can_rewrite_src2 && irop_config[q->op].has_src2)
     {
       IROperand s = tcc_ir_op_get_src2(ir, q);
-      if (irop_get_vreg(s) == dest_vr && irop_get_btype(s) == src_btype && !s.is_llocal)
+      if (irop_get_vreg(s) == dest_vr && irop_get_btype(s) == src_btype && !irop_is_llocal(s))
       {
         tcc_ir_set_src2(ir, j, src1);
         changes++;

@@ -58,11 +58,11 @@ int tcc_ir_opt_add_reassoc(TCCIRState *ir)
       continue;
 
     /* Bail on real memory derefs only; register-promoted locals/llocals carry is_lval as a tag but read from a register. */
-    if (src1.is_lval && !src1.is_const && !src1.is_local && !src1.is_llocal)
+    if (src1.is_lval && !irop_is_const(src1) && !irop_is_local(src1) && !irop_is_llocal(src1))
       continue;
 
     /* Direct case: src1 is a symref-by-value (symref-prop folded the vreg into a sym operand) — combine the immediate into the addend. */
-    if (src1.is_sym && !src1.is_lval)
+    if (irop_is_sym(src1) && !src1.is_lval)
     {
       IRPoolSymref *sref = irop_get_symref_ex(ir, src1);
       if (!sref || !sref->sym)
@@ -75,11 +75,9 @@ int tcc_ir_opt_add_reassoc(TCCIRState *ir)
       Sym *target_sym = sref->sym;
       uint32_t sref_flags = sref->flags;
       int btype_d = irop_get_btype(src1);
-      uint8_t local_d = src1.is_local;
-      uint8_t const_d = src1.is_const;
       uint8_t uns_d = src1.is_unsigned;
       uint32_t pool_idx_d = tcc_ir_pool_add_symref(ir, target_sym, (int32_t)new_addend_d, sref_flags);
-      IROperand new_src_d = irop_make_symref(-1, pool_idx_d, 0, local_d, const_d, btype_d);
+      IROperand new_src_d = irop_make_symref(-1, pool_idx_d, 0, btype_d);
       new_src_d.is_unsigned = uns_d;
       q->op = TCCIR_OP_ASSIGN;
       tcc_ir_set_src1(ir, i, new_src_d);
@@ -145,7 +143,7 @@ int tcc_ir_opt_add_reassoc(TCCIRState *ir)
     else if (def_q->op == TCCIR_OP_ASSIGN)
     {
       def_src1 = tcc_ir_op_get_src1(ir, def_q);
-      if (!def_src1.is_sym || def_src1.is_lval)
+      if (!irop_is_sym(def_src1) || def_src1.is_lval)
         continue;
       def_is_assign_symref = 1;
       eff_c1 = 0;
@@ -156,7 +154,7 @@ int tcc_ir_opt_add_reassoc(TCCIRState *ir)
     }
 
     /* Reject forwarding a real memory deref def_src1 (is_lval, non-local/llocal): an intervening STORE/CALL may have changed it. is_const is deliberately excluded — a global symref deref is is_const (address) but its value changes across stores. */
-    if (def_src1.is_lval && !def_src1.is_local && !def_src1.is_llocal)
+    if (def_src1.is_lval && !irop_is_local(def_src1) && !irop_is_llocal(def_src1))
       continue;
 
     /* def_src1 must not be redefined in [def_idx, i) — incl. def_q itself for self-update chains like V0 = V0 + 200. */
@@ -227,7 +225,7 @@ int tcc_ir_opt_add_reassoc(TCCIRState *ir)
       if (new_addend != (int32_t)new_addend)
         continue;
       uint32_t pool_idx = tcc_ir_pool_add_symref(ir, sref->sym, (int32_t)new_addend, sref->flags);
-      IROperand new_src = irop_make_symref(-1, pool_idx, 0, def_src1.is_local, def_src1.is_const,
+      IROperand new_src = irop_make_symref(-1, pool_idx, 0,
                                            irop_get_btype(def_src1));
       new_src.is_unsigned = def_src1.is_unsigned;
       q->op = TCCIR_OP_ASSIGN;

@@ -44,6 +44,7 @@ static void setup_tcc_state(void)
   tcc_state->float_registers_for_allocator = 32;
   tcc_state->float_registers_map_for_allocator = (1ull << 32) - 1;
   tcc_state->optimize = 0;
+  tcc_state->opt_peephole = 1;
 }
 
 static SValue lval_of(SValue sv)
@@ -122,13 +123,10 @@ static int emit_imm32_store_indexed(TCCIRState *ir, int base_vreg, int32_t value
 
 /* Hand-builds a raw stackoff operand representing a plain (non-llocal) spill
  * slot: vr=-1, is_lval=1 (so machine_op_from_ir yields MACH_OP_SPILL rather
- * than MACH_OP_FRAME_ADDR), is_llocal=0 (so needs_deref comes out false --
- * the double-indirection llocal case is test_codegen_atomic.c's concern, not
- * this one). Mirrors test_atomic_style_llocal_operand's construction, minus
- * the llocal flag. */
+ * than MACH_OP_FRAME_ADDR). */
 static IROperand spill_slot_op(int32_t offset)
 {
-  return irop_make_stackoff(-1, offset, 1, 0, 0, IROP_BTYPE_INT32);
+  return irop_make_stackoff(-1, offset, 1, 0, IROP_BTYPE_INT32);
 }
 
 /* dest = spill slot, src1 = plain register value -- the shape both the
@@ -1093,8 +1091,8 @@ UT_TEST(test_dispatch_block_copy_routes_to_block_copy_mop)
   uint32_t symref_idx = tcc_ir_pool_add_symref(ir, NULL, 0, 0);
 
   int pool_base = ir->iroperand_pool_count;
-  tcc_ir_pool_add(ir, irop_make_stackoff(-1, -16, 0, 0, 0, IROP_BTYPE_INT32)); /* dest: stack offset */
-  tcc_ir_pool_add(ir, irop_make_symref(-1, symref_idx, 0, 1, 1, IROP_BTYPE_INT32)); /* src1: symbol ref */
+  tcc_ir_pool_add(ir, irop_make_stackoff(-1, -16, 0, 0, IROP_BTYPE_INT32)); /* dest: stack offset */
+  tcc_ir_pool_add(ir, irop_make_symref(-1, symref_idx, 0, IROP_BTYPE_INT32)); /* src1: symbol ref */
   tcc_ir_pool_add(ir, irop_make_imm32(-1, 64, IROP_BTYPE_INT32)); /* src2: size in bytes */
   int idx = ir->next_instruction_index;
   IRQuadCompact *q = &ir->compact_instructions[idx];

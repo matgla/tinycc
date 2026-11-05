@@ -44,6 +44,7 @@
 #undef NRVO_MAX_OBJ
 #undef NRVO_MAX_REFS
 #undef NRVO_MAX_SITES
+#undef NRVO_READ
 #undef NRVO_SPAN_MAX
 #undef NRVO_SPAN_WORDS
 #undef NRVO_VIDX

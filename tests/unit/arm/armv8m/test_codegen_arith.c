@@ -49,6 +49,7 @@ static void setup_tcc_state(void)
   tcc_state->float_registers_for_allocator = 32;
   tcc_state->float_registers_map_for_allocator = (1ull << 32) - 1;
   tcc_state->optimize = 0;
+  tcc_state->opt_peephole = 1;
 }
 
 /* -O0 no longer runs the dry-run/rehearsal walks: it skips the rehearsal

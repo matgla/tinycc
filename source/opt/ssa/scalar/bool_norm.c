@@ -119,8 +119,8 @@ static int k01_temp(IRSSAOptCtx *ctx, int32_t vr, int depth, int vars_left)
     return k01_operand(ctx, s1, depth + 1, vars_left);
   case TCCIR_OP_AND:
     /* `v & 1` is boolean whatever v holds. */
-    if ((irop_is_plain_imm(s1) && !s1.is_sym && irop_get_imm64_ex(ir, s1) == 1) ||
-        (irop_is_plain_imm(s2) && !s2.is_sym && irop_get_imm64_ex(ir, s2) == 1))
+    if ((irop_is_plain_imm(s1) && !irop_is_sym(s1) && irop_get_imm64_ex(ir, s1) == 1) ||
+        (irop_is_plain_imm(s2) && !irop_is_sym(s2) && irop_get_imm64_ex(ir, s2) == 1))
       return 1;
     /* fall through */
   case TCCIR_OP_OR:
@@ -137,13 +137,13 @@ static int k01_operand(IRSSAOptCtx *ctx, IROperand op, int depth, int vars_left)
 {
   if (depth > K01_MAX_DEPTH)
     return 0;
-  if (irop_is_plain_imm(op) && !op.is_sym)
+  if (irop_is_plain_imm(op) && !irop_is_sym(op))
   {
     int64_t v = irop_get_imm64_ex(ctx->ir, op);
     return v == 0 || v == 1;
   }
   int32_t vr = irop_get_vreg(op);
-  if (vr < 0 || op.is_sym)
+  if (vr < 0 || irop_is_sym(op))
     return 0;
   int ty = TCCIR_DECODE_VREG_TYPE(vr);
   if (ty == TCCIR_VREG_TYPE_TEMP)
@@ -203,7 +203,7 @@ static void bn_add_use(IRSSAOptCtx *ctx, IROperand op, int idx)
 
 static int bn_is_imm(TCCIRState *ir, IROperand op, int64_t want)
 {
-  return irop_is_plain_imm(op) && !op.is_sym && irop_get_imm64_ex(ir, op) == want;
+  return irop_is_plain_imm(op) && !irop_is_sym(op) && irop_get_imm64_ex(ir, op) == want;
 }
 
 /* Retarget a SETIF (dest+src1) as a binary op (dest+src1+src2).  The pool packs
@@ -332,7 +332,7 @@ static int bn_not_test(IRSSAOptCtx *ctx, int i)
   IROperand t = tcc_ir_op_get_src1(ir, q);
   int32_t tvr = irop_get_vreg(t);
   /* Both are 0 or 1, so the width either is tested at does not matter. */
-  if (t.is_lval || t.is_sym || tvr < 0 || TCCIR_DECODE_VREG_TYPE(tvr) != TCCIR_VREG_TYPE_TEMP || bn_not_int(t))
+  if (t.is_lval || irop_is_sym(t) || tvr < 0 || TCCIR_DECODE_VREG_TYPE(tvr) != TCCIR_VREG_TYPE_TEMP || bn_not_int(t))
     return 0;
   IRSSAVregInfo *tvi = ssa_opt_vinfo(ctx, tvr);
   if (!tvi || tvi->def_count != 1 || tvi->def_phi_block >= 0 || tvi->def_instr < 0 || tvi->use_count != 1)

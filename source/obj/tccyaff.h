@@ -23,7 +23,7 @@
  *        returned, so an object aligned past that -- `static int buf[4]
  *        __attribute__((aligned(64)))` -- was aligned only against a base the
  *        linker assumed and nothing reproduced. */
-#define YAFF_VERSION 4
+#define YAFF_VERSION 5
 
 typedef struct {
   uint32_t nbucket;
@@ -116,6 +116,16 @@ typedef struct __attribute__((packed)) YaffArchSection {
   uint32_t required_features; /* bitmask of YaffArchFeature */
 } YaffArchSection;
 
+/* An image linked with --hot-text: a block of its code the loader may run from a
+ * copy in fast memory, addresses into it going to the copy.  The flash copy stays
+ * valid code, so a loader that ignores this or finds no memory still runs it.
+ * Grown through YaffArchSection.size; every other image keeps the short section. */
+typedef struct __attribute__((packed)) YaffHotTextArchSection {
+  YaffArchSection arch;
+  uint32_t hot_text_offset; /* into the code section, 8-aligned */
+  uint32_t hot_text_length;
+} YaffHotTextArchSection;
+
 /* Every code address the module hands the loader -- an exported symbol, a
  * data relocation's value -- already carries its Thumb bit exactly: set for
  * code, clear for a data object placed in an executable section.  Without it
@@ -185,7 +195,14 @@ typedef struct __attribute__((packed)) YaffHeader {
    * the alignment it had at link time. */
   uint32_t data_alignment;
   uint32_t data_alignment_offset;
+  /* YAFF_MEMORY_*: where the process's memory should go (-slow-memory). */
+  uint32_t memory_flags;
 } YaffHeader;
+
+/* Start the process's stack, data and thunks in the slowest memory with room:
+ * for programs that mostly wait on others, like the shell, and should not take
+ * fast memory from what they start. */
+#define YAFF_MEMORY_SLOW 1u
 
 typedef enum YaffSectionCode {
   YAFF_SECTION_CODE = 0,

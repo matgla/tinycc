@@ -102,81 +102,18 @@ static void rse_free_def_map(void)
   rse_def_map_size = 0;
 }
 
-static int rse_resolve_temp_addr_impl(TCCIRState *ir, int32_t vr,
-                                      const Sym **out_sym, int64_t *out_off,
-                                      int depth)
-{
-  if (depth <= 0)
-    return 0;
-  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
-    return 0;
-
-  int pos = TCCIR_DECODE_VREG_POSITION(vr);
-  if (!rse_def_map || pos >= rse_def_map_size)
-    return 0;
-  int def_idx = rse_def_map[pos];
-  if (def_idx < 0) /* -1 (none) or RSE_DEF_MULTI */
-    return 0;
-
-  IRQuadCompact *dq = &ir->compact_instructions[def_idx];
-  if (dq->op != TCCIR_OP_ADD && dq->op != TCCIR_OP_LEA && dq->op != TCCIR_OP_ASSIGN)
-    return 0;
-  IROperand s1 = tcc_ir_op_get_src1(ir, dq);
-
-  int64_t base_off = 0;
-  const Sym *base_sym = NULL;
-  int resolved = 0;
-
-  /* Case A: src1 is a SYMREF (&global + addend). */
-  if (s1.is_sym && !s1.is_lval)
-  {
-    IRPoolSymref *sr = irop_get_symref_ex(ir, s1);
-    if (!sr || !sr->sym)
-      return 0;
-    base_sym = sr->sym;
-    base_off = (int64_t)sr->addend;
-    resolved = 1;
-  }
-  /* Case B: src1 is a stack-local STACKOFF (Addr[StackLoc[off]]).  A non-zero
-     vreg_type marks a vreg's *potential* spill encoding, where the offset is only
-     metadata and the program reads the vreg — see IROP_TAG_STACKOFF in
-     tccir_operand.h.  Treating one as a real slot would key two unrelated
-     addresses the same. */
-  else if (s1.is_local && !s1.is_lval && !s1.is_llocal && irop_get_tag(s1) == IROP_TAG_STACKOFF &&
-           irop_get_vreg(s1) < 0)
-  {
-    base_sym = NULL;
-    base_off = irop_get_stack_offset(s1);
-    resolved = 1;
-  }
-  /* Case C: src1 is itself a TEMP — recurse. */
-  else if (!s1.is_lval && irop_get_tag(s1) == IROP_TAG_VREG)
-  {
-    int32_t inner_vr = irop_get_vreg(s1);
-    if (!rse_resolve_temp_addr_impl(ir, inner_vr, &base_sym, &base_off, depth - 1))
-      return 0;
-    resolved = 1;
-  }
-
-  if (!resolved)
-    return 0;
-
-  if (dq->op == TCCIR_OP_ADD)
-  {
-    if (!tcc_ir_op_src2_is_imm(ir, dq))
-      return 0;
-    base_off += tcc_ir_op_src2_imm(ir, dq);
-  }
-
-  *out_sym = base_sym;
-  *out_off = base_off;
-  return 1;
-}
-
+/* Resolve a single-def TEMP to (sym, byte_off): `&global + addend` or a frame
+   slot, through ADD #imm chains and TEMP copies, four TEMPs deep. */
 static int rse_resolve_temp_addr(TCCIRState *ir, int32_t vr,
                                  const Sym **out_sym, int64_t *out_off)
 {
-  return rse_resolve_temp_addr_impl(ir, vr, out_sym, out_off, 4);
+  IRAddrWalk w = {.max_hops = 4, .flags = IR_AW_SYMREF | IR_AW_TEMP_SLOT, .def_at = rse_def_map, .n_temps = rse_def_map_size};
+  IRAddrKey k;
+  if (!ir_opt_addr_walk(ir, vr, -1, &w, &k))
+    return 0;
+  *out_sym = k.sym;
+  *out_off = k.off;
+  return 1;
 }
 
 /* Reject accesses reaching outside `sym`: a cross-symbol key would alias two
@@ -225,7 +162,7 @@ static int rse_resolve_store_addr(TCCIRState *ir, IRQuadCompact *q,
                         : irop_btype_byte_width(dest.btype);
 
   /* Direct SYMREF dest (STORE_INDEXED base may have lost is_lval via disp_fusion). */
-  if (dest.is_sym)
+  if (irop_is_sym(dest))
   {
     if (op == TCCIR_OP_STORE && !dest.is_lval)
       return 0;
@@ -244,7 +181,7 @@ static int rse_resolve_store_addr(TCCIRState *ir, IRQuadCompact *q,
      as the LEA form above (NULL sym, frame offset), so the two unify.  Restricted
      to slots with no backing vreg: a VAR-backed local reports offset 0 whatever
      its position, so its offset would alias every other VAR's. */
-  if (dest.is_local && dest.is_lval && !dest.is_llocal && irop_get_tag(dest) == IROP_TAG_STACKOFF &&
+  if (irop_is_local(dest) && dest.is_lval && !irop_is_llocal(dest) && irop_get_tag(dest) == IROP_TAG_STACKOFF &&
       irop_get_vreg(dest) < 0)
   {
     *out_sym = NULL;
@@ -328,7 +265,7 @@ static int rse_resolve_arg_addr(TCCIRState *ir, IROperand arg, const Sym **out_s
 {
   if (arg.is_lval)
     return 0;
-  if (arg.is_sym)
+  if (irop_is_sym(arg))
   {
     IRPoolSymref *sr = irop_get_symref_ex(ir, arg);
     if (!sr || !sr->sym)
@@ -337,7 +274,7 @@ static int rse_resolve_arg_addr(TCCIRState *ir, IROperand arg, const Sym **out_s
     *out_off = (int64_t)sr->addend;
     return 1;
   }
-  if (arg.is_local && !arg.is_llocal && irop_get_tag(arg) == IROP_TAG_STACKOFF && irop_get_vreg(arg) < 0)
+  if (irop_is_local(arg) && !irop_is_llocal(arg) && irop_get_tag(arg) == IROP_TAG_STACKOFF && irop_get_vreg(arg) < 0)
   {
     *out_sym = NULL;
     *out_off = irop_get_stack_offset(arg);
@@ -363,7 +300,7 @@ static int rse_collect_copy_sources(TCCIRState *ir, RseRegion *out, int max)
     IROperand size_op, src_op;
     if (!ir_opt_get_call_param_operand(ir, i, 2, &size_op))
       continue;
-    if (!irop_is_immediate(size_op) || size_op.is_sym)
+    if (!irop_is_immediate(size_op) || irop_is_sym(size_op))
       continue;
     int64_t size = irop_get_imm64_ex(ir, size_op);
     if (size <= 0 || size > 4096)
@@ -550,7 +487,7 @@ int tcc_ir_opt_byte_store_merge(TCCIRState *ir)
    `Addr[StackLoc[off]]` or a single-def TEMP (incl. +imm chains). */
 static int cmd_resolve_addr_op(TCCIRState *ir, IROperand op, const Sym **sym, int64_t *off)
 {
-  if (irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_local && !op.is_llocal &&
+  if (irop_get_tag(op) == IROP_TAG_STACKOFF && irop_is_local(op) && !irop_is_llocal(op) &&
       irop_get_vreg(op) == -1)
   {
     *sym = NULL;
@@ -1138,14 +1075,9 @@ int tcc_ir_opt_const_memcpy_to_dest(TCCIRState *ir)
     return 0;
   if (ir->captured_count > 0 || ir->has_static_chain)
     return 0;
-  for (int i = 0; i < n; i++)
-  {
-    int op = ir->compact_instructions[i].op;
-    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SETJMP || op == TCCIR_OP_LONGJMP ||
-        op == TCCIR_OP_INLINE_ASM || op == TCCIR_OP_VLA_ALLOC ||
-        op == TCCIR_OP_SET_CHAIN || op == TCCIR_OP_INIT_CHAIN_SLOT)
-      return 0;
-  }
+  if (ir_opt_fn_features(ir) & (IR_FN_IJUMP | IR_FN_SETJMP | IR_FN_LONGJMP | IR_FN_INLINE_ASM |
+                                IR_FN_VLA_ALLOC | IR_FN_SET_CHAIN | IR_FN_INIT_CHAIN_SLOT))
+    return 0;
 
   int changes = 0;
   rse_build_def_map(ir);

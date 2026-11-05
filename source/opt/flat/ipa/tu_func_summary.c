@@ -71,6 +71,7 @@ void tcc_ir_tu_func_summary_clear_all(void)
   {
     TuFuncSummary *n = tu_summary_head->next;
     tu_symset_free(&tu_summary_head->calls);
+    tu_symset_free(&tu_summary_head->noreturn_known);
     tu_symset_free(&tu_summary_head->static_reads);
     tu_symset_free(&tu_summary_head->static_writes);
     tu_symset_free(&tu_summary_head->global_writes);
@@ -82,7 +83,7 @@ void tcc_ir_tu_func_summary_clear_all(void)
 
 static Sym *tu_extract_sym(TCCIRState *ir, IROperand op)
 {
-  if (!op.is_sym)
+  if (!irop_is_sym(op))
     return NULL;
   IRPoolSymref *ref = irop_get_symref_ex(ir, op);
   return ref ? ref->sym : NULL;
@@ -255,7 +256,7 @@ void tcc_ir_collect_tu_static_reads_preopt(TCCIRState *ir)
     {
       IROperand op = rops[oi];
       Sym *sym = NULL;
-      if (op.is_sym)
+      if (irop_is_sym(op))
         sym = tu_extract_sym(ir, op);
       else if (irop_get_vreg(op) >= 0)
         sym = tu_vreg_map_lookup(map, mc, irop_get_vreg(op));
@@ -281,20 +282,48 @@ void tcc_ir_collect_tu_static_reads_preopt(TCCIRState *ir)
         if (is_addr_derive && irop_config[q->op].has_src1)
         {
           IROperand s1 = tcc_ir_op_get_src1(ir, q);
-          if (s1.is_sym && !s1.is_lval)
+          if (irop_is_sym(s1) && !s1.is_lval)
             derived = tu_extract_sym(ir, s1);
-          else if (!s1.is_sym && !s1.is_lval && irop_get_vreg(s1) >= 0)
+          else if (!irop_is_sym(s1) && !s1.is_lval && irop_get_vreg(s1) >= 0)
             derived = tu_vreg_map_lookup(map, mc, irop_get_vreg(s1));
         }
         if (!derived && q->op == TCCIR_OP_MLA)
         {
           IROperand acc = tcc_ir_op_get_accum(ir, q);
-          if (acc.is_sym && !acc.is_lval)
+          if (irop_is_sym(acc) && !acc.is_lval)
             derived = tu_extract_sym(ir, acc);
-          else if (!acc.is_sym && !acc.is_lval && irop_get_vreg(acc) >= 0)
+          else if (!irop_is_sym(acc) && !acc.is_lval && irop_get_vreg(acc) >= 0)
             derived = tu_vreg_map_lookup(map, mc, irop_get_vreg(acc));
         }
         tu_vreg_map_def(map, &mc, dvr, derived && tu_is_static_global_candidate(derived) ? derived : NULL);
+      }
+    }
+  }
+  /* An overflowed map lost what it knew about every address taken or derived, before
+   * the overflow too, so any address use may be the one a later pass folds away. */
+  if (mc == TU_VREG_MAP_OVERFLOW)
+  {
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      IROperand rops[3];
+      int nrops = 0;
+      if (irop_config[q->op].has_src1)
+        rops[nrops++] = tcc_ir_op_get_src1(ir, q);
+      if (irop_config[q->op].has_src2)
+        rops[nrops++] = tcc_ir_op_get_src2(ir, q);
+      if (q->op == TCCIR_OP_MLA)
+        rops[nrops++] = tcc_ir_op_get_accum(ir, q);
+      for (int oi = 0; oi < nrops; oi++)
+      {
+        if (!irop_is_sym(rops[oi]))
+          continue;
+        Sym *sym = tu_extract_sym(ir, rops[oi]);
+        if (sym && tu_is_static_global_candidate(sym) &&
+            !(oi == 0 && !rops[oi].is_lval && tu_is_block_copy_dest_param(ir, q, copy_ids, nids)))
+          tu_symset_add(&tu_source_reads, sym);
       }
     }
   }
@@ -468,7 +497,7 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
         if (irop_config[q->op].has_src1)
         {
           IROperand s1 = tcc_ir_op_get_src1(ir, q);
-          if (s1.is_sym && !s1.is_lval)
+          if (irop_is_sym(s1) && !s1.is_lval)
           {
             Sym *sym = tu_extract_sym(ir, s1);
             if (sym && tu_is_static_global_candidate(sym))
@@ -478,7 +507,7 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
         if (!derived_sym && (q->op == TCCIR_OP_MLA))
         {
           IROperand acc = tcc_ir_op_get_accum(ir, q);
-          if (acc.is_sym && !acc.is_lval)
+          if (irop_is_sym(acc) && !acc.is_lval)
           {
             Sym *sym = tu_extract_sym(ir, acc);
             if (sym && tu_is_static_global_candidate(sym))
@@ -501,7 +530,7 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
         {
           IROperand acc = tcc_ir_op_get_accum(ir, q);
           int32_t avr = irop_get_vreg(acc);
-          if (avr >= 0 && !acc.is_sym)
+          if (avr >= 0 && !irop_is_sym(acc))
             derived_sym = tu_vreg_map_lookup(vreg_map, vreg_map_count, avr);
         }
 
@@ -555,7 +584,7 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
           if (esc)
             tu_symset_add(&escaped_syms, esc);
         }
-        if (s1.is_sym && !s1.is_lval)
+        if (irop_is_sym(s1) && !s1.is_lval)
         {
           Sym *sym = tu_extract_sym(ir, s1);
           if (sym && tu_is_static_global_candidate(sym))
@@ -630,7 +659,11 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
     {
       Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
       if (callee)
+      {
         tu_symset_add(&s->calls, callee);
+        if (callee->type.ref && callee->type.ref->f.func_noreturn)
+          tu_symset_add(&s->noreturn_known, callee);
+      }
       else
         s->writes_unknown = 1; /* indirect call */
 
@@ -673,7 +706,7 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
       Sym *write_sym = NULL;
 
       int dest_is_direct_sym =
-          dest.is_sym &&
+          irop_is_sym(dest) &&
           (dest.is_lval || q->op == TCCIR_OP_STORE_INDEXED ||
            q->op == TCCIR_OP_STORE_POSTINC);
       if (dest_is_direct_sym)
@@ -711,7 +744,7 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
       if (irop_config[q->op].has_src1)
       {
         IROperand s1 = tcc_ir_op_get_src1(ir, q);
-        if (s1.is_sym)
+        if (irop_is_sym(s1))
         {
           Sym *sym = tu_extract_sym(ir, s1);
           if (sym && tu_is_static_global_candidate(sym))
@@ -780,7 +813,7 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
       for (int oi = 0; oi < nrops; oi++)
       {
         IROperand op = rops[oi];
-        if (!op.is_lval || op.is_sym)
+        if (!op.is_lval || irop_is_sym(op))
           continue;
         int32_t vr = irop_get_vreg(op);
         if (vr < 0)
@@ -817,7 +850,8 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
         break;
       }
     }
-    if (is_escaped)
+    /* An overflowed map no longer knows where an address went: it may have escaped. */
+    if (is_escaped || vreg_map_count == TU_VREG_MAP_OVERFLOW)
       tu_symset_add(&s->static_reads, sym);
   }
 

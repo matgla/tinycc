@@ -331,6 +331,10 @@ any revival needs that design discussion, not this plan.
   -O0 with the trade documented at `source/ir/codegen.c:2723-2731`. Merging pass 0
   into the real pass is a codegen rewrite with miscompile risk far above
   its ~1.5 ms/corpus value.
+  *Superseded 2026-11-04:* on the board the walk was 15% of a self-host at
+  -O0, not 1.5 ms. It is still not merged into the real pass; -O0 instead
+  skips it by fixing the two frame areas it sized, see `o0_skips_dry` in
+  `source/ir/codegen.c`.
 * **Preprocessor/lexer micro-opts** (`next_nomacro` 6.6%) — real but flat,
   high-risk-per-percent, and partially covered by past work (token lookup
   cache, lazy builtins). Revisit only if Phase 0's device table promotes it.
@@ -557,3 +561,28 @@ ranking from Phase 0 before it is worth starting. The two new leads this work
 produced are both bugs rather than perf items: the `pack64_implicit`-masked
 64-bit bitfield miscompile (§8), and tcc's missing same-TU inlining (§7),
 which would pay off across the whole self-hosted build.
+
+---
+
+## 10. No SSA at -O0, 2026-11-04
+
+Section 9's conclusion no longer holds: the four miscompiles came from variables
+held in registers across control flow. With anything whose range holds a block
+start in memory, registers hold only values local to a block, whose intervals are
+exact. SSA,
+dominators, frontiers, `ra_promote_multidef_temps_to_vars`,
+`ra_widen_intervals_by_liveness`, `ra_refine_live_regs_accurate`, phi folds, hints
+and graph coalescing have nothing left to do (`ra_o0_direct`). Slots are not
+reused: the address-taken extension depended on SSA to follow derived pointers
+(`pr15262`).
+
+| Board model, 77 self-host units at -O0 | before | after |
+|---|---|---|
+| compile | 289.9 s | 259.8 s (-10.4%) |
+| `func-alloc` | 65.1 s | 35.3 s |
+| `.text` | 2,427,964 B | 2,474,702 B (+1.9%) |
+
+Kept: `ra_fold_const_branches` and the SSA DCE step (dead branches must go at -O0:
+`medce-1`, `fp-cmp-7`, `96_nodata_wanted`), and the full path for functions with
+inline asm. Rejected on measurement: every integer value on the stack,
+.text +43%, `cg:emit` +27%, and the link no longer fits on the board.

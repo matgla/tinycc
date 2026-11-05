@@ -358,7 +358,7 @@ static int ssa_bool_norm(IRSSAOptCtx *ctx, int cmp_idx)
 
   IROperand cmp_s1 = tcc_ir_op_get_src1(ir, cmp_q);
   int32_t vr = irop_get_vreg(cmp_s1);
-  if (vr < 0 || cmp_s1.is_lval || cmp_s1.is_sym)
+  if (vr < 0 || cmp_s1.is_lval || irop_is_sym(cmp_s1))
     return 0;
   if (!ssa_vreg_is_bool01(ctx, vr))
     return 0;
@@ -419,7 +419,7 @@ static int ssa_var_block_def_src(IRSSAOptCtx *ctx, IRBasicBlock *bb,
       if (kdv >= 0 &&
           TCCIR_DECODE_VREG_TYPE(kdv) == TCCIR_VREG_TYPE_VAR &&
           TCCIR_DECODE_VREG_POSITION(kdv) == var_pos) {
-        if (kq->op == TCCIR_OP_STORE && kd.is_lval && !kd.is_local)
+        if (kq->op == TCCIR_OP_STORE && kd.is_lval && !irop_is_local(kd))
           continue;
         if (kq->op == TCCIR_OP_ASSIGN || kq->op == TCCIR_OP_STORE) {
           *src_out = tcc_ir_op_get_src1(ir, kq);
@@ -433,7 +433,7 @@ static int ssa_var_block_def_src(IRSSAOptCtx *ctx, IRBasicBlock *bb,
       /* An anonymous StackLoc store cannot alias a VAR that lives in a
        * register, but its slot offset says nothing about where an
        * address-taken VAR's slot ends up (see sccp_resolve_var). */
-      if (kd.tag == IROP_TAG_STACKOFF && kd.is_local && kd.is_lval && !addrtaken)
+      if (kd.tag == IROP_TAG_STACKOFF && irop_is_local(kd) && kd.is_lval && !addrtaken)
         continue;
       return -1;   /* TEMP-DEREF or global STORE: may alias via escaped pointer */
     }
@@ -705,7 +705,7 @@ static int ssa_resolve_stack_addr(IRSSAOptCtx *ctx, IROperand op, int use_idx,
   TCCIRState *ir = ctx->ir;
   for (int hop = 0; hop < 4; hop++) {
     if (is_stack_address_operand(op)) {
-      if (op.is_llocal)
+      if (irop_is_llocal(op))
         return 0;
       int64_t off = irop_get_stack_offset(op);
       /* Addresses model as bias+offset; keep offsets far from the bias so
@@ -726,7 +726,7 @@ static int ssa_resolve_stack_addr(IRSSAOptCtx *ctx, IROperand op, int use_idx,
     if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR) {
       /* Only a slot reference (STACKOFF-tagged lval) resolves; a deref through
        * a VAR-held pointer is VREG-tagged and must not. */
-      if (op.tag != IROP_TAG_STACKOFF || !op.is_local || !op.is_lval)
+      if (op.tag != IROP_TAG_STACKOFF || !irop_is_local(op) || !op.is_lval)
         return 0;
       if (!use_bb)
         return 0;
@@ -803,12 +803,12 @@ static int ssa_cmp_values_stack_addr(IRSSAOptCtx *ctx, int cmp_idx,
   if ((r1 ^ r2) == 0)
     return 0;
   int64_t other_val;
-  if (irop_is_immediate(other) && !other.is_lval && !other.is_sym &&
+  if (irop_is_immediate(other) && !other.is_lval && !irop_is_sym(other) &&
       irop_get_imm64_ex(ir, other) == 0)
     other_val = 0;
   else if (!other.is_lval &&
            (other.tag == IROP_TAG_SYMREF ||
-            (irop_is_immediate(other) && other.is_sym)))
+            (irop_is_immediate(other) && irop_is_sym(other))))
     other_val = bias + 1;
   else
     return 0;
@@ -831,10 +831,10 @@ static int ssa_operand_symref_id(IRSSAOptCtx *ctx, IRBasicBlock *bb, int use_idx
   /* A register value (VREG, non-lval) or a VAR slot read (STACKOFF, is_lval,
    * is_local) — the latter yields the stored value (an address), not a deref. */
   int32_t vr = -1;
-  if (!s.is_sym) {
+  if (!irop_is_sym(s)) {
     if (s.tag == IROP_TAG_VREG && !s.is_lval)
       vr = irop_get_vreg(s);
-    else if (s.tag == IROP_TAG_STACKOFF && s.is_lval && s.is_local)
+    else if (s.tag == IROP_TAG_STACKOFF && s.is_lval && irop_is_local(s))
       vr = irop_get_vreg(s);
   }
   int vt = (vr >= 0) ? TCCIR_DECODE_VREG_TYPE(vr) : -1;
@@ -844,7 +844,7 @@ static int ssa_operand_symref_id(IRSSAOptCtx *ctx, IRBasicBlock *bb, int use_idx
       IRQuadCompact *dq = &ir->compact_instructions[vi->def_instr];
       if (dq->op == TCCIR_OP_ASSIGN) {
         IROperand ds = tcc_ir_op_get_src1(ir, dq);
-        if (ds.is_sym && !ds.is_lval)
+        if (irop_is_sym(ds) && !ds.is_lval)
           s = ds;
       }
     }
@@ -861,19 +861,19 @@ static int ssa_operand_symref_id(IRSSAOptCtx *ctx, IRBasicBlock *bb, int use_idx
       IRQuadCompact *dq = &ir->compact_instructions[vi->def_instr];
       if (dq->op == TCCIR_OP_ASSIGN || dq->op == TCCIR_OP_STORE) {
         IROperand ds = tcc_ir_op_get_src1(ir, dq);
-        if (ds.is_sym && !ds.is_lval)
+        if (irop_is_sym(ds) && !ds.is_lval)
           s = ds;
       }
     }
     /* Else a reassignable VAR: its reaching same-block slot def. */
-    if (!s.is_sym && bb) {
+    if (!irop_is_sym(s) && bb) {
       IROperand ks;
       if (ssa_var_block_def_src(ctx, bb, use_idx, vr, &ks) >= 0 &&
-          ks.is_sym && !ks.is_lval)
+          irop_is_sym(ks) && !ks.is_lval)
         s = ks;
     }
   }
-  if (!s.is_sym)
+  if (!irop_is_sym(s))
     return 0;
   IRPoolSymref *r = irop_get_symref_ex(ir, s);
   if (!r || !r->sym)
@@ -1298,7 +1298,7 @@ static int ssa_vreg_is_nonneg(IRSSAOptCtx *ctx, int32_t vreg, int use_idx, int *
       int32_t kdv = irop_get_vreg(kd);
       if (kdv >= 0 && TCCIR_DECODE_VREG_TYPE(kdv) == TCCIR_VREG_TYPE_VAR &&
           TCCIR_DECODE_VREG_POSITION(kdv) == var_pos) {
-        if (kq->op == TCCIR_OP_STORE && kd.is_lval && !kd.is_local)
+        if (kq->op == TCCIR_OP_STORE && kd.is_lval && !irop_is_local(kd))
           continue; /* pointer-deref through V, not a slot def */
         return ssa_call_result_nonneg(ir, k, may_be_nan);
       }
@@ -1307,7 +1307,7 @@ static int ssa_vreg_is_nonneg(IRSSAOptCtx *ctx, int32_t vreg, int use_idx, int *
       return 0;
     if (kq->op == TCCIR_OP_STORE) {
       IROperand kd = tcc_ir_op_get_dest(ir, kq);
-      if (kd.tag == IROP_TAG_STACKOFF && kd.is_local && kd.is_lval)
+      if (kd.tag == IROP_TAG_STACKOFF && irop_is_local(kd) && kd.is_lval)
         continue;
       return 0;
     }
@@ -1499,7 +1499,7 @@ static int ssa_fold_return_const_reuse(IRSSAOptCtx *ctx, int ret_idx)
   int n = ir->next_instruction_index;
   IRQuadCompact *R = &ir->compact_instructions[ret_idx];
   IROperand rv = tcc_ir_op_get_src1(ir, R);
-  if (rv.is_sym || rv.is_lval || !irop_is_immediate(rv))
+  if (irop_is_sym(rv) || rv.is_lval || !irop_is_immediate(rv))
     return 0;
   if (!tcc_state || TCC_OPT(tcc_state, optimize) < 2)
     return 0;
@@ -1577,20 +1577,20 @@ static int ssa_fold_return_const_reuse(IRSSAOptCtx *ctx, int ret_idx)
   {
     IROperand a = tcc_ir_op_get_src1(ir, T);
     IROperand b = tcc_ir_op_get_src2(ir, T);
-    if (!a.is_sym && !a.is_lval && irop_get_vreg(a) >= 0 && irop_is_immediate(b) && !b.is_sym &&
+    if (!irop_is_sym(a) && !a.is_lval && irop_get_vreg(a) >= 0 && irop_is_immediate(b) && !irop_is_sym(b) &&
         irop_get_imm64_ex(ir, b) == cval)
     {
       vop = a;
       matched = 1;
     }
-    else if (!b.is_sym && !b.is_lval && irop_get_vreg(b) >= 0 && irop_is_immediate(a) && !a.is_sym &&
+    else if (!irop_is_sym(b) && !b.is_lval && irop_get_vreg(b) >= 0 && irop_is_immediate(a) && !irop_is_sym(a) &&
              irop_get_imm64_ex(ir, a) == cval)
     {
       vop = b;
       matched = 1;
     }
   }
-  if (!matched || vop.is_sym || vop.is_lval || irop_get_vreg(vop) < 0)
+  if (!matched || irop_is_sym(vop) || vop.is_lval || irop_get_vreg(vop) < 0)
     return 0;
   int vt = TCCIR_DECODE_VREG_TYPE(irop_get_vreg(vop));
   if (vt != TCCIR_VREG_TYPE_PARAM && vt != TCCIR_VREG_TYPE_VAR && vt != TCCIR_VREG_TYPE_TEMP)

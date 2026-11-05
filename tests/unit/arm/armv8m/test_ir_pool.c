@@ -30,7 +30,7 @@ static void ut_pool_free(TCCIRState *ir)
 static IROperand ut_irop_with_imm(int32_t imm)
 {
   IROperand op = {0};
-  op.vr = (IROP_TAG_IMM32 << 18);
+  op.vr = (IROP_TAG_IMM32 << IROP_TAG_SHIFT);
   op.u.imm32 = imm;
   return op;
 }

@@ -38,7 +38,7 @@ static int lob_is_local_ptr_op(const uint8_t *local_ptr, IROperand sop)
   int r = 0;
   int32_t vr = irop_get_vreg(sop);
   int tag = irop_get_tag(sop);
-  if (tag == IROP_TAG_STACKOFF && sop.is_local && !sop.is_lval && !sop.is_llocal && !sop.is_param)
+  if (tag == IROP_TAG_STACKOFF && irop_is_local(sop) && !sop.is_lval && !irop_is_llocal(sop) && !sop.is_param)
     r = 1;
   if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
   {
@@ -143,7 +143,7 @@ static int ir_opt_direct_auto_vreg_store_is_local(IROperand op)
   int32_t vr;
   int vt;
 
-  if (op.is_lval || op.is_sym || op.is_llocal)
+  if (op.is_lval || irop_is_sym(op) || irop_is_llocal(op))
     return 0;
 
   vr = irop_get_vreg(op);
@@ -160,7 +160,7 @@ static int ir_opt_direct_auto_vreg_store_is_local(IROperand op)
 
 static int ir_opt_operand_is_volatile_sym(TCCIRState *ir, IROperand s)
 {
-  if (!s.is_sym)
+  if (!irop_is_sym(s))
     return 0;
   Sym *sym = irop_get_sym_ex(ir, s);
   return sym && (sym->type.t & VT_VOLATILE);
@@ -178,7 +178,7 @@ static int ir_opt_operand_access_is_volatile(TCCIRState *ir, IROperand op)
     return 1;
   if (op.is_lval && tcc_ir_access_is_volatile(ir, op))
     return 1;
-  if (op.is_sym || op.is_llocal)
+  if (irop_is_sym(op) || irop_is_llocal(op))
     return 0;
   int32_t vr = irop_get_vreg(op);
   if (vr < 0)
@@ -238,7 +238,7 @@ static int ir_opt_op_is_essential(TCCIRState *ir, IRQuadCompact *q, int idx,
     int dest_vt = TCCIR_DECODE_VREG_TYPE(dest_vr);
     /* Direct write to a non-volatile param is unobservable once the body is side-effect-free. */
     if (tcc_state && tcc_state->ir_late_reopt_phase &&
-        !dest.is_lval && !dest.is_sym && !dest.is_llocal &&
+        !dest.is_lval && !irop_is_sym(dest) && !irop_is_llocal(dest) &&
         dest_vt == TCCIR_VREG_TYPE_PARAM &&
         !ir_opt_param_vreg_is_volatile(TCCIR_DECODE_VREG_POSITION(dest_vr)))
       return 0;
@@ -607,13 +607,13 @@ static int ir_opt_op_is_inf_dead_anchor(TCCIRState *ir, IRQuadCompact *q, int id
   {
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     /* Store to a global (sym lval): observable-without-return only if volatile. */
-    if (dest.is_sym && dest.is_lval)
+    if (irop_is_sym(dest) && dest.is_lval)
     {
       Sym *s = irop_get_sym_ex(ir, dest);
       return (s && (s->type.t & VT_VOLATILE)) ? 1 : 0;
     }
     /* Direct store to a local/param vreg: dead unless volatile. */
-    if (!dest.is_lval && !dest.is_sym && !dest.is_llocal)
+    if (!dest.is_lval && !irop_is_sym(dest) && !irop_is_llocal(dest))
     {
       int32_t dvr = irop_get_vreg(dest);
       int dvt = TCCIR_DECODE_VREG_TYPE(dvr);
@@ -699,9 +699,8 @@ int tcc_ir_opt_dead_before_infinite_loop(TCCIRState *ir)
     return 0;
 
   /* Indirect jumps have statically-unknown successors — bail. */
-  for (int i = 0; i < n; i++)
-    if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
-      return 0;
+  if (ir_opt_fn_features(ir) & IR_FN_IJUMP)
+    return 0;
 
 #define GETBIT(arr, k) ((arr)[(k) / 8] & (1 << ((k) % 8)))
 #define SETBIT(arr, k) ((arr)[(k) / 8] |= (1 << ((k) % 8)))
@@ -1203,15 +1202,15 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
       {
         /* Address of a stack-local or non-volatile param: a local-only pointer. */
         IROperand s = tcc_ir_op_get_src1(ir, q);
-        if (s.is_llocal)
+        if (irop_is_llocal(s))
           break;
         int tag = irop_get_tag(s);
-        if (tag == IROP_TAG_STACKOFF && s.is_local)
+        if (tag == IROP_TAG_STACKOFF && irop_is_local(s))
           set = 1;
         else
         {
           int32_t svr = irop_get_vreg(s);
-          if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_VAR && s.is_local)
+          if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_VAR && irop_is_local(s))
             set = 1;
           else if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_PARAM &&
                    !ir_opt_param_vreg_is_volatile(TCCIR_DECODE_VREG_POSITION(svr)))
@@ -1288,7 +1287,7 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
       int tag = irop_get_tag(dop);
       if (ir_opt_direct_auto_vreg_store_is_local(dop))
         ok = 1;
-      else if (tag == IROP_TAG_STACKOFF && dop.is_local && !dop.is_param)
+      else if (tag == IROP_TAG_STACKOFF && irop_is_local(dop) && !dop.is_param)
         ok = 1;
     }
     else if (q->op == TCCIR_OP_STORE_INDEXED)
@@ -1296,7 +1295,7 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
       /* Direct indexed write into a local stack object stays in this frame; require
        * the address-of form (an lvalue slot would load a pointer then store through it). */
       int tag = irop_get_tag(dop);
-      if (tag == IROP_TAG_STACKOFF && dop.is_local && !dop.is_lval && !dop.is_llocal && !dop.is_param)
+      if (tag == IROP_TAG_STACKOFF && irop_is_local(dop) && !dop.is_lval && !irop_is_llocal(dop) && !dop.is_param)
         ok = 1;
     }
     else

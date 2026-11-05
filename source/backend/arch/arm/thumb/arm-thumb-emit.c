@@ -51,6 +51,7 @@ int ot(thumb_opcode op)
   if (th_widen_armed)
     th_widen_armed_apply(&op);
 
+#if CONFIG_TCC_CHECKS
   /* Detect instructions that write to R9 when it's reserved for GOT pointer.
    * Exclude push/pop/stmdb/ldmia which legitimately save/restore R9. */
   if (text_and_data_separation && !allow_r9_write)
@@ -62,6 +63,7 @@ int ot(thumb_opcode op)
                 op.opcode, op.size, (unsigned)ind, g_debug_current_op);
     }
   }
+#endif
 
   /* Update the MOV-coalescing register-equivalence cache and the STR->LDR
    * redundant-reload cache based on what is about to be emitted.  This only

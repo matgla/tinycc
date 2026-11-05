@@ -28,11 +28,19 @@ int tcc_ir_opt_run_gens(IROptCtx *ctx, const IROptGen *gens, int count)
   if (any_du)
     tcc_ir_opt_ctx_require_du(ctx);
 
+  /* Where each opcode's patterns start: every instruction asked every pattern. */
+  short first[TCCIR_OP_COUNT];
+  for (int op = 0; op < TCCIR_OP_COUNT; op++)
+    first[op] = (short)count;
+  for (int g = count - 1; g >= 0; g--)
+    for (int op = gens[g].op >= 0 ? gens[g].op : 0; op < (gens[g].op >= 0 ? gens[g].op + 1 : TCCIR_OP_COUNT); op++)
+      first[op] = (short)g;
+
   for (int i = 0; i < ir->next_instruction_index; i++) {
     int op = ir->compact_instructions[i].op;
     if (op == TCCIR_OP_NOP)
       continue;
-    for (int g = 0; g < count; g++) {
+    for (int g = first[op]; g < count; g++) {
       if (gens[g].op >= 0 && gens[g].op != op)
         continue;
       int d = gens[g].fn(ctx, i);

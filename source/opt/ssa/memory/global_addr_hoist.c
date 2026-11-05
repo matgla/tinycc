@@ -77,7 +77,7 @@ static int gah_consts_on;
 static int gah_operand_hoistable_const(IROperand op, int32_t *out_val)
 {
   int32_t v;
-  if (op.is_sym || op.is_local || op.is_llocal || op.is_lval)
+  if (irop_is_sym(op) || irop_is_local(op) || irop_is_llocal(op) || op.is_lval)
     return 0;
   if (irop_get_tag(op) != IROP_TAG_IMM32)
     return 0;
@@ -145,7 +145,7 @@ static IROperand gah_make_def_src(TCCIRState *ir, Sym *sym, int32_t addend)
 {
   if (sym) {
     uint32_t sidx = tcc_ir_pool_add_symref(ir, sym, addend, 0);
-    return irop_make_symref(-1, sidx, 0, 0, 0, IROP_BTYPE_INT32);
+    return irop_make_symref(-1, sidx, 0, IROP_BTYPE_INT32);
   }
   return irop_make_imm32(-1, addend, IROP_BTYPE_INT32);
 }
@@ -198,7 +198,7 @@ static int gah_op_hoistable(TccIrOp op)
 static int gah_operand_hoistable(const TCCIRState *ir, IROperand op, Sym **out_sym, int32_t *out_addend)
 {
   IRPoolSymref *sr;
-  if (!op.is_sym || op.is_local)
+  if (!irop_is_sym(op) || irop_is_local(op))
     return 0;
   if (irop_get_tag(op) != IROP_TAG_SYMREF)
     return 0;
@@ -374,7 +374,6 @@ int tcc_ir_ssa_opt_global_addr_hoist(TCCIRState *ir)
       IROperand nw = irop_make_vreg(cl->tbase, orig.btype);
       nw.is_lval = orig.is_lval;
       nw.is_unsigned = orig.is_unsigned;
-      nw.is_static = orig.is_static;
       nw.is_complex = orig.is_complex;
       switch (cl->uses[k].slot) {
       case GAH_SLOT_SRC1: tcc_ir_op_set_src1(ir, q, nw); break;
@@ -647,7 +646,6 @@ int tcc_ir_ssa_opt_local_addr_cse(TCCIRState *ir)
         nw = irop_make_vreg(classes[c].tbase, orig.btype);
         nw.is_lval = orig.is_lval;
         nw.is_unsigned = orig.is_unsigned;
-        nw.is_static = orig.is_static;
         nw.is_complex = orig.is_complex;
         lac_set_slot(ir, q, slots[s], nw);
       }
@@ -1016,7 +1014,6 @@ int tcc_ir_ssa_opt_loop_addr_hoist(TCCIRState *ir)
           nw = irop_make_vreg(classes[c].tbase, orig.btype);
           nw.is_lval = orig.is_lval;
           nw.is_unsigned = orig.is_unsigned;
-          nw.is_static = orig.is_static;
           nw.is_complex = orig.is_complex;
           lac_set_slot(ir, q, slots[s], nw);
         }
@@ -1090,7 +1087,7 @@ static int osk_value_use(TCCIRState *ir, IRQuadCompact *q, int32_t *out_val)
     return 0;
   }
   s = tcc_ir_op_get_src1(ir, q);
-  if (s.is_sym || s.is_local || s.is_llocal || s.is_lval || s.is_complex)
+  if (irop_is_sym(s) || irop_is_local(s) || irop_is_llocal(s) || s.is_lval || s.is_complex)
     return 0;
   if (irop_get_tag(s) != IROP_TAG_IMM32 || s.btype != IROP_BTYPE_INT32)
     return 0;

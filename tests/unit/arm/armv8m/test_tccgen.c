@@ -2632,6 +2632,10 @@ int tcc_machine_has_bit_ops(void)
 {
   return 1;
 }
+int tcc_machine_has_unaligned_words(void)
+{
+  return 1;
+}
 
 UT_TEST(test_gind)
 {

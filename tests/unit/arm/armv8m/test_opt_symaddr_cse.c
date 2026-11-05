@@ -30,7 +30,7 @@ static TCCIRState *symaddr_ir(void)
 static IROperand symaddr_ref(TCCIRState *ir, Sym *sym, int32_t addend, int is_lval)
 {
   uint32_t idx = tcc_ir_pool_add_symref(ir, sym, addend, 0);
-  return irop_make_symref(0, idx, is_lval, 0, 0, I32);
+  return irop_make_symref(0, idx, is_lval, I32);
 }
 
 UT_TEST(test_symaddr_cse_hoists_repeated_base)

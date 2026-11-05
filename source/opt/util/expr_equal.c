@@ -30,8 +30,8 @@ int ir_opt_nonvreg_expr_equal(TCCIRState *ir, IROperand a, IROperand b)
     int32_t a_vr = irop_get_vreg(a);
     int32_t b_vr = irop_get_vreg(b);
     /* Same slot = same vreg identity (including both anonymous at -1) plus same offset/attrs. */
-    if (a_vr == b_vr && a.u.imm32 == b.u.imm32 && a.is_lval == b.is_lval && a.is_local == b.is_local &&
-        a.is_llocal == b.is_llocal && a.is_param == b.is_param && irop_get_btype(a) == irop_get_btype(b))
+    if (a_vr == b_vr && a.u.imm32 == b.u.imm32 && a.is_lval == b.is_lval && irop_is_local(a) == irop_is_local(b) &&
+        irop_is_llocal(a) == irop_is_llocal(b) && a.is_param == b.is_param && irop_get_btype(a) == irop_get_btype(b))
       return 1;
     return 0;
   }
@@ -39,8 +39,8 @@ int ir_opt_nonvreg_expr_equal(TCCIRState *ir, IROperand a, IROperand b)
   if (a_tag != IROP_TAG_SYMREF)
     return 0;
 
-  if (a.is_lval != b.is_lval || a.is_llocal != b.is_llocal || a.is_local != b.is_local || a.is_const != b.is_const ||
-      a.is_unsigned != b.is_unsigned || a.is_static != b.is_static || a.is_sym != b.is_sym ||
+  if (a.is_lval != b.is_lval || irop_is_llocal(a) != irop_is_llocal(b) || irop_is_local(a) != irop_is_local(b) || irop_is_const(a) != irop_is_const(b) ||
+      a.is_unsigned != b.is_unsigned || irop_is_sym(a) != irop_is_sym(b) ||
       a.is_param != b.is_param || a.is_complex != b.is_complex || irop_get_btype(a) != irop_get_btype(b))
   {
     return 0;
@@ -72,8 +72,8 @@ static int ir_opt_setif_cmp_operand_equal(TCCIRState *ir, IROperand a, IROperand
   {
     int32_t a_vr = irop_get_vreg(a);
     int32_t b_vr = irop_get_vreg(b);
-    if (a_vr == b_vr && a.u.imm32 == b.u.imm32 && a.is_lval == b.is_lval && a.is_local == b.is_local &&
-        a.is_llocal == b.is_llocal && a.is_param == b.is_param && irop_get_btype(a) == irop_get_btype(b))
+    if (a_vr == b_vr && a.u.imm32 == b.u.imm32 && a.is_lval == b.is_lval && irop_is_local(a) == irop_is_local(b) &&
+        irop_is_llocal(a) == irop_is_llocal(b) && a.is_param == b.is_param && irop_get_btype(a) == irop_get_btype(b))
       return 1;
   }
 
@@ -428,8 +428,8 @@ static int ir_opt_pure_expr_equal_impl(TCCIRState *ir, IROperand a, int a_use_id
   {
     if (a_vr != b_vr)
       return 0;
-    return a.vr == b.vr && a.u.imm32 == b.u.imm32 && a.is_unsigned == b.is_unsigned && a.is_static == b.is_static &&
-           a.is_sym == b.is_sym && a.is_param == b.is_param;
+    return a.vr == b.vr && a.u.imm32 == b.u.imm32 && a.is_unsigned == b.is_unsigned &&
+           irop_is_sym(a) == irop_is_sym(b) && a.is_param == b.is_param;
   }
 
   a_def_idx = tcc_ir_find_defining_instruction(ir, a_vr, a_use_idx);

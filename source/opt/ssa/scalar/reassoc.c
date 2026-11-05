@@ -108,8 +108,8 @@ OPT_GEN_SSA(reassoc_bin, 0) {
   GUARD(
     when(is_imm32(psrc2));
     and_not(psrc1.is_lval);
-    and_not(psrc1.is_local);
-    and_not(psrc1.is_llocal);
+    and_not(irop_is_local(psrc1));
+    and_not(irop_is_llocal(psrc1));
     and_not(tcc_ir_barrel_shift_at(ir, &ir->compact_instructions[pidx]));
     /* A signed ADD/SUB is taken not to overflow; one that absorbs an unsigned,
      * wrapping, inner ADD/SUB is not (pr55137, see flat add_reassoc). */
@@ -150,7 +150,7 @@ OPT_GEN_SSA(reassoc_symref_def, 0) {
   if (na != (int32_t)na)
     return 0;
   uint32_t nidx = tcc_ir_pool_add_symref(ir, sr->sym, (int32_t)na, sr->flags);
-  IROperand nsrc = irop_make_symref(-1, nidx, 0, psrc1.is_local, psrc1.is_const,
+  IROperand nsrc = irop_make_symref(-1, nidx, 0,
                                     irop_get_btype(psrc1));
   nsrc.is_unsigned = psrc1.is_unsigned;
   RETIRE_PAIR(nsrc, 1);

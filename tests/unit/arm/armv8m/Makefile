@@ -183,12 +183,10 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/dce/zero_vla_elim.c \
 	$(TOP)/source/opt/flat/dce/body_essential.c \
 	$(TOP)/source/opt/flat/dce/noreturn_collapse.c \
-	$(TOP)/source/opt/flat/dce/infinite_loop_simplify.c \
 	$(TOP)/source/opt/flat/dce/trap_only_body_suppress.c \
 	$(TOP)/source/opt/flat/dce/infinite_self_recursion.c \
 	$(TOP)/source/opt/flat/dce/noreturn_call_epilogue.c \
 	$(TOP)/source/opt/flat/dce/dead_addrvar_elim.c \
-	$(TOP)/source/opt/flat/dce/dead_trailing_addrvar_store.c \
 	$(TOP)/source/opt/flat/dce/uninit_ub.c \
 	$(TOP)/source/opt/flat/dce/ub_only_body_elide.c \
 	$(TOP)/source/opt/flat/dce/const_return_uninit_elide.c \
@@ -198,6 +196,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/util/vreg_def_use.c \
 	$(TOP)/source/opt/engine/pass_timing.c \
 	$(TOP)/source/opt/analysis/alias.c \
+	$(TOP)/source/opt/analysis/frame_ptr.c \
 	$(TOP)/source/opt/analysis/memref.c \
 	$(TOP)/source/opt/analysis/mem_ssa.c \
 	$(TOP)/source/ir/cfg.c \
@@ -230,7 +229,6 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/memory/mem_init.c \
 	$(TOP)/source/opt/flat/memory/memmove_to_indexed_stores.c \
 	$(TOP)/source/opt/flat/memory/escape_copy_call.c \
-	$(TOP)/source/opt/flat/memory/addrof_var_fwd.c \
 	$(TOP)/source/opt/flat/memory/ptr_local_fwd.c \
 	$(TOP)/source/opt/flat/memory/param_copy_alias.c \
 	$(TOP)/source/opt/flat/memory/struct_arg_split.c \
@@ -1509,8 +1507,7 @@ UT11_MODULE_SRCS := \
 	$(TOP)/source/opt/ssa/string/str_strchr.c \
 	$(TOP)/source/opt/ssa/string/str_strstr.c \
 	$(TOP)/source/opt/ssa/string/str_memchr.c \
-	$(TOP)/source/opt/ssa/scalar/bitop_const_fold.c \
-	$(TOP)/source/opt/ssa/scalar/var_imm_prop.c
+	$(TOP)/source/opt/ssa/scalar/bitop_const_fold.c
 	# gvn.c already in UT_MODULE_SRCS (source/opt/ssa/scalar/gvn.c)
 
 UT11_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR11)/%.o,$(UT11_MODULE_SRCS))
@@ -1534,7 +1531,6 @@ UT11_LOCAL_SRCS := \
 	test_ssa_opt_branch.c \
 	test_ssa_opt_cmp_eq.c \
 	test_ssa_opt_vrp.c \
-	test_ssa_opt_setif_or_taut.c \
 	test_ssa_opt_cmp_offset_fold.c \
 	test_ssa_opt_load_cse.c \
 	test_opt_volatile.c \

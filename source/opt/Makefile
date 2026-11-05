@@ -41,6 +41,7 @@ CORE_OPT_SRC = \
 	source/opt/util/ir_insert.c \
 	source/opt/analysis/du_chains.c \
 	source/opt/analysis/alias.c \
+	source/opt/analysis/frame_ptr.c \
 	source/opt/analysis/memref.c \
 	source/opt/analysis/mem_ssa.c \
 	source/opt/engine/ctx.c \

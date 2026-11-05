@@ -93,7 +93,7 @@ int tcc_ir_opt_shl32_or_chain(TCCIRState *ir)
       int32_t shl_vr = irop_get_vreg(shl_cand);
       if (TCCIR_DECODE_VREG_TYPE(shl_vr) != TCCIR_VREG_TYPE_TEMP)
         continue;
-      if (shl_cand.is_lval || shl_cand.is_sym)
+      if (shl_cand.is_lval || irop_is_sym(shl_cand))
         continue;
       if (ir_opt_du_uses(&du, shl_vr) != 1 || !ir_opt_du_is_single_def(&du, shl_vr))
         continue;

@@ -2,6 +2,7 @@
 #include "../opt/ssa/memory/copy_fwd.c"
 #undef CFW_AF_UNKNOWN
 #undef CFW_DBG
+#undef CFW_ESC_MAPS
 #undef CFW_MAX_READS
 #undef CFW_RELAY_MAX
 #undef USING_GLOBALS

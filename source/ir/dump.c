@@ -245,9 +245,9 @@ int tcc_ir_dump_passes_match(TCCState *s, const char *pass_name)
 }
 
 /* Shared by tccgen.c RUN_PASS and ir/opt/ssa_opt.c so every pass is observable the same way */
+#ifdef CONFIG_TCC_DEBUG
 void tcc_ir_dump_after_pass(TCCIRState *ir, const char *pass_name)
 {
-#ifdef CONFIG_TCC_DEBUG
   if (!tcc_ir_dump_passes_match(tcc_state, pass_name))
     return;
   tcc_ir_dump_set_show_physical_regs(0);
@@ -263,11 +263,8 @@ void tcc_ir_dump_after_pass(TCCIRState *ir, const char *pass_name)
     printf("]\n");
   }
   printf("=== END AFTER %s ===\n", pass_name);
-#else
-  (void)ir;
-  (void)pass_name;
-#endif
 }
+#endif
 
 static char vreg_type_prefix(int vreg)
 {
@@ -361,7 +358,7 @@ void tcc_ir_dump_op(TCCIRState *ir, IROperand op, FILE *out)
   }
   break;
   case IROP_TAG_STACKOFF:
-    if (op.is_llocal)
+    if (irop_is_llocal(op))
     {
       int32_t vreg = irop_get_vreg(op);
       int spilled = 0;

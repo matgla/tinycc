@@ -489,6 +489,7 @@ int inline_body_has_return_stmt(TokenString *func_str);
 int inline_body_has_shadowed_ident(TokenString *func_str);
 int inline_body_has_side_effects(TokenString *func_str);
 int inline_body_has_static_local(TokenString *func_str);
+int inline_body_leaf_ops(TokenString *func_str, int depth);
 int inline_body_has_large_local_array(TokenString *func_str, int limit);
 int inline_body_has_unsafe_loops(TokenString *func_str);
 int inline_body_has_unsafe_shadowed_ident(TokenString *func_str, Sym *call_func_sym);
@@ -617,6 +618,9 @@ int struct_is_single_2byte_scalar_member(const CType *type);
 int struct_is_small_bitfield_word(const CType *type);
 int struct_member_copy_safe(const CType *type);
 #define SMALL_AGGREGATE_COPY_MAX 16
+int small_unaligned_copy_plan(const CType *stype, int size, int align, int *w_out, unsigned char *covered);
+void ir_emit_small_unaligned_copy(const SValue *src, int src_deref, const SValue *dst, int dst_deref, int size,
+                                  const unsigned char *covered);
 int small_aggregate_copy_plan(const CType *stype, int size, int align, int src_off, int dst_off, int *w_out,
                               unsigned char *covered);
 void ir_emit_small_aggregate_copy(const SValue *src, int src_deref, const SValue *dst, int dst_deref, int size,

@@ -153,7 +153,7 @@ static int pf_arg_is_param(IROperand op, const IRParamForm *f)
            irop_get_stack_offset(op) == f->off;
   case IR_PF_HOME:
     return irop_get_tag(op) == IROP_TAG_STACKOFF && irop_get_vreg(op) < 0 && op.is_lval && !op.is_param &&
-           op.is_local && op.btype == IROP_BTYPE_STRUCT && irop_get_stack_offset(op) == f->off;
+           irop_is_local(op) && op.btype == IROP_BTYPE_STRUCT && irop_get_stack_offset(op) == f->off;
   default:
     return 0;
   }
@@ -819,6 +819,9 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
   tcc_ls_reset_scratch_cache(&ir->ls);
   tcc_ir_mark_nested_captured_params(ir);
   tcc_ir_avoid_spilling_stack_passed_params(ir);
+  /* -O0 has no use for the slot weights and move coalescing below: a shorter
+   * encoding, a saved move (ra_o0_direct). */
+  const int o0 = TCC_OPT(tcc_state, optimize) == 0 && !ir->inline_asm_count;
 
   /* Initial min-local-offset scan */
   {
@@ -884,7 +887,7 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
   }
 
   {
-    uint32_t *weights = spill_slot_weights(ir);
+    uint32_t *weights = o0 ? tcc_mallocz(sizeof(uint32_t) * (size_t)(ir->next_local_variable + ir->next_temporary_variable + ir->next_parameter + 1)) : spill_slot_weights(ir);
     tcc_ls_compact_stack_locations_weighted(&ir->ls, loc, weights);
     tcc_free(weights);
   }
@@ -974,7 +977,7 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
         for (int k = 0; k < nops; k++) {
           IROperand *o = &ops[k];
           int has_stackoff = (o->tag == IROP_TAG_STACKOFF) ||
-                             (o->is_local || o->is_llocal);
+                             (irop_is_local(*o) || irop_is_llocal(*o));
           if (!has_stackoff)
             continue;
           int vr = irop_get_vreg(*o);
@@ -1016,7 +1019,8 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
     loc = ra_reserved_frame_floor(loc, func_var);
   }
 
-  tcc_ir_move_coalescing(ir);
+  if (!o0)
+    tcc_ir_move_coalescing(ir);
   if (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("ra:jumpif_to_next"))
     tcc_ir_drop_jumpif_to_next(ir);
 
@@ -1049,7 +1053,7 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
         for (int k = 0; k < nops; k++) {
           IROperand *o = &ops[k];
           int has_stackoff = (o->tag == IROP_TAG_STACKOFF) ||
-                             (o->is_local || o->is_llocal);
+                             (irop_is_local(*o) || irop_is_llocal(*o));
           if (!has_stackoff)
             continue;
           int vr = irop_get_vreg(*o);

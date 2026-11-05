@@ -255,6 +255,10 @@ int tcc_machine_has_bit_ops(void)
 {
   return 1;
 }
+int tcc_machine_has_unaligned_words(void)
+{
+  return 1;
+}
 
 void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest, TccIrOp op)
 {
@@ -934,6 +938,11 @@ void tcc_gen_machine_strldr_cache_set_enabled(int enabled)
 {
   (void)enabled;
   cgstub_record("strldr_cache_set_enabled", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
+}
+
+void tcc_gen_machine_peepholes_set_enabled(int enabled)
+{
+  (void)enabled;
 }
 
 void tcc_gen_machine_str_elide_set_enabled(int enabled)

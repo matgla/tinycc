@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include "small_ir.h"
+
 struct Sym;
 struct TCCIRState;
 struct SValue;
@@ -12,9 +14,7 @@ struct CType;
  * Vreg encoding
  * ============================================================================
  * Vreg encoding: type in top 4 bits, position in bottom 17 bits.
- * Bits 17-27 are used for IROperand tag+flags+btype encoding.
- *
- * 17 bits for position = 131,072 max vregs (plenty for any function)
+ * The bits between them hold the IROperand tag, flags and btype.
  */
 
 typedef enum TCCIR_VREG_TYPE
@@ -24,31 +24,30 @@ typedef enum TCCIR_VREG_TYPE
   TCCIR_VREG_TYPE_PARAM = 3,
 } TCCIR_VREG_TYPE;
 
-#define TCCIR_VREG_POSITION_MASK 0x1FFFF /* 17 bits for position */
+/* The largest of the 76 self-host units needs 14 bits, and past 32K of one kind a
+ * function no longer fits in 8 MB of PSRAM anyway: tcc_error() says so. */
+#if TCC_IR_SMALL_QUAD
+#define TCCIR_VREG_POSITION_BITS 15
+#else
+#define TCCIR_VREG_POSITION_BITS 17
+#endif
+#define TCCIR_VREG_POSITION_MASK ((1 << TCCIR_VREG_POSITION_BITS) - 1)
+#define TCCIR_VREG_TYPE_SHIFT 29
+#define TCCIR_VREG_TYPE_NEG 7 /* no vreg: IROP_NEG_VREG_SENTINEL, or IROP_NONE */
 #define TCCIR_DECODE_VREG_POSITION(vr) ((vr) & TCCIR_VREG_POSITION_MASK)
-#define TCCIR_DECODE_VREG_TYPE(vr) ((vr) >> 28)
-#define TCCIR_ENCODE_VREG(type, position) (((type) << 28) | ((position) & TCCIR_VREG_POSITION_MASK))
+#define TCCIR_DECODE_VREG_TYPE(vr) ((vr) >> TCCIR_VREG_TYPE_SHIFT)
+#define TCCIR_ENCODE_VREG(type, position) (((type) << TCCIR_VREG_TYPE_SHIFT) | ((position) & TCCIR_VREG_POSITION_MASK))
 
 /* ============================================================================
- * IROperand: Compact 10-byte operand representation (vs ~56 byte SValue)
+ * IROperand: Compact 8-byte operand representation (vs ~56 byte SValue)
  * ============================================================================
  * Always includes vreg field so optimization passes can access it directly.
  * Tag, flags, and btype are packed into the vr field.
  *
- * vr field layout (32 bits):
- *   Bits 0-17:  vreg position (18 bits, max 262K vregs)
- *   Bits 18-20: tag (3 bits) - IROP_TAG_*
- *   Bit 21:     is_lval - value is an lvalue (needs dereference)
- *   Bit 22:     is_llocal - VT_LLOCAL semantics (double indirection)
- *   Bit 23:     is_local - VT_LOCAL semantics
- *   Bit 24:     is_const - VT_CONST semantics
- *   Bits 25-27: btype (3 bits) - IROP_BTYPE_*
- *   Bits 28-31: vreg type (4 bits) - TCCIR_VREG_TYPE_*
- *
- * Special case: vr == -1 (0xFFFFFFFF) means "no vreg associated".
+ * Special case: IROP_NONE_WORD, every bit of the vreg half set, means "no operand".
  */
 
-/* Tags for IROperand (stored in bits 18-20 of vr) */
+/* Tags for IROperand */
 #define IROP_TAG_NONE 0     /* sentinel for unused operand */
 #define IROP_TAG_VREG 1     /* pure vreg with no additional data */
 #define IROP_TAG_IMM32 2    /* payload.imm32: signed 32-bit immediate */
@@ -77,10 +76,11 @@ typedef enum TCCIR_VREG_TYPE
 #define IROP_VREG_PHYS_VALID 0x100u /* validity flag for pinned phys reg */
 #define IROP_VREG_PHYS_MASK 0x1Fu   /* bits 0-4: register number */
 
-/* Sentinel for negative vreg encoding - upper 13 bits of position all set */
-#define IROP_NEG_VREG_SENTINEL 0x1FFF0 /* position bits 4-16 all set, bits 0-3 hold neg index */
+/* Sentinel for negative vreg encoding: every position bit above the low 4, which
+ * hold the negative index. */
+#define IROP_NEG_VREG_SENTINEL (TCCIR_VREG_POSITION_MASK & ~0xF)
 
-/* Compressed basic type (stored in bits 25-27 of vr)
+/* Compressed basic type
  * This allows reconstruction of type.t during iroperand_to_svalue().
  * Preserves byte/short distinction for correct load instruction generation. */
 #define IROP_BTYPE_INT32 0   /* VT_VOID, VT_INT, VT_PTR */
@@ -92,26 +92,38 @@ typedef enum TCCIR_VREG_TYPE
 #define IROP_BTYPE_INT8 6    /* VT_BYTE */
 #define IROP_BTYPE_INT16 7   /* VT_SHORT */
 
-typedef struct __attribute__((packed)) IROperand
+/* An operand holds what the tag cannot tell: irop_is_local(), irop_is_const() and
+ * irop_is_sym() answer the rest.  On the device it is two words, and quads of them
+ * make up most of a compile's memory traffic; the cross keeps a 9th byte for its
+ * 17-bit position and the flags that no longer fit, so never read a flag out of a
+ * raw word, and replace one with irop_set_word(). */
+typedef struct
+#if !TCC_IR_SMALL_QUAD
+    __attribute__((packed))
+#endif
+    IROperand
 {
-  /* vreg id with embedded tag+flags+btype, -1 if not associated */
   union
   {
-    int32_t vr; /* raw access for encoding/decoding */
+    int32_t vr; /* raw word; not an encoded vreg: see irop_get_vreg */
     struct
     {
-      uint32_t position : 17;  /* vreg position (0-16) */
-      uint32_t is_complex : 1; /* DONE: Phase 2 - VT_COMPLEX: complex type flag (17) */
-      uint32_t tag : 3;        /* IROP_TAG_* (18-20) */
-      uint32_t is_lval : 1;    /* VT_LVAL: needs dereference (21) */
-      uint32_t is_llocal : 1;  /* VT_LLOCAL: double indirection (22) */
-      uint32_t is_local : 1;   /* VT_LOCAL: stack-relative (23) */
-      uint32_t is_const : 1;   /* VT_CONST: constant value (24) */
-      uint32_t btype : 3;      /* IROP_BTYPE_* (25-27) */
-      uint32_t vreg_type : 4;  /* TCCIR_VREG_TYPE_* (28-31).
-                                  For IROP_TAG_STACKOFF: zero means a real
-                                  direct StackLoc reference; non-zero means a
-                                  vreg-backed spill encoding (see above). */
+      uint32_t position : TCCIR_VREG_POSITION_BITS; /* vreg position */
+      uint32_t is_complex : 1;                      /* VT_COMPLEX */
+      uint32_t tag : 3;                             /* IROP_TAG_* */
+      uint32_t is_lval : 1;                         /* VT_LVAL: needs dereference */
+      uint32_t btype : 3;                           /* IROP_BTYPE_* */
+#if TCC_IR_SMALL_QUAD
+      uint32_t is_unsigned : 1; /* VT_UNSIGNED */
+      uint32_t is_param : 1;    /* VT_PARAM: stack-passed parameter */
+      uint32_t aux : 4;         /* IROP_AUX_* flag bits */
+#else
+      uint32_t reserved : 4;
+#endif
+      uint32_t vreg_type : 3; /* TCCIR_VREG_TYPE_*, or TCCIR_VREG_TYPE_NEG; for
+                                 IROP_TAG_STACKOFF, zero means a real direct
+                                 StackLoc reference and non-zero a vreg-backed
+                                 spill encoding (see above). */
     };
   };
   union
@@ -125,21 +137,58 @@ typedef struct __attribute__((packed)) IROperand
       int16_t aux_data;   /* aux: stack offset for STACKOFF, symref_idx for SYMREF */
     } s;
   } u;
-  /* Type flags (filled during IR construction) */
+#if !TCC_IR_SMALL_QUAD
   uint8_t is_unsigned : 1; /* VT_UNSIGNED flag */
-  uint8_t is_static : 1;   /* VT_STATIC flag */
-  uint8_t is_sym : 1;      /* VT_SYM: has associated symbol */
   uint8_t is_param : 1;    /* VT_PARAM: stack-passed parameter (needs offset_to_args) */
-  uint8_t aux : 4;         /* IROP_AUX_* flag bits (see below).  Deliberately ONE
-                            * 4-bit member accessed via masks, not individual
-                            * 1-bit members: growing this struct's bitfield
-                            * member count makes host GCC stop scalarizing the
-                            * packed 9-byte struct in by-value copies, which
-                            * measurably tripled whole-IR scan passes (vrp on
-                            * tests2/101_cleanup went 19s -> 56s). */
+  uint8_t reserved2 : 2;
+  uint8_t aux : 4; /* IROP_AUX_* flag bits (see below).  Deliberately ONE
+                    * 4-bit member accessed via masks, not individual
+                    * 1-bit members: growing this struct's bitfield
+                    * member count makes host GCC stop scalarizing the
+                    * packed 9-byte struct in by-value copies, which
+                    * measurably tripled whole-IR scan passes (vrp on
+                    * tests2/101_cleanup went 19s -> 56s). */
+#endif
 } IROperand;
 
+#if TCC_IR_SMALL_QUAD
+_Static_assert(sizeof(IROperand) == 8, "IROperand must be 8 bytes");
+/* IROP_NONE: all ones, except that its flags read as clear in both layouts. */
+#define IROP_NONE_WORD ((int32_t)0xE07FFFFFu)
+/* The bits both layouts keep in the word. */
+#define IROP_WORD_COMMON ((int32_t)0xE07FFFFFu)
+#else
 _Static_assert(sizeof(IROperand) == 9, "IROperand must be 9 bytes");
+#define IROP_NONE_WORD (-1)
+#define IROP_WORD_COMMON (-1)
+#endif
+
+#define IROP_TAG_SHIFT (TCCIR_VREG_POSITION_BITS + 1)
+#define IROP_BTYPE_SHIFT (TCCIR_VREG_POSITION_BITS + 5)
+
+/* Flags the tag already decides.  IROP_NONE has every word bit set, so it reads as
+ * local, llocal and const and not as a symbol, whatever its raw tag says. */
+#define IROP_RAW_TAG_W(w) (((uint32_t)(w) >> IROP_TAG_SHIFT) & 7u)
+#define IROP_W_IS_NONE(w) (((int32_t)(w) | ~IROP_WORD_COMMON) == -1)
+static inline int irop_is_local_w(int32_t w)
+{
+  return IROP_RAW_TAG_W(w) == IROP_TAG_STACKOFF || IROP_W_IS_NONE(w);
+}
+static inline int irop_is_const_w(int32_t w)
+{
+  return (0xF4u >> IROP_RAW_TAG_W(w)) & 1u; /* IMM32, F32, I64, F64, SYMREF */
+}
+static inline int irop_is_sym_w(int32_t w)
+{
+  return IROP_RAW_TAG_W(w) == IROP_TAG_SYMREF && !IROP_W_IS_NONE(w);
+}
+#define irop_is_local(op) irop_is_local_w((op).vr)
+#define irop_is_const(op) irop_is_const_w((op).vr)
+#define irop_is_sym(op) irop_is_sym_w((op).vr)
+/* Nothing builds a VT_LLOCAL operand any more; only IROP_NONE answers yes. */
+#define irop_is_llocal(op) IROP_W_IS_NONE((op).vr)
+/* Replace the addressing half and keep the flags, on either layout. */
+#define irop_set_word(op, w) ((op).vr = ((int32_t)(w) & IROP_WORD_COMMON) | ((op).vr & ~IROP_WORD_COMMON))
 
 /* IROperand.aux flag bits. */
 #define IROP_AUX_ALIGN4_OK 0x1u   /* Access address is proven >= 4-byte aligned. */
@@ -286,17 +335,12 @@ struct CType *irop_get_ctype(IROperand op);
 int irop_compare_svalue(const struct TCCIRState *ir, const struct SValue *sv, IROperand op, const char *context);
 
 /* Position sentinel value: max 17-bit value means "no position" */
-#define IROP_POSITION_NONE 0x1FFFF
+#define IROP_POSITION_NONE TCCIR_VREG_POSITION_MASK
 
-/* Inlined only when a real optimizing compiler builds tcc (gcc/clang host
- * cross).  tcc itself performs NO cross-call inlining of these: with the
- * definitions visible in the TU it still emits one local out-of-line copy per
- * TU and keeps every call (measured: 136 call-site relocations either way in
- * source/ir/codegen.c).  On the self-hosted armv8m device compiler that is
- * +112 KB of .text across the build for zero speedup, which is why these were
- * de-inlined in the first place -- see the note in tccir_operand.c.  Gating on
- * __TINYC__ keeps the device build on the shared copies and gives the host
- * cross the inlining (measured -6..-7% on body-heavy -O0 compiles). */
+/* Inlined only when gcc or clang builds tcc (the host cross: -6..-7% on body-heavy
+ * -O0 compiles).  Static inline, the self-hosted compiler does expand them, and it is
+ * not worth it there: -2.2% compile time on the board model against 265 KB more
+ * .text, 14% of the device compiler, with more of the time now fetching code. */
 #ifndef __TINYC__
 #define TCC_IROP_INLINE_ACCESSORS 1
 #endif
@@ -369,19 +413,18 @@ IRPoolSymref *irop_get_symref_ex(const struct TCCIRState *ir, IROperand op);
 #ifdef TCC_IROP_INLINE_ACCESSORS
 static inline int32_t irop_get_vreg_w(int32_t w)
 {
-  IROperand op = {.vr = w};
-  /* IROP_NONE (vr == -1, all bits set) must return -1 before the negative vreg
-   * sentinel check, because its bit pattern also matches the sentinel. */
-  if (op.vr == -1)
+  /* The same as tccir_operand.c: see the comment there. */
+  const uint32_t type = (uint32_t)w >> TCCIR_VREG_TYPE_SHIFT, position = (uint32_t)w & TCCIR_VREG_POSITION_MASK;
+  if (type == 0)
     return -1;
-  if (op.vreg_type == 0xF && (op.position & IROP_NEG_VREG_SENTINEL) == IROP_NEG_VREG_SENTINEL)
+  if (type == TCCIR_VREG_TYPE_NEG)
   {
-    int neg_idx = op.position & 0xF;
-    return -(neg_idx + 1);
+    if (IROP_W_IS_NONE(w))
+      return -1;
+    if ((position & IROP_NEG_VREG_SENTINEL) == IROP_NEG_VREG_SENTINEL)
+      return -(int32_t)((position & 0xF) + 1);
   }
-  if (op.vreg_type == 0)
-    return -1;
-  return (op.vreg_type << 28) | op.position;
+  return (int32_t)((type << TCCIR_VREG_TYPE_SHIFT) | position);
 }
 
 static inline int32_t(irop_get_vreg)(const IROperand op)
@@ -394,14 +437,14 @@ int32_t irop_get_vreg(const IROperand op);
 
 /* Sentinel for "no operand" */
 #define IROP_NONE                                                                                                      \
-  ((IROperand){.vr = -1, .u = {.imm32 = 0}, .is_unsigned = 0, .is_static = 0, .is_sym = 0, .is_param = 0, .aux = 0})
+  ((IROperand){.vr = IROP_NONE_WORD, .u = {.imm32 = 0}})
 
 /* Helper to initialize type-flag byte to defaults */
 void irop_init_phys_regs(IROperand *op);
 
 /* Helper to set vreg fields from a vreg value.
  * For negative vregs (temp locals like -1, -2, etc.), we use a special encoding:
- * - Set vreg_type to 0xF and position bits 4-17 to all 1s as sentinel
+ * - Set vreg_type to TCCIR_VREG_TYPE_NEG and position bits 4 and up to all 1s as sentinel
  * - Store (-vreg - 1) in position bits 0-3 (supports -1 to -16)
  * For positive vregs, encode normally in position and vreg_type bitfields.
  */
@@ -414,7 +457,7 @@ IROperand irop_make_vreg(int32_t vreg, int btype);
 
 IROperand irop_make_imm32(int32_t vreg, int32_t val, int btype);
 
-IROperand irop_make_stackoff(int32_t vreg, int32_t offset, int is_lval, int is_llocal, int is_param_flag, int btype);
+IROperand irop_make_stackoff(int32_t vreg, int32_t offset, int is_lval, int is_param_flag, int btype);
 
 IROperand irop_make_f32(int32_t vreg, uint32_t bits);
 
@@ -422,7 +465,7 @@ IROperand irop_make_i64(int32_t vreg, uint32_t pool_idx, int btype);
 
 IROperand irop_make_f64(int32_t vreg, uint32_t pool_idx);
 
-IROperand irop_make_symref(int32_t vreg, uint32_t pool_idx, int is_lval, int is_local, int is_const, int btype);
+IROperand irop_make_symref(int32_t vreg, uint32_t pool_idx, int is_lval, int btype);
 
 /* Decoding helpers */
 int irop_is_none(const IROperand op);
@@ -482,12 +525,25 @@ int irop_op_is_const(const IROperand op);
 #ifndef TCC_IROP_INLINE_ACCESSORS
 int32_t irop_get_vreg_w(int32_t w);
 #endif
-int irop_get_tag_w(int32_t w);
-int irop_get_btype_w(int32_t w);
+/* One test each: IROP_NONE, every bit set, is the only word needing more than the
+ * field, and these run tens of millions of times in a compile. */
+static inline int irop_get_tag_w(int32_t w)
+{
+  const int tag = IROP_RAW_TAG_W(w);
+  return tag == IROP_TAG_SYMREF && IROP_W_IS_NONE(w) ? IROP_TAG_NONE : tag;
+}
+static inline int irop_is_none_w(int32_t w)
+{
+  return irop_get_tag_w(w) == IROP_TAG_NONE;
+}
+static inline int irop_get_btype_w(int32_t w)
+{
+  const int btype = ((uint32_t)w >> IROP_BTYPE_SHIFT) & 7u;
+  return btype == 7 && IROP_W_IS_NONE(w) ? IROP_BTYPE_INT32 : btype;
+}
 int irop_is_64bit_w(int32_t w);
 int irop_needs_pair_w(int32_t w);
 int irop_is_immediate_w(int32_t w);
-int irop_is_none_w(int32_t w);
 int irop_has_vreg_w(int32_t w);
 int irop_op_is_lval_w(int32_t w);
 #define irop_get_vreg(op) irop_get_vreg_w((op).vr)
@@ -505,12 +561,12 @@ int irop_op_is_lval_w(int32_t w);
 static inline int irop_is_vreg_value_w(int32_t w)
 {
   IROperand op = {.vr = w};
-  if (irop_get_vreg(op) < 0 || op.is_llocal)
+  if (irop_get_vreg(op) < 0 || irop_is_llocal(op))
     return 0;
   int tag = irop_get_tag(op);
   if (tag == IROP_TAG_VREG)
     return !op.is_lval;
-  return tag == IROP_TAG_STACKOFF && op.is_local && op.is_lval;
+  return tag == IROP_TAG_STACKOFF && irop_is_local(op) && op.is_lval;
 }
 #else
 int irop_is_vreg_value_w(int32_t w);
@@ -528,7 +584,7 @@ static inline int irop_dest_defines_vreg_w(int32_t w)
   if (tag == IROP_TAG_VREG)
     return !d.is_lval;
   if (tag == IROP_TAG_STACKOFF)
-    return d.is_lval && !d.is_llocal;
+    return d.is_lval && !irop_is_llocal(d);
   return 0;
 }
 #else

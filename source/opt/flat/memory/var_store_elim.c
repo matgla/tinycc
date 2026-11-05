@@ -86,9 +86,9 @@ static int ir_op_pure_for_dead_var_dest(TCCIRState *ir, IRQuadCompact *q)
     /* volatile ruled out above; what is left must not be MMIO */
     IROperand s = tcc_ir_op_get_src1(ir, q);
     int32_t v = irop_get_vreg(s);
-    return irop_is_immediate(s) || s.is_sym ||
+    return irop_is_immediate(s) || irop_is_sym(s) ||
            (v <= -2 && v >= -9) ||
-           (irop_get_tag(s) == IROP_TAG_STACKOFF && s.is_local);
+           (irop_get_tag(s) == IROP_TAG_STACKOFF && irop_is_local(s));
   }
   case TCCIR_OP_STORE: {
     /* only local stores are safe; pointer stores are observable */
@@ -112,9 +112,8 @@ int tcc_ir_opt_dead_var_store_elim(TCCIRState *ir)
   if (n == 0)
     return 0;
 
-  for (int i = 0; i < n; i++)
-    if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
-      return 0;
+  if (ir_opt_fn_features(ir) & IR_FN_IJUMP)
+    return 0;
 
   int max_var = 0;
   for (int i = 0; i < n; i++)

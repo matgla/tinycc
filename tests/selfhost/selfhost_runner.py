@@ -156,14 +156,9 @@ def run_cross_reference(test_file, output_dir, timeout=10):
     sut = prepare_test(MACHINE, compile_result.elf_file)
     stdout_lines = []
     try:
-        # The SubprocessSUT wrapper used by prepare_test buffers output; read
-        # until the process exits and then collect everything.
+        # Wait for the process to exit, then collect everything it wrote.
         sut.wait(timeout=timeout)
-        if sut._proc.stdout is not None:
-            data = sut._proc.stdout.read()
-            if data:
-                text = data.decode("utf-8", errors="replace")
-                stdout_lines = text.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+        stdout_lines = sut.read_remaining().splitlines()
     finally:
         sut.close()
 

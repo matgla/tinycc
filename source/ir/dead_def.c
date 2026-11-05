@@ -99,7 +99,7 @@ static int32_t dd_plain_temp_dest(TCCIRState *ir, IRQuadCompact *q)
     return -1;
   IROperand d = tcc_ir_op_get_dest(ir, q);
   int32_t vr = irop_get_vreg(d);
-  if (vr < 0 || d.is_lval || d.is_llocal || irop_get_tag(d) != IROP_TAG_VREG ||
+  if (vr < 0 || d.is_lval || irop_is_llocal(d) || irop_get_tag(d) != IROP_TAG_VREG ||
       TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
     return -1;
   return vr;
@@ -126,7 +126,7 @@ static int dd_may_read_memory(IROperand o)
 {
   if (irop_is_none(o))
     return 0;
-  if (o.is_lval || o.is_llocal)
+  if (o.is_lval || irop_is_llocal(o))
     return 1;
   const int tag = irop_get_tag(o);
   if (tag == IROP_TAG_IMM32 || tag == IROP_TAG_F32 || tag == IROP_TAG_I64 || tag == IROP_TAG_F64)

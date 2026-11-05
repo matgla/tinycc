@@ -170,8 +170,270 @@ LIBTCCAPI void tcc_set_realloc(TCCReallocFunc *realloc)
 #undef tcc_mallocz
 #undef tcc_strdup
 
+/* -----------------------------------------------------------------------------
+ * Hot IR arrays in fast memory.
+ *
+ * On the board a data miss costs 84 cycles and on-chip SRAM cannot miss, but SRAM
+ * is 336 KB against a compile's megabytes and goes to whoever asks first.  Most of
+ * a compile's misses fall on a few arrays every pass walks, so this process keeps
+ * its heap out of SRAM (MAP_SLOW) and places those arrays in an arena there,
+ * taken the first time a function is compiled.  An array that does not fit stays
+ * on the heap, so nothing depends on how much SRAM is free.
+ *
+ * TCC_ALLOC_PROFILE builds declare every allocation to the board model's allocprof
+ * port (tools/board_model/rp2350_timing.c) for scripts/selfhost_profile.py, and
+ * take the knobs TCC_TIER (0 first come, 1 arena, 2 arena + slow heap, the default,
+ * 3 all slow), TCC_ARENA_KB, TCC_ALLOCPROF and TCC_POOLMAP.
+ * -------------------------------------------------------------------------- */
+#if defined(TCC_IS_NATIVE) && defined(TARGETOS_YasOS)
+#include <sys/mman.h>
+#include "memory/hot_arena.h"
+
+extern int __malloc_map_flags;
+
+#define HOT_ARENA_MAX_BYTES (320u * 1024u)
+#define HOT_ARENA_MIN_BYTES (16u * 1024u)
+#define HOT_ARENA_STEP_BYTES (8u * 1024u)
+
+static HotArena hot_arena;
+static size_t hot_arena_mapped;
+static char hot_arena_tried;
+
+#ifdef TCC_ALLOC_PROFILE
+#include <fcntl.h>
+#include <unistd.h>
+#define PROF_SITES 4000
+static int hot_mode = 2;
+static int prof_on;
+static volatile unsigned prof_port;
+static struct ProfSite
+{
+  const char *file;
+  int line;
+} *prof_sites;
+
+static int prof_site(const char *file, int line)
+{
+  unsigned h = ((unsigned)(unsigned long)file * 31u + (unsigned)line) % PROF_SITES;
+  while (prof_sites[h].file)
+  {
+    if (prof_sites[h].file == file && prof_sites[h].line == line)
+      return (int)h;
+    h = (h + 1) % PROF_SITES;
+  }
+  prof_sites[h].file = file;
+  prof_sites[h].line = line;
+  return (int)h;
+}
+
+static void prof_alloc(void *p, unsigned long size, const char *file, int line)
+{
+  if (!prof_on)
+    return;
+  int site = prof_site(file, line);
+  prof_port = (1u << 28) | (unsigned)site;
+  prof_port = (unsigned)(unsigned long)p;
+  prof_port = (unsigned)size;
+}
+
+static void prof_free(void *p)
+{
+  if (!prof_on || !p)
+    return;
+  prof_port = 2u << 28;
+  prof_port = (unsigned)(unsigned long)p;
+}
+
+static void poolmap_dump(const char *when)
+{
+  char buf[4096];
+  int fd = open("/proc/poolmap", O_RDONLY);
+  if (fd < 0)
+    return;
+  long n = read(fd, buf, sizeof buf - 1);
+  close(fd);
+  if (n <= 0)
+    return;
+  buf[n] = 0;
+  char *line = buf;
+  while (*line)
+  {
+    char *e = (char *)strchr(line, '\n');
+    if (e)
+      *e = 0;
+    printf("POOLMAP %s %s\n", when, line);
+    if (!e)
+      break;
+    line = e + 1;
+  }
+}
+
+static void prof_exit(void)
+{
+  if (prof_on)
+  {
+    prof_on = 0;
+    for (int i = 0; i < PROF_SITES; i++)
+      if (prof_sites[i].file)
+        printf("ALLOCSITE %d %s %d\n", i, prof_sites[i].file, prof_sites[i].line);
+  }
+  if (getenv("TCC_POOLMAP"))
+    poolmap_dump("exit");
+  printf("ARENA bytes=%lu peak=%lu misses=%u\n", (unsigned long)hot_arena_mapped, (unsigned long)hot_arena.peak,
+         hot_arena.misses);
+  fflush(stdout);
+}
+#else
+#define prof_alloc(p, size, file, line) ((void)0)
+#define prof_free(p) ((void)0)
+#endif
+
+PUB_FUNC void tcc_memory_tiers_setup(void)
+{
+  static char done;
+  if (done)
+    return;
+  done = 1;
+#ifdef TCC_ALLOC_PROFILE
+  const char *e = getenv("TCC_TIER");
+  if (e)
+    hot_mode = atoi(e);
+  if (hot_mode == 0 || hot_mode == 3)
+    hot_arena_tried = 1;
+  if (hot_mode >= 2)
+    __malloc_map_flags = MAP_SLOW;
+  if (getenv("TCC_POOLMAP"))
+    poolmap_dump("start");
+  if (getenv("TCC_ALLOCPROF"))
+  {
+    prof_sites = tcc_mallocz(PROF_SITES * sizeof(*prof_sites));
+    prof_port = 0xA110C8EDu;
+    prof_on = 1;
+  }
+  atexit(prof_exit);
+#else
+  __malloc_map_flags = MAP_SLOW;
+#endif
+}
+
+static void *hot_alloc(unsigned long size)
+{
+  if (!hot_arena_tried)
+  {
+    hot_arena_tried = 1;
+    size_t want = HOT_ARENA_MAX_BYTES;
+#ifdef TCC_ALLOC_PROFILE
+    if (getenv("TCC_ARENA_KB"))
+      want = (size_t)atoi(getenv("TCC_ARENA_KB")) * 1024u;
+#endif
+    for (; want >= HOT_ARENA_MIN_BYTES; want -= HOT_ARENA_STEP_BYTES)
+    {
+      void *m = mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FAST, -1, 0);
+      if (m != MAP_FAILED)
+      {
+        hot_arena_init(&hot_arena, m, want);
+        hot_arena_mapped = want;
+        break;
+      }
+    }
+  }
+  return hot_arena_alloc(&hot_arena, size);
+}
+
+PUB_FUNC void tcc_hot_release(void)
+{
+  if (hot_arena_mapped && !hot_arena.used)
+  {
+    munmap(hot_arena.base, hot_arena_mapped);
+    hot_arena.base = hot_arena.end = NULL;
+    hot_arena_mapped = 0;
+  }
+  hot_arena_tried = 1;
+}
+
+PUB_FUNC void *tcc_hot_mallocz_at(unsigned long size, const char *file, int line)
+{
+  void *p = hot_alloc(size);
+  if (!p)
+    return tcc_mallocz_at(size, file, line);
+  memset(p, 0, size);
+  prof_alloc(p, size, file, line);
+  return p;
+}
+
+PUB_FUNC void tcc_hot_free(void *ptr)
+{
+  if (!ptr)
+    return;
+  if (!hot_arena_contains(&hot_arena, ptr))
+  {
+    tcc_free(ptr);
+    return;
+  }
+  prof_free(ptr);
+  hot_arena_free(&hot_arena, ptr);
+}
+
+PUB_FUNC void *tcc_hot_realloc_at(void *ptr, unsigned long size, const char *file, int line)
+{
+  if (!ptr)
+  {
+    void *p = hot_alloc(size);
+    if (p)
+    {
+      prof_alloc(p, size, file, line);
+      return p;
+    }
+    return tcc_malloc_at(size, file, line);
+  }
+  /* A block that had to leave comes back only through tcc_hot_settle. */
+  if (!hot_arena_contains(&hot_arena, ptr))
+    return tcc_realloc_at(ptr, size, file, line);
+  const size_t old = hot_arena_block_size(ptr);
+  if (hot_arena_resize(&hot_arena, ptr, size))
+  {
+    prof_free(ptr);
+    prof_alloc(ptr, size, file, line);
+    return ptr;
+  }
+  void *n = hot_alloc(size);
+  if (n)
+    prof_alloc(n, size, file, line);
+  else
+    n = tcc_malloc_at(size, file, line);
+  memcpy(n, ptr, old < size ? old : size);
+  tcc_hot_free(ptr);
+  return n;
+}
+
+PUB_FUNC void *tcc_hot_settle_at(void *ptr, unsigned long used, unsigned long cap, const char *file, int line)
+{
+  if (ptr && hot_arena_contains(&hot_arena, ptr) && hot_arena_resize(&hot_arena, ptr, cap))
+  {
+    prof_free(ptr);
+    prof_alloc(ptr, cap, file, line);
+    return ptr;
+  }
+  void *n = hot_alloc(cap);
+  if (n)
+    prof_alloc(n, cap, file, line);
+  else if (ptr && hot_arena_contains(&hot_arena, ptr))
+    n = tcc_malloc_at(cap, file, line);
+  else
+    return tcc_realloc_at(ptr, cap, file, line);
+  if (used)
+    memcpy(n, ptr, used);
+  tcc_hot_free(ptr);
+  return n;
+}
+#else
+#define prof_alloc(p, size, file, line) ((void)0)
+#define prof_free(p) ((void)0)
+#endif
+
 PUB_FUNC void tcc_free(void *ptr)
 {
+  prof_free(ptr);
   reallocator(ptr, 0);
 }
 
@@ -203,6 +465,7 @@ typedef struct TCCAllocSite
 static TCCAllocSite tcc_alloc_sites[TCC_ALLOC_SITES];
 static int tcc_nb_alloc_sites;
 
+#if TCC_RECORD_ALLOC_SITES
 static void tcc_record_alloc(unsigned long size, const char *file, int line)
 {
   int i;
@@ -229,17 +492,25 @@ static void tcc_record_alloc(unsigned long size, const char *file, int line)
   tcc_alloc_sites[i].count = 1;
   tcc_alloc_sites[i].bytes = size;
 }
+#else
+#define tcc_record_alloc(size, file, line) ((void)0)
+#endif
 
 PUB_FUNC void *tcc_malloc_at(unsigned long size, const char *file, int line)
 {
   tcc_record_alloc(size, file, line);
-  return reallocator(0, size);
+  void *r = reallocator(0, size);
+  prof_alloc(r, size, file, line);
+  return r;
 }
 
 PUB_FUNC void *tcc_realloc_at(void *ptr, unsigned long size, const char *file, int line)
 {
   tcc_record_alloc(size, file, line);
-  return reallocator(ptr, size);
+  prof_free(ptr);
+  void *r = reallocator(ptr, size);
+  prof_alloc(r, size, file, line);
+  return r;
 }
 
 PUB_FUNC void *tcc_mallocz_at(unsigned long size, const char *file, int line)
@@ -462,9 +733,11 @@ PUB_FUNC void tcc_memcheck(int d)
    definitions in this file could be written. Without this every allocation
    made by libtcc.c -- sections, the state, file buffers -- lands in the
    profile as "<unattributed>", which was a third of a small compile's bytes. */
+#if TCC_RECORD_ALLOC_SITES
 #define tcc_malloc(size) tcc_malloc_at(size, __FILE__, __LINE__)
 #define tcc_mallocz(size) tcc_mallocz_at(size, __FILE__, __LINE__)
 #define tcc_realloc(ptr, size) tcc_realloc_at(ptr, size, __FILE__, __LINE__)
+#endif
 
 #endif /* MEM_DEBUG */
 
@@ -701,6 +974,11 @@ PUB_FUNC void _tcc_ice(const char *fmt, ...)
   va_start(ap, fmt);
   error1(ERROR_ERROR, "compiler_error: ", fmt, ap);
   exit(1);
+}
+
+PUB_FUNC void _tcc_ice_stop(void)
+{
+  _tcc_ice("internal error");
 }
 
 PUB_FUNC void _tcc_warning(const char *fmt, ...)
@@ -1039,6 +1317,7 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   /* free include paths */
   dynarray_reset(&s1->include_paths, &s1->nb_include_paths);
   dynarray_reset(&s1->sysinclude_paths, &s1->nb_sysinclude_paths);
+  dynarray_reset(&s1->inc_dir_lists, &s1->nb_inc_dir_lists);
 
   tcc_free(s1->tcc_lib_path);
   tcc_free(s1->soname);
@@ -1050,6 +1329,11 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   tcc_free(s1->outfile);
   tcc_free(s1->deps_outfile);
   tcc_free(s1->linker_script);
+  tcc_free(s1->hot_text_file);
+  tcc_free(s1->ram_text_file);
+  dynarray_reset(&s1->hot_text_flash_names, &s1->nb_hot_text_flash_names);
+  dynarray_reset(&s1->ram_text_names, &s1->nb_ram_text_names);
+  dynarray_reset(&s1->ram_text_section_names, &s1->nb_ram_text_section_names);
 #ifdef CONFIG_TCC_DEBUG
   tcc_free(s1->dump_ir_passes);
 #endif
@@ -1626,6 +1910,16 @@ static int tcc_set_linker(TCCState *s, const char *option)
     {
       s->gc_sections = 1;
     }
+    else if (link_option(option, "hot-text=", &p))
+    {
+      copy_linker_arg(&s->hot_text_file, p, 0);
+      ignoring = 1;
+    }
+    else if (link_option(option, "ram-text=", &p))
+    {
+      copy_linker_arg(&s->ram_text_file, p, 0);
+      ignoring = 1;
+    }
     else if (link_option(option, "gc-sections-aggressive", &p))
     {
       /* The lazy per-object loader this used to enable linked symbols
@@ -1760,6 +2054,7 @@ enum
   TCC_OPTION_current_version,
   TCC_OPTION_mpic_data_is_text_relative,
   TCC_OPTION_stack_size,
+  TCC_OPTION_slow_memory,
   TCC_OPTION_heap_size,
   TCC_OPTION_share_rodata,
   TCC_OPTION_no_share_rodata,
@@ -1833,6 +2128,7 @@ static const TCCOption tcc_options[] = {
     {"march=", TCC_OPTION_march, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"march", TCC_OPTION_march, TCC_OPTION_HAS_ARG},
     {"mpic-data-is-text-relative", TCC_OPTION_mpic_data_is_text_relative, 0},
+    {"slow-memory", TCC_OPTION_slow_memory, 0},
     {"stack-size=", TCC_OPTION_stack_size, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"stack-size", TCC_OPTION_stack_size, TCC_OPTION_HAS_ARG},
     {"heap-size=", TCC_OPTION_heap_size, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
@@ -1924,6 +2220,7 @@ static const FlagDef options_f[] = {{offsetof(TCCState, char_is_unsigned), 0, "u
                                     {offsetof(TCCState, opt_iv_strength_red), 0, "iv-strength-red"},
                                     {offsetof(TCCState, opt_loop_unroll), 0, "loop-unroll"},
                                     {offsetof(TCCState, opt_reroll), 0, "reroll-blocks"},
+                                    {offsetof(TCCState, opt_peephole), 0, "peephole"},
                                     {offsetof(TCCState, opt_jump_threading), 0, "jump-threading"},
                                     {offsetof(TCCState, opt_vrp), 0, "vrp"},
                                     {offsetof(TCCState, opt_float_narrow), 0, "float-narrow"},
@@ -2421,6 +2718,9 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
       printf("Setting text and data separation to: 1\n");
       s->text_and_data_separation = 1;
       break;
+    case TCC_OPTION_slow_memory:
+      s->yaff_slow_memory = 1;
+      break;
     case TCC_OPTION_stack_size:
       s->yaff_stack_size = (unsigned int)strtoul(optarg, NULL, 0);
       break;
@@ -2568,6 +2868,7 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->opt_vrp = 1;             /* Value range propagation branch folding */
         s->opt_float_narrow = 1;    /* Narrow double math to float when safe */
         s->opt_jump_threading = 1;  /* Jump threading optimization */
+        s->opt_peephole = 1;        /* Instruction fusion, code generation caches */
         s->opt_inline_small = 1;    /* Inline tiny static/inline functions (≤30 words) */
         s->opt_inline_called_once = 1; /* Inline static functions called from one place, bodies deferred to TU end */
         s->opt_drop_unused_statics = 1; /* Emit only the statics something live refers to */
@@ -2795,6 +3096,7 @@ PUB_FUNC void tcc_print_stats(TCCState *s1, unsigned total_time)
             s1->bench_output_write_us,
             s1->bench_output_time > accounted ? s1->bench_output_time - accounted : 0);
   }
+#if TCC_RECORD_ALLOC_SITES
   if (tcc_nb_big_allocs)
   {
     int i, j, shown;
@@ -2817,6 +3119,7 @@ PUB_FUNC void tcc_print_stats(TCCState *s1, unsigned total_time)
               tcc_alloc_sites[i].count, tcc_alloc_sites[i].bytes / 1024);
     }
   }
+#endif
 #ifdef MEM_DEBUG
   fprintf(stderr, "# memory usage");
 #ifdef TCC_IS_NATIVE

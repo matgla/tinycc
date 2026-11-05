@@ -97,7 +97,7 @@ static int mi_base_ok(IROperand *base, int *is_stack)
     return 1;
   if (tag == IROP_TAG_STACKOFF)
   {
-    if (op.is_llocal)
+    if (irop_is_llocal(op))
       return 0;
     *is_stack = 1;
     return 1;
@@ -148,7 +148,7 @@ static int mi_resolve_lea_base(TCCIRState *ir, IROperand op, IROperand *out_slot
     if (dq->op != TCCIR_OP_LEA)
       return 0;
     ls = tcc_ir_op_get_src1(ir, dq);
-    if (ls.is_llocal)
+    if (irop_is_llocal(ls))
       return 0;
     /* LEA of a stack slot: hand back the STACKOFF address form -- the caller
      * routes it through the per-piece direct-slot path (offset adjustable). */

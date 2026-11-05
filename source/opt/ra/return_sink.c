@@ -45,8 +45,8 @@
 static int rs_plain(IROperand o)
 {
   if (irop_is_immediate(o))
-    return !o.is_sym;
-  return irop_is_vreg_value(o) && !o.is_sym && !o.is_complex;
+    return !irop_is_sym(o);
+  return irop_is_vreg_value(o) && !irop_is_sym(o) && !o.is_complex;
 }
 
 static int rs_int_btype(int bt)

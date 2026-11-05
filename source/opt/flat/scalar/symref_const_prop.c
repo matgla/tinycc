@@ -52,8 +52,6 @@ int tcc_ir_opt_symref_const_prop(TCCIRState *ir)
     int gen;
     uint32_t pool_idx;
     int btype;
-    uint8_t is_local;
-    uint8_t is_const;
     uint8_t is_unsigned;
   } SymrefTmp;
 
@@ -94,7 +92,7 @@ int tcc_ir_opt_symref_const_prop(TCCIRState *ir)
         continue;
       IROperand opnd = tcc_ir_op_get_src1_or_2(ir, q, slot != 0);
       /* Operand must be a plain vreg (not already a sym/imm operand). */
-      if (opnd.is_sym)
+      if (irop_is_sym(opnd))
         continue;
       int32_t opnd_vr = irop_get_vreg(opnd);
       if (TCCIR_DECODE_VREG_TYPE(opnd_vr) != TCCIR_VREG_TYPE_TEMP)
@@ -111,8 +109,7 @@ int tcc_ir_opt_symref_const_prop(TCCIRState *ir)
       const int use_btype = irop_get_btype(opnd);
       if (use_btype == IROP_BTYPE_STRUCT && map[pos].pool_idx > INT16_MAX)
         continue;
-      IROperand new_opnd = irop_make_symref(-1, map[pos].pool_idx, opnd.is_lval, map[pos].is_local,
-                                            map[pos].is_const, use_btype);
+      IROperand new_opnd = irop_make_symref(-1, map[pos].pool_idx, opnd.is_lval, use_btype);
       if (use_btype == IROP_BTYPE_STRUCT)
       {
         new_opnd.u.s.ctype_idx = opnd.u.s.ctype_idx;
@@ -144,14 +141,12 @@ int tcc_ir_opt_symref_const_prop(TCCIRState *ir)
         if (q->op == TCCIR_OP_ASSIGN)
         {
           IROperand src1 = tcc_ir_op_get_src1(ir, q);
-          if (src1.is_sym && !src1.is_lval && pos <= max_tmp_pos)
+          if (irop_is_sym(src1) && !src1.is_lval && pos <= max_tmp_pos)
           {
             map[pos].gen = current_gen;
             map[pos].pool_idx = irop_get_btype(src1) == IROP_BTYPE_STRUCT ? (uint32_t)(uint16_t)src1.u.s.aux_data
                                                                           : (uint32_t)src1.u.pool_idx;
             map[pos].btype = irop_get_btype(src1);
-            map[pos].is_local = src1.is_local;
-            map[pos].is_const = src1.is_const;
             map[pos].is_unsigned = src1.is_unsigned;
             recorded = 1;
           }

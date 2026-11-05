@@ -15,4 +15,5 @@
 #undef HINT_IDX
 #undef RA_EXITPHI_PUSH
 #undef RA_WIDEN_MAX_WORDS
+#undef W_MARK_USE
 #undef W_ROW

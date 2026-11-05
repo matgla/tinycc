@@ -96,7 +96,7 @@ int tcc_ir_opt_invariant_global_load_hoist(TCCIRState *ir)
     if (q->op != TCCIR_OP_STORE)
       continue;
     IROperand sdest = tcc_ir_op_get_dest(ir, q);
-    if (!sdest.is_sym || !sdest.is_lval)
+    if (!irop_is_sym(sdest) || !sdest.is_lval)
       continue;
     IRPoolSymref *sref = irop_get_symref_ex(ir, sdest);
     if (!sref || !sref->sym)
@@ -136,14 +136,14 @@ int tcc_ir_opt_invariant_global_load_hoist(TCCIRState *ir)
       case TCCIR_OP_STORE:
       {
         IROperand dest = tcc_ir_op_get_dest(ir, q);
-        if (dest.is_sym && dest.is_lval)
+        if (irop_is_sym(dest) && dest.is_lval)
         {
           IRPoolSymref *sref = irop_get_symref_ex(ir, dest);
           if (!sref || !sref->sym)
             clobber[i] = 1;
           /* else: direct global store - tracked via written_globals */
         }
-        else if (!dest.is_local)
+        else if (!irop_is_local(dest))
         {
           clobber[i] = 1;
         }
@@ -186,7 +186,7 @@ int tcc_ir_opt_invariant_global_load_hoist(TCCIRState *ir)
         irop_config[q->op].has_dest && irop_config[q->op].has_src1)
     {
       IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      if (src1.is_sym && src1.is_lval)
+      if (irop_is_sym(src1) && src1.is_lval)
         is_load_like = 1;
     }
 

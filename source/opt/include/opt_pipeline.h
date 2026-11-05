@@ -61,6 +61,7 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group);
 extern const IRPassGroup propagation_group;
 extern const IRPassGroup memory_group;
 extern const IRPassGroup late_cleanup_group;
+extern const IRPassGroup ra_late_cleanup_group;
 extern const IRPassGroup entry_store_group;
 
 /* Concrete gen-pass adapters (pipeline-callable). */

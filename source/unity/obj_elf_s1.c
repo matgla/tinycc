@@ -6,7 +6,9 @@
 #undef LD_TOK_EOF
 #undef LD_TOK_NAME
 #include "../obj/tccelf_load.c"
+#undef LINK_ARENA_MIN
 #include "../obj/tccelf_output.c"
 #include "../obj/tccelf_reloc.c"
 #include "../obj/tccelf_sym.c"
 #undef ELFCLASS_BITS
+#undef SYM_ATTR_CHUNK_BITS

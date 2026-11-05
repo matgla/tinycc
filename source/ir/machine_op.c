@@ -161,7 +161,7 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
   /*    fill_registers_ir returns early for these.                       */
   /* ------------------------------------------------------------------ */
 
-  if (vreg < 0 && (op->is_local || op->is_llocal || tag == IROP_TAG_STACKOFF))
+  if (vreg < 0 && (irop_is_local(*op) || irop_is_llocal(*op) || tag == IROP_TAG_STACKOFF))
   {
     const int32_t stack_off = irop_get_stack_offset(*op);
 
@@ -178,7 +178,7 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
       return m;
     }
 
-    if (op->is_param && op->is_local)
+    if (op->is_param && irop_is_local(*op))
     {
       m.kind = MACH_OP_PARAM_STACK;
       m.u.param.offset = stack_off;
@@ -195,7 +195,7 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
 
     m.kind = MACH_OP_SPILL;
     m.u.spill.offset = stack_off;
-    m.needs_deref = (bool)op->is_llocal;
+    m.needs_deref = (bool)irop_is_llocal(*op);
     return m;
   }
 
@@ -250,7 +250,7 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
     else
       m.u.param.offset = interval->original_offset;
     int need_lval = op->is_lval;
-    if (!op->is_const && !op->is_local && !op->is_llocal && interval->is_lvalue)
+    if (!irop_is_const(*op) && !irop_is_local(*op) && !irop_is_llocal(*op) && interval->is_lvalue)
       need_lval = 1;
     m.needs_deref = (bool)need_lval;
     return m;
@@ -269,7 +269,7 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
                      interval->allocation.r0 == PREG_NONE ||
                      alloc_offset != 0;
   if (needs_stack && op->btype != IROP_BTYPE_STRUCT &&
-      (op->is_local || op->is_llocal) && !op->is_param && tag == IROP_TAG_STACKOFF)
+      (irop_is_local(*op) || irop_is_llocal(*op)) && !op->is_param && tag == IROP_TAG_STACKOFF)
   {
     int32_t delta = op->u.imm32 - interval->original_offset;
     alloc_offset += delta;
@@ -285,7 +285,7 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
   {
     /* Determine need_lval and double-indirection (llocal). */
     int need_lval;
-    if (op->is_local || op->is_llocal)
+    if (irop_is_local(*op) || irop_is_llocal(*op))
     {
       /* Local variable: preserve original is_lval (load vs address-of). */
       need_lval = op->is_lval;
@@ -297,7 +297,7 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
     }
 
     int use_llocal = 0;
-    if (op->is_lval && !op->is_local && !op->is_llocal)
+    if (op->is_lval && !irop_is_local(*op) && !irop_is_llocal(*op))
     {
       /* The original use wants to dereference the value in this vreg.
        * Since the value is spilled, we need double indirection:
@@ -318,7 +318,7 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
     }
 
 
-    if (spilled_param && op->is_local)
+    if (spilled_param && irop_is_local(*op))
     {
       /* Stack-passed parameter that stayed on stack. */
       m.kind = MACH_OP_PARAM_STACK;
@@ -388,14 +388,14 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
       {
         m.kind = MACH_OP_SPILL;
         m.u.spill.offset = stack_off;
-        m.needs_deref = (bool)op->is_llocal;
+        m.needs_deref = (bool)irop_is_llocal(*op);
       }
       return m;
     }
 
     /* Preserve is_lval only for pointer derefs, not for locals promoted to reg. */
     int preserve_lval = 0;
-    if (op->is_lval && !op->is_const && !op->is_local && !op->is_llocal)
+    if (op->is_lval && !irop_is_const(*op) && !irop_is_local(*op) && !irop_is_llocal(*op))
     {
       preserve_lval = 1;
     }

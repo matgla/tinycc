@@ -97,7 +97,7 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
         IROperand s = tcc_ir_op_get_slot(ir, q, k);
         if (!irop_has_vreg(s))
           continue;
-        if (!addressing && (!s.is_lval || s.is_local || s.is_llocal))
+        if (!addressing && (!s.is_lval || irop_is_local(s) || irop_is_llocal(s)))
           continue;
         int idx = ir_opt_du_idx(&du, irop_get_vreg(s));
         if (idx >= 0)
@@ -133,7 +133,7 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
        * operand is a memory read at the shift result's address; replacing it
        * with the shift source would silently delete that load.  The local
        * forms likewise carry an implicit memory access. */
-      if (src2.is_lval || src2.is_local || src2.is_llocal)
+      if (src2.is_lval || irop_is_local(src2) || irop_is_llocal(src2))
         continue;
 
       int32_t vr2 = irop_get_vreg(src2);
@@ -197,7 +197,7 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
 
       /* A local's home reads its value only when aliases and volatile accesses cannot change it. */
       IRLiveInterval *shift_live = tcc_ir_try_get_live_interval(ir, irop_get_vreg(shift_src1));
-      if ((shift_src1.is_local && !shift_live) ||
+      if ((irop_is_local(shift_src1) && !shift_live) ||
           (shift_live && (shift_live->addrtaken || shift_live->is_volatile)) ||
           tcc_ir_access_is_volatile(ir, shift_src1))
         continue;

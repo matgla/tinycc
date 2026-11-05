@@ -98,7 +98,7 @@ static int cmpf_trace(TCCIRState *ir, IROperand op, int before_idx, IROperand *b
         {
           IRQuadCompact *dq2 = &ir->compact_instructions[d2];
           IROperand s2b = tcc_ir_op_get_src2(ir, dq2);
-          if (dq2->op == TCCIR_OP_SHL && irop_is_immediate(s2b) && !s2b.is_sym &&
+          if (dq2->op == TCCIR_OP_SHL && irop_is_immediate(s2b) && !irop_is_sym(s2b) &&
               tcc_ir_op_dest_btype(ir, dq2) == IROP_BTYPE_INT32)
           {
             int a = (int)irop_get_imm64_ex(ir, s2b);

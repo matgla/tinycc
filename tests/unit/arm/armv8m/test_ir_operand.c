@@ -182,7 +182,7 @@ UT_TEST(test_make_imm32_roundtrips)
 UT_TEST(test_make_stackoff_roundtrips)
 {
   int vreg = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 5);
-  IROperand op = irop_make_stackoff(vreg, -28, 1, 0, 1, IROP_BTYPE_INT32);
+  IROperand op = irop_make_stackoff(vreg, -28, 1, 1, IROP_BTYPE_INT32);
 
   UT_ASSERT_EQ(irop_get_tag(op), IROP_TAG_STACKOFF);
   UT_ASSERT_EQ(irop_get_vreg(op), vreg);
@@ -446,7 +446,7 @@ UT_TEST(test_svalue_to_iroperand_symref_roundtrip)
   IROperand op = svalue_to_iroperand(ir, &sv);
 
   UT_ASSERT_EQ(irop_get_tag(op), IROP_TAG_SYMREF);
-  UT_ASSERT(op.is_sym);
+  UT_ASSERT(irop_is_sym(op));
   UT_ASSERT(irop_op_is_lval(op));
   UT_ASSERT_EQ(irop_get_sym_ex(ir, op), &gsym);
 
@@ -1216,6 +1216,48 @@ UT_TEST(test_op_is_const_predicate)
   return 0;
 }
 
+/* irop_is_local/const/sym come from the tag alone, and IROP_NONE keeps its answers
+ * on both layouts: this is what the flags stored in the operand used to say. */
+UT_TEST(test_flags_follow_the_tag)
+{
+  int32_t vr = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 3);
+  IROperand reg = irop_make_vreg(vr, IROP_BTYPE_INT32);
+  UT_ASSERT(!irop_is_local(reg) && !irop_is_const(reg) && !irop_is_sym(reg) && !irop_is_llocal(reg));
+  IROperand slot = irop_make_stackoff(vr, -12, 1, 0, IROP_BTYPE_INT32);
+  UT_ASSERT(irop_is_local(slot) && !irop_is_const(slot) && !irop_is_sym(slot) && !irop_is_llocal(slot));
+  IROperand imm = irop_make_imm32(-1, 7, IROP_BTYPE_INT32);
+  UT_ASSERT(!irop_is_local(imm) && irop_is_const(imm) && !irop_is_sym(imm));
+  UT_ASSERT(irop_is_const(irop_make_f32(-1, 0)));
+  UT_ASSERT(irop_is_const(irop_make_i64(-1, 0, IROP_BTYPE_INT64)));
+  UT_ASSERT(irop_is_const(irop_make_f64(-1, 0)));
+  IROperand sym = irop_make_symref(-1, 0, 0, IROP_BTYPE_INT32);
+  UT_ASSERT(!irop_is_local(sym) && irop_is_const(sym) && irop_is_sym(sym));
+
+  IROperand none = IROP_NONE;
+  UT_ASSERT(irop_is_none(none) && irop_get_vreg(none) == -1);
+  UT_ASSERT(irop_is_local(none) && irop_is_const(none) && !irop_is_sym(none) && irop_is_llocal(none));
+  UT_ASSERT(none.is_lval && !none.is_unsigned && !none.is_param && !none.aux);
+  return 0;
+}
+
+/* Replacing the word keeps the flags, whichever half of the operand they live in. */
+UT_TEST(test_set_word_keeps_flags)
+{
+  IROperand op = irop_make_vreg(TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, 1), IROP_BTYPE_INT8);
+  op.is_unsigned = 1;
+  op.is_param = 1;
+  op.aux = IROP_AUX_NONVOLATILE;
+  irop_set_word(op, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 9));
+  UT_ASSERT_EQ(irop_get_vreg(op), TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 9));
+  UT_ASSERT(op.is_unsigned && op.is_param);
+  UT_ASSERT_EQ(op.aux, IROP_AUX_NONVOLATILE);
+  UT_ASSERT_EQ(op.btype, IROP_BTYPE_INT32);
+  /* A dropped call result: no operand any more, though its flags stay. */
+  irop_set_word(op, -1);
+  UT_ASSERT(irop_is_none(op) && irop_is_llocal(op) && op.is_unsigned);
+  return 0;
+}
+
 UT_TEST(test_vreg_value_distinguishes_home_from_dereference)
 {
   int32_t vr = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 3);
@@ -1224,14 +1266,12 @@ UT_TEST(test_vreg_value_distinguishes_home_from_dereference)
   value.is_lval = 1;
   UT_ASSERT(!irop_is_vreg_value(value));
 
-  IROperand home = irop_make_stackoff(vr, -12, 1, 0, 0, IROP_BTYPE_INT32);
+  IROperand home = irop_make_stackoff(vr, -12, 1, 0, IROP_BTYPE_INT32);
   UT_ASSERT(irop_is_vreg_value(home));
-  home.is_llocal = 1;
-  UT_ASSERT(!irop_is_vreg_value(home));
-  home.is_llocal = home.is_lval = 0;
+  home.is_lval = 0;
   UT_ASSERT(!irop_is_vreg_value(home));
 
-  IROperand slot = irop_make_stackoff(0, -12, 1, 0, 0, IROP_BTYPE_INT32);
+  IROperand slot = irop_make_stackoff(0, -12, 1, 0, IROP_BTYPE_INT32);
   UT_ASSERT(!irop_is_vreg_value(slot));
   UT_ASSERT(!irop_is_vreg_value(irop_make_none()));
   UT_ASSERT(!irop_is_vreg_value(irop_make_imm32(0, 4, IROP_BTYPE_INT32)));
@@ -1275,5 +1315,74 @@ UT_TEST(test_compare_svalue_matches_const)
 
   tcc_ir_free(ir);
   tcc_state->ir = NULL;
+  return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Scans comparing a slot with a vreg, without decoding                       */
+/* -------------------------------------------------------------------------- */
+
+UT_TEST(test_vreg_is_real_only_for_what_decoding_returns)
+{
+  UT_ASSERT(tcc_ir_vreg_is_real(irop_get_vreg(irop_make_vreg(TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 3), IROP_BTYPE_INT32))));
+  UT_ASSERT(tcc_ir_vreg_is_real(TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, 0)));
+  UT_ASSERT(tcc_ir_vreg_is_real(TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_PARAM, TCCIR_VREG_POSITION_MASK)));
+  UT_ASSERT(!tcc_ir_vreg_is_real(-1));
+  UT_ASSERT(!tcc_ir_vreg_is_real(-16));
+  UT_ASSERT(!tcc_ir_vreg_is_real(0));
+  UT_ASSERT(!tcc_ir_vreg_is_real(5));
+  /* bits above the position: no decoded operand has them */
+  UT_ASSERT(!tcc_ir_vreg_is_real(TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 3) | (1 << (TCCIR_VREG_POSITION_BITS + 1))));
+  return 0;
+}
+
+UT_TEST(test_slot_holds_agrees_with_decoding)
+{
+  static const int ops[] = {TCCIR_OP_ADD, TCCIR_OP_ASSIGN, TCCIR_OP_NOP, TCCIR_OP_JUMP, TCCIR_OP_STORE};
+  TCCIRState *ir = tcc_ir_alloc();
+  IROperand slots[3], *pool = ir->iroperand_pool;
+  const int pool_count = ir->iroperand_pool_count;
+  IRQuadCompact q;
+  uint32_t x = 0x9E3779B9u;
+
+  memset(&q, 0, sizeof(q));
+  memset(slots, 0, sizeof(slots));
+  ir->iroperand_pool = slots;
+  ir->iroperand_pool_count = 3;
+  for (int round = 0; round < 20000; round++)
+  {
+    for (int s = 0; s < 3; s++)
+    {
+      x ^= x << 13, x ^= x >> 17, x ^= x << 5;
+      /* mostly the words that are tricky: no type, or the no-vreg type and its sentinels */
+      slots[s].vr = (int32_t)x;
+      if (round % 4 == 1)
+        slots[s].vr = (int32_t)(x & ~((uint32_t)7 << TCCIR_VREG_TYPE_SHIFT));
+      else if (round % 4 == 2)
+        slots[s].vr = (int32_t)(x | ((uint32_t)7 << TCCIR_VREG_TYPE_SHIFT) | IROP_NEG_VREG_SENTINEL);
+      else if (round % 4 == 3)
+        slots[s].vr = s ? IROP_NONE_WORD : (int32_t)((x & 0x7FF) | ((uint32_t)TCCIR_VREG_TYPE_TEMP << TCCIR_VREG_TYPE_SHIFT));
+    }
+    for (unsigned o = 0; o < sizeof(ops) / sizeof(ops[0]); o++)
+    {
+      q.op = ops[o];
+      const int32_t d = tcc_ir_op_dest_vreg(ir, &q), s1 = tcc_ir_op_src1_vreg(ir, &q), s2 = tcc_ir_op_src2_vreg(ir, &q);
+      const int32_t ask[] = {d, s1, s2, (int32_t)((uint32_t)slots[0].vr & IROP_VREG_WORD_MASK),
+                             TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 0)};
+      for (unsigned a = 0; a < sizeof(ask) / sizeof(ask[0]); a++)
+      {
+        if (!tcc_ir_vreg_is_real(ask[a]))
+          continue;
+        UT_ASSERT_EQ(tcc_ir_op_dest_is_vreg(ir, &q, ask[a]), d == ask[a]);
+        UT_ASSERT_EQ(tcc_ir_op_src1_is_vreg(ir, &q, ask[a]), s1 == ask[a]);
+        UT_ASSERT_EQ(tcc_ir_op_src2_is_vreg(ir, &q, ask[a]), s2 == ask[a]);
+      }
+      /* The macro for a value that may not be real is the decoder, for any value. */
+      UT_ASSERT_EQ(IR_SLOT_HOLDS(dest, ir, &q, -1, tcc_ir_vreg_is_real(-1)), d == -1);
+    }
+  }
+  ir->iroperand_pool = pool;
+  ir->iroperand_pool_count = pool_count;
+  tcc_ir_free(ir);
   return 0;
 }

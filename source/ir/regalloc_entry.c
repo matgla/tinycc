@@ -288,7 +288,7 @@ static void ra_mark_rematerializable(TCCIRState *ir)
       else if (slot == 1) { if (!irop_config[q->op].has_src1) continue; s = tcc_ir_op_get_src1(ir, q); }
       else if (slot == 2) { if (!irop_config[q->op].has_src2) continue; s = tcc_ir_op_get_src2(ir, q); }
       else { if (!tcc_ir_op_is_mac(q->op)) continue; s = tcc_ir_op_get_accum(ir, q); }
-      if (!(s.is_lval && !s.is_local && !s.is_llocal))
+      if (!(s.is_lval && !irop_is_local(s) && !irop_is_llocal(s)))
         continue;
       int32_t vr = irop_get_vreg(s);
       if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
@@ -308,7 +308,7 @@ static void ra_mark_rematerializable(TCCIRState *ir)
     if (tcc_ir_op_dest_is_lval(ir, dq) || tcc_ir_op_dest_btype(ir, dq) != IROP_BTYPE_INT32)
       continue;
     IROperand s = tcc_ir_op_get_src1(ir, dq);
-    if (s.tag != IROP_TAG_IMM32 || s.is_lval || s.is_sym || s.is_local || s.is_llocal)
+    if (s.tag != IROP_TAG_IMM32 || s.is_lval || irop_is_sym(s) || irop_is_local(s) || irop_is_llocal(s))
       continue;
     IRLiveInterval *iv = &ir->temporary_variables_live_intervals[t];
     /* An -Os shared constant (os_const_share): the reload is the point. */
@@ -337,7 +337,7 @@ static void ra_mark_rematerializable(TCCIRState *ir)
 static int ra_cfg_cleanup(TCCIRState *ir)
 {
   int total = 0;
-  const IRPassGroup *cleanup_group = &late_cleanup_group;
+  const IRPassGroup *cleanup_group = &ra_late_cleanup_group;
   for (int outer = 0; outer < 3; outer++) {
     int ch = 0;
     for (int i = 0; i < 8; i++) {
@@ -443,13 +443,12 @@ static int ra_split_is_call(TCCIRState *ir, IRQuadCompact *q)
  * temp cannot stand in for (the var's address, double indirection). */
 static int ra_split_use_operand(IROperand s, IROperand *out, int32_t to)
 {
-  if (s.is_llocal || s.btype == IROP_BTYPE_STRUCT || s.is_complex)
+  if (irop_is_llocal(s) || s.btype == IROP_BTYPE_STRUCT || s.is_complex)
     return 0;
   IROperand t = s;
-  if (s.is_local) {
+  if (irop_is_local(s)) {
     if (!s.is_lval)
       return 0; /* address of the var's home */
-    t.is_local = 0;
     t.is_lval = 0;
   } else if (s.tag != IROP_TAG_VREG)
     return 0;
@@ -515,11 +514,11 @@ static void ra_split_insert(TCCIRState *ir, RaSplitCopy *cp, int ncp)
   tcc_ir_label_sync(ir);
   int old_n = ir->next_instruction_index;
   int new_cap = old_n + ncp + 16;
-  IRQuadCompact *ni = tcc_mallocz(new_cap * sizeof(IRQuadCompact));
+  IRQuadCompact *ni = tcc_hot_mallocz(new_cap * sizeof(IRQuadCompact));
   int *old_to_new = tcc_malloc((old_n + 1) * sizeof(int));
   while (ir->iroperand_pool_count + 2 * ncp > ir->iroperand_pool_capacity) {
-    int nc = ir->iroperand_pool_capacity ? ir->iroperand_pool_capacity * 2 : 256;
-    ir->iroperand_pool = tcc_realloc(ir->iroperand_pool, nc * sizeof(IROperand));
+    int nc = tcc_ir_pool_capacity_for(ir->iroperand_pool_capacity, ir->iroperand_pool_count + 2 * ncp);
+    ir->iroperand_pool = tcc_hot_realloc(ir->iroperand_pool, nc * sizeof(IROperand));
     ir->iroperand_pool_capacity = nc;
   }
   int wp = 0, c = 0;
@@ -547,7 +546,7 @@ static void ra_split_insert(TCCIRState *ir, RaSplitCopy *cp, int ncp)
       ni[wp].op = TCCIR_OP_ASSIGN;
       ni[wp].operand_base = pb;
       ni[wp].line_num = line;
-      ni[wp].orig_index = ++ir->max_orig_index;
+      ni[wp].orig_index = tcc_ir_fresh_orig_index(ir);
       wp++;
     }
     if (i == old_n) {
@@ -581,7 +580,7 @@ static void ra_split_insert(TCCIRState *ir, RaSplitCopy *cp, int ncp)
     if (table->default_target >= 0 && table->default_target <= old_n)
       table->default_target = old_to_new[table->default_target];
   }
-  tcc_free(ir->compact_instructions);
+  tcc_hot_free(ir->compact_instructions);
   ir->compact_instructions = ni;
   ir->compact_instructions_size = new_cap;
   ir->next_instruction_index = wp;
@@ -620,17 +619,17 @@ static int ra_split_def_kind(TCCIRState *ir, IRQuadCompact *q, int32_t v)
     if (irop_get_btype(d) != IROP_BTYPE_INT32 || d.is_complex)
       return -1;
     /* promoted VAR through its spill encoding: STORE StackLoc(V) = V's def */
-    if (vt == TCCIR_VREG_TYPE_VAR && d.tag == IROP_TAG_STACKOFF && d.is_local && d.is_lval && !d.is_llocal)
+    if (vt == TCCIR_VREG_TYPE_VAR && d.tag == IROP_TAG_STACKOFF && irop_is_local(d) && d.is_lval && !irop_is_llocal(d))
       return 2;
     /* a temp's in-place def (SSA renaming of a promoted var's slot store) */
-    if (vt == TCCIR_VREG_TYPE_TEMP && d.tag == IROP_TAG_VREG && !d.is_lval && !d.is_local && !d.is_llocal)
+    if (vt == TCCIR_VREG_TYPE_TEMP && d.tag == IROP_TAG_VREG && !d.is_lval && !irop_is_local(d) && !irop_is_llocal(d))
       return 2;
     return 0; /* a store THROUGH the value: a use, classified by the caller */
   }
   if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC)
     return 0;
   int bt = irop_get_btype(d);
-  if (ra_split_op_excluded(q->op) || d.tag != IROP_TAG_VREG || d.is_lval || d.is_local || d.is_llocal ||
+  if (ra_split_op_excluded(q->op) || d.tag != IROP_TAG_VREG || d.is_lval || irop_is_local(d) || irop_is_llocal(d) ||
       d.is_complex || !(bt == IROP_BTYPE_INT32 || bt == IROP_BTYPE_INT8 || bt == IROP_BTYPE_INT16))
     return -1;
   return 1;
@@ -911,11 +910,11 @@ static int ra_split_spilled(TCCIRState *ir, IRCFG *cfg, SSAInterval *intervals, 
        * A PARAM base is a plain use too (its home slot is only read); only
        * the loop group ever sees param candidates. */
       int ok = (q->op == TCCIR_OP_STORE && TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP && d.is_lval &&
-                !d.is_local && !d.is_llocal && d.tag == IROP_TAG_VREG) ||
+                !irop_is_local(d) && !irop_is_llocal(d) && d.tag == IROP_TAG_VREG) ||
                (q->op == TCCIR_OP_STORE_INDEXED &&
                 (TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP ||
                  TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_PARAM) &&
-                d.tag == IROP_TAG_VREG && !d.is_local && !d.is_llocal);
+                d.tag == IROP_TAG_VREG && !irop_is_local(d) && !irop_is_llocal(d));
       nuse[c]++;
       if (!ok)
         bad[c] = 1;
@@ -1680,9 +1679,9 @@ static int ra_bump_sink(TCCIRState *ir)
       continue;
     IROperand d = tcc_ir_op_get_dest(ir, q);
     IROperand s1 = tcc_ir_op_get_src1(ir, q);
-    if (d.is_lval || d.is_local || d.is_llocal || d.is_sym || d.is_complex || irop_get_tag(d) != IROP_TAG_VREG)
+    if (d.is_lval || irop_is_local(d) || irop_is_llocal(d) || irop_is_sym(d) || d.is_complex || irop_get_tag(d) != IROP_TAG_VREG)
       continue;
-    if (s1.is_lval || s1.is_local || s1.is_llocal || s1.is_sym || s1.is_complex || irop_get_tag(s1) != IROP_TAG_VREG)
+    if (s1.is_lval || irop_is_local(s1) || irop_is_llocal(s1) || irop_is_sym(s1) || s1.is_complex || irop_get_tag(s1) != IROP_TAG_VREG)
       continue;
     if (irop_get_btype(d) != IROP_BTYPE_INT32 || irop_get_btype(s1) != IROP_BTYPE_INT32)
       continue;
@@ -1723,7 +1722,7 @@ static int ra_bump_sink(TCCIRState *ir)
         if (ra_bump_operand_hit(o[m], dv)) {
           halt = 1; /* T read or written: the ADD must stay above */
         } else if (ra_bump_operand_hit(o[m], pv)) {
-          if (o[m].is_local || o[m].is_llocal)
+          if (irop_is_local(o[m]) || irop_is_llocal(o[m]))
             halt = 1; /* a spill-encoded P: not worth reasoning about */
           else if (m == 0 && irop_config[kq->op].has_dest && !o[m].is_lval && kq->op != TCCIR_OP_STORE_INDEXED)
             halt = 1; /* P redefined (a STORE into a plain vreg too): the ADD reads the old value */
@@ -1808,9 +1807,9 @@ static int ra_bump_sink(TCCIRState *ir)
         continue;
       IROperand d = tcc_ir_op_get_dest(ir, q);
       IROperand s1 = tcc_ir_op_get_src1(ir, q);
-      if (d.is_lval || d.is_local || d.is_llocal || d.is_sym || d.is_complex || irop_get_tag(d) != IROP_TAG_VREG)
+      if (d.is_lval || irop_is_local(d) || irop_is_llocal(d) || irop_is_sym(d) || d.is_complex || irop_get_tag(d) != IROP_TAG_VREG)
         continue;
-      if (s1.is_lval || s1.is_local || s1.is_llocal || s1.is_sym || s1.is_complex || irop_get_tag(s1) != IROP_TAG_VREG)
+      if (s1.is_lval || irop_is_local(s1) || irop_is_llocal(s1) || irop_is_sym(s1) || s1.is_complex || irop_get_tag(s1) != IROP_TAG_VREG)
         continue;
       if (irop_get_btype(d) != IROP_BTYPE_INT32 || irop_get_btype(s1) != IROP_BTYPE_INT32)
         continue;
@@ -1845,12 +1844,12 @@ static int ra_bump_sink(TCCIRState *ir)
         for (int m = 0; m < no; m++) {
           int is_def = m == 0 && irop_config[kq->op].has_dest && !o[m].is_lval && kq->op != TCCIR_OP_STORE_INDEXED;
           if (ra_bump_operand_hit(o[m], tv)) {
-            if (is_def || o[m].is_local || o[m].is_llocal)
+            if (is_def || irop_is_local(o[m]) || irop_is_llocal(o[m]))
               ok = 0;
             else
               reads++;
           } else if (ra_bump_operand_hit(o[m], pv)) {
-            if (o[m].is_local || o[m].is_llocal)
+            if (irop_is_local(o[m]) || irop_is_llocal(o[m]))
               ok = 0;
             else if (is_def)
               writes_p = 1;
@@ -2219,25 +2218,18 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
     tcc_pass_timing_end(&ra2_pt, -1);
     return;
   }
-  tcc_ir_cfg_compute_dominators(cfg);
-  tcc_ir_cfg_compute_dom_frontiers(cfg);
-
-  ra_promote_multidef_temps_to_vars(ir, cfg);
+  if (!ra_o0_direct(ir))
+  {
+    tcc_ir_cfg_compute_dominators(cfg);
+    tcc_ir_cfg_compute_dom_frontiers(cfg);
+    ra_promote_multidef_temps_to_vars(ir, cfg);
+  }
   tcc_ir_dump_after_pass(ir, "ssa_promote");
 
-  /* Construct SSA.
-   *
-   * NOTE (docs/plans/o0_compile_perf.md §9): this is NOT skippable at -O0,
-   * even though DCE-on-phis is the only -O0 *optimization* downstream of it.
-   * SSA renaming is what gives every definition its own vreg, which is what
-   * makes the allocator's one-interval-per-vreg model sound; a value defined
-   * on two paths otherwise gets a single interval spanning both.  Forcing the
-   * no-promotable fallback at -O0 was measured at -20% compile time and -210 B
-   * of code, and miscompiled 4 gcc-torture execute tests (990404-1, pr125291,
-   * pr34415, pending-4) -- with dominators and promotion still running, so it
-   * is the renaming itself that is load-bearing.  Making -O0 cheaper here
-   * needs a different interval model, not a skip. */
-  IRSSAState *ssa = tcc_ir_ssa_construct(ir, cfg);
+  /* Construct SSA: what lets a variable live in a register across control flow.
+   * Without it a value defined on two paths is one interval spanning both, so
+   * -O0 keeps what crosses a block in memory instead (ra_o0_direct). */
+  IRSSAState *ssa = ra_o0_direct(ir) ? NULL : tcc_ir_ssa_construct(ir, cfg);
   int had_promotable = (ssa != NULL);
   if (!ssa) {
     /* No promotable variables; still build intervals from flat IR */
@@ -2297,73 +2289,7 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
       if (had_promotable) {
         tcc_ir_ssa_opt_run(&ssa_opt_ctx);
       } else {
-        /* Run a pass, then make it observable to -dump-ir-passes=<name>
-         * golden snapshots (same names as the tcc_ir_ssa_opt_run driver). */
-#define RUN_SSA(name, call)                                                                                            \
-  do                                                                                                                   \
-  {                                                                                                                    \
-    if (!tcc_ir_opt_pass_disabled(name))                                                                               \
-    {                                                                                                                  \
-      int _c;                                                                                                          \
-      TCC_PASS_TIMED(_c, name, (call));                                                                                \
-      np_changes += _c;                                                                                                \
-    }                                                                                                                  \
-    tcc_ir_dump_after_pass(ir, name);                                                                                  \
-  } while (0)
-        ssa_opt_ctx.no_stack_fwd = 0;
-        for (int np_iter = 0; np_iter < 5; np_iter++) {
-          int np_changes = 0;
-          RUN_SSA("ssa:var_const_fold", ssa_opt_var_const_fold(&ssa_opt_ctx));
-          RUN_SSA("ssa:var_forward", ssa_opt_var_forward(&ssa_opt_ctx));
-          RUN_SSA("ssa:sccp", ssa_opt_sccp(&ssa_opt_ctx));
-          RUN_SSA("ssa:load_cse", ssa_opt_load_cse(&ssa_opt_ctx));
-          RUN_SSA("ssa:diamond_store_fwd", ssa_opt_diamond_store_fwd(&ssa_opt_ctx));
-          RUN_SSA("ssa:const_string_fold", tcc_ir_ssa_opt_const_string_fold(&ssa_opt_ctx));
-          RUN_SSA("ssa:bitop_const_fold", tcc_ir_ssa_opt_bitop_const_fold(&ssa_opt_ctx));
-          RUN_SSA("ssa:ptr_store_dse", tcc_ir_ssa_opt_ptr_store_dse(&ssa_opt_ctx));
-          RUN_SSA("ssa:ptr_silent_store", tcc_ir_ssa_opt_ptr_silent_store(&ssa_opt_ctx));
-          RUN_SSA("ssa:cprop", ssa_opt_cprop(&ssa_opt_ctx));
-          RUN_SSA("ssa:fold", ssa_opt_fold(&ssa_opt_ctx));
-          RUN_SSA("ssa:var_imm_prop", ssa_opt_var_imm_prop(&ssa_opt_ctx));
-          RUN_SSA("ssa:const_prop_tmp", ssa_opt_const_prop_tmp(&ssa_opt_ctx));
-          RUN_SSA("ssa:branch", ssa_opt_branch(&ssa_opt_ctx));
-          RUN_SSA("ssa:vrp", (tcc_state && TCC_OPT(tcc_state, opt_vrp)) ? ssa_opt_vrp(&ssa_opt_ctx) : 0);
-          RUN_SSA("ssa:setif_or_taut",
-                  (tcc_state && TCC_OPT(tcc_state, opt_const_prop)) ? ssa_opt_setif_or_taut(&ssa_opt_ctx) : 0);
-          RUN_SSA("ssa:setif_mask_fold",
-                  (tcc_state && TCC_OPT(tcc_state, opt_const_prop)) ? ssa_opt_setif_mask_fold(&ssa_opt_ctx) : 0);
-          RUN_SSA("ssa:cmp_offset_fold",
-                  (tcc_state && TCC_OPT(tcc_state, opt_const_prop)) ? ssa_opt_cmp_offset_fold(&ssa_opt_ctx) : 0);
-          RUN_SSA("ssa:reassoc", ssa_opt_reassoc(&ssa_opt_ctx));
-          RUN_SSA("ssa:strength", ssa_opt_strength(&ssa_opt_ctx));
-          RUN_SSA("ssa:narrow", ssa_opt_narrow(&ssa_opt_ctx));
-          RUN_SSA("ssa:gvn", ssa_opt_gvn(&ssa_opt_ctx));
-          RUN_SSA("ssa:dup_diamond", ssa_opt_dup_diamond(&ssa_opt_ctx));
-          RUN_SSA("ssa:phi_simplify", ssa_opt_phi_simplify(&ssa_opt_ctx));
-          RUN_SSA("ssa:copy_fwd",
-                  TCC_OPT(tcc_state, opt_store_load_fwd) ? ssa_opt_copy_fwd(&ssa_opt_ctx) : 0);
-          RUN_SSA("ssa:load_combine",
-                  TCC_OPT(tcc_state, optimize) >= 2 ? ssa_opt_load_combine(&ssa_opt_ctx) : 0);
-          RUN_SSA("ssa:dce", ssa_opt_dce(&ssa_opt_ctx));
-          np_changes += tcc_ir_ssa_opt_guard_collapse(&ssa_opt_ctx);
-          if (!np_changes)
-            break;
-        }
-        /* After the loop, never inside it: bool_norm deletes the `CMP b,#0`
-         * that setif_mask_fold matches on (see the SSA driver's tail). */
-        if (tcc_state && TCC_OPT(tcc_state, opt_const_prop) &&
-            !tcc_ir_opt_pass_disabled("ssa:bool_norm")) {
-          int _c;
-          TCC_PASS_TIMED(_c, "ssa:bool_norm", ssa_opt_bool_norm(&ssa_opt_ctx));
-          tcc_ir_dump_after_pass(ir, "ssa:bool_norm");
-          if (_c)
-            ssa_opt_dce(&ssa_opt_ctx);
-        }
-        /* Target-specific fusions (MLA, LOAD/STORE_INDEXED on ARM). These
-         * don't need promotable vars or phi nodes — they pattern-match on
-         * existing TEMP vregs. */
-        tcc_ir_ssa_opt_run_target(&ssa_opt_ctx);
-#undef RUN_SSA
+        tcc_ir_ssa_opt_run_fallback(&ssa_opt_ctx);
       }
     } else {
       /* -O0.  `ssa_opt_dce` here is *not* an optimization the level is meant to
@@ -2545,6 +2471,9 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   tcc_pass_timing_begin(&ra2_pt, "ra2:phis_folds");
   ra_resolve_phis(ir, cfg, ssa, &phi_stats);
   ra_phi_resolve_pre_ra_mode = 0;
+  /* Both arrays were rebuilt with the old ones still in place, so on a large
+   * function they landed in slow memory, and fast memory has just come free. */
+  tcc_ir_settle(ir);
   /* The one edit that makes a phi disappear: every dump before this one can
    * have phis in it (with -dump-ir-passes=ssa_phi to see them) and no dump
    * after it can, because there is no phi left to show. */
@@ -2557,7 +2486,8 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
    * behind in dense switch case bodies. Each fold drops one ASSIGN and one
    * SSA temp from the case body, cutting both the per-case instruction count
    * and the phi-temp live ranges that drive the linear scan into spills. */
-  ra_fold_phi_const_chain(ir);
+  if (!ra_o0_direct(ir))
+    ra_fold_phi_const_chain(ir);
   dbg_scan_imm_dest(ir,"ra_fold_phi_const_chain");
 
   /* Once the per-case bodies are canonicalised to "T_phi <- const; JMP merge",
@@ -2696,8 +2626,6 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
       ssa->block_phis = tcc_realloc(ssa->block_phis, cfg->num_blocks * sizeof(IRPhiNode *));
       memset(ssa->block_phis, 0, cfg->num_blocks * sizeof(IRPhiNode *));
     }
-    if (!tcc_ir_opt_pass_disabled("ra:setif_chain"))
-      tcc_ir_setif_test_chain_fold(ir);
     tcc_ir_opt_setif_branch_fuse(ir);
   }
   tcc_ir_dump_after_pass(ir, "ra:setif_fuse");
@@ -2859,23 +2787,30 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
     ra_build_intervals(ir, cfg, ssa, &intervals, &interval_count, call_prefix, &max_vreg_pos);
     tcc_pass_timing_end(&ra2_pt, -1);
     tcc_pass_timing_begin(&ra2_pt, "ra2:hints");
-    ra_build_narrow_weights(ir, target, intervals, interval_count, max_vreg_pos);
+    if (!ra_o0_direct(ir))
+      ra_build_narrow_weights(ir, target, intervals, interval_count, max_vreg_pos);
 
     /* Build phi register hints. block_phis is empty after pre-RA resolution,
      * so the phi-based pass is a no-op; the assign-based pass picks up
      * the explicit copies emitted at predecessor block ends. */
-    ra_build_phi_hints(intervals, interval_count, ssa, cfg, max_vreg_pos);
-    ra_build_assign_hints(intervals, interval_count, ir, max_vreg_pos);
-    ra_build_load_param_hints(intervals, interval_count, ir, max_vreg_pos);
-    ra_build_bfi_hints(intervals, interval_count, ir, max_vreg_pos);
-    ra_build_outgoing_param_hints(intervals, interval_count, ir, max_vreg_pos);
+    if (!ra_o0_direct(ir))
+      ra_build_phi_hints(intervals, interval_count, ssa, cfg, max_vreg_pos);
+    if (!ra_o0_direct(ir))
+      ra_build_assign_hints(intervals, interval_count, ir, max_vreg_pos);
+    if (!ra_o0_direct(ir))
+      ra_build_load_param_hints(intervals, interval_count, ir, max_vreg_pos);
+    if (!ra_o0_direct(ir))
+      ra_build_bfi_hints(intervals, interval_count, ir, max_vreg_pos);
+    if (!ra_o0_direct(ir))
+      ra_build_outgoing_param_hints(intervals, interval_count, ir, max_vreg_pos);
 
     /* Graph-based coalescing (accurate liveness + interference) — merges
      * copy-related non-interfering vregs, including multi-predecessor merge-phis
      * the in-scan transfer cannot handle.  Gated by TCC_COALESCE. */
     tcc_pass_timing_end(&ra2_pt, -1);
     tcc_pass_timing_begin(&ra2_pt, "ra2:coalesce_g");
-    ra_coalesce_graph(ir, intervals, interval_count, max_vreg_pos);
+    if (!ra_o0_direct(ir))
+      ra_coalesce_graph(ir, intervals, interval_count, max_vreg_pos);
     tcc_pass_timing_end(&ra2_pt, -1);
     tcc_pass_timing_begin(&ra2_pt, "ra2:scan");
 
@@ -2922,17 +2857,25 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
       for (int i = 0; i < interval_count && !any; i++)
         if (intervals[i].coalesce_to >= 0) any = 1;
       if (any) {
+        /* The first interval of each vreg that is its own representative. */
+        const int slots = 4 * max_vreg_pos;
+        int *rep = tcc_malloc(sizeof(int) * (slots + 1));
+        for (int k = 0; k < slots; k++)
+          rep[k] = -1;
+#define RA_REP_SLOT(vr) (TCCIR_DECODE_VREG_TYPE(vr) * max_vreg_pos + TCCIR_DECODE_VREG_POSITION(vr))
+        for (int j = interval_count - 1; j >= 0; j--)
+          if (intervals[j].coalesce_to < 0)
+            rep[RA_REP_SLOT(intervals[j].vreg)] = j;
         for (int i = 0; i < interval_count; i++) {
           if (intervals[i].coalesce_to < 0) continue;
-          for (int j = 0; j < interval_count; j++) {
-            if (intervals[j].vreg != intervals[i].coalesce_to || intervals[j].coalesce_to >= 0)
-              continue;
-            intervals[i].r0 = intervals[j].r0;
-            intervals[i].r1 = intervals[j].r1;
-            intervals[i].stack_location = intervals[j].stack_location;
-            break;
-          }
+          const int j = rep[RA_REP_SLOT(intervals[i].coalesce_to)];
+          if (j < 0) continue;
+          intervals[i].r0 = intervals[j].r0;
+          intervals[i].r1 = intervals[j].r1;
+          intervals[i].stack_location = intervals[j].stack_location;
         }
+#undef RA_REP_SLOT
+        tcc_free(rep);
       }
     }
 
@@ -2991,14 +2934,16 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
    * is cleared. We just need to build the live_regs bitmap from the
    * intervals the linear scan produced. */
   ra_build_live_regs_bitmap(ir);
-  ra_refine_live_regs_accurate(ir);
+  if (!ra_o0_direct(ir))
+    ra_refine_live_regs_accurate(ir);
 
   /* Strip dead phi copies now that allocation and every liveness/scratch
    * bitmap are final.  A phi copy into a never-read temp is dead code whose
    * register the scan may have reused for a value live across the merge; left
    * in, it clobbers that value (seed 198468).  Running it here — after the
    * bitmaps — keeps the allocation identical and only drops dead instructions. */
-  ra_eliminate_dead_reg_copies(ir);
+  if (!ra_o0_direct(ir)) /* no phi copies at -O0 */
+    ra_eliminate_dead_reg_copies(ir);
 
   ra_repair_incomplete_calls(ir);
 

@@ -235,7 +235,7 @@ static IROperand utb_noreturn_attr_callee(TCCIRState *ir)
   callee.type.ref = &ref;
   ref.f.func_noreturn = 1;
   uint32_t sidx = tcc_ir_pool_add_symref(ir, &callee, 0, 0);
-  return irop_make_symref(0, sidx, 0, 0, 0, I32);
+  return irop_make_symref(0, sidx, 0, I32);
 }
 
 /* Build a SYMREF callee whose name is looked up via get_tok_str(). */
@@ -244,7 +244,7 @@ static IROperand utb_named_callee(TCCIRState *ir, Sym *sym, int tok, const char 
   sym->v = tok;
   utb_set_tok_str(tok, name);
   uint32_t sidx = tcc_ir_pool_add_symref(ir, sym, 0, 0);
-  return irop_make_symref(0, sidx, 0, 0, 0, I32);
+  return irop_make_symref(0, sidx, 0, I32);
 }
 
 /* Attach a single switch table to the IR.  Caller must have allocated `targets`. */

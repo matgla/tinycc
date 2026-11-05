@@ -118,13 +118,21 @@ void free_deferred_chunks(Section *sec)
   while (c)
   {
     DeferredChunk *next = c->next;
-    /* source_path is now duplicated, so free it */
-    if (c->source_path)
-      tcc_free((void *)c->source_path);
     tcc_free(c);
     c = next;
   }
   sec->deferred_head = sec->deferred_tail = NULL;
+}
+
+/* One copy of a path per run of chunks from that file: there can be a chunk for
+ * every function of a program, and a copy each costs as much as the chunk. */
+static const char *deferred_path(TCCState *s1, const char *path)
+{
+  if (!path)
+    return NULL;
+  if (!s1->nb_deferred_paths || strcmp(s1->deferred_paths[s1->nb_deferred_paths - 1], path))
+    dynarray_add(&s1->deferred_paths, &s1->nb_deferred_paths, tcc_strdup(path));
+  return s1->deferred_paths[s1->nb_deferred_paths - 1];
 }
 
 /* Add a deferred chunk to a section */
@@ -132,8 +140,8 @@ void section_add_deferred(TCCState *s1, Section *sec, const char *path, unsigned
                                  unsigned long size, unsigned long dest_off)
 {
   DeferredChunk *chunk = tcc_mallocz(sizeof(DeferredChunk));
-  /* Duplicate the path string so it survives after loading context changes */
-  chunk->source_path = path ? tcc_strdup(path) : NULL;
+  /* The path has to survive after loading context changes */
+  chunk->source_path = deferred_path(s1, path);
   /* For archives, the file_offset is already relative to the member start */
   chunk->file_offset = (uint32_t)file_off;
   chunk->size = (uint32_t)size;
@@ -153,6 +161,36 @@ void section_add_deferred(TCCState *s1, Section *sec, const char *path, unsigned
   sec->has_deferred_chunks = 1;
 
   (void)path; /* silence warning when debug disabled */
+}
+
+/* Read a lazy section's chunks into `dest`, its offset 0, and drop them.  *fd
+ * stays open on *fd_path for the next call, which is usually the same file;
+ * the caller closes it.  -1 with the error reported if a file cannot be read. */
+ST_FUNC int deferred_chunks_read(TCCState *s1, DeferredChunk **chunks, unsigned char *dest, int *fd, const char **fd_path)
+{
+  DeferredChunk *c = *chunks, *next;
+  for (; c; c = c->next)
+  {
+    if (*fd_path != c->source_path)
+    {
+      if (*fd >= 0)
+        close(*fd);
+      *fd = open(c->source_path, O_RDONLY | O_BINARY);
+      *fd_path = c->source_path;
+      if (*fd < 0)
+        return tcc_error_noabort("cannot reopen '%s'", c->source_path);
+    }
+    lseek(*fd, c->file_offset, SEEK_SET);
+    if (full_read(*fd, dest + c->dest_offset, c->size) != c->size)
+      return tcc_error_noabort("short read from '%s'", c->source_path);
+  }
+  for (c = *chunks; c; c = next)
+  {
+    next = c->next;
+    tcc_free(c);
+  }
+  *chunks = NULL;
+  return 0;
 }
 
 /* Load all deferred data for a section */
@@ -920,7 +958,8 @@ ST_FUNC void free_section(Section *s)
   free_reloc_patches(s);       /* Clean up relocation patches */
   tcc_free(s->str_hash);       /* Clean up string hash table */
   tcc_free(s->hash_val_cache); /* Clean up hash value cache */
-  tcc_free(s->data);
+  if (!link_arena_owns(s->s1, s->data))
+    tcc_free(s->data);
   s->data = NULL;
   s->data_allocated = s->data_offset = 0;
   s->str_hash = NULL;
@@ -949,8 +988,13 @@ ST_FUNC void tccelf_delete(TCCState *s1)
 
   /* free all sections */
   for (i = 1; i < s1->nb_sections; i++)
+  {
     free_section(s1->sections[i]);
+    if (link_arena_owns(s1, s1->sections[i]))
+      s1->sections[i] = NULL;
+  }
   dynarray_reset(&s1->sections, &s1->nb_sections);
+  dynarray_reset(&s1->deferred_paths, &s1->nb_deferred_paths);
   tcc_free(s1->section_ht);
   s1->section_ht = NULL;
   s1->section_ht_mask = 0;
@@ -962,12 +1006,21 @@ ST_FUNC void tccelf_delete(TCCState *s1)
   s1->undef_sym_alloc = 0;
 
   for (i = 0; i < s1->nb_priv_sections; i++)
+  {
     free_section(s1->priv_sections[i]);
+    if (link_arena_owns(s1, s1->priv_sections[i]))
+      s1->priv_sections[i] = NULL;
+  }
   dynarray_reset(&s1->priv_sections, &s1->nb_priv_sections);
+  tcc_free(s1->link_arena);
+  s1->link_arena = NULL;
+  s1->link_arena_size = s1->link_arena_used = 0;
 
-  tcc_free(s1->sym_attrs);
-  s1->sym_attrs = NULL;
-  s1->nb_sym_attrs = 0;
+  for (i = 0; i < s1->nb_sym_attr_chunks; i++)
+    tcc_free(s1->sym_attr_chunks[i]);
+  tcc_free(s1->sym_attr_chunks);
+  s1->sym_attr_chunks = NULL;
+  s1->nb_sym_attr_chunks = 0;
   symtab_section = NULL; /* for tccrun.c:rt_printline() */
 }
 

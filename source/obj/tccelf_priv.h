@@ -135,6 +135,7 @@ ST_FUNC void tcc_load_referenced_sections(TCCState *s1);
 
 /* Defined in tccelf_sym.c. */
 Section *section_ht_find(TCCState *s1, const char *name);
+ST_FUNC void section_ht_rebuild(TCCState *s1);
 ST_FUNC Section *new_section(TCCState *s1, const char *name, int sh_type, int sh_flags);
 ST_FUNC Section *new_symtab(TCCState *s1, const char *symtab_name, int sh_type, int sh_flags, const char *strtab_name,
                             const char *hash_name, int hash_sh_flags);

@@ -117,6 +117,8 @@ typedef struct
   int inexact; /* CFA_WRITE of a width this could not tell (4 bytes assumed) */
 } CfwAcc;
 
+#define CFW_ESC_MAPS 8
+
 typedef struct
 {
   TCCIRState *ir;
@@ -136,6 +138,14 @@ typedef struct
   int *sret_param;   /* CALL -> its PARAM0 when that is the struct-return buffer, else -1 */
   int *copy_param;   /* 3 per instruction: PARAM0..2 of a copy-helper CALL */
   uint8_t *param_redef; /* by position: a parameter some instruction defines (cfw_incoming_ptr) */
+  int *esc;          /* the CFA_ESCAPE accesses, once the scan is done */
+  int nesc;          /* -1: not listed yet */
+  struct
+  {
+    int lo, hi;
+    uint8_t *map;
+  } esc_map[CFW_ESC_MAPS]; /* cfw_esc_map's answers: the copies of one object ask alike */
+  int esc_map_next;
   int nparam;
 } Cfw;
 
@@ -174,7 +184,7 @@ static int cfw_copy_helper_align(TCCIRState *ir, IRQuadCompact *call)
 /* A direct frame operand: no vreg, not a parameter's slot. */
 static int cfw_direct_frame(IROperand op, int *off)
 {
-  if (irop_get_tag(op) != IROP_TAG_STACKOFF || irop_get_vreg(op) >= 0 || op.is_param || !op.is_local)
+  if (irop_get_tag(op) != IROP_TAG_STACKOFF || irop_get_vreg(op) >= 0 || op.is_param || !irop_is_local(op))
     return 0;
   *off = irop_get_stack_offset(op);
   return 1;
@@ -198,8 +208,8 @@ static int cfw_temp_frame_addr_root(Cfw *c, int32_t vr, int *off, int *root)
     IRQuadCompact *dq = &ir->compact_instructions[vi->def_instr];
     IROperand src = tcc_ir_op_get_src1(ir, dq);
     int base;
-    const int direct = !src.is_lval && !src.is_llocal && cfw_direct_frame(src, &base);
-    const int copy = irop_get_tag(src) == IROP_TAG_VREG && !src.is_lval && !src.is_local && !src.is_llocal;
+    const int direct = !src.is_lval && !irop_is_llocal(src) && cfw_direct_frame(src, &base);
+    const int copy = irop_get_tag(src) == IROP_TAG_VREG && !src.is_lval && !irop_is_local(src) && !irop_is_llocal(src);
     if (dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB)
     {
       if (tcc_ir_op_src2_tag(ir, dq) != IROP_TAG_IMM32 || tcc_ir_op_src2_is_lval(ir, dq) || tcc_ir_op_src2_is_sym(ir, dq))
@@ -230,7 +240,7 @@ static int cfw_temp_frame_addr(Cfw *c, int32_t vr, int *off)
 /* The frame address an address-valued operand names; *root as above. */
 static int cfw_frame_addr_root(Cfw *c, IROperand op, int *off, int *root)
 {
-  if (op.is_lval || op.is_llocal)
+  if (op.is_lval || irop_is_llocal(op))
     return 0;
   if (cfw_direct_frame(op, off))
   {
@@ -250,12 +260,12 @@ static int cfw_frame_addr(Cfw *c, IROperand op, int *off)
  * is not frame memory, -1 when it is memory this cannot place. */
 static int cfw_frame_mem(Cfw *c, IROperand op, int *off)
 {
-  if (!op.is_lval && !op.is_llocal)
+  if (!op.is_lval && !irop_is_llocal(op))
     return 0;
-  if (irop_get_tag(op) == IROP_TAG_STACKOFF && irop_get_vreg(op) < 0 && !op.is_param && op.is_local)
+  if (irop_get_tag(op) == IROP_TAG_STACKOFF && irop_get_vreg(op) < 0 && !op.is_param && irop_is_local(op))
   {
     *off = irop_get_stack_offset(op);
-    return op.is_llocal ? -1 : 1;
+    return irop_is_llocal(op) ? -1 : 1;
   }
   if (irop_get_tag(op) == IROP_TAG_VREG && op.is_lval && TCCIR_DECODE_VREG_TYPE(irop_get_vreg(op)) == TCCIR_VREG_TYPE_TEMP)
     return cfw_temp_frame_addr(c, irop_get_vreg(op), off) ? 1 : -1;
@@ -307,7 +317,7 @@ static int cfw_indexed_frame(Cfw *c, int i, int *base, int *lo, int *hi)
   const int load = q->op == TCCIR_OP_LOAD_INDEXED;
   IROperand b = tcc_ir_op_get_dest_or_src1(ir, q, load);
   IROperand idx = tcc_ir_op_get_src2(ir, q), sc = tcc_ir_op_get_scale(ir, q);
-  if (!cfw_frame_addr(c, b, base) || irop_get_tag(idx) != IROP_TAG_IMM32 || idx.is_lval || idx.is_sym ||
+  if (!cfw_frame_addr(c, b, base) || irop_get_tag(idx) != IROP_TAG_IMM32 || idx.is_lval || irop_is_sym(idx) ||
       irop_get_tag(sc) != IROP_TAG_IMM32)
     return 0;
   const int scale = irop_get_imm32(sc);
@@ -428,7 +438,7 @@ static void cfw_scan(Cfw *c, int i)
   if (op == TCCIR_OP_LOAD)
   {
     IROperand s = ops[irop_config[op].has_dest];
-    if (cfw_frame_mem(c, s, &off) == 1 && !s.is_llocal && (w = cfw_width(s)) > 0)
+    if (cfw_frame_mem(c, s, &off) == 1 && !irop_is_llocal(s) && (w = cfw_width(s)) > 0)
     {
       cfw_add(c, off, off + w, i, i, CFA_LOAD);
       return;
@@ -438,7 +448,7 @@ static void cfw_scan(Cfw *c, int i)
    * is a TEMP: its own uses are classified where they appear. */
   const int addr_arith = (op == TCCIR_OP_ASSIGN || op == TCCIR_OP_LEA ||
                           ((op == TCCIR_OP_ADD || op == TCCIR_OP_SUB) && nops == 3 &&
-                           irop_get_tag(ops[2]) == IROP_TAG_IMM32 && !ops[2].is_lval && !ops[2].is_sym)) &&
+                           irop_get_tag(ops[2]) == IROP_TAG_IMM32 && !ops[2].is_lval && !irop_is_sym(ops[2]))) &&
                          irop_config[op].has_dest && irop_get_tag(ops[0]) == IROP_TAG_VREG && !ops[0].is_lval &&
                          TCCIR_DECODE_VREG_TYPE(irop_get_vreg(ops[0])) == TCCIR_VREG_TYPE_TEMP;
   /* ... provided the TEMP itself resolves (one definition), and no phi
@@ -460,10 +470,10 @@ static void cfw_scan(Cfw *c, int i)
     if (r == 1)
     {
       w = cfw_width(o);
-      const int guessed = w <= 0 || o.is_llocal;
+      const int guessed = w <= 0 || irop_is_llocal(o);
       if (guessed)
         w = 4;
-      cfw_add(c, off, off + w, i, i, is_dest && !o.is_llocal ? CFA_WRITE : CFA_READ);
+      cfw_add(c, off, off + w, i, i, is_dest && !irop_is_llocal(o) ? CFA_WRITE : CFA_READ);
       c->acc[c->nacc - 1].inexact = guessed;
     }
     else if (r == 0 && !is_dest && !(traced && k == 1))
@@ -712,10 +722,10 @@ static IROperand cfw_src_mem(TCCIRState *ir, const CfwSrc *src, IROperand orig, 
 {
   IROperand r;
   if (src->is_sym)
-    r = irop_make_symref(-1, cfw_sym_at(ir, src, k), 1, 0, 0, irop_get_btype(orig)); /* never a struct */
+    r = irop_make_symref(-1, cfw_sym_at(ir, src, k), 1, irop_get_btype(orig)); /* never a struct */
   else if (src->is_frame)
   {
-    r = irop_make_stackoff(-1, src->off + k, 1, 0, 0, irop_get_btype(orig));
+    r = irop_make_stackoff(-1, src->off + k, 1, 0, irop_get_btype(orig));
     if (irop_get_btype(orig) == IROP_BTYPE_STRUCT)
     {
       r.u.s.ctype_idx = orig.u.s.ctype_idx;
@@ -874,30 +884,50 @@ static void cfw_build_cfg(Cfw *c)
  * from there on a call, an unknown store or load, or inline asm may touch its
  * bytes.  Before (where this is 0) only the recorded accesses name them.  An
  * escape is never undone: a loop carries it back to its head.  NULL when the
- * object never escapes. */
+ * object never escapes.  The map stays Cfw's, for the next copy of the object: an
+ * escape never changes once the scan is done.  A copy holds two at most. */
 static uint8_t *cfw_esc_map(Cfw *c, int lo, int hi)
 {
   const int n = c->n, nb = c->nb;
+  if (c->nesc < 0)
+  {
+    c->nesc = 0;
+    for (int k = 0; k < c->nacc; k++)
+      if (c->acc[k].kind == CFA_ESCAPE)
+        c->nesc++;
+    c->esc = tcc_malloc(sizeof(int) * (c->nesc + 1));
+    c->nesc = 0;
+    for (int k = 0; k < c->nacc; k++)
+      if (c->acc[k].kind == CFA_ESCAPE)
+        c->esc[c->nesc++] = k;
+  }
   int any = 0;
-  for (int k = 0; k < c->nacc; k++)
-    if (c->acc[k].kind == CFA_ESCAPE && cfw_overlaps(&c->acc[k], lo, hi))
+  for (int e = 0; e < c->nesc; e++)
+    if (cfw_overlaps(&c->acc[c->esc[e]], lo, hi))
     {
       any = 1;
-      if (c->acc[k].at < 0)
+      if (c->acc[c->esc[e]].at < 0)
         any = 2; /* named where no instruction shows it: everywhere */
     }
   if (!any)
     return NULL;
+  for (int k = 0; k < CFW_ESC_MAPS; k++)
+    if (c->esc_map[k].map && c->esc_map[k].lo == lo && c->esc_map[k].hi == hi)
+      return c->esc_map[k].map;
+  const int slot = c->esc_map_next;
+  c->esc_map_next = (slot + 1) % CFW_ESC_MAPS;
+  tcc_free(c->esc_map[slot].map);
   uint8_t *m = tcc_malloc(n);
+  c->esc_map[slot].lo = lo, c->esc_map[slot].hi = hi, c->esc_map[slot].map = m;
   if (any == 2)
   {
     memset(m, 1, n);
     return m;
   }
   memset(m, 0, n);
-  for (int k = 0; k < c->nacc; k++)
-    if (c->acc[k].kind == CFA_ESCAPE && cfw_overlaps(&c->acc[k], lo, hi))
-      m[c->acc[k].at] = 1;
+  for (int e = 0; e < c->nesc; e++)
+    if (cfw_overlaps(&c->acc[c->esc[e]], lo, hi))
+      m[c->acc[c->esc[e]].at] = 1;
   uint8_t *gen = tcc_mallocz(nb), *in = tcc_mallocz(nb), *out = tcc_mallocz(nb);
   for (int b = 0; b < nb; b++)
     for (int i = c->bstart[b]; i < c->bstart[b + 1]; i++)
@@ -1055,14 +1085,14 @@ static int cfw_copy(Cfw *c, int ci)
       return 0;
     src.is_frame = 1;
   }
-  else if (irop_get_tag(sop) == IROP_TAG_VREG && !sop.is_lval && !sop.is_local && !sop.is_llocal &&
+  else if (irop_get_tag(sop) == IROP_TAG_VREG && !sop.is_lval && !irop_is_local(sop) && !irop_is_llocal(sop) &&
            irop_get_vreg(sop) >= 0 && irop_get_btype(sop) == IROP_BTYPE_INT32)
   {
     src.val = sop;
     src.vr = irop_get_vreg(sop);
     src.align = c->copy_align[ci];
   }
-  else if (irop_get_tag(sop) == IROP_TAG_SYMREF && !sop.is_lval && !sop.is_local && !sop.is_llocal &&
+  else if (irop_get_tag(sop) == IROP_TAG_SYMREF && !sop.is_lval && !irop_is_local(sop) && !irop_is_llocal(sop) &&
            irop_get_vreg(sop) < 0 && irop_get_btype(sop) != IROP_BTYPE_STRUCT && irop_get_symref_ex(ir, sop) &&
            irop_get_symref_ex(ir, sop)->sym && !(irop_get_symref_ex(ir, sop)->sym->type.t & VT_VOLATILE))
   {
@@ -1079,13 +1109,13 @@ static int cfw_copy(Cfw *c, int ci)
    * access may read or write it.  One that may precede the copy leaves nothing
    * to prove; one the copy reaches keeps it (below). */
   int changes = 0;
-  uint8_t *desc = cfw_esc_map(c, dlo, dhi), *sesc = NULL;
+  uint8_t *desc = cfw_esc_map(c, dlo, dhi);
   uint8_t *cover = NULL, *ain = NULL, *aout = NULL, *rin = NULL, *rout = NULL;
   int8_t *af = NULL, *rf = NULL;
   if (desc && desc[ci])
     goto done;
   if (src.is_frame)
-    src.esc = sesc = cfw_esc_map(c, slo, shi);
+    src.esc = cfw_esc_map(c, slo, shi);
 
   /* Where the copy holds, over the whole CFG.  AVAILABLE before an instruction:
    * on every path to it the copy ran with nothing since that may write D or
@@ -1336,7 +1366,7 @@ static int cfw_copy(Cfw *c, int ci)
     {
       /* A plain load of the bytes it read, at the symbol's address. */
       IROperand dst = tcc_ir_op_get_dest(ir, &ir->compact_instructions[x->insn]);
-      v = irop_make_symref(-1, cfw_sym_at(ir, &src, x->lo - d), 1, 0, 0, irop_get_btype(dst));
+      v = irop_make_symref(-1, cfw_sym_at(ir, &src, x->lo - d), 1, irop_get_btype(dst));
       v.is_unsigned = dst.is_unsigned;
       irop_carry_access_marks(&v, o);
       ir->compact_instructions[x->insn].op = TCCIR_OP_LOAD;
@@ -1346,7 +1376,7 @@ static int cfw_copy(Cfw *c, int ci)
     else if (x->kind == CFA_COPY_SRC || x->kind == CFA_LOAD_IDX)
     {
       if (src.is_frame)
-        v = irop_make_stackoff(-1, src.off + k, 0, 0, 0, IROP_BTYPE_INT32);
+        v = irop_make_stackoff(-1, src.off + k, 0, 0, IROP_BTYPE_INT32);
       else if (src.is_sym)
       {
         v = src.val;
@@ -1379,8 +1409,6 @@ static int cfw_copy(Cfw *c, int ci)
     changes++;
   }
 done:
-  tcc_free(desc);
-  tcc_free(sesc);
   tcc_free(cover);
   tcc_free(af);
   tcc_free(rf);
@@ -1396,7 +1424,7 @@ done:
 static int cfw_incoming_ptr(Cfw *c, IROperand op)
 {
   const int32_t vr = irop_get_vreg(op);
-  if (irop_get_tag(op) != IROP_TAG_VREG || op.is_llocal || op.is_local || vr < 0 ||
+  if (irop_get_tag(op) != IROP_TAG_VREG || irop_is_llocal(op) || irop_is_local(op) || vr < 0 ||
       TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_PARAM)
     return 0;
   const int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -1555,7 +1583,7 @@ static int cfw_touches_unknown(Cfw *c, int i)
     /* A variable's own home is no frame object. */
     if (irop_get_tag(o) == IROP_TAG_STACKOFF && irop_get_vreg(o) >= 0)
       continue;
-    if ((o.is_lval || o.is_llocal) && cfw_frame_mem(c, o, &off) != 1 && !(o.is_lval && cfw_incoming_ptr(c, o)))
+    if ((o.is_lval || irop_is_llocal(o)) && cfw_frame_mem(c, o, &off) != 1 && !(o.is_lval && cfw_incoming_ptr(c, o)))
       return 1;
   }
   return 0;
@@ -1577,14 +1605,14 @@ static int cfw_relay_slot(Cfw *c, const CfwAcc *x, int from, int to, IROperand *
       return -1;
     if (c->copy_len[call] > 0 && cfw_frame_align(to) < c->copy_align[call])
       return -1;
-    *out = irop_make_stackoff(-1, to, 0, 0, 0, IROP_BTYPE_INT32);
+    *out = irop_make_stackoff(-1, to, 0, 0, IROP_BTYPE_INT32);
     return irop_config[q->op].has_dest ? 1 : 0;
   }
   if ((q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_BLOCK_COPY) || x->at != x->insn)
     return -1;
   IROperand o = tcc_ir_op_get_dest(ir, q);
   int off;
-  if (!cfw_direct_frame(o, &off) || off != from || o.is_llocal || tcc_ir_access_is_volatile(ir, o))
+  if (!cfw_direct_frame(o, &off) || off != from || irop_is_llocal(o) || tcc_ir_access_is_volatile(ir, o))
     return -1;
   if (irop_get_btype(o) == IROP_BTYPE_STRUCT)
   {
@@ -1772,7 +1800,6 @@ static int cfw_relay(Cfw *c, int ci)
       c->acc[a].kind = CFA_READ, c->acc[a].lo = c->acc[a].hi = 0;
   changes = 1;
 out:
-  tcc_free(desc);
   tcc_free(spad);
   tcc_free(need);
   tcc_free(blk);
@@ -1791,7 +1818,18 @@ int ssa_opt_copy_fwd(IRSSAOptCtx *ctx)
       tcc_ir_calls_returns_twice(ir))
     return 0;
 
+  /* Most functions copy nothing: no need for what follows to find that out. */
+  int any_copy = 0;
+  for (int i = 0; i < n && !any_copy; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    any_copy = (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL) && cfw_copy_helper_align(ir, q) > 0;
+  }
+  if (!any_copy)
+    return 0;
+
   Cfw c = {0};
+  c.nesc = -1;
   c.ir = ir;
   c.ctx = ctx;
   c.n = n;
@@ -1852,7 +1890,7 @@ int ssa_opt_copy_fwd(IRSSAOptCtx *ctx)
         (c.copy_align[i] = cfw_copy_helper_align(ir, q)) > 0)
     {
       IROperand l = tcc_ir_op_get_src1(ir, &ir->compact_instructions[c.copy_param[3 * i + 2]]);
-      if (irop_get_tag(l) == IROP_TAG_IMM32 && !l.is_lval && !l.is_sym && irop_get_imm32(l) > 0)
+      if (irop_get_tag(l) == IROP_TAG_IMM32 && !l.is_lval && !irop_is_sym(l) && irop_get_imm32(l) > 0)
       {
         c.copy_len[i] = irop_get_imm32(l);
         ncopies++;
@@ -1930,6 +1968,9 @@ int ssa_opt_copy_fwd(IRSSAOptCtx *ctx)
     }
   if (changes)
     tcc_ir_ssa_opt_rebuild(ctx);
+  for (int k = 0; k < CFW_ESC_MAPS; k++)
+    tcc_free(c.esc_map[k].map);
+  tcc_free(c.esc);
   tcc_free(c.param_redef);
   tcc_free(c.acc);
   tcc_free(c.block_of);

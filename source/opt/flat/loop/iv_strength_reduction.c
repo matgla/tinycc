@@ -96,7 +96,7 @@ static int sr_div_value_stays_in_regs(TCCIRState *ir, int lo, int hi, int32_t se
          * below.  Refusing the deref outright was the most common rejection
          * across the benchmark sources (`escape scan ... feeds_mem=1`). */
         if (reads[r].is_lval &&
-            !(TCCIR_DECODE_VREG_TYPE(rv) == TCCIR_VREG_TYPE_VAR && reads[r].is_local))
+            !(TCCIR_DECODE_VREG_TYPE(rv) == TCCIR_VREG_TYPE_VAR && irop_is_local(reads[r])))
         {
           int addr_slot =
               ((q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_LOAD_INDEXED) && slots[r] == 1) ||
@@ -191,9 +191,9 @@ static int sr_memory_base_invariant(TCCIRState *ir, IRLoop *loop, IROperand base
   int own_slot = vr >= 0 &&
                  (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR ||
                   TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_PARAM) &&
-                 !base.is_llocal &&
-                 (base.is_local || !base.is_lval);
-  int reads_memory = base.is_lval || base.is_llocal;
+                 !irop_is_llocal(base) &&
+                 (irop_is_local(base) || !base.is_lval);
+  int reads_memory = base.is_lval || irop_is_llocal(base);
   if (own_slot)
   {
     IRLiveInterval *vi = tcc_ir_get_live_interval(ir, vr);

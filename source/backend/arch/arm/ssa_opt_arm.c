@@ -661,7 +661,7 @@ int ssa_gen_arm_fuse_load_through_add_imm(IRSSAOptCtx *ctx, int instr_idx)
   IROperand load_src = tcc_ir_op_get_src1(ir, load_q);
   if (!load_src.is_lval)
     return 0;
-  if (load_src.is_local || load_src.is_llocal)
+  if (irop_is_local(load_src) || irop_is_llocal(load_src))
     return 0;
   if (load_src.tag != IROP_TAG_VREG)
     return 0;
@@ -780,8 +780,8 @@ static int arm_addreg_base(IRSSAOptCtx *ctx, int32_t lea_vr, int mem_idx, IROper
     return 0;
   IROperand a = tcc_ir_op_get_src1(ir, dq);
   IROperand b = tcc_ir_op_get_src2(ir, dq);
-  if (a.tag != IROP_TAG_VREG || b.tag != IROP_TAG_VREG || a.is_lval || b.is_lval || a.is_local || b.is_local ||
-      a.is_llocal || b.is_llocal || a.is_sym || b.is_sym)
+  if (a.tag != IROP_TAG_VREG || b.tag != IROP_TAG_VREG || a.is_lval || b.is_lval || irop_is_local(a) || irop_is_local(b) ||
+      irop_is_llocal(a) || irop_is_llocal(b) || irop_is_sym(a) || irop_is_sym(b))
     return 0;
   if (irop_is_64bit(a) || irop_is_64bit(b) || irop_is_64bit(tcc_ir_op_get_dest(ir, dq)))
     return 0;
@@ -814,7 +814,7 @@ static int ssa_gen_arm_fuse_load_through_add_reg(IRSSAOptCtx *ctx, int instr_idx
     return 0;
   IROperand dest = tcc_ir_op_get_dest(ir, q);
   IROperand src = tcc_ir_op_get_src1(ir, q);
-  if (!arm_addreg_value_ok(dest) || !src.is_lval || src.is_local || src.is_llocal || src.tag != IROP_TAG_VREG ||
+  if (!arm_addreg_value_ok(dest) || !src.is_lval || irop_is_local(src) || irop_is_llocal(src) || src.tag != IROP_TAG_VREG ||
       tcc_ir_access_is_volatile(ir, src))
     return 0;
   int32_t lea_vr = irop_get_vreg(src);
@@ -848,7 +848,7 @@ static int ssa_gen_arm_fuse_store_through_add_reg(IRSSAOptCtx *ctx, int instr_id
     return 0;
   IROperand dest = tcc_ir_op_get_dest(ir, q);
   IROperand val = tcc_ir_op_get_src1(ir, q);
-  if (!arm_addreg_value_ok(dest) || !arm_addreg_value_ok(val) || dest.is_local || dest.is_llocal ||
+  if (!arm_addreg_value_ok(dest) || !arm_addreg_value_ok(val) || irop_is_local(dest) || irop_is_llocal(dest) ||
       dest.tag != IROP_TAG_VREG || tcc_ir_access_is_volatile(ir, dest))
     return 0;
   int32_t lea_vr = irop_get_vreg(dest);
@@ -904,7 +904,7 @@ int ssa_gen_arm_fuse_store_through_add_imm(IRSSAOptCtx *ctx, int instr_idx)
     return 0;
 
   IROperand store_dest = tcc_ir_op_get_dest(ir, store_q);
-  if (store_dest.is_local || store_dest.is_llocal)
+  if (irop_is_local(store_dest) || irop_is_llocal(store_dest))
     return 0;
   if (store_dest.tag != IROP_TAG_VREG)
     return 0;
@@ -978,7 +978,7 @@ int ssa_gen_arm_fuse_mla_accum_through_add_imm(IRSSAOptCtx *ctx, int instr_idx)
 
   /* Accum is at operand_base + 3. */
   IROperand accum = ir->iroperand_pool[mla_q->operand_base + 3];
-  if (!accum.is_lval || accum.is_llocal || accum.is_local || accum.is_sym)
+  if (!accum.is_lval || irop_is_llocal(accum) || irop_is_local(accum) || irop_is_sym(accum))
     return 0;
   if (accum.tag != IROP_TAG_VREG)
     return 0;
@@ -1134,7 +1134,7 @@ int ssa_gen_arm_fuse_store_src_through_add_imm(IRSSAOptCtx *ctx, int instr_idx)
     return 0;
 
   IROperand store_src = tcc_ir_op_get_src1(ir, store_q);
-  if (!store_src.is_lval || store_src.is_llocal || store_src.is_local || store_src.is_sym)
+  if (!store_src.is_lval || irop_is_llocal(store_src) || irop_is_local(store_src) || irop_is_sym(store_src))
     return 0;
   if (store_src.tag != IROP_TAG_VREG)
     return 0;
@@ -1378,8 +1378,8 @@ static int arm_chain_use_disp(TCCIRState *ir, int idx, int32_t t, int *disp, int
     return 0;
   IROperand *ops = &ir->iroperand_pool[q->operand_base];
   IROperand base = ops[is_store ? 0 : 1], index = ops[2], scale = ops[3];
-  if (irop_get_vreg(base) != t || irop_get_tag(base) != IROP_TAG_VREG || base.is_lval || base.is_local ||
-      base.is_llocal)
+  if (irop_get_vreg(base) != t || irop_get_tag(base) != IROP_TAG_VREG || base.is_lval || irop_is_local(base) ||
+      irop_is_llocal(base))
     return 0;
   if (irop_get_tag(index) != IROP_TAG_IMM32 || irop_get_tag(scale) != IROP_TAG_IMM32 || scale.u.imm32 != 0)
     return 0;
@@ -1427,7 +1427,7 @@ static int ssa_gen_arm_indexed_chain(IRSSAOptCtx *ctx, int instr_idx)
     return 0;
   }
   int32_t nvr = irop_get_vreg(nb);
-  if (nvr < 0 || nb.is_lval || nb.is_local || nb.is_llocal || irop_get_btype(nb) == IROP_BTYPE_INT64)
+  if (nvr < 0 || nb.is_lval || irop_is_local(nb) || irop_is_llocal(nb) || irop_get_btype(nb) == IROP_BTYPE_INT64)
     return 0;
   if (k1 < -4096 || k1 > 4096)
     return 0;

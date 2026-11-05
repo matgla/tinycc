@@ -195,6 +195,7 @@ UNITY_GROUPS_opt = opt_analysis opt_engine opt_flat_cfg opt_flat_dce opt_flat_fu
 UNITY_MEMBERS_opt_analysis = \
 	source/opt/analysis/alias.c \
 	source/opt/analysis/du_chains.c \
+	source/opt/analysis/frame_ptr.c \
 	source/opt/analysis/mem_ssa.c \
 	source/opt/analysis/memref.c
 UNITY_MEMBERS_opt_engine = \
@@ -221,9 +222,7 @@ UNITY_MEMBERS_opt_flat_dce = \
 	source/opt/flat/dce/const_return_uninit_elide.c \
 	source/opt/flat/dce/dce.c \
 	source/opt/flat/dce/dead_addrvar_elim.c \
-	source/opt/flat/dce/dead_trailing_addrvar_store.c \
 	source/opt/flat/dce/dead_vla.c \
-	source/opt/flat/dce/infinite_loop_simplify.c \
 	source/opt/flat/dce/infinite_self_recursion.c \
 	source/opt/flat/dce/noreturn_call_epilogue.c \
 	source/opt/flat/dce/noreturn_collapse.c \
@@ -317,7 +316,6 @@ UNITY_MEMBERS_opt_flat_memory_dse = \
 	source/opt/flat/memory/store_inplace_arith.c \
 	source/opt/flat/memory/var_store_elim.c
 UNITY_MEMBERS_opt_flat_memory_fwd = \
-	source/opt/flat/memory/addrof_var_fwd.c \
 	source/opt/flat/memory/copy_source_load_fwd.c \
 	source/opt/flat/memory/entry_store_prop.c \
 	source/opt/flat/memory/param_copy_alias.c \
@@ -418,8 +416,7 @@ UNITY_MEMBERS_opt_ssa_scalar = \
 	source/opt/ssa/scalar/reassoc.c \
 	source/opt/ssa/scalar/setif_or_taut.c \
 	source/opt/ssa/scalar/strength.c \
-	source/opt/ssa/scalar/tmp_block_const.c \
-	source/opt/ssa/scalar/var_imm_prop.c
+	source/opt/ssa/scalar/tmp_block_const.c
 UNITY_MEMBERS_opt_ssa_scalar_prop = \
 	source/opt/ssa/scalar/cprop.c \
 	source/opt/ssa/scalar/sccp.c

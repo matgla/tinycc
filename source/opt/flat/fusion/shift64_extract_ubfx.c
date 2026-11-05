@@ -88,7 +88,7 @@ int tcc_ir_opt_shift64_extract_ubfx(TCCIRState *ir)
     else if (q->op == TCCIR_OP_UBFX)
     {
       IROperand p = tcc_ir_op_get_src2(ir, q);
-      if (!irop_is_immediate(p) || p.is_sym)
+      if (!irop_is_immediate(p) || irop_is_sym(p))
         continue;
       if (!u64x_ubfx_params((int32_t)irop_get_imm64_ex(ir, p), &lsb_in, &width))
         continue;

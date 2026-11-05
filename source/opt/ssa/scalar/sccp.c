@@ -11,6 +11,7 @@
 #define USING_GLOBALS
 #include "ir.h"
 #include "ssa_opt.h"
+#include "opt_utils.h"
 #include "licm.h"
 #include <limits.h>
 
@@ -201,13 +202,13 @@ static int sccp_get_store_src_value_ex(SCCPState *s, IROperand src,
     return st;
 
   int load_off = INT_MIN;
-  if (src.tag == IROP_TAG_STACKOFF && src.is_lval && src.is_local && !src.is_llocal) {
+  if (src.tag == IROP_TAG_STACKOFF && src.is_lval && irop_is_local(src) && !irop_is_llocal(src)) {
     int32_t svr = irop_get_vreg(src);
     if (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)
       load_off = irop_get_stack_offset(src);
   }
   if (load_off == INT_MIN && src.tag == IROP_TAG_VREG && src.is_lval &&
-      !src.is_local) {
+      !irop_is_local(src)) {
     int32_t svr = irop_get_vreg(src);
     if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_TEMP)
       load_off = sccp_lea_slot(s->ctx, svr);
@@ -248,7 +249,7 @@ static int sccp_store_target_off(IRSSAOptCtx *ctx, IRQuadCompact *sq,
   TCCIRState *ir = ctx->ir;
   IROperand sd = tcc_ir_op_get_dest(ir, sq);
   if (sq->op == TCCIR_OP_STORE) {
-    if (sd.tag == IROP_TAG_STACKOFF && sd.is_lval && sd.is_local) {
+    if (sd.tag == IROP_TAG_STACKOFF && sd.is_lval && irop_is_local(sd)) {
       /* A store to a VAR carries the VAR's spill placeholder, not a frame
        * slot: every load site already refuses to match a VAR operand by its
        * offset, and the store side must too.  Zig's CaptureValue.wrap zeroes
@@ -281,15 +282,15 @@ static int sccp_store_may_escape(IRSSAOptCtx *ctx, IRQuadCompact *sq)
   TCCIRState *ir = ctx->ir;
   IROperand sd = tcc_ir_op_get_dest(ir, sq);
   /* Resolvable stack dests are compared by offset in the caller. */
-  if (sd.tag == IROP_TAG_STACKOFF && sd.is_lval && sd.is_local)
+  if (sd.tag == IROP_TAG_STACKOFF && sd.is_lval && irop_is_local(sd))
     return 0;
-  if (sd.tag == IROP_TAG_VREG && sd.is_lval && !sd.is_local) {
+  if (sd.tag == IROP_TAG_VREG && sd.is_lval && !irop_is_local(sd)) {
     int off = sccp_indirect_slot(ctx, sq, SSA_OPT_INDIRECT_DEST);
     if (off != INT_MIN)
       return 0;
   }
   /* Named-local-slot writes are separate from the stack load being tracked. */
-  if (sd.is_local && !sd.is_lval)
+  if (irop_is_local(sd) && !sd.is_lval)
     return 0;
   return 1;
 }
@@ -505,7 +506,7 @@ static int sccp_slot_addr_escapes(SCCPState *s, int load_lo, int load_hi)
       }
       for (int k = 0; k < nops && !s->esc_all; k++) {
         IROperand o = ops[k];
-        if (o.is_lval || !o.is_local)
+        if (o.is_lval || !irop_is_local(o))
           continue;
         if (o.tag != IROP_TAG_STACKOFF || irop_get_vreg(o) != -1) {
           /* spill-encoded &VAR or unknown local encoding — untrackable */
@@ -529,7 +530,7 @@ static int sccp_slot_addr_escapes(SCCPState *s, int load_lo, int load_hi)
       }
       if (!s->esc_all &&
           (op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_STORE_POSTINC) &&
-          !dest.is_lval && dest.is_local &&
+          !dest.is_lval && irop_is_local(dest) &&
           !(dest.tag == IROP_TAG_STACKOFF && irop_get_vreg(dest) == -1))
         s->esc_all = 1;
     }
@@ -639,7 +640,7 @@ static int sccp_store_indexed_base_off(IRSSAOptCtx *ctx, IRQuadCompact *q)
     return INT_MIN;
   TCCIRState *ir = ctx->ir;
   IROperand base = tcc_ir_op_get_dest(ir, q);
-  if (base.tag != IROP_TAG_VREG || base.is_local)
+  if (base.tag != IROP_TAG_VREG || irop_is_local(base))
     return INT_MIN;
   int32_t bvr = irop_get_vreg(base);
   if (bvr < 0 || TCCIR_DECODE_VREG_TYPE(bvr) != TCCIR_VREG_TYPE_TEMP)
@@ -703,9 +704,9 @@ static int sccp_indexed_store_base_off(IRSSAOptCtx *ctx, IRQuadCompact *q)
     return INT_MIN;
   TCCIRState *ir = ctx->ir;
   IROperand base = tcc_ir_op_get_dest(ir, q);
-  if (base.tag == IROP_TAG_STACKOFF && base.is_local && irop_get_vreg(base) == -1)
+  if (base.tag == IROP_TAG_STACKOFF && irop_is_local(base) && irop_get_vreg(base) == -1)
     return irop_get_stack_offset(base);
-  if (base.tag == IROP_TAG_VREG && !base.is_local) {
+  if (base.tag == IROP_TAG_VREG && !irop_is_local(base)) {
     int32_t bvr = irop_get_vreg(base);
     if (bvr >= 0 && TCCIR_DECODE_VREG_TYPE(bvr) == TCCIR_VREG_TYPE_TEMP)
       return sccp_lea_slot(ctx, bvr);
@@ -860,7 +861,7 @@ static int sccp_loop_writes_slot_between(SCCPState *s, int from_idx, int to_idx,
         IROperand p = tcc_ir_op_get_src1(ir, q);
         if (!p.is_lval) {
           int aoff = INT_MIN;
-          if (irop_get_tag(p) == IROP_TAG_STACKOFF && p.is_local && irop_get_vreg(p) == -1)
+          if (irop_get_tag(p) == IROP_TAG_STACKOFF && irop_is_local(p) && irop_get_vreg(p) == -1)
             aoff = irop_get_stack_offset(p);
           else {
             int32_t pvr = irop_get_vreg(p);
@@ -915,10 +916,10 @@ static int sccp_operand_is_volatile_frame(IRSSAOptCtx *ctx, IROperand o, int is_
 {
   if (!(o.is_lval || is_base) || !irop_access_is_volatile(o))
     return 0;
-  if (o.tag == IROP_TAG_STACKOFF && o.is_local && irop_get_vreg(o) == -1)
+  if (o.tag == IROP_TAG_STACKOFF && irop_is_local(o) && irop_get_vreg(o) == -1)
     return 1;
   int32_t vr = irop_get_vreg(o);
-  return o.tag == IROP_TAG_VREG && !o.is_local && vr >= 0 &&
+  return o.tag == IROP_TAG_VREG && !irop_is_local(o) && vr >= 0 &&
          TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP && sccp_lea_slot(ctx, vr) != INT_MIN;
 }
 
@@ -1124,14 +1125,14 @@ static int sccp_resolve_var(SCCPState *s, IROperand use, int instr_idx,
       if (dv >= 0 &&
           TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_VAR &&
           TCCIR_DECODE_VREG_POSITION(dv) == var_pos &&
-          dest.is_local) {
+          irop_is_local(dest)) {
         return sccp_var_store_value(s, q, use, i, 0, out, dep_src_pos);
       }
     }
 
     if (q->op == TCCIR_OP_STORE) {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
-      if (dest.tag == IROP_TAG_STACKOFF && dest.is_local && dest.is_lval) {
+      if (dest.tag == IROP_TAG_STACKOFF && irop_is_local(dest) && dest.is_lval) {
         /* original_offset is the frontend's creation-time `loc` watermark,
          * not the var's final frame slot (that only exists after regalloc):
          * several distinct address-taken VARs can report the SAME offset,
@@ -1171,7 +1172,7 @@ static int sccp_resolve_var(SCCPState *s, IROperand use, int instr_idx,
             if (is_def) {
               IROperand ls = tcc_ir_op_get_src1(ir, lq);
               int32_t lsv = irop_get_vreg(ls);
-              if (lsv >= 0 && ls.is_local && !ls.is_lval &&
+              if (lsv >= 0 && irop_is_local(ls) && !ls.is_lval &&
                   TCCIR_DECODE_VREG_TYPE(lsv) == TCCIR_VREG_TYPE_VAR &&
                   TCCIR_DECODE_VREG_POSITION(lsv) == var_pos) {
                 resolved = 1;
@@ -1224,7 +1225,7 @@ static int sccp_get_operand_value_ex(SCCPState *s, IROperand op,
   }
 
   /* *V is not a slot read of V, so it must return BOTTOM, never resolve_var. */
-  if (op.tag == IROP_TAG_VREG && op.is_lval && !op.is_local) {
+  if (op.tag == IROP_TAG_VREG && op.is_lval && !irop_is_local(op)) {
     int32_t tvr = irop_get_vreg(op);
     if (tvr >= 0 && TCCIR_DECODE_VREG_TYPE(tvr) == TCCIR_VREG_TYPE_TEMP) {
       int load_off = sccp_lea_slot(s->ctx, tvr);
@@ -1241,7 +1242,7 @@ static int sccp_get_operand_value_ex(SCCPState *s, IROperand op,
       return SCCP_BOTTOM;
   }
 
-  if (op.tag == IROP_TAG_STACKOFF && op.is_lval && op.is_local && !op.is_llocal) {
+  if (op.tag == IROP_TAG_STACKOFF && op.is_lval && irop_is_local(op) && !irop_is_llocal(op)) {
     int32_t svr = irop_get_vreg(op);
     if (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR) {
       int dep_pos = -1;
@@ -1275,94 +1276,23 @@ static int sccp_get_operand_value_ex(SCCPState *s, IROperand op,
   return SCCP_BOTTOM;
 }
 
+/* The shared integer fold (opt_utils.h) plus the SSA-only PACK64; 0 when the
+ * instruction must stay (a shift count outside [0, width) above all: this
+ * table once masked the count the x86 way and folded `1u << 40` to 256 where
+ * the ARM shift gives 0). */
 static int sccp_eval_binary(int op, int64_t v1, int64_t v2, int64_t *result,
                             int is_64)
 {
-  switch (op) {
-  case TCCIR_OP_ADD: *result = v1 + v2; break;
-  case TCCIR_OP_SUB: *result = v1 - v2; break;
-  case TCCIR_OP_MUL: *result = v1 * v2; break;
-  case TCCIR_OP_AND: *result = v1 & v2; break;
-  case TCCIR_OP_OR:  *result = v1 | v2; break;
-  case TCCIR_OP_XOR: *result = v1 ^ v2; break;
-  case TCCIR_OP_PACK64: /* dest_lo = src1, dest_hi = src2 */
+  if (op == TCCIR_OP_PACK64) { /* dest_lo = src1, dest_hi = src2 */
     if (!is_64)
       return 0;
     *result = (int64_t)(((uint64_t)(uint32_t)v2 << 32) | (uint32_t)v1);
-    break;
-  case TCCIR_OP_SHL: {
-    int mask = is_64 ? 63 : 31;
-    *result = (int64_t)((uint64_t)v1 << (v2 & mask));
-    break;
+    return 1;
   }
-  case TCCIR_OP_ROR: {
-    uint32_t v = (uint32_t)v1;
-    uint32_t n = (uint32_t)v2 & 31;
-    *result = (int64_t)(int32_t)((v >> n) | (v << (32 - n)));
-    break;
-  }
-  case TCCIR_OP_SHR: {
-    int mask = is_64 ? 63 : 31;
-    if (is_64)
-      *result = (int64_t)((uint64_t)v1 >> (v2 & mask));
-    else
-      *result = (int64_t)((uint32_t)(int32_t)v1 >> (v2 & mask));
-    break;
-  }
-  case TCCIR_OP_SAR: {
-    int mask = is_64 ? 63 : 31;
-    if (is_64)
-      *result = v1 >> (v2 & mask);
-    else
-      *result = (int64_t)((int32_t)v1 >> (v2 & mask));
-    break;
-  }
-  case TCCIR_OP_DIV:
-    if (v2 == 0) return 0;
-    /* INT_MIN / -1 traps on hardware divide: never fold it. */
-    if (v2 == -1) {
-      if (is_64) {
-        if (v1 == INT64_MIN) return 0;
-      } else if ((int32_t)v1 == INT32_MIN) {
-        return 0;
-      }
-    }
-    if (is_64)
-      *result = v1 / v2;
-    else
-      *result = (int64_t)((int32_t)v1 / (int32_t)v2);
-    break;
-  case TCCIR_OP_UDIV:
-    if (v2 == 0) return 0;
-    if (is_64)
-      *result = (int64_t)((uint64_t)v1 / (uint64_t)v2);
-    else
-      *result = (int64_t)((uint32_t)(int32_t)v1 / (uint32_t)(int32_t)v2);
-    break;
-  case TCCIR_OP_IMOD:
-    if (v2 == 0) return 0;
-    if (v2 == -1) {
-      if (is_64) {
-        if (v1 == INT64_MIN) return 0;
-      } else if ((int32_t)v1 == INT32_MIN) {
-        return 0;
-      }
-    }
-    if (is_64)
-      *result = v1 % v2;
-    else
-      *result = (int64_t)((int32_t)v1 % (int32_t)v2);
-    break;
-  case TCCIR_OP_UMOD:
-    if (v2 == 0) return 0;
-    if (is_64)
-      *result = (int64_t)((uint64_t)v1 % (uint64_t)v2);
-    else
-      *result = (int64_t)((uint32_t)(int32_t)v1 % (uint32_t)(int32_t)v2);
-    break;
-  default:
+  if (op == TCCIR_OP_UMULL || op == TCCIR_OP_SMULL || op == TCCIR_OP_UBFX || op == TCCIR_OP_PDIV)
+    return 0; /* not folded here before; the flat tier's const_prop_tmp takes them */
+  if (!ir_opt_const_binop((TccIrOp)op, is_64, v1, v2, result))
     return 0;
-  }
   if (!is_64)
     *result = (int64_t)(int32_t)(uint32_t)*result;
   return 1;
@@ -1516,7 +1446,7 @@ static void sccp_visit_instr(SCCPState *s, int idx)
 
     if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_STORE) {
       IROperand src = tcc_ir_op_get_src1(ir, q);
-      if (src.is_lval || src.is_local || src.is_llocal) {
+      if (src.is_lval || irop_is_local(src) || irop_is_llocal(src)) {
         if (sccp_set_bottom(dest_cell))
           sccp_add_ssa(s, TCCIR_DECODE_VREG_POSITION(dest_vr));
         goto handle_control_flow;
@@ -1541,8 +1471,8 @@ static void sccp_visit_instr(SCCPState *s, int idx)
       IROperand src1 = tcc_ir_op_get_src1(ir, q);
       IROperand src2 = tcc_ir_op_get_src2(ir, q);
 
-      if (src1.is_lval || src1.is_local || src1.is_llocal ||
-          src2.is_lval || src2.is_local || src2.is_llocal) {
+      if (src1.is_lval || irop_is_local(src1) || irop_is_llocal(src1) ||
+          src2.is_lval || irop_is_local(src2) || irop_is_llocal(src2)) {
         if (sccp_set_bottom(dest_cell))
           sccp_add_ssa(s, TCCIR_DECODE_VREG_POSITION(dest_vr));
         goto handle_control_flow;
@@ -1590,8 +1520,8 @@ static void sccp_visit_instr(SCCPState *s, int idx)
         goto handle_control_flow;
       }
 
-      if (src.tag == IROP_TAG_STACKOFF && src.is_lval && src.is_local &&
-          !src.is_llocal && (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)) {
+      if (src.tag == IROP_TAG_STACKOFF && src.is_lval && irop_is_local(src) &&
+          !irop_is_llocal(src) && (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)) {
         int64_t sval = 0;
         int dep_pos = -1;
         int rst = sccp_resolve_stack_load(s, irop_get_stack_offset(src),
@@ -1607,7 +1537,7 @@ static void sccp_visit_instr(SCCPState *s, int idx)
         }
       }
 
-      if (src.tag == IROP_TAG_VREG && src.is_lval && !src.is_local) {
+      if (src.tag == IROP_TAG_VREG && src.is_lval && !irop_is_local(src)) {
         int eff_off = sccp_indirect_slot(s->ctx, q, SSA_OPT_INDIRECT_SRC1);
         if (eff_off != INT_MIN) {
           int64_t sval = 0;
@@ -2017,7 +1947,7 @@ static int sccp_apply(SCCPState *s)
       int got = 0;
 
       /* Case A: TEMP-DEREF *T where T resolves to &StackLoc[N]. */
-      if (src.tag == IROP_TAG_VREG && src.is_lval && !src.is_local) {
+      if (src.tag == IROP_TAG_VREG && src.is_lval && !irop_is_local(src)) {
         int32_t tvr = irop_get_vreg(src);
         if (tvr >= 0 && TCCIR_DECODE_VREG_TYPE(tvr) == TCCIR_VREG_TYPE_TEMP) {
           int load_off = sccp_lea_slot(s->ctx, tvr);
@@ -2038,7 +1968,7 @@ static int sccp_apply(SCCPState *s)
 
       /* Case B: direct StackLoc-lvalue (not a VAR). */
       if (!got && src.tag == IROP_TAG_STACKOFF && src.is_lval &&
-          src.is_local && !src.is_llocal) {
+          irop_is_local(src) && !irop_is_llocal(src)) {
         int32_t svr = irop_get_vreg(src);
         if (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR) {
           int dep_pos = -1;
@@ -2054,7 +1984,7 @@ static int sccp_apply(SCCPState *s)
       if (!got) {
         int32_t svr = src_vr;
         int src_is_stack_var = (src.tag == IROP_TAG_STACKOFF && src.is_lval &&
-                                src.is_local && !src.is_llocal &&
+                                irop_is_local(src) && !irop_is_llocal(src) &&
                                 svr >= 0 &&
                                 TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_VAR);
         int src_var_pos = (svr >= 0) ? TCCIR_DECODE_VREG_POSITION(svr) : -1;
@@ -2089,7 +2019,7 @@ static int sccp_apply(SCCPState *s)
             }
             if (kq->op == TCCIR_OP_STORE) {
               IROperand kd = tcc_ir_op_get_dest(ir, kq);
-              if (kd.tag == IROP_TAG_STACKOFF && kd.is_local && kd.is_lval)
+              if (kd.tag == IROP_TAG_STACKOFF && irop_is_local(kd) && kd.is_lval)
                 continue;
               break;
             }
@@ -2110,7 +2040,7 @@ static int sccp_apply(SCCPState *s)
                   if (oi == 1 && !irop_config[uq->op].has_src2) continue;
                   IROperand op = tcc_ir_op_get_src1_or_2(ir, uq, oi != 0);
                   if (irop_get_vreg(op) == svr &&
-                      !(op.is_local && !op.is_lval)) {
+                      !(irop_is_local(op) && !op.is_lval)) {
                     other_uses++;
                     break;
                   }

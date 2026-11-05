@@ -83,7 +83,7 @@ int tcc_ir_opt_null_store_dom_return(TCCIRState *ir)
       IROperand op2;
       if (!nsdr_operand_by_slot(ir, q, k, &op2))
         continue;
-      if (op2.is_sym)
+      if (irop_is_sym(op2))
       {
         Sym *sym = irop_get_sym_ex(ir, op2);
         if (sym && (sym->type.t & VT_VOLATILE))
@@ -118,7 +118,7 @@ int tcc_ir_opt_null_store_dom_return(TCCIRState *ir)
         continue;
       if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
         continue;
-      if (op.is_local && !op.is_lval)
+      if (irop_is_local(op) && !op.is_lval)
       {
         int p = TCCIR_DECODE_VREG_POSITION(vr);
         if (p >= 0 && p < NSDR_MAX_VAR)
@@ -172,7 +172,7 @@ int tcc_ir_opt_null_store_dom_return(TCCIRState *ir)
     if (q->op == TCCIR_OP_STORE)
     {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
-      if (dest.is_lval && !dest.is_local)
+      if (dest.is_lval && !irop_is_local(dest))
       {
         /* Direct immediate NULL address operand. */
         if (irop_is_lval_imm_addr(dest) && irop_get_imm64_ex(ir, dest) == 0)

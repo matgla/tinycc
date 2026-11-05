@@ -106,13 +106,13 @@ static EspAddr *esp_slot(EspAddrMap *m, int32_t vr)
 static int32_t esp_value_vreg(IROperand op)
 {
   int32_t vr = irop_get_vreg(op);
-  if (vr < 0 || op.is_sym)
+  if (vr < 0 || irop_is_sym(op))
     return -1;
   int tag = irop_get_tag(op);
   if (tag == IROP_TAG_VREG)
     return op.is_lval ? -1 : vr;
   if (tag == IROP_TAG_STACKOFF) /* a VAR/PARAM named through its home; is_llocal derefs it */
-    return op.is_llocal ? -1 : vr;
+    return irop_is_llocal(op) ? -1 : vr;
   return -1;
 }
 
@@ -122,7 +122,7 @@ static EspAddr esp_operand_addr(EspAddrMap *m, IROperand op)
   EspAddr a = {0, ESP_NONE};
   if (irop_get_tag(op) == IROP_TAG_STACKOFF && irop_get_vreg(op) < 0)
   {
-    if (op.is_local && !op.is_lval && !op.is_llocal)
+    if (irop_is_local(op) && !op.is_lval && !irop_is_llocal(op))
     {
       a.off = irop_get_stack_offset(op);
       a.state = ESP_ONE;
@@ -372,7 +372,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       IROperand bc_dest = tcc_ir_op_get_dest(ir, q);
       IROperand bc_src = tcc_ir_op_get_src1(ir, q);
 
-      if (!bc_dest.is_local || irop_get_tag(bc_dest) != IROP_TAG_STACKOFF)
+      if (!irop_is_local(bc_dest) || irop_get_tag(bc_dest) != IROP_TAG_STACKOFF)
         continue;
       if (!tcc_ir_op_src2_is_imm(ir, q))
         continue;
@@ -438,11 +438,11 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     IROperand src1 = tcc_ir_op_get_src1(ir, q);
 
-    LOG_IR_GEN("ENTRY_STORE_PROP: STORE at i=%d: dest local=%d lval=%d llocal=%d tag=%d", i, dest.is_local,
-               dest.is_lval, dest.is_llocal, irop_get_tag(dest));
+    LOG_IR_GEN("ENTRY_STORE_PROP: STORE at i=%d: dest local=%d lval=%d llocal=%d tag=%d", i, irop_is_local(dest),
+               dest.is_lval, irop_is_llocal(dest), irop_get_tag(dest));
 
     /* Only direct StackLoc stores (is_local, is_lval, not through pointer) */
-    if (!dest.is_local || !dest.is_lval || dest.is_llocal)
+    if (!irop_is_local(dest) || !dest.is_lval || irop_is_llocal(dest))
       continue;
     if (irop_get_tag(dest) != IROP_TAG_STACKOFF)
       continue;
@@ -468,7 +468,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
 
     /* Only const or stack-address values; anything else invalidates the prior entry (last-write-wins). */
     int is_const = irop_is_immediate(src1);
-    int is_stackaddr = src1.is_local && !src1.is_lval && irop_get_tag(src1) == IROP_TAG_STACKOFF;
+    int is_stackaddr = irop_is_local(src1) && !src1.is_lval && irop_get_tag(src1) == IROP_TAG_STACKOFF;
     if (!is_const && !is_stackaddr)
     {
       for (int k = 0; k < estore_count; k++)
@@ -524,7 +524,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       if (eq->op == TCCIR_OP_BLOCK_COPY)
       {
         IROperand bcd = tcc_ir_op_get_dest(ir, eq);
-        if (bcd.is_local && irop_get_tag(bcd) == IROP_TAG_STACKOFF && tcc_ir_op_src2_is_imm(ir, eq))
+        if (irop_is_local(bcd) && irop_get_tag(bcd) == IROP_TAG_STACKOFF && tcc_ir_op_src2_is_imm(ir, eq))
         {
           int64_t bbase = irop_get_stack_offset(bcd);
           int64_t bsz = tcc_ir_op_src2_imm(ir, eq);
@@ -550,7 +550,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       int have_soff = 0;
       if (eq->op == TCCIR_OP_STORE)
       {
-        if (sd.is_local && sd.is_lval && !sd.is_llocal && irop_get_tag(sd) == IROP_TAG_STACKOFF)
+        if (irop_is_local(sd) && sd.is_lval && !irop_is_llocal(sd) && irop_get_tag(sd) == IROP_TAG_STACKOFF)
         {
           soff = irop_get_stack_offset(sd);
           have_soff = 1;
@@ -559,7 +559,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       else if (eq->op == TCCIR_OP_STORE_INDEXED)
       {
         /* disp_fusion lowers `st.field = x` to a STORE_INDEXED over a non-lval stack base; still invalidates the slot. */
-        if (sd.is_local && !sd.is_lval && !sd.is_llocal && irop_get_tag(sd) == IROP_TAG_STACKOFF)
+        if (irop_is_local(sd) && !sd.is_lval && !irop_is_llocal(sd) && irop_get_tag(sd) == IROP_TAG_STACKOFF)
         {
           IROperand scale_op = tcc_ir_op_get_scale(ir, eq);
           if (tcc_ir_op_src2_is_imm(ir, eq) && !tcc_ir_op_src2_is_sym(ir, eq) && irop_is_immediate(scale_op))
@@ -603,7 +603,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
         if (si == 1 && !irop_config[eq->op].has_src2)
           continue;
         IROperand op = tcc_ir_op_get_src1_or_2(ir, eq, si != 0);
-        if (!op.is_local || op.is_lval || irop_get_tag(op) != IROP_TAG_STACKOFF)
+        if (!irop_is_local(op) || op.is_lval || irop_get_tag(op) != IROP_TAG_STACKOFF)
           continue;
         int64_t aoff = irop_get_stack_offset(op);
         for (int k = 0; k < estore_count; k++)
@@ -741,7 +741,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
     if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LEA || q->op == TCCIR_OP_STORE)
     {
       IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      if (src1.is_local && !src1.is_lval && irop_get_tag(src1) == IROP_TAG_STACKOFF)
+      if (irop_is_local(src1) && !src1.is_lval && irop_get_tag(src1) == IROP_TAG_STACKOFF)
       {
         IROperand dest = tcc_ir_op_get_dest(ir, q);
         int32_t vr = irop_get_vreg(dest);
@@ -871,7 +871,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
               rt_valid[dp] = 1;
             }
           }
-          else if (s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF && tcc_ir_op_src2_is_imm(ir, q) &&
+          else if (irop_is_local(s1) && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF && tcc_ir_op_src2_is_imm(ir, q) &&
                    !tcc_ir_op_src2_is_sym(ir, q))
           {
             LEA_SET(lea_map, tmp_defs, dp, irop_get_stack_offset(s1) + tcc_ir_op_src2_imm(ir, q), 0);
@@ -893,7 +893,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
               if (sp <= max_var && var_lea_map[sp].valid) { base = var_lea_map[sp].offset; have = 1; }
               else if (sp <= max_var && var_rt_valid[sp]) { base = var_rt_base[sp]; have = 1; }
             }
-            else if (s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF)
+            else if (irop_is_local(s1) && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF)
             {
               base = irop_get_stack_offset(s1);
               have = 1;
@@ -925,7 +925,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
               var_rt_valid[dp] = 1;
             }
           }
-          else if (s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF &&
+          else if (irop_is_local(s1) && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF &&
                    tcc_ir_op_src2_is_imm(ir, q) && !tcc_ir_op_src2_is_sym(ir, q))
           {
             LEA_SET(var_lea_map, var_defs, dp, irop_get_stack_offset(s1) + tcc_ir_op_src2_imm(ir, q), 0);
@@ -941,7 +941,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
               if (sp <= max_tmp && lea_map[sp].valid) { base = lea_map[sp].offset; have = 1; }
               else if (sp <= max_tmp && rt_valid[sp]) { base = rt_base[sp]; have = 1; }
             }
-            else if (s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF)
+            else if (irop_is_local(s1) && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF)
             {
               base = irop_get_stack_offset(s1);
               have = 1;
@@ -971,7 +971,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       int32_t dv = irop_get_vreg(sd);
       int64_t soff = 0x7FFFFFFFLL;
       int exact = 0;
-      if (eq->op == TCCIR_OP_STORE_INDEXED && sd.is_local && !sd.is_lval && !sd.is_llocal &&
+      if (eq->op == TCCIR_OP_STORE_INDEXED && irop_is_local(sd) && !sd.is_lval && !irop_is_llocal(sd) &&
           irop_get_tag(sd) == IROP_TAG_STACKOFF)
       {
         if (!tcc_ir_op_src2_is_imm(ir, eq) || tcc_ir_op_src2_is_sym(ir, eq))
@@ -983,7 +983,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       }
       else if (dv < 0 || (eq->op == TCCIR_OP_STORE && irop_dest_defines_vreg(sd)))
         continue; /* a direct slot (Phase 1.5) or a vreg definition, not a store through one */
-      else if (!sd.is_local)
+      else if (!irop_is_local(sd))
       {
         SimpleLeaEntry *le = NULL;
         int dp = TCCIR_DECODE_VREG_POSITION(dv);
@@ -1081,7 +1081,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
     if (eq->op != TCCIR_OP_FUNCPARAMVAL)
       continue;
     IROperand op = tcc_ir_op_get_src1(ir, eq);
-    if (op.is_local && !op.is_lval && irop_get_tag(op) == IROP_TAG_STACKOFF)
+    if (irop_is_local(op) && !op.is_lval && irop_get_tag(op) == IROP_TAG_STACKOFF)
     {
       int64_t aoff = irop_get_stack_offset(op);
       int dup = 0;
@@ -1125,7 +1125,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       continue;
     IROperand fop = tcc_ir_op_get_src1(ir, eq);
     int64_t foff = 0x7FFFFFFFLL;
-    if (fop.is_local && !fop.is_lval && irop_get_tag(fop) == IROP_TAG_STACKOFF)
+    if (irop_is_local(fop) && !fop.is_lval && irop_get_tag(fop) == IROP_TAG_STACKOFF)
       foff = irop_get_stack_offset(fop);
     else
     {
@@ -1169,7 +1169,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       {
         /* Runtime address when the index is runtime OR the base is a runtime array pointer; skip only the fully-constant case (Phase 2.5 handles it). */
         int imm_index = tcc_ir_op_src2_is_imm(ir, eq) && !tcc_ir_op_src2_is_sym(ir, eq);
-        if (sd.is_local && irop_get_tag(sd) == IROP_TAG_STACKOFF)
+        if (irop_is_local(sd) && irop_get_tag(sd) == IROP_TAG_STACKOFF)
         {
           if (imm_index)
             continue; /* fully constant address — Phase 2.5 handles it precisely */
@@ -1190,7 +1190,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       }
       else /* plain STORE / STORE_POSTINC through a TEMP / VAR deref */
       {
-        if (sd.is_local) continue; /* direct stores handled by Phase 1 */
+        if (irop_is_local(sd)) continue; /* direct stores handled by Phase 1 */
         if (dv < 0) continue;
         int dp = TCCIR_DECODE_VREG_POSITION(dv);
         if (TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP)
@@ -1293,7 +1293,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
     int32_t base_vr = irop_get_vreg(li_src1);
     if (base_vr < 0 || TCCIR_DECODE_VREG_TYPE(base_vr) != TCCIR_VREG_TYPE_TEMP)
       continue;
-    if (!irop_is_immediate(li_src2) || li_src2.is_sym)
+    if (!irop_is_immediate(li_src2) || irop_is_sym(li_src2))
       continue;
     if (tcc_ir_access_is_volatile(ir, li_src1))
       continue; /* a volatile read is never forwarded (the base carries the mark) */
@@ -1341,7 +1341,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       }
       tcc_ir_set_src2_none(ir, i);
 
-      if (estores[k].value.is_local && !estores[k].value.is_lval && irop_get_tag(estores[k].value) == IROP_TAG_STACKOFF)
+      if (irop_is_local(estores[k].value) && !estores[k].value.is_lval && irop_get_tag(estores[k].value) == IROP_TAG_STACKOFF)
       {
         int32_t d_vr = tcc_ir_op_dest_vreg(ir, q);
         if (d_vr >= 0 && TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_TEMP)
@@ -1379,7 +1379,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       continue;
 
     IROperand src1 = tcc_ir_op_get_src1(ir, q);
-    if (!src1.is_local || !src1.is_lval || src1.is_llocal || src1.is_complex)
+    if (!irop_is_local(src1) || !src1.is_lval || irop_is_llocal(src1) || src1.is_complex)
       continue;
     if (irop_get_tag(src1) != IROP_TAG_STACKOFF)
       continue;
@@ -1448,7 +1448,7 @@ static int phf_stack_word_load(TCCIRState *ir, int before, int32_t vr)
     if (lq->op != TCCIR_OP_LOAD)
       return -1;
     IROperand a = tcc_ir_op_get_src1(ir, lq);
-    if (irop_get_tag(a) != IROP_TAG_STACKOFF || !a.is_param || !a.is_lval || a.is_llocal || irop_get_vreg(a) >= 0 ||
+    if (irop_get_tag(a) != IROP_TAG_STACKOFF || !a.is_param || !a.is_lval || irop_is_llocal(a) || irop_get_vreg(a) >= 0 ||
         irop_get_btype(a) != IROP_BTYPE_INT32 || irop_is_64bit(a) || a.is_complex || irop_get_stack_offset(a) < 0 ||
         tcc_ir_access_is_volatile(ir, a))
       return -1;
@@ -1487,12 +1487,12 @@ int tcc_ir_opt_param_home_fwd(TCCIRState *ir)
     if (q->op != TCCIR_OP_STORE)
       continue;
     IROperand d = tcc_ir_op_get_dest(ir, q), s = tcc_ir_op_get_src1(ir, q);
-    if (irop_get_tag(d) != IROP_TAG_STACKOFF || !d.is_local || !d.is_lval || d.is_llocal ||
+    if (irop_get_tag(d) != IROP_TAG_STACKOFF || !irop_is_local(d) || !d.is_lval || irop_is_llocal(d) ||
         irop_get_vreg(d) >= 0 || irop_get_btype(d) != IROP_BTYPE_INT32 || irop_is_64bit(d) || d.is_complex ||
         tcc_ir_access_is_volatile(ir, d))
       continue;
     int32_t pv = irop_get_vreg(s);
-    if (pv < 0 || s.is_lval || s.is_local || s.is_llocal || irop_get_btype(s) != IROP_BTYPE_INT32 ||
+    if (pv < 0 || s.is_lval || irop_is_local(s) || irop_is_llocal(s) || irop_get_btype(s) != IROP_BTYPE_INT32 ||
         irop_is_64bit(s) || s.is_complex)
       continue;
     /* A PARAM vreg, or a TEMP holding an incoming stack word. */
@@ -1555,7 +1555,7 @@ int tcc_ir_opt_param_home_fwd(TCCIRState *ir)
         for (int k = 0; k < nh; k++)
           if (irop_get_vreg(h[k].p) == vr && h[k].def != i)
             h[k].bad = 1;
-      if (irop_get_tag(op) != IROP_TAG_STACKOFF || !op.is_local || op.is_llocal || vr >= 0)
+      if (irop_get_tag(op) != IROP_TAG_STACKOFF || !irop_is_local(op) || irop_is_llocal(op) || vr >= 0)
         continue;
       const int o = irop_get_stack_offset(op);
       if (!op.is_lval)
@@ -1620,7 +1620,7 @@ int tcc_ir_opt_param_home_fwd(TCCIRState *ir)
       if (s == 1) { if (!irop_config[q->op].has_src1) continue; op = tcc_ir_op_get_src1(ir, q); }
       else if (s == 2) { if (!irop_config[q->op].has_src2) continue; op = tcc_ir_op_get_src2(ir, q); }
       else { if (!ir_op_has(q->op, IROP_A_SLOT3)) continue; op = ir->iroperand_pool[q->operand_base + 3]; }
-      if (irop_get_tag(op) != IROP_TAG_STACKOFF || !op.is_local || !op.is_lval || op.is_llocal ||
+      if (irop_get_tag(op) != IROP_TAG_STACKOFF || !irop_is_local(op) || !op.is_lval || irop_is_llocal(op) ||
           irop_get_vreg(op) >= 0 || irop_get_btype(op) != IROP_BTYPE_INT32 || irop_is_64bit(op) || op.is_complex ||
           tcc_ir_access_is_volatile(ir, op))
         continue;

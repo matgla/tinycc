@@ -246,8 +246,10 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
     if (is_leader[i])
       nb++;
 
-  cfg->blocks = tcc_mallocz(nb * sizeof(IRBasicBlock));
-  cfg->instr_to_block = tcc_malloc(n * sizeof(int)); /* every entry written below */
+  if (nb > TCC_IR_MAX_BLOCKS || n > TCC_IR_ORIG_INDEX_MAX)
+    tcc_error("function too large: %d basic blocks, %d IR instructions", nb, n);
+  cfg->blocks = tcc_hot_mallocz(nb * sizeof(IRBasicBlock));
+  cfg->instr_to_block = tcc_hot_mallocz(n * sizeof(ir_block_idx_t)); /* every entry written below */
 
   /* Create blocks */
   int bi = -1;
@@ -299,9 +301,9 @@ void tcc_ir_cfg_free(IRCFG *cfg)
   tcc_free(cfg->edge_store);
   tcc_free(cfg->df_store);
   tcc_free(cfg->dom_children_store);
-  tcc_free(cfg->blocks);
+  tcc_hot_free(cfg->blocks);
   tcc_free(cfg->rpo_order);
-  tcc_free(cfg->instr_to_block);
+  tcc_hot_free(cfg->instr_to_block);
   tcc_free(cfg->dom_tin);
   tcc_free(cfg->dom_tout);
   tcc_free(cfg);
@@ -414,15 +416,19 @@ void tcc_ir_cfg_compute_dominators(IRCFG *cfg)
    * are never visited and keep idom == -1, exactly as under CHK, whose
    * reachable set (rpo over the same succ edges) is the same. */
   int nb = cfg->num_blocks;
+  /* One block for everything below: a CFG builds these on every pass that asks, 8000
+   * times in eight units, and each array was its own trip through malloc. */
+  typedef struct { int block; int ci; } DomFrame;
+  int *scratch = tcc_malloc(sizeof(int) * (size_t)nb * 7 + sizeof(DomFrame) * (size_t)nb);
   if (nb > 1) {
-    int *pre = tcc_malloc(nb * sizeof(int));    /* block -> preorder, -1 unreachable */
-    int *vertex = tcc_malloc(nb * sizeof(int)); /* preorder -> block */
-    int *parent = tcc_malloc(nb * sizeof(int)); /* preorder -> preorder of DFS parent */
+    int *pre = scratch;          /* block -> preorder, -1 unreachable */
+    int *vertex = scratch + nb;  /* preorder -> block */
+    int *parent = vertex + nb;   /* preorder -> preorder of DFS parent */
     for (int i = 0; i < nb; i++)
       pre[i] = -1;
 
-    typedef struct { int block; int ci; } DomFrame;
-    DomFrame *stack = tcc_malloc(nb * sizeof(DomFrame));
+    int *semi = parent + nb, *ancestor = semi + nb, *label = ancestor + nb, *estk = label + nb;
+    DomFrame *stack = (DomFrame *)(estk + nb);
     int sp = 0, np = 0;
     pre[0] = 0; vertex[0] = 0; parent[0] = 0; np = 1;
     stack[sp++] = (DomFrame){0, 0};
@@ -441,16 +447,11 @@ void tcc_ir_cfg_compute_dominators(IRCFG *cfg)
         sp--;
       }
     }
-    tcc_free(stack);
 
     /* Semidominators, processing vertices in decreasing preorder.  The
      * uniform eval covers both theorem cases: an unlinked (smaller-preorder)
      * pred still has semi == its own preorder, so eval returning it yields
      * exactly the pred's number. */
-    int *semi = tcc_malloc(np * sizeof(int));
-    int *ancestor = tcc_malloc(np * sizeof(int));
-    int *label = tcc_malloc(np * sizeof(int));
-    int *estk = tcc_malloc(np * sizeof(int));
     for (int i = 0; i < np; i++) {
       semi[i] = i;
       ancestor[i] = -1;
@@ -482,13 +483,6 @@ void tcc_ir_cfg_compute_dominators(IRCFG *cfg)
       cfg->blocks[vertex[w]].idom = vertex[a];
     }
 
-    tcc_free(pre);
-    tcc_free(vertex);
-    tcc_free(parent);
-    tcc_free(semi);
-    tcc_free(ancestor);
-    tcc_free(label);
-    tcc_free(estk);
   }
 
   /* Pre/post-order stamps over the idom tree for O(1) dominance queries. */
@@ -501,17 +495,18 @@ void tcc_ir_cfg_compute_dominators(IRCFG *cfg)
     cfg->dom_dfs_count = nb;
     for (int i = 0; i < nb; i++) { cfg->dom_tin[i] = -1; cfg->dom_tout[i] = -1; }
 
-    int *ccount = tcc_mallocz(sizeof(int) * nb);
+    int *ccount = scratch;
+    memset(ccount, 0, sizeof(int) * nb);
     for (int ri = 0; ri < cfg->rpo_count; ri++) {
       int b = cfg->rpo_order[ri];
       int p = cfg->blocks[b].idom;
       if (b != 0 && p >= 0 && p != b)
         ccount[p]++;
     }
-    int *cstart = tcc_malloc(sizeof(int) * (nb + 1));
+    int *cstart = ccount + nb;
     cstart[0] = 0;
     for (int i = 0; i < nb; i++) cstart[i + 1] = cstart[i] + ccount[i];
-    int *chld = tcc_malloc(sizeof(int) * (cstart[nb] > 0 ? cstart[nb] : 1));
+    int *chld = cstart + nb + 1;
     int *nxt = ccount; /* reuse as per-parent write cursor, then DFS child cursor */
     for (int i = 0; i < nb; i++) nxt[i] = cstart[i];
     for (int ri = 0; ri < cfg->rpo_count; ri++) {
@@ -523,7 +518,7 @@ void tcc_ir_cfg_compute_dominators(IRCFG *cfg)
     for (int i = 0; i < nb; i++) nxt[i] = cstart[i];
 
     if (cfg->rpo_count > 0) {
-      int *stack = tcc_malloc(sizeof(int) * (cfg->rpo_count + 1));
+      int *stack = chld + nb;
       int sp = 0, clock = 0;
       stack[sp++] = 0;
       cfg->dom_tin[0] = clock++;
@@ -538,12 +533,9 @@ void tcc_ir_cfg_compute_dominators(IRCFG *cfg)
           sp--;
         }
       }
-      tcc_free(stack);
     }
-    tcc_free(ccount);
-    tcc_free(cstart);
-    tcc_free(chld);
   }
+  tcc_free(scratch);
 }
 
 int tcc_ir_cfg_dominates(IRCFG *cfg, int a, int b)

@@ -21,11 +21,9 @@
 static IROperand narrow_copy_src(IROperand dest, int32_t vr)
 {
   IROperand s = dest;
-  s.vr = vr;
+  irop_set_word(s, vr);
   s.tag = IROP_TAG_VREG;
   s.is_lval = 0;
-  s.is_local = 0;
-  s.is_llocal = 0;
   s.u.imm32 = 0;
   return s;
 }
@@ -46,7 +44,7 @@ OPT_GEN_SSA(narrow_shr, TCCIR_OP_SHR) {
     and(imm(src2) > 0 && imm(src2) < 32);
     and(imm(psrc2) == imm(src2));
     and_not(is_i64f64(psrc1) || is_i64f64(pdest) || is_i64f64(dest) || is_i64f64(src1));
-    and_not(psrc1.is_lval || psrc1.is_local || psrc1.is_llocal));
+    and_not(psrc1.is_lval || irop_is_local(psrc1) || irop_is_llocal(psrc1)));
 
   uint32_t mask = (1u << (32 - imm(src2))) - 1;
   RETIRE_PAIR(psrc1, 0);
@@ -175,7 +173,7 @@ OPT_GEN_SSA(narrow_ubfx_noop, TCCIR_OP_UBFX) {
     fits = !(pparam & UBFX_HI_HALF) && pwidth > 0 && pwidth <= width;
   } else if (pop == TCCIR_OP_AND && is_imm32(psrc2) && !irop_is_64bit(psrc1)) {
     fits = (uint32_t)imm(psrc2) < (1u << width);
-  } else if ((pop == TCCIR_OP_LOAD || pop == TCCIR_OP_ASSIGN) && psrc1.is_lval && !psrc1.is_llocal &&
+  } else if ((pop == TCCIR_OP_LOAD || pop == TCCIR_OP_ASSIGN) && psrc1.is_lval && !irop_is_llocal(psrc1) &&
              psrc1.is_unsigned) {
     int bt = irop_get_btype(psrc1);
     fits = (bt == IROP_BTYPE_INT8 && width >= 8) || (bt == IROP_BTYPE_INT16 && width >= 16);

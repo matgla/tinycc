@@ -23,7 +23,7 @@ before and after register allocation:
  │  PHASE 2: SSA Construction + SSA-Phase Optimizations            │
  │  ir/regalloc.c  (tcc_ir_optimize)                              │
  │  Loop transforms (flat IR) → CFG/SSA build → SSA opt engine    │
- │  Passes: var_const_fold, sccp, cprop, fold, branch, DCE, ...  │
+ │  Passes: sccp, cprop, fold, branch, DCE, ...  │
  └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼

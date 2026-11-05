@@ -97,10 +97,10 @@ static int ke_is_scalar32(IROperand op)
 /* Bits a value operand may have set when an instruction reads it. */
 static uint32_t ke_val(const KnownExt *ke, IROperand op)
 {
-  if (irop_is_none(op) || op.is_lval || op.is_llocal)
+  if (irop_is_none(op) || op.is_lval || irop_is_llocal(op))
     return KE_ALL;
   int tag = irop_get_tag(op);
-  if (tag == IROP_TAG_IMM32 && !op.is_sym && ke_is_scalar32(op))
+  if (tag == IROP_TAG_IMM32 && !irop_is_sym(op) && ke_is_scalar32(op))
     return (uint32_t)irop_get_imm32(op);
   if (tag != IROP_TAG_VREG || irop_is_64bit(op))
     return KE_ALL;
@@ -136,10 +136,10 @@ static int ke_mask_sw(uint32_t m)
 /* The width a value operand is known to be sign-extended from, 32 when unknown. */
 static int ke_sw(const KnownExt *ke, IROperand op)
 {
-  if (irop_is_none(op) || op.is_lval || op.is_llocal)
+  if (irop_is_none(op) || op.is_lval || irop_is_llocal(op))
     return 32;
   int tag = irop_get_tag(op);
-  if (tag == IROP_TAG_IMM32 && !op.is_sym && ke_is_scalar32(op))
+  if (tag == IROP_TAG_IMM32 && !irop_is_sym(op) && ke_is_scalar32(op))
     return ke_imm_sw(irop_get_imm32(op));
   if (tag != IROP_TAG_VREG || irop_is_64bit(op))
     return 32;
@@ -176,7 +176,7 @@ static uint32_t ke_smear(uint32_t m)
 
 static int ke_read_imm(IROperand op, int32_t *out)
 {
-  if (op.is_lval || op.is_sym || irop_get_tag(op) != IROP_TAG_IMM32 || !ke_is_scalar32(op))
+  if (op.is_lval || irop_is_sym(op) || irop_get_tag(op) != IROP_TAG_IMM32 || !ke_is_scalar32(op))
     return 0;
   *out = irop_get_imm32(op);
   return 1;
@@ -470,7 +470,7 @@ static int ke_plain_def(const KnownExt *ke, IRQuadCompact *q)
   if (!irop_config[q->op].has_dest)
     return -1;
   IROperand d = tcc_ir_op_get_dest(ke->ir, q);
-  if (d.is_lval || d.is_llocal || irop_get_tag(d) != IROP_TAG_VREG)
+  if (d.is_lval || irop_is_llocal(d) || irop_get_tag(d) != IROP_TAG_VREG)
     return -1;
   return ke_temp_pos(ke, d);
 }
@@ -505,7 +505,7 @@ static int ke_ext_operand(const KnownExt *ke, IRQuadCompact *q, IROperand *src, 
   }
   else
     return -1;
-  if (s1.is_lval || s1.is_llocal || irop_get_tag(s1) != IROP_TAG_VREG || irop_is_64bit(s1) || !ke_is_scalar32(s1))
+  if (s1.is_lval || irop_is_llocal(s1) || irop_get_tag(s1) != IROP_TAG_VREG || irop_is_64bit(s1) || !ke_is_scalar32(s1))
     return -1;
   int pos = ke_temp_pos(ke, s1);
   if (pos < 0)
@@ -577,69 +577,6 @@ static int ke_body_returns(const KnownExt *ke, uint32_t *ret)
   return 1;
 }
 
-/* The single-definition TEMP a value is a copy of, through ASSIGNs, or -1. */
-static int ke_copy_root(const KnownExt *ke, IROperand op)
-{
-  for (int guard = 0; guard < 16; guard++)
-  {
-    if (op.is_lval || op.is_llocal || irop_get_tag(op) != IROP_TAG_VREG || irop_is_64bit(op))
-      return -1;
-    int pos = ke_temp_pos(ke, op);
-    if (pos < 0 || ke->ndefs[pos] != 1)
-      return -1;
-    int d = ke->defidx[pos];
-    if (d < 0 || ke->ir->compact_instructions[d].op != TCCIR_OP_ASSIGN)
-      return pos;
-    op = tcc_ir_op_get_src1(ke->ir, &ke->ir->compact_instructions[d]);
-  }
-  return -1;
-}
-
-/* `BFI X, V, #lsb, #w` where V's low w bits are X's own field -- the error
- * union word rebuilt from itself after its u16 was tested: `mov r1,r8;
- * bfi r1,r0,#0,#16` with r0 = `uxth r8`.  The insert is a copy of X. */
-static int ke_bfi_is_identity(const KnownExt *ke, IRQuadCompact *q)
-{
-  TCCIRState *ir = ke->ir;
-  int lsb, width;
-  if (tcc_ir_barrel_shift_at(ir, q) || !ke_bfi_field(ir, q, &lsb, &width))
-    return 0;
-  int x = ke_copy_root(ke, tcc_ir_op_get_src1(ir, q));
-  int v = ke_copy_root(ke, tcc_ir_op_get_src2(ir, q));
-  if (x < 0 || v < 0)
-    return 0;
-  if (v == x)
-    return lsb == 0;
-  int d = ke->defidx[v];
-  if (d < 0)
-    return 0;
-  IRQuadCompact *vq = &ir->compact_instructions[d];
-  if (tcc_ir_barrel_shift_at(ir, vq) || tcc_ir_shift64_dead_half_at(ir, vq) || tcc_ir_zero_half64_at(ir, vq))
-    return 0;
-  IROperand a = tcc_ir_op_get_src1(ir, vq), b = tcc_ir_op_get_src2(ir, vq);
-  uint32_t field = width == 32 ? KE_ALL : (1u << width) - 1u;
-  int32_t k;
-  switch (vq->op)
-  {
-  case TCCIR_OP_UBFX:
-    /* bits [k&31, +width') of Y, width' covering the field */
-    return ke_read_imm(b, &k) && !(k & UBFX_HI_HALF) && (k & 0x1F) == lsb && ((k >> 5) & 0x1F) >= width &&
-           ke_copy_root(ke, a) == x;
-  case TCCIR_OP_SHR:
-    return ke_read_imm(b, &k) && k == lsb && ke_copy_root(ke, a) == x;
-  case TCCIR_OP_AND:
-    if (lsb != 0)
-      return 0;
-    if (ke_read_imm(b, &k))
-      return ((uint32_t)k & field) == field && ke_copy_root(ke, a) == x;
-    if (ke_read_imm(a, &k))
-      return ((uint32_t)k & field) == field && ke_copy_root(ke, b) == x;
-    return 0;
-  default:
-    return 0;
-  }
-}
-
 /* `X SBFX #0,#w`, or `X [LOAD]` of a register TEMP at a narrow type (MOV plus
  * SXTB/SXTH/UXTB/UXTH): the TEMP operand, the width, and whether the
  * extension is signed; -1 when q is neither. */
@@ -655,7 +592,7 @@ static int ke_reg_ext_operand(const KnownExt *ke, IRQuadCompact *q, IROperand *s
   IROperand s1 = tcc_ir_op_get_src1(ir, q);
   if (d.is_lval || irop_get_tag(d) != IROP_TAG_VREG || !ke_is_scalar32(d))
     return -1;
-  if (s1.is_lval || s1.is_llocal || s1.is_complex || irop_get_tag(s1) != IROP_TAG_VREG || irop_is_64bit(s1))
+  if (s1.is_lval || irop_is_llocal(s1) || s1.is_complex || irop_get_tag(s1) != IROP_TAG_VREG || irop_is_64bit(s1))
     return -1;
   int32_t k;
   if (q->op == TCCIR_OP_SBFX)
@@ -730,7 +667,7 @@ static int ke_bool_select_operand(const KnownExt *ke, int i, IROperand *x, int *
   if (tq->op == TCCIR_OP_CMP && (!ke_read_imm(tcc_ir_op_get_src2(ir, tq), &k) || k != 0))
     return -1;
   IROperand s = tcc_ir_op_get_src1(ir, tq);
-  if (s.is_lval || s.is_llocal || irop_get_tag(s) != IROP_TAG_VREG || irop_is_64bit(s) || !ke_is_scalar32(s))
+  if (s.is_lval || irop_is_llocal(s) || irop_get_tag(s) != IROP_TAG_VREG || irop_is_64bit(s) || !ke_is_scalar32(s))
     return -1;
   int pos = ke_temp_pos(ke, s);
   if (pos < 0)
@@ -853,7 +790,7 @@ int tcc_ir_known_ext(TCCIRState *ir, IRSSAState *ssa)
         ke.poison[pos] = 1;
       if (s > 0 && ke_writes_operands(q->op))
         ke.poison[pos] = 1;
-      if (s > 0 || o.is_lval || o.is_llocal)
+      if (s > 0 || o.is_lval || irop_is_llocal(o))
         ke.nuses[pos] += ke.nuses[pos] < 2;
     }
     int pos = ke_plain_def(&ke, q);
@@ -869,7 +806,7 @@ int tcc_ir_known_ext(TCCIRState *ir, IRSSAState *ssa)
        * is written in a way this pass does not read. */
       IROperand d = tcc_ir_op_get_dest(ir, q);
       int dp = ke_temp_pos(&ke, d);
-      if (dp >= 0 && !d.is_lval && !d.is_llocal)
+      if (dp >= 0 && !d.is_lval && !irop_is_llocal(d))
         ke.poison[dp] = 1;
     }
     IROperand src;
@@ -1031,22 +968,6 @@ int tcc_ir_known_ext(TCCIRState *ir, IRSSAState *ssa)
     q->op = TCCIR_OP_ASSIGN;
     tcc_ir_set_src1(ir, i, src);
     tcc_ir_set_src2_none(ir, i);
-    changes++;
-  }
-
-  for (int i = 0; i < n && !tcc_ir_opt_pass_disabled("ra:known_ext_bfi"); i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op != TCCIR_OP_BFI || ke_plain_def(&ke, q) < 0 || !ke_bfi_is_identity(&ke, q))
-      continue;
-    IROperand x = tcc_ir_op_get_src1(ir, q);
-    int dbt = tcc_ir_op_dest_btype(ir, q);
-    if (irop_get_btype(x) != dbt)
-      x = irop_retype_scalar(x, dbt);
-    q->op = TCCIR_OP_ASSIGN;
-    tcc_ir_set_src1(ir, i, x);
-    tcc_ir_set_src2_none(ir, i);
-    ir->bfi_params[q->orig_index] = 0;
     changes++;
   }
 

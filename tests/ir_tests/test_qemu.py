@@ -140,7 +140,7 @@ TEST_FILES = [
     ("bug_dead_loop_rotated_mid_exit.c", 0),
     ("bug_dead_loop_rotated_outlined_arm.c", 0),
     ("bug_dead_trail_addrvar_ptr_copy.c", 0),
-    ("bug_dead_trail_volatile_access.c", 0),  # dead_trail_addrvar keeps writes that access volatile memory
+    ("bug_dead_trail_volatile_access.c", 0),  # dead writes that access volatile memory stay
     ("bug_narrow_volatile_load_dead_local.c", 0),  # a volatile load into a dead char/short local stays
     ("bug_volatile_64bit_store_kept.c", 0),  # an overwritten 64-bit volatile store stays
     ("bug_redundant_assign_volatile_local.c", 0),  # an overwritten store to a volatile local stays
@@ -843,6 +843,7 @@ TEST_FILES = [
     # `mov hi, #0` dies (per-word may-be-set masks); refusals: two defs, a high
     # word also stored, SAR of a maybe-negative value, loop-carried values.
     ("bug_u64_zero_high_shift.c", 0),
+    ("bug_tu_vreg_map_overflow_loses_escape.c", 0),
     ("bug_u64_known_high_word.c", 0),
 
     # `(v64 >> k) & mask` with k >= 32 as one UBFX on the high word -- every
@@ -1216,6 +1217,9 @@ TEST_FILES = [
     # no scratch save slot for an instruction phase 3 vacated registers at
     ("bug_scratch_area_fixed_insns.c", 0),
     ("bug_scratch_area_no_real_push.c", 0),
+    ("bug_o0_fixed_scratch_saves.c", 0),
+    ("bug_o0_memory_across_blocks.c", 0),
+    ("bug_link_many_function_sections.c", 0),
     # ptr seed 8507: ssa:load_cse's TVStore (store through an unresolved
     # TEMP pointer) survived a direct StackLoc store to the same address,
     # forwarding a stale constant into a later deref of that pointer.
@@ -1712,6 +1716,8 @@ TEST_FILES = [
     # ... and keeps the LEA when its address reaches a store through a
     # VAR-to-VAR copy (gcc 990128-1 wrote through argc on the device).
     ("bug_dead_addrvar_var_copy_chain.c", 0),
+    ("bug_frame_ptr_addr_into_param.c", 0),  # &local copied into a PARAM vreg escapes the frame facts
+    ("bug_const_fold_shift_count_out_of_range.c", 0),  # a constant shift count >= width is not folded
     # A stack-copied struct argument whose base scratch is LR loads its words
     # through another register, and not through a live IP.
     ("495_stack_struct_arg_base_in_lr.c", 0),
@@ -2352,6 +2358,12 @@ TEST_FILES = [
     ("420_bitfield_unit_narrow.c", 0),
     # RA interval missed a value live over a forward exit + backward re-entry: wrong at all -O.
     ("bug_ra_interval_forward_exit_backward_reentry.c", 0),
+    ("bug_ra_widen_exposed_rows.c", 0),
+    # packed struct copies inlined as unaligned word chunks: every size, placement and overlap.
+    ("bug_packed_copy_unaligned.c", 0),
+    ("bug_dead_temp_local_other_arm_write.c", 0),
+    ("bug_inline_struct_return_member_arg.c", 0),
+    ("bug_static_inline_early_return_contexts.c", 0),
     ("bug_ra_interval_live_in_at_asm_block_start.c", 0),
     # codegen ADD/SUB+CMP#0 fusion skipped a CMP that is a loop back-edge target (and a volatile read).
     ("bug_sub_cmp0_fusion_jump_target.c", 0),
@@ -2831,9 +2843,10 @@ def test_bool_param_normalized_reverse(opt_level, tmp_path):
 # per-block bit sets exceed the size cap; lower the cap (debug cross knob) so the
 # small reproducer takes that path.
 @pytest.mark.parametrize("opt_level", ["-O1", "-O2", "-Os"])
-def test_ra_widen_size_cap_fallback(opt_level, tmp_path, monkeypatch):
+@pytest.mark.parametrize("test_file", ["bug_ra_interval_forward_exit_backward_reentry.c", "bug_ra_widen_exposed_rows.c"])
+def test_ra_widen_size_cap_fallback(test_file, opt_level, tmp_path, monkeypatch):
     monkeypatch.setenv("TCC_RA_WIDEN_MAX_WORDS", "1")
-    _run_qemu_test("bug_ra_interval_forward_exit_backward_reentry.c", 0, opt_level=opt_level, output_dir=tmp_path)
+    _run_qemu_test(test_file, 0, opt_level=opt_level, output_dir=tmp_path)
 
 
 # Hard-float (-mfloat-abi=hard) execution gate.  Compiles with the VFP

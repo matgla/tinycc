@@ -78,6 +78,12 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
   return 0;
 }
 
+int tcc_ir_ssa_opt_run_fallback(IRSSAOptCtx *ctx)
+{
+  (void)ctx;
+  return 0;
+}
+
 int tcc_ir_ssa_opt_run_target(IRSSAOptCtx *ctx)
 {
   (void)ctx;
@@ -127,7 +133,6 @@ int ssa_opt_branch(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_cmp_eq_prop(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_dup_diamond(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_vrp(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
-int ssa_opt_setif_or_taut(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_setif_mask_fold(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_bool_norm(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_cmp_offset_fold(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
@@ -144,8 +149,6 @@ int tcc_ir_ssa_opt_loop_addr_hoist(TCCIRState *ir) { (void)ir; return 0; }
 int tcc_ir_ssa_opt_os_const_share(TCCIRState *ir) { (void)ir; return 0; }
 int ssa_opt_var_forward(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_var_to_param_forward(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
-int ssa_opt_var_const_fold(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
-int ssa_opt_var_imm_prop(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_const_prop_tmp(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_dead_loop(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 

@@ -97,9 +97,9 @@ static int cj_operand_same(TCCIRState *ir, IROperand a, IROperand b)
 {
   if (irop_is_none(a) || irop_is_none(b))
     return irop_is_none(a) && irop_is_none(b);
-  if (a.tag != b.tag || a.btype != b.btype || a.is_lval != b.is_lval || a.is_llocal != b.is_llocal ||
-      a.is_local != b.is_local || a.is_const != b.is_const || a.is_complex != b.is_complex ||
-      a.is_unsigned != b.is_unsigned || a.is_static != b.is_static || a.is_sym != b.is_sym ||
+  if (a.tag != b.tag || a.btype != b.btype || a.is_lval != b.is_lval || irop_is_llocal(a) != irop_is_llocal(b) ||
+      irop_is_local(a) != irop_is_local(b) || irop_is_const(a) != irop_is_const(b) || a.is_complex != b.is_complex ||
+      a.is_unsigned != b.is_unsigned || irop_is_sym(a) != irop_is_sym(b) ||
       a.is_param != b.is_param || a.aux != b.aux)
     return 0;
   int32_t va = irop_get_vreg(a), vb = irop_get_vreg(b);
@@ -253,7 +253,7 @@ static int cj_defines(IRQuadCompact *q, int s, IROperand o)
     return 0;
   if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(o)) == TCCIR_VREG_TYPE_TEMP)
     return !o.is_lval;
-  return !o.is_llocal; /* a VAR is written through its slot operand */
+  return !irop_is_llocal(o); /* a VAR is written through its slot operand */
 }
 
 /* How many of the tail instructions, counted from the end, can be merged:
@@ -1057,7 +1057,7 @@ static int rm_pair(RMState *st, int *map_a, int *map_b, int *cnt, int *stamp_a, 
 static int rm_sel_operand_ok(IROperand o)
 {
   int32_t vr = irop_get_vreg(o);
-  if (vr < 0 || o.tag != IROP_TAG_VREG || o.is_lval || o.is_llocal || o.is_complex)
+  if (vr < 0 || o.tag != IROP_TAG_VREG || o.is_lval || irop_is_llocal(o) || o.is_complex)
     return 0;
   if (o.btype != IROP_BTYPE_INT32 && o.btype != IROP_BTYPE_INT8 && o.btype != IROP_BTYPE_INT16)
     return 0;
@@ -1112,7 +1112,7 @@ static int rm_sel_clobbered(RMState *st, int from, int to, int32_t sel, uint32_t
       int32_t vr = irop_get_vreg(o);
       if (vr < 0)
       {
-        if (is_stack && s == 0 && o.tag == IROP_TAG_STACKOFF && !o.is_llocal)
+        if (is_stack && s == 0 && o.tag == IROP_TAG_STACKOFF && !irop_is_llocal(o))
         {
           /* A direct frame write: a scalar store names its bytes, <= 8. */
           if (q->op != TCCIR_OP_STORE || o.btype == IROP_BTYPE_STRUCT || o.is_param)
@@ -1212,9 +1212,9 @@ static int rm_insn_same_case(RMState *st, int a, int b, int ia, IRQuadCompact *q
   IROperand oa = cj_slot(ir, qa, 1), ob = cj_slot(ir, qb, 1);
   if (oa.tag != IROP_TAG_IMM32 || ob.tag != IROP_TAG_IMM32 || oa.btype == IROP_BTYPE_STRUCT ||
       irop_get_vreg(oa) >= 0 || irop_get_vreg(ob) >= 0 || oa.btype != ob.btype || oa.is_lval || ob.is_lval ||
-      oa.is_llocal != ob.is_llocal || oa.is_local != ob.is_local || oa.is_const != ob.is_const ||
-      oa.is_complex != ob.is_complex || oa.is_unsigned != ob.is_unsigned || oa.is_static != ob.is_static ||
-      oa.is_sym || ob.is_sym || oa.is_param != ob.is_param || oa.aux != ob.aux)
+      irop_is_llocal(oa) != irop_is_llocal(ob) || irop_is_local(oa) != irop_is_local(ob) || irop_is_const(oa) != irop_is_const(ob) ||
+      oa.is_complex != ob.is_complex || oa.is_unsigned != ob.is_unsigned ||
+      irop_is_sym(oa) || irop_is_sym(ob) || oa.is_param != ob.is_param || oa.aux != ob.aux)
     return 0;
   if (!rm_imm_is_case(oa.u.imm32, st->caseval[a]) || !rm_imm_is_case(ob.u.imm32, st->caseval[b]))
     return 0;
@@ -1715,150 +1715,12 @@ int tcc_ir_drop_jumpif_to_next(TCCIRState *ir)
       continue;
     IROperand a = tcc_ir_op_get_src1(ir, c);
     IROperand b = c->op == TCCIR_OP_CMP ? tcc_ir_op_get_src2(ir, c) : IROP_NONE;
-    if (a.is_lval || a.is_llocal || (!irop_is_none(b) && (b.is_lval || b.is_llocal)))
+    if (a.is_lval || irop_is_llocal(a) || (!irop_is_none(b) && (b.is_lval || irop_is_llocal(b))))
       continue;
     c->op = TCCIR_OP_NOP;
     removed++;
   }
   return removed;
-}
-
-/* `t0 <- SETIF c; t1 <- t0; t2 <- t1 AND #1; CMP t2,#0; JUMPIF` -> `t0 <-
- * SETIF c; CMP t0,#0; JUMPIF`, for setif_fuse to finish: a 0/1 value tests
- * the same through copies and odd masks.  The Zig C backend tests its
- * optionals' bools that way once SRA scalarizes them -- a struct copy, a u8
- * field load -- and the inline compare-exchange of every kernel spin lock
- * reached codegen as ITE/MOV/MOV/CMP/branch.  Only a chain the SETIF heads
- * with nothing else between, each link defined once and used once, and no
- * jump into it.  Returns the number of tests rewritten. */
-int tcc_ir_setif_test_chain_fold(TCCIRState *ir)
-{
-  const int n = ir->next_instruction_index;
-  int changes = 0;
-  /* Where the jumps that are left land: a dropped branch leaves its
-   * target's is_jump_target set.  With a table or indirect jump, trust the
-   * flags. */
-  uint8_t *landed = tcc_mallocz(n + 1);
-  for (int k = 0; k < n; k++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[k];
-    if (q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_IJUMP || ir_op_has(q->op, IROP_A_MAY_BRANCH))
-    {
-      for (int t = 0; t < n; t++)
-        landed[t] = ir->compact_instructions[t].is_jump_target;
-      break;
-    }
-    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
-      continue;
-    int t = tcc_ir_op_dest_imm32(ir, q);
-    while (t >= 0 && t < n && ir->compact_instructions[t].op == TCCIR_OP_NOP)
-      t++;
-    if (t >= 0 && t <= n)
-      landed[t] = 1;
-  }
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *test = &ir->compact_instructions[i];
-    if (test->op != TCCIR_OP_CMP || landed[i])
-      continue;
-    IROperand ts = tcc_ir_op_get_src1(ir, test), tz = tcc_ir_op_get_src2(ir, test);
-    if (!irop_is_immediate(tz) || irop_get_imm64_ex(ir, tz) != 0 || ts.is_lval || ts.is_llocal)
-      continue;
-    int32_t vr = irop_get_vreg(ts);
-    if (vr < 0 || irop_get_btype(ts) == IROP_BTYPE_INT64 || irop_get_btype(ts) == IROP_BTYPE_FLOAT32 ||
-        irop_get_btype(ts) == IROP_BTYPE_FLOAT64)
-      continue;
-    /* Walk the chain back: every non-NOP instruction before the test must be
-     * its next link, up to the SETIF. */
-    int chain[8], len = 0, setif = -1;
-    for (int k = i - 1; k >= 0 && len < 8; k--)
-    {
-      IRQuadCompact *q = &ir->compact_instructions[k];
-      if (q->op == TCCIR_OP_NOP)
-        continue;
-      if (!irop_config[q->op].has_dest || irop_get_vreg(tcc_ir_op_get_dest(ir, q)) != vr ||
-          !irop_dest_defines_vreg(tcc_ir_op_get_dest(ir, q)))
-        break;
-      if (q->op == TCCIR_OP_SETIF)
-      {
-        setif = k;
-        break;
-      }
-      IROperand s1 = tcc_ir_op_get_src1(ir, q);
-      const int bt = irop_get_btype(s1);
-      if (s1.is_lval || s1.is_llocal || irop_get_vreg(s1) < 0 || bt == IROP_BTYPE_INT64 ||
-          bt == IROP_BTYPE_FLOAT32 || bt == IROP_BTYPE_FLOAT64)
-        break;
-      if (q->op == TCCIR_OP_AND)
-      {
-        IROperand m = tcc_ir_op_get_src2(ir, q);
-        if (!irop_is_immediate(m) || !(irop_get_imm64_ex(ir, m) & 1))
-          break;
-      }
-      else if (q->op != TCCIR_OP_ASSIGN)
-        break;
-      chain[len++] = k;
-      vr = irop_get_vreg(s1);
-    }
-    if (setif < 0 || !len)
-      continue;
-    /* Each link (and the SETIF's value) defined once and read once -- by the
-     * next link or the test -- and no jump lands between SETIF and test. */
-    int ok = 1;
-    for (int k = setif + 1; k <= i && ok; k++)
-      ok = !landed[k];
-    int32_t vregs[9];
-    int nv = 0;
-    vregs[nv++] = irop_get_vreg(tcc_ir_op_get_dest(ir, &ir->compact_instructions[setif]));
-    for (int c = len - 1; c >= 0; c--)
-      vregs[nv++] = irop_get_vreg(tcc_ir_op_get_dest(ir, &ir->compact_instructions[chain[c]]));
-    for (int k = 0; k < n && ok; k++)
-    {
-      IRQuadCompact *q = &ir->compact_instructions[k];
-      if (q->op == TCCIR_OP_NOP)
-        continue;
-      if (irop_config[q->op].has_dest && k != setif)
-      {
-        int32_t d = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
-        int is_link = 0;
-        for (int c = 0; c < len; c++)
-          is_link |= chain[c] == k;
-        for (int v = 0; v < nv && !is_link; v++)
-          ok &= d != vregs[v];
-      }
-      for (int s = 1; s <= 2 && ok; s++)
-      {
-        if ((s == 1 && !irop_config[q->op].has_src1) || (s == 2 && !irop_config[q->op].has_src2))
-          continue;
-        int32_t r = irop_get_vreg(s == 1 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q));
-        if (r < 0)
-          continue;
-        /* the reader allowed for vregs[v]: the next link, or the test */
-        for (int v = 0; v < nv; v++)
-          if (r == vregs[v])
-          {
-            int reader = v + 1 < nv ? chain[len - 1 - v] : i;
-            ok &= k == reader && s == 1;
-          }
-      }
-      if (ir_op_has(q->op, IROP_A_SLOT3) && ok && q->operand_base + 3 < (uint32_t)ir->iroperand_pool_count)
-      {
-        int32_t r = irop_get_vreg(ir->iroperand_pool[q->operand_base + 3]);
-        for (int v = 0; v < nv; v++)
-          ok &= r < 0 || r != vregs[v];
-      }
-    }
-    if (!ok)
-      continue;
-    IROperand src = tcc_ir_op_get_dest(ir, &ir->compact_instructions[setif]);
-    src.is_lval = 0;
-    tcc_ir_set_src1(ir, i, src);
-    for (int c = 0; c < len; c++)
-      ir->compact_instructions[chain[c]].op = TCCIR_OP_NOP;
-    changes++;
-  }
-  tcc_free(landed);
-  return changes;
 }
 
 /*
@@ -1922,7 +1784,7 @@ static int bt_identity_move(TCCIRState *ir, int i)
   if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LOAD)
     return 0;
   IROperand s = tcc_ir_op_get_src1(ir, q), d = tcc_ir_op_get_dest(ir, q);
-  if (d.tag != IROP_TAG_VREG || d.is_lval || s.tag != IROP_TAG_VREG || s.is_lval || s.is_llocal || s.is_sym ||
+  if (d.tag != IROP_TAG_VREG || d.is_lval || s.tag != IROP_TAG_VREG || s.is_lval || irop_is_llocal(s) || irop_is_sym(s) ||
       irop_needs_pair(s) || irop_needs_pair(d))
     return 0;
   MachineOperand sm = machine_op_from_ir(ir, &s), dm = machine_op_from_ir(ir, &d);

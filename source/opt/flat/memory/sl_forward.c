@@ -184,7 +184,7 @@ static int sl_fwd_value_within_bits(TCCIRState *ir, IROperand op, int bits)
   if (bits <= 0 || bits >= 32 || irop_is_64bit(op))
     return 0;
   const uint32_t lim = (1u << bits) - 1;
-  if (irop_is_immediate(op) && !op.is_sym)
+  if (irop_is_immediate(op) && !irop_is_sym(op))
     return ((uint64_t)(uint32_t)(int32_t)irop_get_imm64_ex(ir, op) & ~(uint64_t)lim) == 0;
   int32_t vr = irop_get_vreg(op);
   if (vr < 0 || op.is_lval)
@@ -206,10 +206,10 @@ static int sl_fwd_value_within_bits(TCCIRState *ir, IROperand op, int bits)
   if (def->op == TCCIR_OP_AND)
   {
     IROperand a = tcc_ir_op_get_src1(ir, def), b = tcc_ir_op_get_src2(ir, def);
-    if (irop_is_immediate(b) && !b.is_sym &&
+    if (irop_is_immediate(b) && !irop_is_sym(b) &&
         ((uint64_t)(uint32_t)(int32_t)irop_get_imm64_ex(ir, b) & ~(uint64_t)lim) == 0)
       return 1;
-    return irop_is_immediate(a) && !a.is_sym &&
+    return irop_is_immediate(a) && !irop_is_sym(a) &&
            ((uint64_t)(uint32_t)(int32_t)irop_get_imm64_ex(ir, a) & ~(uint64_t)lim) == 0;
   }
   if (def->op == TCCIR_OP_LOAD || def->op == TCCIR_OP_ASSIGN)
@@ -264,9 +264,9 @@ static int sl_fwd_all_uses_self_narrowing(TCCIRState *ir, int32_t value_vr, int 
       IROperand a = tcc_ir_op_get_src1(ir, q);
       IROperand b = tcc_ir_op_get_src2(ir, q);
       IROperand imm;
-      if (irop_get_vreg(a) == value_vr && irop_is_immediate(b) && !b.is_sym)
+      if (irop_get_vreg(a) == value_vr && irop_is_immediate(b) && !irop_is_sym(b))
         imm = b;
-      else if (irop_get_vreg(b) == value_vr && irop_is_immediate(a) && !a.is_sym)
+      else if (irop_get_vreg(b) == value_vr && irop_is_immediate(a) && !irop_is_sym(a))
         imm = a;
       else
         return 0;
@@ -311,7 +311,7 @@ static int sl_fwd_width_overlap(const SlFwdDeadStore *d, IROperand op)
 {
   TCCIRState *ir = d->ir;
   int read = 0;
-  if (op.is_local && irop_get_sym_ex(ir, op) == d->sym)
+  if (irop_is_local(op) && irop_get_sym_ex(ir, op) == d->sym)
   {
     int64_t roff = irop_get_imm64_ex(ir, op);
     if (roff > d->off && roff < d->off + d->store_w)
@@ -337,7 +337,7 @@ static int sl_fwd_width_overlap(const SlFwdDeadStore *d, IROperand op)
 static int sl_fwd_addr_alias(const SlFwdDeadStore *d, IROperand op)
 {
   TCCIRState *ir = d->ir;
-  if (op.is_local && !op.is_lval && !op.is_llocal && irop_get_sym_ex(ir, op) == d->sym)
+  if (irop_is_local(op) && !op.is_lval && !irop_is_llocal(op) && irop_get_sym_ex(ir, op) == d->sym)
   {
     int64_t base_off = irop_get_imm64_ex(ir, op);
     if (base_off <= d->off && (d->off - base_off) < 1024)
@@ -573,7 +573,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
       IROperand lsrc1 = tcc_ir_op_get_src1(ir, lq);
       int32_t d_vr = tcc_ir_op_dest_vreg(ir, lq);
       /* Only record concrete stack addresses; VAR-tagged operands read offset=0 and would collide. */
-      if (lsrc1.is_local && !lsrc1.is_lval && d_vr >= 0 &&
+      if (irop_is_local(lsrc1) && !lsrc1.is_lval && d_vr >= 0 &&
           (TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_TEMP ||
            TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_VAR))
       {
@@ -667,7 +667,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
           int32_t s1_vr = irop_get_vreg(lsrc1);
           int32_t s2_vr = irop_get_vreg(lsrc2);
           if (s1_vr >= 0 && !lsrc1.is_lval && TCCIR_DECODE_VREG_TYPE(s1_vr) == TCCIR_VREG_TYPE_TEMP &&
-              irop_is_immediate(lsrc2) && !lsrc2.is_sym)
+              irop_is_immediate(lsrc2) && !irop_is_sym(lsrc2))
           {
             int s1_pos = TCCIR_DECODE_VREG_POSITION(s1_vr);
             if (s1_pos <= max_tmp && lea_map[s1_pos].valid)
@@ -680,7 +680,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
           }
           /* Check: constant + LEA_temp (ADD is commutative) */
           else if (s2_vr >= 0 && !lsrc2.is_lval && TCCIR_DECODE_VREG_TYPE(s2_vr) == TCCIR_VREG_TYPE_TEMP &&
-                   irop_is_immediate(lsrc1) && !lsrc1.is_sym)
+                   irop_is_immediate(lsrc1) && !irop_is_sym(lsrc1))
           {
             int s2_pos = TCCIR_DECODE_VREG_POSITION(s2_vr);
             if (s2_pos <= max_tmp && lea_map[s2_pos].valid)
@@ -692,8 +692,8 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
             }
           }
           /* Check: StackAddr + constant (address-of stack slot plus offset) */
-          else if (lsrc1.is_local && !lsrc1.is_lval && irop_get_tag(lsrc1) == IROP_TAG_STACKOFF &&
-                   irop_is_immediate(lsrc2) && !lsrc2.is_sym)
+          else if (irop_is_local(lsrc1) && !lsrc1.is_lval && irop_get_tag(lsrc1) == IROP_TAG_STACKOFF &&
+                   irop_is_immediate(lsrc2) && !irop_is_sym(lsrc2))
           {
             int64_t loff = irop_get_stack_offset(lsrc1) + irop_get_imm64_ex(ir, lsrc2);
             lea_map[dest_pos].offset = loff;
@@ -725,8 +725,8 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
             }
           }
           /* Check: constant + StackAddr (commutative) */
-          else if (lsrc2.is_local && !lsrc2.is_lval && irop_get_tag(lsrc2) == IROP_TAG_STACKOFF &&
-                   irop_is_immediate(lsrc1) && !lsrc1.is_sym)
+          else if (irop_is_local(lsrc2) && !lsrc2.is_lval && irop_get_tag(lsrc2) == IROP_TAG_STACKOFF &&
+                   irop_is_immediate(lsrc1) && !irop_is_sym(lsrc1))
           {
             int64_t loff = irop_get_stack_offset(lsrc2) + irop_get_imm64_ex(ir, lsrc1);
             lea_map[dest_pos].offset = loff;
@@ -798,7 +798,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
       /* TEMP <- Addr[StackLoc] [ASSIGN]: direct stack address assigned to a TEMP. */
       if (lq->op == TCCIR_OP_ASSIGN && !tcc_ir_op_dest_is_lval(ir, lq) && d_vr >= 0 &&
           TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_TEMP &&
-          lsrc1.is_local && !lsrc1.is_lval && irop_get_tag(lsrc1) == IROP_TAG_STACKOFF)
+          irop_is_local(lsrc1) && !lsrc1.is_lval && irop_get_tag(lsrc1) == IROP_TAG_STACKOFF)
       {
         int dp = TCCIR_DECODE_VREG_POSITION(d_vr);
         if (dp <= max_tmp)
@@ -847,7 +847,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
         IROperand src = tcc_ir_op_get_src1_or_2(ir, lq, src_i != 0);
         if (irop_get_tag(src) != IROP_TAG_STACKOFF)
           continue;
-        if (src.is_lval || src.is_llocal)
+        if (src.is_lval || irop_is_llocal(src))
           continue;
         /* STACKOFF with a vreg: offset is in the spill slot, not u.imm32 — tracked via the LEA map. */
         if (irop_get_vreg(src) != -1)
@@ -955,7 +955,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
     if (aq->op == TCCIR_OP_ASSIGN || aq->op == TCCIR_OP_LOAD)
     {
       IROperand asrc1 = tcc_ir_op_get_src1(ir, aq);
-      if (irop_is_immediate(asrc1) && !asrc1.is_sym && !asrc1.is_lval && !asrc1.is_local)
+      if (irop_is_immediate(asrc1) && !irop_is_sym(asrc1) && !asrc1.is_lval && !irop_is_local(asrc1))
       {
         fwd_tmp_val[apos] = asrc1;
         fwd_tmp_valid[apos] = 1;
@@ -1140,7 +1140,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
         else
         {
           LOG_SL_FWD("CALL@i=%d callee=NULL (tag=%d vr=%d is_sym=%d)", i, irop_get_tag(csrc), irop_get_vreg(csrc),
-                     csrc.is_sym);
+                     irop_is_sym(csrc));
         }
         if (is_pure_aeabi)
           LOG_SL_FWD("CALL@i=%d PURE — skipping invalidation", i);
@@ -1279,7 +1279,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
 
       /* Only forward for stack locals or LEA-resolvable non-locals. */
       int load_via_lea = 0;
-      if (!src1.is_local)
+      if (!irop_is_local(src1))
       {
         if (src1.is_lval)
         {
@@ -1343,8 +1343,8 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
                  "is_lval=%d is_llocal=%d is_sym=%d u.imm32=%d",
                  i, (const void *)addr_sym, (long long)addr_offset, (int)src1.btype, load_via_lea,
                  (int)irop_get_tag(src1), (int)TCCIR_DECODE_VREG_TYPE(irop_get_vreg(src1)),
-                 (int)TCCIR_DECODE_VREG_POSITION(irop_get_vreg(src1)), (int)src1.is_local, (int)src1.is_lval,
-                 (int)src1.is_llocal, (int)src1.is_sym, (int)src1.u.imm32);
+                 (int)TCCIR_DECODE_VREG_POSITION(irop_get_vreg(src1)), (int)irop_is_local(src1), (int)src1.is_lval,
+                 (int)irop_is_llocal(src1), (int)irop_is_sym(src1), (int)src1.u.imm32);
 
       int matched_any = 0;
       int rejected_width = 0;
@@ -1983,7 +1983,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
                        "load_bytes=%d full=0x%x narrow=%d sv_tag=%d sv_islval=%d sv_islocal=%d",
                        i, prev_e->instruction_idx, delta, entry_bytes, load_bytes, full, narrow,
                        (int)irop_get_tag(prev_e->stored_value), (int)prev_e->stored_value.is_lval,
-                       (int)prev_e->stored_value.is_local);
+                       (int)irop_is_local(prev_e->stored_value));
             if (q->op != TCCIR_OP_FUNCPARAMVAL)
               q->op = TCCIR_OP_ASSIGN;
             int pool_off = q->operand_base + irop_config[q->op].has_dest;
@@ -2020,7 +2020,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
       IROperand li_src2 = tcc_ir_op_get_src2(ir, q);
       int32_t base_vr = tcc_ir_op_src1_vreg(ir, q);
       if (base_vr >= 0 && TCCIR_DECODE_VREG_TYPE(base_vr) == TCCIR_VREG_TYPE_TEMP && irop_is_immediate(li_src2) &&
-          !li_src2.is_sym)
+          !irop_is_sym(li_src2))
       {
         int bp = TCCIR_DECODE_VREG_POSITION(base_vr);
         if (bp <= max_tmp && lea_map[bp].valid)
@@ -2103,7 +2103,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
       IROperand src1 = tcc_ir_op_get_src1(ir, q);
       int32_t addr_vr = irop_get_vreg(src1);
 
-      if (src1.is_local)
+      if (irop_is_local(src1))
       {
         const Sym *addr_sym;
         int64_t addr_offset;
@@ -2193,7 +2193,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
         /* Resolve address directly for locals or via the LEA map for TEMP derefs. */
         const Sym *addr_sym = NULL;
         int64_t addr_offset = 0;
-        if (src.is_local && !src.is_llocal)
+        if (irop_is_local(src) && !irop_is_llocal(src))
         {
           int src_tag = irop_get_tag(src);
           if (src_tag == IROP_TAG_SYMREF)
@@ -2383,7 +2383,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
         IROperand si_scale = tcc_ir_op_get_scale(ir, q);
         int32_t base_vr = tcc_ir_op_dest_vreg(ir, q);
         if (base_vr >= 0 && TCCIR_DECODE_VREG_TYPE(base_vr) == TCCIR_VREG_TYPE_TEMP &&
-            irop_is_immediate(si_src2) && !si_src2.is_sym &&
+            irop_is_immediate(si_src2) && !irop_is_sym(si_src2) &&
             irop_get_tag(si_scale) == IROP_TAG_IMM32 && si_scale.u.imm32 == 0)
         {
           int bp = TCCIR_DECODE_VREG_POSITION(base_vr);
@@ -2479,7 +2479,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
       /* Forward a tracked StackLoc value into this STORE's src1 (STORE dest <- StackLoc[X]). */
       {
         IROperand stsrc1 = tcc_ir_op_get_src1(ir, q);
-        if (stsrc1.is_local && stsrc1.is_lval)
+        if (irop_is_local(stsrc1) && stsrc1.is_lval)
         {
           int32_t s_vr = irop_get_vreg(stsrc1);
           const Sym *s_sym;
@@ -2569,7 +2569,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
       int j;
 
       /* Only track stack locals; a LEA-mapped pointer counts as a local store. */
-      if (!dest.is_local)
+      if (!irop_is_local(dest))
       {
         /* VAR dest writes the VAR's own storage — can't alias tracked slots; skip. */
         {
@@ -2875,7 +2875,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
             }
           }
         }
-        if (!sv_resolved && sv.is_lval && sv.is_local && !sv.is_llocal)
+        if (!sv_resolved && sv.is_lval && irop_is_local(sv) && !irop_is_llocal(sv))
         {
           int32_t sv_vr = irop_get_vreg(sv);
           int sv_tag = irop_get_tag(sv);
@@ -2956,7 +2956,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
           int32_t s2v = irop_get_vreg(as2);
           /* Require !is_lval on the LEA operand — a DEREF source (`*T + c`) is a value, not the address T. */
           if (s1v >= 0 && !as1.is_lval && TCCIR_DECODE_VREG_TYPE(s1v) == TCCIR_VREG_TYPE_TEMP &&
-              irop_is_immediate(as2) && !as2.is_sym)
+              irop_is_immediate(as2) && !irop_is_sym(as2))
           {
             int s1p = TCCIR_DECODE_VREG_POSITION(s1v);
             if (s1p <= max_tmp && lea_map[s1p].valid)
@@ -2967,7 +2967,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
             }
           }
           else if (s2v >= 0 && !as2.is_lval && TCCIR_DECODE_VREG_TYPE(s2v) == TCCIR_VREG_TYPE_TEMP &&
-                   irop_is_immediate(as1) && !as1.is_sym)
+                   irop_is_immediate(as1) && !irop_is_sym(as1))
           {
             int s2p = TCCIR_DECODE_VREG_POSITION(s2v);
             if (s2p <= max_tmp && lea_map[s2p].valid)
@@ -3002,7 +3002,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
               lea_map[adp] = lea_map[sv_pos];
             }
             /* Case 2: src is a VAR/PARAM — check hash table for its stored value */
-            else if (asrc.is_local)
+            else if (irop_is_local(asrc))
             {
               const Sym *vs = NULL;
               int64_t vo;
@@ -3160,7 +3160,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
       if (irop_config[jq->op].has_src1)
       {
         IROperand s1 = tcc_ir_op_get_src1(ir, jq);
-        if (s1.is_local && irop_get_imm64_ex(ir, s1) == off && irop_get_sym_ex(ir, s1) == sym)
+        if (irop_is_local(s1) && irop_get_imm64_ex(ir, s1) == off && irop_get_sym_ex(ir, s1) == sym)
           still_read = 1;
         if (!still_read)
           if (sl_fwd_width_overlap(&dc, s1))
@@ -3172,7 +3172,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
       if (!still_read && irop_config[jq->op].has_src2)
       {
         IROperand s2 = tcc_ir_op_get_src2(ir, jq);
-        if (s2.is_local && irop_get_imm64_ex(ir, s2) == off && irop_get_sym_ex(ir, s2) == sym)
+        if (irop_is_local(s2) && irop_get_imm64_ex(ir, s2) == off && irop_get_sym_ex(ir, s2) == sym)
           still_read = 1;
         if (!still_read)
           if (sl_fwd_width_overlap(&dc, s2))
@@ -3188,7 +3188,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
       if (!still_read && jq->op == TCCIR_OP_MLA)
       {
         IROperand acc = tcc_ir_op_get_accum(ir, jq);
-        if (acc.is_local && irop_get_imm64_ex(ir, acc) == off && irop_get_sym_ex(ir, acc) == sym)
+        if (irop_is_local(acc) && irop_get_imm64_ex(ir, acc) == off && irop_get_sym_ex(ir, acc) == sym)
           still_read = 1;
         if (!still_read)
           if (sl_fwd_width_overlap(&dc, acc))
@@ -3201,7 +3201,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
       if (!still_read && jq->op != TCCIR_OP_STORE && irop_config[jq->op].has_dest)
       {
         IROperand d = tcc_ir_op_get_dest(ir, jq);
-        if (d.is_local && irop_get_imm64_ex(ir, d) == off && irop_get_sym_ex(ir, d) == sym)
+        if (irop_is_local(d) && irop_get_imm64_ex(ir, d) == off && irop_get_sym_ex(ir, d) == sym)
           still_read = 1;
         if (!still_read)
           if (sl_fwd_width_overlap(&dc, d))
@@ -3214,7 +3214,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
       if (!still_read && jq->op == TCCIR_OP_STORE && irop_config[jq->op].has_dest)
       {
         IROperand d = tcc_ir_op_get_dest(ir, jq);
-        if (d.is_local && (d.is_lval || d.is_llocal) && irop_get_imm64_ex(ir, d) == off &&
+        if (irop_is_local(d) && (d.is_lval || irop_is_llocal(d)) && irop_get_imm64_ex(ir, d) == off &&
             irop_get_sym_ex(ir, d) == sym)
           still_read = 1;
         if (!still_read)
@@ -3304,9 +3304,8 @@ static int tcc_ir_opt_global_sl_fwd__timed(TCCIRState *ir)
 
 
   /* IJUMP (computed goto) targets aren't marked is_jump_target — skip the whole function. */
-  for (int i = 0; i < n; i++)
-    if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
-      return 0;
+  if (ir_opt_fn_features(ir) & IR_FN_IJUMP)
+    return 0;
 
 #define GSLFWD_MAX_ENTRIES 16
   struct
@@ -3371,7 +3370,7 @@ static int tcc_ir_opt_global_sl_fwd__timed(TCCIRState *ir)
         if (!has)
           continue;
         IROperand u = tcc_ir_op_get_src1_or_2(ir, q, s != 0);
-        if (!u.is_sym || !u.is_lval)
+        if (!irop_is_sym(u) || !u.is_lval)
           continue;
         /* A volatile read of the global has to stay a read. */
         if (tcc_ir_access_is_volatile(ir, u))
@@ -3422,7 +3421,7 @@ static int tcc_ir_opt_global_sl_fwd__timed(TCCIRState *ir)
       IROperand src1 = tcc_ir_op_get_src1(ir, q);
 
       /* STORE to a GlobalSym: refresh that entry. */
-      if (dest.is_sym && dest.is_lval)
+      if (irop_is_sym(dest) && dest.is_lval)
       {
         IRPoolSymref *dref = irop_get_symref_ex(ir, dest);
         if (!dref || !dref->sym)
@@ -3459,7 +3458,7 @@ static int tcc_ir_opt_global_sl_fwd__timed(TCCIRState *ir)
         int dbtype = irop_get_btype(dest);
         /* Track plain value vregs and immediate constants (INT32/INT64); invalidate anything else. */
         int32_t val_vr = irop_get_vreg(src1);
-        int store_is_plain_vreg = (val_vr >= 0 && !src1.is_lval && !src1.is_sym);
+        int store_is_plain_vreg = (val_vr >= 0 && !src1.is_lval && !irop_is_sym(src1));
         int store_is_imm = irop_is_immediate(src1);
         if ((dbtype != IROP_BTYPE_INT32 && dbtype != IROP_BTYPE_INT64) ||
             (!store_is_plain_vreg && !store_is_imm))
@@ -3522,7 +3521,7 @@ static int tcc_ir_opt_global_sl_fwd__timed(TCCIRState *ir)
       }
 
       /* A local stack store can't alias globals; an unknown pointer write invalidates everything. */
-      if (!dest.is_local)
+      if (!irop_is_local(dest))
       {
         entry_count = 0;
       }

@@ -118,7 +118,7 @@ static int caf_resolve_lval(const CAggTmpAddr *ta, int max_tmp, const IROperand 
   *outroot = CAF_ROOT_NONE;
   if (!op->is_lval)
     return 0;
-  if (irop_get_tag(*op) == IROP_TAG_STACKOFF && op->is_local && irop_get_vreg(*op) == -1)
+  if (irop_get_tag(*op) == IROP_TAG_STACKOFF && irop_is_local(*op) && irop_get_vreg(*op) == -1)
   {
     *outoff = irop_get_stack_offset(*op);
     return 1;
@@ -147,6 +147,10 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
     return 0;
   if (ir->captured_count > 0 || ir->has_static_chain)
     return 0; /* nested fn: parent-frame slot reachable via static chain */
+  /* Only dadd/dsub CALLs are rewritten: a body without a call has nothing
+   * for the lattice walk below to change. */
+  if (!(ir_opt_fn_features(ir) & IR_FN_CALL))
+    return 0;
 
   for (int i = 0; i < n; i++)
   {
@@ -206,7 +210,7 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
     }
     IROperand s1 = tcc_ir_op_get_src1(ir, q);
     if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LEA) &&
-        irop_get_tag(s1) == IROP_TAG_STACKOFF && s1.is_local && !s1.is_lval &&
+        irop_get_tag(s1) == IROP_TAG_STACKOFF && irop_is_local(s1) && !s1.is_lval &&
         irop_get_vreg(s1) == -1)
     {
       ta[pos].has_off = 1;
@@ -247,7 +251,7 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
     int _ok = 0;                                                             \
     if (!(_op).is_lval)                                                      \
     {                                                                        \
-      if (irop_get_tag(_op) == IROP_TAG_STACKOFF && (_op).is_local &&        \
+      if (irop_get_tag(_op) == IROP_TAG_STACKOFF && irop_is_local((_op)) &&        \
           irop_get_vreg(_op) == -1)                                          \
       {                                                                      \
         (_outroot) = irop_get_stack_offset(_op);                            \

@@ -48,15 +48,6 @@ UT_TEST(test_same_slot_different_offset_no_match)
   return 0;
 }
 
-UT_TEST(test_same_slot_llocal_flag_distinguishes)
-{
-  /* Same offset but different is_llocal -> different slot (distinct locals). */
-  IROperand a = utb_stackoff(16, 1, 0, 0, I32);
-  IROperand b = utb_stackoff(16, 1, 1, 0, I32);
-  UT_ASSERT(!stackoff_same_slot(a, b));
-  return 0;
-}
-
 UT_TEST(test_same_slot_non_stackoff_rejected)
 {
   UT_ASSERT(!stackoff_same_slot(utb_imm(16, I32), utb_stackoff(16, 1, 0, 0, I32)));

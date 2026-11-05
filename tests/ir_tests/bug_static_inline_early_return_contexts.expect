@@ -1,0 +1,16 @@
+classify -1
+classify -1
+classify 274
+classify 515
+classify -2
+classify -7
+classify 1793
+condition ok
+sum -756
+ternary 274
+nested 256
+loop 4
+once -2 -1 274 calls 3
+pair -1 0 10 -10 13 7 104 208
+member -4 5
+first 40 51 7 18

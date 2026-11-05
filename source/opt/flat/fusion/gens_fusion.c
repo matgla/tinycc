@@ -27,7 +27,7 @@ static int rot_source_stable(TCCIRState *ir, IROperand v, int from, int to)
   if (kind != TCCIR_VREG_TYPE_VAR && kind != TCCIR_VREG_TYPE_PARAM)
     return !v.is_lval;
   if (v.is_lval) {
-    if (!v.is_local || v.is_llocal)
+    if (!irop_is_local(v) || irop_is_llocal(v))
       return 0;
     IRLiveInterval *li = tcc_ir_get_live_interval(ir, vr);
     if (!li || li->addrtaken || li->is_volatile)
@@ -102,8 +102,8 @@ static int ir_gen_rotate_fusion(IROptCtx *ctx, int i)
   /* a + b == 32 is a rotate only for 32-bit values, and only if both shifts
    * read the same value (not one a deref of it). */
   IROperand shl_src1 = tcc_ir_op_get_src1(ir, shl_q);
-  if (shl_src1.is_lval != shr_src1.is_lval || shl_src1.is_local != shr_src1.is_local ||
-      shl_src1.is_llocal != shr_src1.is_llocal)
+  if (shl_src1.is_lval != shr_src1.is_lval || irop_is_local(shl_src1) != irop_is_local(shr_src1) ||
+      irop_is_llocal(shl_src1) != irop_is_llocal(shr_src1))
     return 0;
   int min_idx = shl_idx < shr_idx ? shl_idx : shr_idx;
   if (!rot_source_stable(ir, shl_src1, min_idx, i))
@@ -278,7 +278,7 @@ static int ir_gen_mla_fusion(IROptCtx *ctx, int i)
     }
   }
 
-  if ((ms1.is_lval && !ms1.is_local && !ms1.is_llocal) || (ms2.is_lval && !ms2.is_local && !ms2.is_llocal) ||
+  if ((ms1.is_lval && !irop_is_local(ms1) && !irop_is_llocal(ms1)) || (ms2.is_lval && !irop_is_local(ms2) && !irop_is_llocal(ms2)) ||
       (!long_mla && (irop_is_immediate(ms1) || irop_is_immediate(ms2))) || dup_mul ||
       ir_opt_du_uses(du, mul_result_vr) != 1)
     return 0;
@@ -433,7 +433,7 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
       return 0;
 
     IROperand shl_src2 = tcc_ir_op_get_src2(ir, shl_q);
-    if (!shl_src2.is_const)
+    if (!irop_is_const(shl_src2))
       return 0;
 
     shift_amount = shl_src2.u.imm32;
@@ -441,9 +441,9 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
       return 0;
 
     index_op = tcc_ir_op_get_src1(ir, shl_q);
-    if (index_op.is_local || index_op.is_llocal)
+    if (irop_is_local(index_op) || irop_is_llocal(index_op))
       return 0;
-    if (base_op.is_llocal || base_op.is_lval)
+    if (irop_is_llocal(base_op) || base_op.is_lval)
       return 0;
 
     /* The fused access reads index and base at the memory op, not at the SHL /
@@ -480,12 +480,12 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
     if (src1_sym || src2_sym) {
       base_op = src1_sym ? add_src1 : add_src2;
       index_op = src1_sym ? add_src2 : add_src1;
-      if (!irop_has_vreg(index_op) || index_op.is_const)
+      if (!irop_has_vreg(index_op) || irop_is_const(index_op))
         return 0;
     } else {
       if (!irop_has_vreg(add_src1) || !irop_has_vreg(add_src2))
         return 0;
-      if (add_src1.is_const || add_src2.is_const)
+      if (irop_is_const(add_src1) || irop_is_const(add_src2))
         return 0;
       base_op = add_src1;
       index_op = add_src2;
@@ -496,9 +496,9 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
      * double-indirection (is_llocal) and bare pointer lvalues (is_lval without
      * is_local), which need an extra dereference the index slot cannot express;
      * base must be a plain pointer register. */
-    if (index_op.is_llocal || (index_op.is_lval && !index_op.is_local))
+    if (irop_is_llocal(index_op) || (index_op.is_lval && !irop_is_local(index_op)))
       return 0;
-    if (base_op.is_local || base_op.is_llocal || base_op.is_lval)
+    if (irop_is_local(base_op) || irop_is_llocal(base_op) || base_op.is_lval)
       return 0;
 
     /* The ADD must reach the memory op with no intervening control flow and
@@ -527,6 +527,7 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
 
   q->op = is_store ? TCCIR_OP_STORE_INDEXED : TCCIR_OP_LOAD_INDEXED;
 
+  tcc_ir_pool_ensure(ir, 4);
   int new_base_idx = ir->iroperand_pool_count;
   if (new_base_idx + 4 > ir->iroperand_pool_capacity) {
     q->op = is_store ? TCCIR_OP_STORE : TCCIR_OP_LOAD;
@@ -610,12 +611,12 @@ static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
    * stack variable's value, not an address, so folding would corrupt it. */
   if (irop_config[q->op].has_src1) {
     IROperand s1 = tcc_ir_op_get_src1(ir, q);
-    if (s1.is_lval && !s1.is_local && !s1.is_llocal && irop_has_vreg(s1))
+    if (s1.is_lval && !irop_is_local(s1) && !irop_is_llocal(s1) && irop_has_vreg(s1))
       operand_positions[num_deref++] = 1;
   }
   if (irop_config[q->op].has_src2) {
     IROperand s2 = tcc_ir_op_get_src2(ir, q);
-    if (s2.is_lval && !s2.is_local && !s2.is_llocal && irop_has_vreg(s2))
+    if (s2.is_lval && !irop_is_local(s2) && !irop_is_llocal(s2) && irop_has_vreg(s2))
       operand_positions[num_deref++] = 2;
   }
 
@@ -679,16 +680,16 @@ static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
         continue;
 
       IROperand shl_src2 = tcc_ir_op_get_src2(ir, shl_q);
-      if (!shl_src2.is_const)
+      if (!irop_is_const(shl_src2))
         continue;
       scale_amount = shl_src2.u.imm32;
       if (scale_amount < 1 || scale_amount > 3)
         continue;
 
       index_op = tcc_ir_op_get_src1(ir, shl_q);
-      if (index_op.is_llocal)
+      if (irop_is_llocal(index_op))
         continue;
-      if (base_op.is_llocal || base_op.is_lval)
+      if (irop_is_llocal(base_op) || base_op.is_lval)
         continue;
 
       if (!ir_xform_same_block(ir, shl_idx, i))
@@ -716,7 +717,7 @@ static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
       /* Thumb-2 ldr/str displacement range (positive imm12 / negative imm8). */
       if (imm_disp > 4095 || imm_disp < -255)
         continue;
-      if (base_op.is_local || base_op.is_llocal || base_op.is_lval)
+      if (irop_is_local(base_op) || irop_is_llocal(base_op) || base_op.is_lval)
         continue;
 
       {

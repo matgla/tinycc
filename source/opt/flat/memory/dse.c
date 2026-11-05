@@ -117,7 +117,7 @@ typedef struct DseStacklocMarks
 static void dse_mark_stackloc_op(const DseStacklocMarks *m, IROperand op)
 {
   TCCIRState *ir = m->ir;
-  if (op.is_local && irop_get_vreg(op) < 0)
+  if (irop_is_local(op) && irop_get_vreg(op) < 0)
   {
     const Sym *_sym;
     int64_t _off;
@@ -322,7 +322,7 @@ static int dse_overwritten_addrvar_stores(TCCIRState *ir)
     IROperand var = tcc_ir_op_get_src1(ir, lea);
     int32_t avr = irop_get_vreg(addr), vvr = irop_get_vreg(var);
     if (!irop_is_vreg_value(addr) || avr < 0 || TCCIR_DECODE_VREG_TYPE(avr) != TCCIR_VREG_TYPE_TEMP ||
-        vvr < 0 || TCCIR_DECODE_VREG_TYPE(vvr) != TCCIR_VREG_TYPE_VAR || var.is_llocal ||
+        vvr < 0 || TCCIR_DECODE_VREG_TYPE(vvr) != TCCIR_VREG_TYPE_VAR || irop_is_llocal(var) ||
         tcc_ir_access_is_volatile(ir, var) || tcc_ir_operand_names_volatile_var(ir, var))
       continue;
 
@@ -343,7 +343,7 @@ static int dse_overwritten_addrvar_stores(TCCIRState *ir)
         IROperand scale = tcc_ir_op_get_scale(ir, q);
         int width = ir_opt_store_btype_size_bytes(value.btype);
         if (!irop_is_vreg_value(dest) || irop_get_vreg(dest) != avr ||
-            !irop_is_immediate(value) || value.is_sym || value.is_complex || width <= 0 ||
+            !irop_is_immediate(value) || irop_is_sym(value) || value.is_complex || width <= 0 ||
             irop_get_tag(index) != IROP_TAG_IMM32 || index.is_lval || index.u.imm32 < 0 ||
             irop_get_tag(scale) != IROP_TAG_IMM32 || scale.is_lval || scale.u.imm32 != 0 ||
             tcc_ir_access_is_volatile(ir, dest))
@@ -647,7 +647,7 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
         if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED)
         {
           const IROperand d = tcc_ir_op_get_dest(ir, q);
-          if (!d.is_local || q->op == TCCIR_OP_STORE_INDEXED)
+          if (!irop_is_local(d) || q->op == TCCIR_OP_STORE_INDEXED)
             dse_mark_var_used(var_used, max_var_pos, irop_get_vreg(d));
         }
 
@@ -667,10 +667,10 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
           continue;
         const IROperand dest = tcc_ir_op_get_dest(ir, q);
         /* For STORE, only eliminate local stores (not pointer dereferences) */
-        if (q->op == TCCIR_OP_STORE && !dest.is_local)
+        if (q->op == TCCIR_OP_STORE && !irop_is_local(dest))
           continue;
         /* Skip stores to parent frame via static chain — externally visible */
-        if (dest.is_llocal)
+        if (irop_is_llocal(dest))
           continue;
         int32_t vr = irop_get_vreg(dest);
         if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
@@ -724,7 +724,7 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
       if (q->op != TCCIR_OP_STORE)
         continue;
       IROperand dest = tcc_ir_op_get_dest(ir, q);
-      if (!dest.is_local || irop_get_vreg(dest) >= 0)
+      if (!irop_is_local(dest) || irop_get_vreg(dest) >= 0)
         continue;
       const Sym *off_sym;
       int64_t off;
@@ -766,266 +766,29 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
       }
     }
 
-    /* addr_tmp[pos] = 1 if TMP pos was defined from an Addr[StackLoc] */
-    /* addr_tmp_read[pos] = 1 if the addr or pointed-to data is observable */
+    /* addr_tmp[pos]: TMP pos materialises an anonymous StackLoc's address;
+     * addr_tmp_read[pos]: that address, or the data behind it, is observable.
+     * Both come from the shared points-to facts (ir_opt_frame_ptr): a read
+     * through any pointer that may carry the address, a use the facts cannot
+     * follow (a value stored or passed on, an index, a volatile store), or a
+     * pointer that may hold several objects' addresses. */
     uint8_t *addr_tmp = NULL;
     uint8_t *addr_tmp_read = NULL;
 
     if (max_tmp_stackloc > 0)
     {
+      const IRFramePtr *fp = ir_opt_frame_ptr(ir);
       addr_tmp = tcc_mallocz((max_tmp_stackloc + 8) / 8);
       addr_tmp_read = tcc_mallocz((max_tmp_stackloc + 8) / 8);
-
-      for (int i = 0; i < n; i++)
+      for (int pos = 0; pos <= max_tmp_stackloc && pos < fp->ntmp; pos++)
       {
-        IRQuadCompact *q = &ir->compact_instructions[i];
-        if (q->op == TCCIR_OP_NOP)
+        int o = fp->tmp_anon_obj[pos];
+        if (o < 0)
           continue;
-        if (irop_config[q->op].has_src1)
-        {
-          if (tcc_ir_op_src1_is_local(ir, q) && !tcc_ir_op_src1_is_lval(ir, q) && tcc_ir_op_src1_vreg(ir, q) < 0)
-          {
-            IROperand d = tcc_ir_op_get_dest(ir, q);
-            int32_t dvr = irop_get_vreg(d);
-            /* A memory read whose address operand is a StackLoc (a LOAD_INDEXED
-             * over a local array) loads the array's CONTENT, it does not define
-             * the array's address: the result is not an addr-TMP, and the array
-             * must stay marked read so its initializer survives. */
-            if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP && dse_defines_dest(q, d) &&
-                !ir_op_has(q->op, IR_HZ_MEM_READ))
-            {
-              int dpos = TCCIR_DECODE_VREG_POSITION(dvr);
-              if (dpos <= max_tmp_stackloc)
-                addr_tmp[dpos / 8] |= (1 << (dpos % 8));
-            }
-          }
-        }
+        addr_tmp[pos / 8] |= (1 << (pos % 8));
+        if (fp->objs[o].read || fp->read_all)
+          addr_tmp_read[pos / 8] |= (1 << (pos % 8));
       }
-
-      /* prop_tmp/prop_var record origin addr-TMP position; -1 = not addr-prop, -2 = ambiguous. */
-      int *prop_tmp = tcc_mallocz((max_tmp_stackloc + 1) * sizeof(int));
-      int *prop_var = max_var_stackloc >= 0 ? tcc_mallocz((max_var_stackloc + 1) * sizeof(int)) : NULL;
-      memset(prop_tmp, 0xFF, (max_tmp_stackloc + 1) * sizeof(int)); /* -1 */
-      if (prop_var)
-        memset(prop_var, 0xFF, (max_var_stackloc + 1) * sizeof(int));
-
-      for (int pos = 0; pos <= max_tmp_stackloc; pos++)
-        if (addr_tmp[pos / 8] & (1 << (pos % 8)))
-          prop_tmp[pos] = pos;
-
-      int prop_changed = 1;
-      while (prop_changed)
-      {
-        prop_changed = 0;
-        for (int i = 0; i < n; i++)
-        {
-          IRQuadCompact *q = &ir->compact_instructions[i];
-          if (q->op == TCCIR_OP_NOP)
-            continue;
-
-          if (!irop_config[q->op].has_src1 || !irop_config[q->op].has_dest)
-            continue;
-          IROperand dest = tcc_ir_op_get_dest(ir, q);
-          int32_t svr = tcc_ir_op_src1_vreg(ir, q);
-          int32_t dvr = irop_get_vreg(dest);
-          if (svr < 0 || dvr < 0)
-            continue;
-
-          int stype = TCCIR_DECODE_VREG_TYPE(svr);
-          int dtype = TCCIR_DECODE_VREG_TYPE(dvr);
-          int spos = TCCIR_DECODE_VREG_POSITION(svr);
-          int dpos = TCCIR_DECODE_VREG_POSITION(dvr);
-          int origin = -1;
-
-          if ((q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_ASSIGN) && stype == TCCIR_VREG_TYPE_TEMP &&
-              dtype == TCCIR_VREG_TYPE_VAR && spos <= max_tmp_stackloc && prop_var && dpos <= max_var_stackloc)
-            origin = prop_tmp[spos];
-          else if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD) && stype == TCCIR_VREG_TYPE_VAR &&
-                   dtype == TCCIR_VREG_TYPE_TEMP && prop_var && spos <= max_var_stackloc && dpos <= max_tmp_stackloc)
-            origin = prop_var[spos];
-          /* VAR -> VAR STORE too: an inlined pointer parameter lands as
-           * `V79 <-- V22 [STORE]`, and Phase 3 counts it as a safe copy, so it
-           * must carry the origin.  Zig's `get(&t8 + 28)` stepped back 28
-           * bytes through such a param; the loads went unseen and t8's stores
-           * died. */
-          else if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD ||
-                    (q->op == TCCIR_OP_STORE && irop_dest_defines_vreg(dest))) &&
-                   stype == TCCIR_VREG_TYPE_VAR && dtype == TCCIR_VREG_TYPE_VAR && prop_var &&
-                   spos <= max_var_stackloc && dpos <= max_var_stackloc)
-            origin = prop_var[spos];
-          else if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB || q->op == TCCIR_OP_ASSIGN) &&
-                   stype == TCCIR_VREG_TYPE_TEMP && dtype == TCCIR_VREG_TYPE_TEMP && spos <= max_tmp_stackloc &&
-                   dpos <= max_tmp_stackloc)
-            origin = prop_tmp[spos];
-          /* Pointer arithmetic into or out of a VAR carries the address as
-           * well: Phase 3 counts every ADD/SUB of an address as safe, so one
-           * whose result is not followed hides the reads through it.  Zig's
-           * `t11 = &t4.path; t12 = *t11` is `V3 <-- T33 ADD #8`, and the
-           * stores filling t4 died although the path was read through V3. */
-          else if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) &&
-                   (stype == TCCIR_VREG_TYPE_VAR || dtype == TCCIR_VREG_TYPE_VAR))
-          {
-            if (stype == TCCIR_VREG_TYPE_TEMP && spos <= max_tmp_stackloc)
-              origin = prop_tmp[spos];
-            else if (stype == TCCIR_VREG_TYPE_VAR && prop_var && spos <= max_var_stackloc)
-              origin = prop_var[spos];
-            if ((dtype == TCCIR_VREG_TYPE_TEMP && dpos > max_tmp_stackloc) ||
-                (dtype == TCCIR_VREG_TYPE_VAR && (!prop_var || dpos > max_var_stackloc)))
-              origin = -1;
-          }
-
-          /* -2 travels on: a copy of an ambiguous address is still an address,
-           * and the loads through it must reach MARK_ORIGIN_READ. */
-          if (origin == -1)
-            continue;
-
-          if (dtype == TCCIR_VREG_TYPE_TEMP && dpos <= max_tmp_stackloc)
-          {
-            if (prop_tmp[dpos] == -1)
-            {
-              prop_tmp[dpos] = origin;
-              prop_changed = 1;
-            }
-            else if (prop_tmp[dpos] != origin && prop_tmp[dpos] != -2)
-            {
-              prop_tmp[dpos] = -2;
-              prop_changed = 1;
-            }
-          }
-          else if (dtype == TCCIR_VREG_TYPE_VAR && prop_var && dpos <= max_var_stackloc)
-          {
-            if (prop_var[dpos] == -1)
-            {
-              prop_var[dpos] = origin;
-              prop_changed = 1;
-            }
-            else if (prop_var[dpos] != origin && prop_var[dpos] != -2)
-            {
-              prop_var[dpos] = -2;
-              prop_changed = 1;
-            }
-          }
-        }
-      }
-
-      /* Mark origin addr-TMP read if any propagated value is used outside the write pipeline. */
-      for (int i = 0; i < n; i++)
-      {
-        IRQuadCompact *q = &ir->compact_instructions[i];
-        if (q->op == TCCIR_OP_NOP)
-          continue;
-
-#define GET_ORIGIN(vr)                                                                                                 \
-  ({                                                                                                                   \
-    int _o = -1;                                                                                                       \
-    int _t = TCCIR_DECODE_VREG_TYPE(vr);                                                                               \
-    int _p = TCCIR_DECODE_VREG_POSITION(vr);                                                                           \
-    if (_t == TCCIR_VREG_TYPE_TEMP && _p <= max_tmp_stackloc)                                                          \
-      _o = prop_tmp[_p];                                                                                               \
-    else if (_t == TCCIR_VREG_TYPE_VAR && prop_var && _p <= max_var_stackloc)                                          \
-      _o = prop_var[_p];                                                                                               \
-    _o;                                                                                                                \
-  })
-
-#define MARK_ORIGIN_READ(origin)                                                                                       \
-  do                                                                                                                   \
-  {                                                                                                                    \
-    if ((origin) == -2)                                                                                                \
-      memset(addr_tmp_read, 0xFF, (max_tmp_stackloc + 8) / 8);                                                         \
-    else if ((origin) >= 0 && (origin) <= max_tmp_stackloc)                                                            \
-      addr_tmp_read[(origin) / 8] |= (1 << ((origin) % 8));                                                            \
-  } while (0)
-
-        if (irop_config[q->op].has_src1)
-        {
-          IROperand s = tcc_ir_op_get_src1(ir, q);
-          int32_t vr = irop_get_vreg(s);
-          if (vr >= 0)
-          {
-            int origin = GET_ORIGIN(vr);
-            if (origin != -1)
-            {
-              int safe = 0;
-              if (q->op == TCCIR_OP_STORE && (!s.is_lval || TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR))
-              {
-                /* For TMP src, is_lval=1 = deref read (unsafe); for VAR src it just means load (safe). */
-                IROperand d = tcc_ir_op_get_dest(ir, q);
-                int32_t dvr = irop_get_vreg(d);
-                /* Only a store that defines the VAR is a copy Phase 2 followed;
-                 * one through the pointer the VAR holds sends the address to
-                 * memory. */
-                if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR && irop_dest_defines_vreg(d))
-                  safe = 1;
-              }
-              else if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB)
-              {
-                /* Deref read (is_lval=1 on a TMP) makes data observable; VAR is_lval=1 is just a pointer copy. */
-                int stype = TCCIR_DECODE_VREG_TYPE(vr);
-                if (!s.is_lval || stype == TCCIR_VREG_TYPE_VAR)
-                  safe = 1;
-              }
-              if (!safe)
-              {
-                LOG_IR_GEN("DSE-SL: Phase3 MARK READ origin=%d at i=%d op=%d src1 is_lval=%d", origin, i, q->op,
-                           s.is_lval);
-                MARK_ORIGIN_READ(origin);
-              }
-            }
-          }
-        }
-
-        /* Check src2: addr-prop as src2 is unusual; conservatively mark read */
-        if (irop_config[q->op].has_src2)
-        {
-          int32_t vr = tcc_ir_op_src2_vreg(ir, q);
-          if (vr >= 0)
-          {
-            int origin = GET_ORIGIN(vr);
-            if (origin != -1)
-            {
-              LOG_IR_GEN("DSE-SL: Phase3 MARK READ origin=%d at i=%d op=%d src2", origin, i, q->op);
-              MARK_ORIGIN_READ(origin);
-            }
-          }
-        }
-
-        /* MLA accumulator (4th operand) is a use not surfaced by src1/src2 — conservatively mark origin read. */
-        if (q->op == TCCIR_OP_MLA)
-        {
-          IROperand s = tcc_ir_op_get_accum(ir, q);
-          int32_t vr = irop_get_vreg(s);
-          if (vr >= 0)
-          {
-            int origin = GET_ORIGIN(vr);
-            if (origin != -1)
-            {
-              LOG_IR_GEN("DSE-SL: Phase3 MARK READ origin=%d at i=%d op=%d accum", origin, i, q->op);
-              MARK_ORIGIN_READ(origin);
-            }
-          }
-        }
-
-        /* STORE dest as an addr-prop TMP is a deref write — safe, no marking,
-         * unless it is a volatile access: that is observable by itself, so the
-         * address and the object stay. */
-        if (irop_config[q->op].has_dest && tcc_ir_instr_access_is_volatile(ir, q))
-        {
-          const int32_t dvr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
-          if (dvr >= 0)
-          {
-            const int origin = GET_ORIGIN(dvr);
-            if (origin != -1)
-              MARK_ORIGIN_READ(origin);
-          }
-        }
-
-#undef GET_ORIGIN
-#undef MARK_ORIGIN_READ
-      }
-
-      tcc_free(prop_tmp);
-      if (prop_var)
-        tcc_free(prop_var);
     }
 
     for (int i = 0; i < n; i++)
@@ -1041,7 +804,7 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
       {
         IROperand s = tcc_ir_op_get_src1(ir, q);
         /* Skip range marking for address-of feeding a write-only TMP (writes only, no read). */
-        if (s.is_local && !s.is_lval && irop_get_vreg(s) < 0 && addr_tmp != NULL &&
+        if (irop_is_local(s) && !s.is_lval && irop_get_vreg(s) < 0 && addr_tmp != NULL &&
             dse_defines_dest(q, tcc_ir_op_get_dest(ir, q)))
         {
           IROperand d = tcc_ir_op_get_dest(ir, q);
@@ -1071,9 +834,9 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
             }
           }
         }
-        LOG_IR_GEN("DSE-SL: MARK src1 at i=%d op=%d is_lval=%d is_local=%d", i, q->op, s.is_lval, s.is_local);
+        LOG_IR_GEN("DSE-SL: MARK src1 at i=%d op=%d is_lval=%d is_local=%d", i, q->op, s.is_lval, irop_is_local(s));
         /* FUNCPARAM passing a STRUCT from a StackLoc may span multiple words — force range marking (scalars keep width-based). */
-        if ((q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID) && s.is_local &&
+        if ((q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID) && irop_is_local(s) &&
             irop_get_vreg(s) < 0 && s.btype == IROP_BTYPE_STRUCT)
         {
           IROperand s_range = s;
@@ -1089,7 +852,7 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
       if (irop_config[q->op].has_src2)
       {
         IROperand s = tcc_ir_op_get_src2(ir, q);
-        LOG_IR_GEN("DSE-SL: MARK src2 at i=%d op=%d is_lval=%d is_local=%d", i, q->op, s.is_lval, s.is_local);
+        LOG_IR_GEN("DSE-SL: MARK src2 at i=%d op=%d is_lval=%d is_local=%d", i, q->op, s.is_lval, irop_is_local(s));
         dse_mark_stackloc_op(&slm, s);
       }
       /* MLA accumulator (4th operand) may reference a StackLoc */
@@ -1122,9 +885,9 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
       if (tcc_ir_instr_access_is_volatile(ir, q))
         continue;
       IROperand dest = tcc_ir_op_get_dest(ir, q);
-      if (!dest.is_local || irop_get_vreg(dest) >= 0)
+      if (!irop_is_local(dest) || irop_get_vreg(dest) >= 0)
         continue; /* Not an anonymous StackLoc */
-      if (dest.is_llocal)
+      if (irop_is_llocal(dest))
         continue; /* Store to parent frame via static chain — externally visible */
 
       const Sym *sym;
@@ -1242,7 +1005,7 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
           if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_src1)
             continue;
           IROperand s = tcc_ir_op_get_src1(ir, q);
-          if (!s.is_local || s.is_lval || irop_get_vreg(s) >= 0)
+          if (!irop_is_local(s) || s.is_lval || irop_get_vreg(s) >= 0)
             continue;
           IROperand d = tcc_ir_op_get_dest(ir, q);
           int32_t dvr = irop_get_vreg(d);

@@ -22,6 +22,7 @@ typedef struct TuFuncSummary
 {
   Sym *func_sym;
   TuSymSet calls;          /* static (intra-TU) functions called */
+  TuSymSet noreturn_known; /* those already noreturn when this body was compiled */
   TuSymSet static_reads;   /* static globals read or address-taken */
   TuSymSet static_writes;  /* static globals written */
   int body_elide_blocker;  /* obvious non-call side effect in the body */

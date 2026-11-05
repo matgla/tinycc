@@ -91,11 +91,8 @@ static inline IROperand ssa_cprop_imm_for_use(IROperand imm, IROperand use)
 {
   IROperand out = imm;
   out.is_lval = 0;
-  out.is_llocal = 0;
-  out.is_local = 0;
   out.btype = use.btype;
   out.is_unsigned = use.is_unsigned;
-  out.is_static = use.is_static;
   return out;
 }
 

@@ -103,7 +103,7 @@ void tcc_ir_analyze_pure_via_sret(TCCIRState *ir, Sym *func_sym)
       if (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_ASSIGN)
       {
         IROperand src = tcc_ir_op_get_src1(ir, q);
-        if (has_sret && src.is_local && irop_get_tag(src) == IROP_TAG_STACKOFF &&
+        if (has_sret && irop_is_local(src) && irop_get_tag(src) == IROP_TAG_STACKOFF &&
             (int32_t)irop_get_stack_offset(src) == sret_slot)
         {
           SRET_MARK(dest_vr);
@@ -122,7 +122,7 @@ void tcc_ir_analyze_pure_via_sret(TCCIRState *ir, Sym *func_sym)
       {
         IROperand src2 = tcc_ir_op_get_src2(ir, q);
         int32_t src1_vr = tcc_ir_op_src1_vreg(ir, q);
-        if (src1_vr >= 0 && SRET_TEST(src1_vr) && irop_is_immediate(src2) && !src2.is_sym)
+        if (src1_vr >= 0 && SRET_TEST(src1_vr) && irop_is_immediate(src2) && !irop_is_sym(src2))
         {
           SRET_MARK(dest_vr);
           changes++;
@@ -148,7 +148,7 @@ void tcc_ir_analyze_pure_via_sret(TCCIRState *ir, Sym *func_sym)
     {
       IROperand dst = tcc_ir_op_get_dest(ir, q);
       /* Local stack slots are not observable to the caller. */
-      if (dst.is_local && irop_get_tag(dst) == IROP_TAG_STACKOFF)
+      if (irop_is_local(dst) && irop_get_tag(dst) == IROP_TAG_STACKOFF)
         break;
       /* A store through an sret-derived pointer is the return value, not a side effect. */
       int32_t dest_vr = irop_get_vreg(dst);
@@ -195,7 +195,7 @@ void tcc_ir_analyze_pure_via_sret(TCCIRState *ir, Sym *func_sym)
       {
         IROperand dst = tcc_ir_op_get_dest(ir, q);
         int32_t dest_vr = irop_get_vreg(dst);
-        if (dst.is_lval && !(dst.is_local && irop_get_tag(dst) == IROP_TAG_STACKOFF) &&
+        if (dst.is_lval && !(irop_is_local(dst) && irop_get_tag(dst) == IROP_TAG_STACKOFF) &&
             !(dest_vr >= 0 && SRET_TEST(dest_vr)))
           pure = 0;
       }

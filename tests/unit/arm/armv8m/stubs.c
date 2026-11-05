@@ -607,7 +607,10 @@ void sso_load_operand(const struct SValue *sv, struct SValue *out)
  *  binary.
  */
 
+#include <stdarg.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <string.h>
 
 struct CType;
 
@@ -652,6 +655,43 @@ int tok_alloc_const(const char *str)
 {
   (void)str;
   return 0;
+}
+
+/* What libtcc.c's error printing reads of the preprocessor: a pass may report an
+ * error now, the IR's size limits for one. */
+struct BufferedFile *file = NULL;
+const int *macro_ptr = NULL;
+int tok_flags = 0;
+int pp_expr = 0;
+
+void pp_error(void *cs)
+{
+  (void)cs;
+}
+
+void cstr_new(void *cs)
+{
+  memset(cs, 0, sizeof(void *) * 2);
+}
+
+void cstr_free(void *cs)
+{
+  (void)cs;
+}
+
+int cstr_vprintf(void *cs, const char *fmt, va_list ap)
+{
+  (void)cs;
+  return vfprintf(stderr, fmt, ap);
+}
+
+int cstr_printf(void *cs, const char *fmt, ...)
+{
+  va_list ap;
+  va_start(ap, fmt);
+  int n = cstr_vprintf(cs, fmt, ap);
+  va_end(ap);
+  return n;
 }
 #endif /* UT_SSA_OPT_REAL */
 

@@ -83,7 +83,7 @@ int ir_opt_eval_const_string_operand(TCCIRState *ir, IROperand op, int use_idx, 
       return 0;
 
     new_idx = tcc_ir_pool_add_symref(ir, symref->sym, symref->addend + (int32_t)addend, symref->flags);
-    *out = irop_make_symref(irop_get_vreg(base_op), new_idx, base_op.is_lval, base_op.is_local, base_op.is_const,
+    *out = irop_make_symref(irop_get_vreg(base_op), new_idx, base_op.is_lval,
                             irop_get_btype(base_op));
     return 1;
   }
@@ -176,7 +176,7 @@ static int ir_opt_btype_size(int btype)
 
 static int ir_opt_stack_addr_offset(IROperand op, int *out_off)
 {
-  if (irop_get_tag(op) != IROP_TAG_STACKOFF || irop_get_vreg(op) != -1 || op.is_lval || !op.is_local)
+  if (irop_get_tag(op) != IROP_TAG_STACKOFF || irop_get_vreg(op) != -1 || op.is_lval || !irop_is_local(op))
     return 0;
   *out_off = (int)irop_get_stack_offset(op);
   return 1;
@@ -255,7 +255,7 @@ static int ir_opt_callee_arg_is_read_only(const char *name, int param_idx)
  * str_strcpy.c), so it does not match the bare-address shape above. */
 static int ir_opt_block_copy_dest_offset(IROperand op, int *out_off)
 {
-  if (irop_get_tag(op) != IROP_TAG_STACKOFF || irop_get_vreg(op) != -1 || op.is_llocal)
+  if (irop_get_tag(op) != IROP_TAG_STACKOFF || irop_get_vreg(op) != -1 || irop_is_llocal(op))
     return 0;
   *out_off = (int)irop_get_stack_offset(op);
   return 1;
@@ -337,7 +337,7 @@ static int sb_apply(TCCIRState *ir, int idx, int base_off, uint8_t *bytes, uint8
     int rel;
     uint64_t val;
 
-    if (irop_get_tag(dst) != IROP_TAG_STACKOFF || !dst.is_lval || !dst.is_local || dst.is_llocal)
+    if (irop_get_tag(dst) != IROP_TAG_STACKOFF || !dst.is_lval || !irop_is_local(dst) || irop_is_llocal(dst))
       return 0;
 
     dst_off = (int)irop_get_stack_offset(dst);
@@ -508,7 +508,7 @@ static const char *sb_callee_name(TCCIRState *ir, int call_idx)
 /* A bare frame address (`&object`), as opposed to an lvalue slot access. */
 static int sb_frame_addr_offset(IROperand op, int *out_off)
 {
-  if (irop_get_tag(op) != IROP_TAG_STACKOFF || irop_get_vreg(op) != -1 || op.is_lval || op.is_llocal)
+  if (irop_get_tag(op) != IROP_TAG_STACKOFF || irop_get_vreg(op) != -1 || op.is_lval || irop_is_llocal(op))
     return 0;
   *out_off = (int)irop_get_stack_offset(op);
   return 1;
@@ -749,7 +749,7 @@ int ir_opt_eval_stack_const_string(TCCIRState *ir, IROperand arg, int use_idx, I
   if (addend < 0)
     return 0;
   pool_idx = tcc_ir_pool_add_symref(ir, sr->sym, addend, sr->flags);
-  cand = irop_make_symref(-1, pool_idx, 0, 0, 1, IROP_BTYPE_INT32);
+  cand = irop_make_symref(-1, pool_idx, 0, IROP_BTYPE_INT32);
 
   /* Confirm against the rodata itself: the candidate must be a string of exactly
    * the length the byte map found.  A later write inside the buffer, or a copy

@@ -116,7 +116,7 @@ static int lbt_operand_reusable(const TCCIRState *ir, IROperand op)
    * have read, at worst one more frame load.  Anything else -- a deref through
    * a pointer, a global, a `*p` -- must not be evaluated a second time.  Same
    * convention as loop_rotate's ROT_VAR_DIRECT. */
-  if (!(TCCIR_DECODE_VREG_TYPE(irop_get_vreg(op)) == TCCIR_VREG_TYPE_VAR && op.is_local))
+  if (!(TCCIR_DECODE_VREG_TYPE(irop_get_vreg(op)) == TCCIR_VREG_TYPE_VAR && irop_is_local(op)))
     return 0;
   /* ... and not when the function has volatile memory and this access is not
    * proven clean: a duplicated read of `volatile int i` is a visible extra
@@ -146,7 +146,7 @@ static int lbt_defines_vreg(const TCCIRState *ir, const IRQuadCompact *q, int32_
     return 0;
   if (!d.is_lval)
     return 1;
-  return TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR && d.is_local;
+  return TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR && irop_is_local(d);
 }
 
 static int lbt_is_memory_op(int op)
@@ -275,7 +275,7 @@ static int lbt_walk_is_postinc_shaped(const TCCIRState *ir, int from, int bump_i
     if (op != TCCIR_OP_LOAD && op != TCCIR_OP_STORE)
       continue;
     IROperand ptr = tcc_ir_op_get_dest_or_src1(ir, q, op == TCCIR_OP_LOAD);
-    if (!ptr.is_lval || ptr.is_local || ptr.is_llocal || ptr.is_sym || !irop_has_vreg(ptr))
+    if (!ptr.is_lval || irop_is_local(ptr) || irop_is_llocal(ptr) || irop_is_sym(ptr) || !irop_has_vreg(ptr))
       continue;
     int32_t pv = irop_get_vreg(ptr);
     if (pv == walk_vreg)
@@ -674,11 +674,11 @@ static int lhd_is_copy(TCCIRState *ir, IRQuadCompact *q)
   if (irop_get_btype(d) != irop_get_btype(s) || irop_is_64bit(d) || s.is_complex)
     return 0;
   if (irop_is_immediate(s))
-    return !s.is_lval && !s.is_sym;
+    return !s.is_lval && !irop_is_sym(s);
   int32_t vr = irop_get_vreg(s);
-  if (s.tag != IROP_TAG_VREG || vr < 0 || s.is_llocal || s.is_sym)
+  if (s.tag != IROP_TAG_VREG || vr < 0 || irop_is_llocal(s) || irop_is_sym(s))
     return 0;
-  return !s.is_lval || (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && s.is_local);
+  return !s.is_lval || (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && irop_is_local(s));
 }
 
 /* A source the copy may read again: re-reading is exactly what the header
@@ -699,7 +699,7 @@ static int lhd_dest_ok(const TCCIRState *ir, IROperand op)
     return 0;
   if (!op.is_lval)
     return 1;
-  if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR || !op.is_local)
+  if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR || !irop_is_local(op))
     return 0;
   return !tcc_ir_access_is_volatile(ir, op) && !tcc_ir_operand_names_volatile_var(ir, op);
 }
@@ -1047,15 +1047,15 @@ static int lhd_try_backedge(TCCIRState *ir, int be)
  * plain immediate. */
 static int lhd_same_operand(const TCCIRState *ir, IROperand a, IROperand b)
 {
-  if (irop_get_tag(a) != irop_get_tag(b) || a.is_lval != b.is_lval || a.is_local != b.is_local ||
-      a.is_llocal != b.is_llocal || a.is_sym || b.is_sym)
+  if (irop_get_tag(a) != irop_get_tag(b) || a.is_lval != b.is_lval || irop_is_local(a) != irop_is_local(b) ||
+      irop_is_llocal(a) != irop_is_llocal(b) || irop_is_sym(a) || irop_is_sym(b))
     return 0;
   if (irop_is_immediate(a))
     return !a.is_lval && irop_get_imm64_ex(ir, a) == irop_get_imm64_ex(ir, b);
   int32_t vr = irop_get_vreg(a);
   if (vr < 0 || vr != irop_get_vreg(b))
     return 0;
-  return !a.is_lval || (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && a.is_local &&
+  return !a.is_lval || (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && irop_is_local(a) &&
                         !tcc_ir_access_is_volatile(ir, a) && !tcc_ir_operand_names_volatile_var(ir, a));
 }
 

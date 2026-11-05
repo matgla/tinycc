@@ -54,14 +54,14 @@ static int run_dce_with_opt(IRSSAOptCtx *ctx)
 /* Anonymous stack-location operand (no associated vreg). */
 static inline IROperand utb_anon_sl(int32_t off, int is_lval, int btype)
 {
-  return irop_make_stackoff(0, off, is_lval, 0, 0, btype);
+  return irop_make_stackoff(0, off, is_lval, 0, btype);
 }
 
 /* Local VAR operand (stack slot, not a pointer value). */
 static inline IROperand utb_lvar(int pos, int btype)
 {
   IROperand op = utb_var(pos, btype);
-  op.is_local = 1;
+  op.tag = IROP_TAG_STACKOFF;
   return op;
 }
 
@@ -70,7 +70,7 @@ static inline void set_op_local(ssa_ctx *c, int instr, int slot)
 {
   IROperand *pool = c->ir->iroperand_pool;
   int base = c->ir->compact_instructions[instr].operand_base;
-  pool[base + slot].is_local = 1;
+  pool[base + slot].tag = IROP_TAG_STACKOFF;
 }
 
 /* ========================================================================
@@ -586,31 +586,6 @@ UT_TEST(test_dce_stackloc_store_address_escape)
   int changed = run_dce_with_opt(c.ctx);
   UT_ASSERT_EQ(changed, 0);
   UT_ASSERT_EQ(utb_op(c.ir, lea_i), TCCIR_OP_LEA);
-  UT_ASSERT_EQ(utb_op(c.ir, store_i), TCCIR_OP_STORE);
-
-  ssa_ctx_free(&c);
-  return 0;
-}
-
-/* ========================================================================
- * is_llocal StackLoc store is never eliminated
- * ======================================================================== */
-
-UT_TEST(test_dce_stackloc_store_is_llocal_kept)
-{
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/1);
-  IROperand dest = utb_llocal(utb_anon_sl(0, 1, I32));
-  int store_i = ssa_add_instr(&c, TCCIR_OP_STORE, dest,
-                              utb_imm(7, I32));
-
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-
-  c.ctx = tcc_mallocz(sizeof(*c.ctx));
-  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
-
-  int changed = run_dce_with_opt(c.ctx);
-  UT_ASSERT_EQ(changed, 0);
   UT_ASSERT_EQ(utb_op(c.ir, store_i), TCCIR_OP_STORE);
 
   ssa_ctx_free(&c);

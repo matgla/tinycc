@@ -12,10 +12,6 @@
 
 struct IRSSAOptCtx;
 
-/* Fold OR-chains of CMP+SETIF booleans whose {LT,EQ,GT} masks cover all states
- * to constant 1. */
-int ssa_opt_setif_or_taut(struct IRSSAOptCtx *ctx);
-
 /* Collapse `CMP <bool-chain>, <bool-chain>` (both built from compares of the
  * same operand pair) plus its flag consumer into a single compare of that pair:
  * `(a<b) ^ (a>b)`  ==>  `a != b`  (gcc PR107881). */

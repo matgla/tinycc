@@ -125,7 +125,7 @@ static void lcs_mem_clobber_overlaps(LcsState *st, int32_t offset, int width,
 /* Accepts a literal Addr[StackLoc[off]] operand or a TEMP/VAR slot marked is_addr. */
 static int lcs_resolve_stack_addr(const LcsState *st, IROperand op, int32_t *out_off)
 {
-  if (op.is_local && !op.is_lval && irop_get_tag(op) == IROP_TAG_STACKOFF)
+  if (irop_is_local(op) && !op.is_lval && irop_get_tag(op) == IROP_TAG_STACKOFF)
   {
     *out_off = irop_get_stack_offset(op);
     return 1;
@@ -232,17 +232,17 @@ static int lcs_read_operand(const TCCIRState *ir, const LcsState *st,
     return 1;
   }
 
-  if (op.is_sym || op.is_llocal)
+  if (irop_is_sym(op) || irop_is_llocal(op))
     return 0;
   /* Address-typed operand: the caller must use lcs_resolve_stack_addr. */
-  if (op.is_local && !op.is_lval)
+  if (irop_is_local(op) && !op.is_lval)
     return 0;
 
   int32_t vr = irop_get_vreg(op);
   /* Pure stack-slot read (no associated vreg): consult the memory map. */
   if (vr < 0)
   {
-    if (op.is_local && op.is_lval && irop_get_tag(op) == IROP_TAG_STACKOFF)
+    if (irop_is_local(op) && op.is_lval && irop_get_tag(op) == IROP_TAG_STACKOFF)
     {
       int32_t off = irop_get_stack_offset(op);
       for (int i = 0; i < st->n_mem; i++)
@@ -277,7 +277,7 @@ static int lcs_read_operand(const TCCIRState *ir, const LcsState *st,
   }
   /* is_local+is_lval on a VAR vreg is a register-resident variable, not memory. */
   if (op.is_lval && slot->is_addr &&
-      (type == TCCIR_VREG_TYPE_TEMP || !op.is_local))
+      (type == TCCIR_VREG_TYPE_TEMP || !irop_is_local(op)))
   {
     int32_t off = (int32_t)slot->value;
     for (int i = 0; i < st->n_mem; i++)
@@ -299,9 +299,9 @@ static int lcs_read_operand(const TCCIRState *ir, const LcsState *st,
 
 static LcsSlot *lcs_dest_slot(LcsState *st, IROperand op)
 {
-  if (op.is_sym || op.is_llocal)
+  if (irop_is_sym(op) || irop_is_llocal(op))
     return NULL;
-  if (op.is_local && !op.is_lval)
+  if (irop_is_local(op) && !op.is_lval)
     return NULL;
   int32_t vr = irop_get_vreg(op);
   if (vr < 0)
@@ -567,7 +567,7 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
 
   case TCCIR_OP_LOAD:
   {
-    if (src1.is_sym || src1.is_llocal) { r.action = 0; return r; }
+    if (irop_is_sym(src1) || irop_is_llocal(src1)) { r.action = 0; return r; }
     /* A non-lval Addr[StackLoc[X]] source is really a LEA. */
     int32_t addr_off;
     if (lcs_resolve_stack_addr(st, src1, &addr_off) && !src1.is_lval)
@@ -609,7 +609,7 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
     }
 
     int32_t off;
-    if (dest.is_local && dest.is_lval && irop_get_tag(dest) == IROP_TAG_STACKOFF)
+    if (irop_is_local(dest) && dest.is_lval && irop_get_tag(dest) == IROP_TAG_STACKOFF)
     {
       off = irop_get_stack_offset(dest);
     }
@@ -655,7 +655,7 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
   case TCCIR_OP_LEA:
   {
     int32_t addr_off;
-    if (src1.is_local && irop_get_tag(src1) == IROP_TAG_STACKOFF)
+    if (irop_is_local(src1) && irop_get_tag(src1) == IROP_TAG_STACKOFF)
       addr_off = irop_get_stack_offset(src1);
     else if (!lcs_resolve_stack_addr(st, src1, &addr_off))
     {
@@ -867,9 +867,9 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
     {
       int32_t a1_off, a2_off;
       int a1_is_addr = lcs_resolve_stack_addr(st, src1, &a1_off) &&
-                       (!src1.is_lval || src1.is_local);
+                       (!src1.is_lval || irop_is_local(src1));
       int a2_is_addr = lcs_resolve_stack_addr(st, src2, &a2_off) &&
-                       (!src2.is_lval || src2.is_local);
+                       (!src2.is_lval || irop_is_local(src2));
       if (a1_is_addr && !a2_is_addr)
       {
         int64_t v2_int;
@@ -1014,14 +1014,14 @@ static int lcs_scan_body(TCCIRState *ir, int start_idx, int end_idx,
       /* FUNCCALLVOID/FUNCPARAMVOID have no real dest. */
       int has_real_dest = !is_call || q->op == TCCIR_OP_FUNCCALLVAL;
       /* is_lval+is_local names the local's stack slot: tracked, not a memory write. */
-      if (has_real_dest && (d.is_llocal || d.is_sym))
+      if (has_real_dest && (irop_is_llocal(d) || irop_is_sym(d)))
         return 0;
-      if (has_real_dest && d.is_local && !d.is_lval)
+      if (has_real_dest && irop_is_local(d) && !d.is_lval)
         return 0;
       int32_t vr = irop_get_vreg(d);
       /* STORE through a non-local vreg: skip the addrtaken check, still size the table. */
       int store_through_vreg = (q->op == TCCIR_OP_STORE) && d.is_lval &&
-                               !d.is_local && !d.is_llocal && !d.is_sym;
+                               !irop_is_local(d) && !irop_is_llocal(d) && !irop_is_sym(d);
       if (has_real_dest && vr >= 0)
       {
         int type = TCCIR_DECODE_VREG_TYPE(vr);
@@ -1060,10 +1060,10 @@ static int lcs_scan_body(TCCIRState *ir, int start_idx, int end_idx,
       if (is_call) continue;
       if (q->op == TCCIR_OP_FUNCPARAMVAL && s == 1) continue;
       if (q->op == TCCIR_OP_FUNCPARAMVOID) continue;
-      if (op.is_sym || op.is_llocal)
+      if (irop_is_sym(op) || irop_is_llocal(op))
         return 0;
       /* Only ASSIGN/LOAD/LEA/ADD/SUB resolve a stack-address source. */
-      if (op.is_local && !op.is_lval)
+      if (irop_is_local(op) && !op.is_lval)
       {
         if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LOAD &&
             q->op != TCCIR_OP_LEA &&
@@ -1155,9 +1155,9 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
     }
     if (!irop_config[q->op].has_dest) continue;
     IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (d.is_llocal || d.is_sym) continue;
+    if (irop_is_llocal(d) || irop_is_sym(d)) continue;
     /* Seed the memory map, plus the VAR slot for pointer-to-local patterns. */
-    if (q->op == TCCIR_OP_STORE && d.is_local && d.is_lval &&
+    if (q->op == TCCIR_OP_STORE && irop_is_local(d) && d.is_lval &&
         irop_get_tag(d) == IROP_TAG_STACKOFF)
     {
       IROperand s1 = tcc_ir_op_get_src1(ir, q);
@@ -1185,7 +1185,7 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
         ms->initial_known = 1;
         mem_has_def[mem_idx] = 1;
       }
-      else if (s1.is_local && !s1.is_lval &&
+      else if (irop_is_local(s1) && !s1.is_lval &&
                irop_get_tag(s1) == IROP_TAG_STACKOFF)
       {
         int32_t dvr = irop_get_vreg(d);
@@ -1270,7 +1270,7 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
         }
       }
     }
-    if (d.is_local && !d.is_lval) continue;
+    if (irop_is_local(d) && !d.is_lval) continue;
     int32_t vr = irop_get_vreg(d);
     if (vr < 0) continue;
     int type = TCCIR_DECODE_VREG_TYPE(vr);
@@ -1302,7 +1302,7 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
         slot->is_addr = 0;
         *has_def = 1;
       }
-      else if (s1.is_local &&
+      else if (irop_is_local(s1) &&
                irop_get_tag(s1) == IROP_TAG_STACKOFF &&
                (q->op == TCCIR_OP_LEA || !s1.is_lval))
       {
@@ -1324,8 +1324,8 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
       IROperand s1 = tcc_ir_op_get_src1(ir, q);
       IROperand s2 = tcc_ir_op_get_src2(ir, q);
       int32_t base_off;
-      if (lcs_resolve_stack_addr(st, s1, &base_off) && (!s1.is_lval || s1.is_local) &&
-          irop_is_immediate(s2) && !s2.is_sym)
+      if (lcs_resolve_stack_addr(st, s1, &base_off) && (!s1.is_lval || irop_is_local(s1)) &&
+          irop_is_immediate(s2) && !irop_is_sym(s2))
       {
         int64_t imm = irop_get_imm64_ex(ir, s2);
         slot->known = 1;
@@ -1335,8 +1335,8 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
         *has_def = 1;
       }
       else if (q->op == TCCIR_OP_ADD &&
-               lcs_resolve_stack_addr(st, s2, &base_off) && (!s2.is_lval || s2.is_local) &&
-               irop_is_immediate(s1) && !s1.is_sym)
+               lcs_resolve_stack_addr(st, s2, &base_off) && (!s2.is_lval || irop_is_local(s2)) &&
+               irop_is_immediate(s1) && !irop_is_sym(s1))
       {
         int64_t imm = irop_get_imm64_ex(ir, s1);
         slot->known = 1;
@@ -1408,7 +1408,7 @@ static int lcs_any_mem_used_after(TCCIRState *ir, const LcsState *st,
     if (irop_config[q->op].has_src2) ops[nops++] = tcc_ir_op_get_src2(ir, q);
     for (int k = 0; k < nops; k++)
     {
-      if (!ops[k].is_local || irop_get_tag(ops[k]) != IROP_TAG_STACKOFF)
+      if (!irop_is_local(ops[k]) || irop_get_tag(ops[k]) != IROP_TAG_STACKOFF)
         continue;
       int32_t off = irop_get_stack_offset(ops[k]);
       for (int m = 0; m < st->n_mem; m++)
@@ -1545,7 +1545,7 @@ static int lcs_generic_loop_is_stack_local(TCCIRState *ir, int start_idx,
       IROperand op = ops[k];
       if (irop_is_none(op) || irop_is_immediate(op))
         continue;
-      if (op.is_sym || op.is_llocal)
+      if (irop_is_sym(op) || irop_is_llocal(op))
         return 0;
 
       int32_t vr = irop_get_vreg(op);
@@ -1565,7 +1565,7 @@ static int lcs_generic_loop_is_stack_local(TCCIRState *ir, int start_idx,
                              : (pos < LCS_MAX_TRACKED_TMPS && addr_tmp[pos]);
           if (!known_addr)
           {
-            if (!op.is_local)
+            if (!irop_is_local(op))
               return 0;
           }
           else
@@ -1574,7 +1574,7 @@ static int lcs_generic_loop_is_stack_local(TCCIRState *ir, int start_idx,
         continue;
       }
 
-      if (!(op.is_local && irop_get_tag(op) == IROP_TAG_STACKOFF))
+      if (!(irop_is_local(op) && irop_get_tag(op) == IROP_TAG_STACKOFF))
         return 0;
       if (op.is_lval)
         saw_stack_mem = 1;
@@ -1588,7 +1588,7 @@ static int lcs_generic_loop_is_stack_local(TCCIRState *ir, int start_idx,
       for (int k = 0; k < 2; k++)
       {
         IROperand op = add_ops[k];
-        if (op.is_local && !op.is_lval && irop_get_tag(op) == IROP_TAG_STACKOFF)
+        if (irop_is_local(op) && !op.is_lval && irop_get_tag(op) == IROP_TAG_STACKOFF)
           return 0;
         int32_t vr = irop_get_vreg(op);
         if (vr >= 0)
@@ -1625,7 +1625,7 @@ static int lcs_generic_loop_is_stack_local(TCCIRState *ir, int start_idx,
           int addr_def = (q->op == TCCIR_OP_LEA ||
                           q->op == TCCIR_OP_ASSIGN ||
                           q->op == TCCIR_OP_LOAD) &&
-                         src1.is_local && !src1.is_lval &&
+                         irop_is_local(src1) && !src1.is_lval &&
                          irop_get_tag(src1) == IROP_TAG_STACKOFF;
           if (addr_def)
             *slot = 1;
@@ -1953,8 +1953,7 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
     if (ms->initial_known && ms->value == ms->initial_value) continue;
     if (slot_pos > slot_end) break;
     int btype = ms->btype ? ms->btype : IROP_BTYPE_INT32;
-    IROperand d = irop_make_stackoff(-1, ms->offset, /*is_lval*/ 1,
-                                     /*is_llocal*/ 0, /*is_param*/ 0, btype);
+    IROperand d = irop_make_stackoff(-1, ms->offset, /*is_lval*/ 1, /*is_param*/ 0, btype);
     d.is_unsigned = ms->is_unsigned;
     int64_t val = ms->value;
     IROperand s = lcs_residual_src(ir, btype, val);

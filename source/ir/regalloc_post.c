@@ -82,7 +82,7 @@ static int ra_alloc_half_spilled(uint16_t half)
  * form has is_lval clear and is an address, not a location). */
 static int ra_rl_slot_offset(IROperand op, int *off)
 {
-  if (op.tag != IROP_TAG_STACKOFF || op.is_llocal || op.is_sym)
+  if (op.tag != IROP_TAG_STACKOFF || irop_is_llocal(op) || irop_is_sym(op))
     return 0;
   if (irop_get_vreg(op) != -1 || !op.is_lval)
     return 0;
@@ -236,7 +236,7 @@ static int ra_redundant_reload_elim(TCCIRState *ir)
                      : (k == 1) ? (irop_config[q->op].has_src1 ? tcc_ir_op_get_src1(ir, q) : IROP_NONE)
                      : (k == 2) ? (irop_config[q->op].has_src2 ? tcc_ir_op_get_src2(ir, q) : IROP_NONE)
                                 : (tcc_ir_op_is_mac(q->op) ? tcc_ir_op_get_accum(ir, q) : IROP_NONE);
-      if (op.tag != IROP_TAG_STACKOFF || op.is_llocal || op.is_lval)
+      if (op.tag != IROP_TAG_STACKOFF || irop_is_llocal(op) || op.is_lval)
         continue;
       if (irop_get_vreg(op) != -1)
         continue;
@@ -446,7 +446,7 @@ static int ra_dfs_width(IROperand op)
  * makes those) was deleted although a call read the slot. */
 static int ra_dfs_is_slot(IROperand op)
 {
-  return op.tag == IROP_TAG_STACKOFF && !op.is_sym && irop_get_vreg(op) < 0;
+  return op.tag == IROP_TAG_STACKOFF && !irop_is_sym(op) && irop_get_vreg(op) < 0;
 }
 
 /* True when the store at `at`, writing [off, off+w), is dead because control
@@ -578,7 +578,7 @@ static int ra_dead_frame_store_elim(TCCIRState *ir)
         continue;
       /* `Addr[StackLoc[..]]` hands the address to something this scan cannot
        * follow; is_llocal reaches memory through a pointer held in the slot. */
-      if (!op.is_lval || op.is_llocal || reaches_past_width)
+      if (!op.is_lval || irop_is_llocal(op) || reaches_past_width)
         return 0;
       /* The destination of a plain STORE is the write under consideration, not
        * a read.  Every other appearance keeps the slot alive. */
@@ -599,7 +599,7 @@ static int ra_dead_frame_store_elim(TCCIRState *ir)
     if (q->op != TCCIR_OP_STORE)
       continue;
     IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (!ra_dfs_is_slot(dest) || !dest.is_lval || dest.is_llocal)
+    if (!ra_dfs_is_slot(dest) || !dest.is_lval || irop_is_llocal(dest))
       continue;
     if (tcc_ir_access_is_volatile(ir, dest))
       continue;
@@ -714,6 +714,62 @@ static int ra_cp_src_regs_clobbered(const LSLiveIntervalState *ls,
   return 0;
 }
 
+/* The interval of each vreg, one lookup per copy: these passes walked every interval
+ * for every copy in a function.  A split vreg has several, and its callers want to
+ * know that. */
+typedef struct RaIvMap
+{
+  struct
+  {
+    uint32_t vreg; /* 0: free */
+    int idx;       /* the first interval */
+    int count;
+  } *e;
+  uint32_t mask;
+} RaIvMap;
+
+static void ra_iv_map_build(RaIvMap *m, const LSLiveIntervalState *ls)
+{
+  uint32_t size = 16;
+  while (size < (uint32_t)ls->next_interval_index * 2)
+    size *= 2;
+  m->e = tcc_mallocz(size * sizeof(*m->e));
+  m->mask = size - 1;
+  for (int j = 0; j < ls->next_interval_index; ++j)
+  {
+    const uint32_t v = ls->intervals[j].vreg;
+    uint32_t i = ((v * 0x9E3779B1u) >> 12) & m->mask;
+    while (m->e[i].vreg && m->e[i].vreg != v)
+      i = (i + 1) & m->mask;
+    if (!m->e[i].vreg)
+    {
+      m->e[i].vreg = v;
+      m->e[i].idx = j;
+    }
+    m->e[i].count++;
+  }
+}
+
+/* The index of vr's first interval, else -1. */
+static int ra_iv_map_first(const RaIvMap *m, int32_t vr)
+{
+  uint32_t i = (((uint32_t)vr * 0x9E3779B1u) >> 12) & m->mask;
+  while (m->e[i].vreg && m->e[i].vreg != (uint32_t)vr)
+    i = (i + 1) & m->mask;
+  return m->e[i].vreg ? m->e[i].idx : -1;
+}
+
+/* The only interval of vr, else NULL; *count says how many it has. */
+static LSLiveInterval *ra_iv_map_only(const RaIvMap *m, LSLiveIntervalState *ls, int32_t vr, int *count)
+{
+  uint32_t i = (((uint32_t)vr * 0x9E3779B1u) >> 12) & m->mask;
+  while (m->e[i].vreg && m->e[i].vreg != (uint32_t)vr)
+    i = (i + 1) & m->mask;
+  *count = m->e[i].vreg ? m->e[i].count : 0;
+  return *count == 1 ? &ls->intervals[m->e[i].idx] : NULL;
+}
+
+
 /* Rewrite the reads of a copy's destination back to its source and drop the
  * copy.  Returns the number of copies removed. */
 static int ra_copy_propagate(TCCIRState *ir)
@@ -728,6 +784,8 @@ static int ra_copy_propagate(TCCIRState *ir)
     return 0;
   if (tcc_ir_opt_pass_disabled("ra:copy_prop"))
     return 0;
+  RaIvMap ivs;
+  ra_iv_map_build(&ivs, ls);
 
   for (int i = 0; i < n; ++i)
   {
@@ -755,8 +813,8 @@ static int ra_copy_propagate(TCCIRState *ir)
        * subtracted from &b).  is_llocal is not the flag that separates them;
        * a plain pointer dereference does not set it. */
       int deref_through_reg = (src.tag == IROP_TAG_VREG && src.is_lval);
-      if ((src.tag == IROP_TAG_VREG || (src.tag == IROP_TAG_STACKOFF && src.is_local)) &&
-          !deref_through_reg && !src.is_llocal && !src.is_sym && dbt == sbt &&
+      if ((src.tag == IROP_TAG_VREG || (src.tag == IROP_TAG_STACKOFF && irop_is_local(src))) &&
+          !deref_through_reg && !irop_is_llocal(src) && !irop_is_sym(src) && dbt == sbt &&
           (dbt == IROP_BTYPE_INT32 || dbt == IROP_BTYPE_INT64 || dbt == IROP_BTYPE_FUNC))
         is_copy_load = 1;
       if (!is_copy_load)
@@ -789,14 +847,10 @@ static int ra_copy_propagate(TCCIRState *ir)
      * hold a DIFFERENT register in each, and the range reasoning below reads
      * a single interval's bounds -- picking one of several would let a read
      * be redirected into the register the other half was living in. */
-    LSLiveInterval *src_iv = NULL, *dst_iv = NULL;
-    int src_ivs = 0, dst_ivs = 0;
-    for (int j = 0; j < ls->next_interval_index; ++j)
-    {
-      if (ls->intervals[j].vreg == (uint32_t)sv) { src_iv = &ls->intervals[j]; src_ivs++; }
-      if (ls->intervals[j].vreg == (uint32_t)dv) { dst_iv = &ls->intervals[j]; dst_ivs++; }
-    }
-    if (!src_iv || !dst_iv || src_ivs != 1 || dst_ivs != 1)
+    int src_ivs, dst_ivs;
+    LSLiveInterval *src_iv = ra_iv_map_only(&ivs, ls, sv, &src_ivs);
+    LSLiveInterval *dst_iv = ra_iv_map_only(&ivs, ls, dv, &dst_ivs);
+    if (!src_iv || !dst_iv)
       continue;
     /* PREG_NONE/PREG_SPILLED are >= 0 but are not registers. */
     if (src_iv->r0 < 0 || src_iv->r0 >= PREG_NONE)
@@ -895,16 +949,13 @@ static int ra_copy_propagate(TCCIRState *ir)
       IRQuadCompact *qk = &ir->compact_instructions[k];
       if (k == i || qk->op == TCCIR_OP_NOP)
         continue;
-      if (irop_config[qk->op].has_dest &&
-          tcc_ir_op_dest_vreg(ir, qk) == dv)
+      if (tcc_ir_op_dest_is_vreg(ir, qk, dv))
       { ok = 0; break; } /* redefined, or written through as an address */
 
       int reads = 0;
-      if (irop_config[qk->op].has_src1 &&
-          tcc_ir_op_src1_vreg(ir, qk) == dv)
+      if (tcc_ir_op_src1_is_vreg(ir, qk, dv))
         reads = 1;
-      if (!reads && irop_config[qk->op].has_src2 &&
-          tcc_ir_op_src2_vreg(ir, qk) == dv)
+      if (!reads && tcc_ir_op_src2_is_vreg(ir, qk, dv))
         reads = 1;
       if (!reads && tcc_ir_op_is_mac(qk->op) &&
           tcc_ir_op_accum_vreg(ir, qk) == dv)
@@ -970,6 +1021,7 @@ static int ra_copy_propagate(TCCIRState *ir)
            (int)(dv & 0xffffff), (int)(sv & 0xffffff), src_iv->r0, nuses, last_use);
   }
 
+  tcc_free(ivs.e);
   return removed;
 }
 
@@ -1150,6 +1202,8 @@ static int ra_retarget_producer(TCCIRState *ir)
     return 0;
   if (tcc_ir_opt_pass_disabled("ra:retarget_producer"))
     return 0;
+  RaIvMap ivs;
+  ra_iv_map_build(&ivs, ls);
   const int tbl_size = ls->live_regs_by_instruction_size;
 
   for (int i = 0; i < n; ++i)
@@ -1208,14 +1262,10 @@ static int ra_retarget_producer(TCCIRState *ir)
     /* Exactly one interval per endpoint: a split vreg holds a different
      * register in each half, and the reasoning below reads one pair of
      * bounds. */
-    LSLiveInterval *src_iv = NULL, *dst_iv = NULL;
-    int src_ivs = 0, dst_ivs = 0;
-    for (int j = 0; j < ls->next_interval_index; ++j)
-    {
-      if (ls->intervals[j].vreg == (uint32_t)sv) { src_iv = &ls->intervals[j]; src_ivs++; }
-      if (ls->intervals[j].vreg == (uint32_t)dv) { dst_iv = &ls->intervals[j]; dst_ivs++; }
-    }
-    if (!src_iv || !dst_iv || src_ivs != 1 || dst_ivs != 1)
+    int src_ivs, dst_ivs;
+    LSLiveInterval *src_iv = ra_iv_map_only(&ivs, ls, sv, &src_ivs);
+    LSLiveInterval *dst_iv = ra_iv_map_only(&ivs, ls, dv, &dst_ivs);
+    if (!src_iv || !dst_iv)
       continue;
     /* PREG_NONE/PREG_SPILLED are >= 0 but are not registers.  Both ends must
      * be register-resident: a spilled destination would turn the producer's
@@ -1340,15 +1390,12 @@ static int ra_retarget_producer(TCCIRState *ir)
       { ok = 0; break; }
       if (ra_asm_goto_label_in(ir, qk, i, i, 1))
       { ok = 0; break; }
-      if (irop_config[qk->op].has_dest &&
-          tcc_ir_op_dest_vreg(ir, qk) == sv)
+      if (tcc_ir_op_dest_is_vreg(ir, qk, sv))
       { ok = 0; break; }
       int reads = 0;
-      if (irop_config[qk->op].has_src1 &&
-          tcc_ir_op_src1_vreg(ir, qk) == sv)
+      if (tcc_ir_op_src1_is_vreg(ir, qk, sv))
         reads = 1;
-      if (!reads && irop_config[qk->op].has_src2 &&
-          tcc_ir_op_src2_vreg(ir, qk) == sv)
+      if (!reads && tcc_ir_op_src2_is_vreg(ir, qk, sv))
         reads = 1;
       if (!reads && tcc_ir_op_is_mac(qk->op) &&
           tcc_ir_op_accum_vreg(ir, qk) == sv)
@@ -1423,6 +1470,7 @@ static int ra_retarget_producer(TCCIRState *ir)
            (int)(dv & 0xffffff), dst_iv->r0, last_use);
   }
 
+  tcc_free(ivs.e);
   return retargeted;
 }
 
@@ -1488,7 +1536,7 @@ static int ra_load_postinc_fuse(TCCIRState *ir)
      * some other way and have no pointer register to write back. */
     if (irop_get_tag(ptr) != IROP_TAG_VREG || !ptr.is_lval)
       continue;
-    if (ptr.is_local || ptr.is_llocal || ptr.is_sym || ptr.is_complex)
+    if (irop_is_local(ptr) || irop_is_llocal(ptr) || irop_is_sym(ptr) || ptr.is_complex)
       continue;
     /* No volatility guard is needed: the fusion neither removes, duplicates nor
      * reorders the access.  `ldr D,[P],#k` performs exactly the access the
@@ -1742,6 +1790,8 @@ int tcc_ir_move_coalescing(TCCIRState *ir)
    * gets moved to register A, then a later ASSIGN moves it back to B. */
   uint32_t *rev_done = NULL;
   int rev_done_size = 0;
+  RaIvMap ivs;
+  ra_iv_map_build(&ivs, ls);
 
   for (int i = 0; i < n; ++i)
   {
@@ -1764,30 +1814,26 @@ int tcc_ir_move_coalescing(TCCIRState *ir)
     if (q->op == TCCIR_OP_LOAD) {
       IROperand ts = tcc_ir_op_get_src1(ir, q);
       int valid_tag = (ts.tag == IROP_TAG_VREG ||
-                       (ts.tag == IROP_TAG_STACKOFF && ts.is_local));
+                       (ts.tag == IROP_TAG_STACKOFF && irop_is_local(ts)));
       int dest_bt = tcc_ir_op_dest_btype(ir, q);
       int src_bt = irop_get_btype(ts);
       int width_safe = (dest_bt == src_bt) &&
                        (dest_bt == IROP_BTYPE_INT32 ||
                         dest_bt == IROP_BTYPE_INT64 ||
                         dest_bt == IROP_BTYPE_FUNC);
-      if (width_safe && valid_tag && !ts.is_llocal && !ts.is_sym) {
+      if (width_safe && valid_tag && !irop_is_llocal(ts) && !irop_is_sym(ts)) {
         int32_t tsv = irop_get_vreg(ts);
         if (tsv >= 0 && tcc_ir_vreg_is_valid(ir, tsv)) {
-          for (int j = 0; j < ls->next_interval_index; ++j) {
-            if (ls->intervals[j].vreg == (uint32_t)tsv) {
-              /* Only a source in a REAL register is a register copy.  PREG_NONE
-               * (0x1F) is >= 0 but means "not allocated" — e.g. a stack-passed
-               * parameter that lives in the caller's frame, not a register.
-               * Coalescing the LOAD result into such a source would make it
-               * inherit PREG_NONE and be mis-lowered as a spill at frame offset
-               * 0 (clobbering the saved frame pointer). */
-              if (ls->intervals[j].r0 >= 0 && ls->intervals[j].r0 < PREG_NONE &&
-                  ls->intervals[j].stack_location == 0)
-                is_copy_load = 1;
-              break;
-            }
-          }
+          const int j = ra_iv_map_first(&ivs, tsv);
+          /* Only a source in a REAL register is a register copy.  PREG_NONE
+           * (0x1F) is >= 0 but means "not allocated" — e.g. a stack-passed
+           * parameter that lives in the caller's frame, not a register.
+           * Coalescing the LOAD result into such a source would make it
+           * inherit PREG_NONE and be mis-lowered as a spill at frame offset
+           * 0 (clobbering the saved frame pointer). */
+          if (j >= 0 && ls->intervals[j].r0 >= 0 && ls->intervals[j].r0 < PREG_NONE &&
+              ls->intervals[j].stack_location == 0)
+            is_copy_load = 1;
         }
       }
     }
@@ -1806,14 +1852,22 @@ int tcc_ir_move_coalescing(TCCIRState *ir)
     if (dv < 0 || !tcc_ir_vreg_is_valid(ir, dv))
       continue;
 
-    LSLiveInterval *src_iv = NULL, *dst_iv = NULL;
-    for (int j = 0; j < ls->next_interval_index; ++j)
+    int src_ivs, dst_ivs;
+    LSLiveInterval *src_iv = ra_iv_map_only(&ivs, ls, sv, &src_ivs);
+    LSLiveInterval *dst_iv = ra_iv_map_only(&ivs, ls, dv, &dst_ivs);
+    if (!src_ivs || !dst_ivs) continue;
+    if (!src_iv || !dst_iv)
     {
-      if (ls->intervals[j].vreg == (uint32_t)sv) src_iv = &ls->intervals[j];
-      if (ls->intervals[j].vreg == (uint32_t)dv) dst_iv = &ls->intervals[j];
-      if (src_iv && dst_iv) break;
+      /* A split vreg: the first of its intervals, or a later one reached before
+       * the other end's. */
+      src_iv = dst_iv = NULL;
+      for (int j = 0; j < ls->next_interval_index; ++j)
+      {
+        if (ls->intervals[j].vreg == (uint32_t)sv) src_iv = &ls->intervals[j];
+        if (ls->intervals[j].vreg == (uint32_t)dv) dst_iv = &ls->intervals[j];
+        if (src_iv && dst_iv) break;
+      }
     }
-    if (!src_iv || !dst_iv) continue;
     /* Both endpoints must live in a REAL register.  PREG_NONE (0x1F) and
      * PREG_SPILLED (0x20) are >= 0 but are NOT registers (e.g. a stack-passed
      * parameter resident in the caller's frame).  Coalescing onto such an
@@ -2086,6 +2140,7 @@ rev_check_done:
 
   if (rev_done)
     tcc_free(rev_done);
+  tcc_free(ivs.e);
 
   if (coalesced > 0)
     tcc_ls_recompute_dirty_registers(ls);

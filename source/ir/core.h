@@ -37,6 +37,10 @@ void tcc_ir_reset(struct TCCIRState *ir);
  * ============================================================================ */
 
 /* Insert instruction with SValue operands */
+/* A new orig_index, for an instruction a pass creates. */
+int tcc_ir_fresh_orig_index(struct TCCIRState *ir);
+/* The capacity to give the operand pool for `needed` slots, starting from `cap`. */
+int tcc_ir_pool_capacity_for(int cap, int needed);
 int tcc_ir_put(struct TCCIRState *ir, TccIrOp op, 
                 struct SValue *src1, struct SValue *src2, struct SValue *dest);
 

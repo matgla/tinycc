@@ -158,7 +158,7 @@ int tcc_ir_vreg_index_defs(TCCIRState *ir, int32_t vreg)
 
 int tcc_ir_find_defining_instruction(TCCIRState *ir, int32_t vreg, int before_idx)
 {
-  if (!ir || vreg < 0 || before_idx <= 0)
+  if (!ir || !tcc_ir_vreg_is_real(vreg) || before_idx <= 0)
     return -1;
 
   /* With no def, or one def that is known, the answer needs no walk; past n
@@ -175,7 +175,7 @@ int tcc_ir_find_defining_instruction(TCCIRState *ir, int32_t vreg, int before_id
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
-    if (tcc_ir_op_dest_vreg(ir, q) == vreg)
+    if (tcc_ir_op_dest_is_vreg(ir, q, vreg))
       return i;
   }
   return -1;
@@ -193,7 +193,7 @@ int tcc_ir_vreg_coalesced(TCCIRState *ir, int32_t vreg)
 
 int tcc_ir_vreg_has_single_use(TCCIRState *ir, int32_t vreg, int exclude_idx)
 {
-  if (!ir || vreg < 0)
+  if (!ir || !tcc_ir_vreg_is_real(vreg))
     return 0;
 
   IRVregIndex *x = vidx_get(ir);
@@ -234,7 +234,7 @@ int tcc_ir_vreg_has_single_use(TCCIRState *ir, int32_t vreg, int exclude_idx)
       return 0;
 
 
-    if (tcc_ir_op_src1_vreg(ir, q) == vreg || tcc_ir_op_src2_vreg(ir, q) == vreg)
+    if (tcc_ir_op_src1_is_vreg(ir, q, vreg) || tcc_ir_op_src2_is_vreg(ir, q, vreg))
     {
       use_count++;
       if (use_count > 1)

@@ -48,7 +48,7 @@ int tcc_ir_opt_dead_init_via_call(TCCIRState *ir)
       if (!ir_opt_get_call_param_operand(ir, call_idx, ps->param_idx, &pop))
         continue;
       /* Param must be Addr[StackLoc[X]] — local, not lval, STACKOFF-tagged. */
-      if (!pop.is_local || pop.is_lval)
+      if (!irop_is_local(pop) || pop.is_lval)
         continue;
       if (irop_get_tag(pop) != IROP_TAG_STACKOFF)
         continue;
@@ -69,7 +69,7 @@ int tcc_ir_opt_dead_init_via_call(TCCIRState *ir)
         if (sq->op != TCCIR_OP_STORE)
           continue;
         IROperand sdst = tcc_ir_op_get_dest(ir, sq);
-        if (!sdst.is_local || irop_get_tag(sdst) != IROP_TAG_STACKOFF)
+        if (!irop_is_local(sdst) || irop_get_tag(sdst) != IROP_TAG_STACKOFF)
           continue;
         int32_t s_off = (int32_t)irop_get_stack_offset(sdst);
         int s_size = fws_btype_bytes(sdst.btype);
@@ -94,7 +94,7 @@ int tcc_ir_opt_dead_init_via_call(TCCIRState *ir)
             if (k == 2 && !irop_config[tq->op].has_src2)
               continue;
             IROperand op = tcc_ir_op_get_src1_or_2(ir, tq, k != 1);
-            if (!op.is_local || irop_get_tag(op) != IROP_TAG_STACKOFF)
+            if (!irop_is_local(op) || irop_get_tag(op) != IROP_TAG_STACKOFF)
               continue;
             if (!op.is_lval)
               continue;

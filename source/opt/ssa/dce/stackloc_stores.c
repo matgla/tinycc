@@ -73,7 +73,7 @@ static void sl_mark_range(uint8_t *bm, const Sym *sym,
 
 static int sl_is_anon_stackloc(IROperand op)
 {
-  return op.is_local && irop_get_vreg(op) < 0;
+  return irop_is_local(op) && irop_get_vreg(op) < 0;
 }
 
 static void sl_mark_op(TCCIRState *ir, uint8_t *bm, IROperand op,
@@ -181,7 +181,7 @@ int dce_dead_stackloc_stores(IRSSAOptCtx *ctx)
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     if (!sl_is_anon_stackloc(dest))
       continue;
-    if (dest.is_llocal)
+    if (irop_is_llocal(dest))
       continue;
 
     const Sym *sym;

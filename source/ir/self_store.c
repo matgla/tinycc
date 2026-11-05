@@ -57,7 +57,7 @@ static int sc_frame_access(TCCIRState *ir, IROperand op, int *off, int *width)
   if (irop_is_none(op) || irop_get_vreg(op) >= 0 || op.is_param || !op.is_lval)
     return 0;
   int tag = irop_get_tag(op);
-  if (tag != IROP_TAG_STACKOFF && !(tag == IROP_TAG_VREG && (op.is_local || op.is_llocal)))
+  if (tag != IROP_TAG_STACKOFF && !(tag == IROP_TAG_VREG && (irop_is_local(op) || irop_is_llocal(op))))
     return 0;
   if (tcc_ir_access_is_volatile(ir, op))
     return 0;
@@ -70,7 +70,7 @@ static int sc_frame_access(TCCIRState *ir, IROperand op, int *off, int *width)
 static int32_t sc_temp_value(IROperand op)
 {
   int32_t vr = irop_get_vreg(op);
-  if (vr < 0 || op.is_lval || op.is_llocal || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+  if (vr < 0 || op.is_lval || irop_is_llocal(op) || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
     return -1;
   if (irop_get_tag(op) != IROP_TAG_VREG)
     return -1;

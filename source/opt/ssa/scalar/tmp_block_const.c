@@ -89,7 +89,7 @@ static int tbc_resolve(TCCIRState *ir, IROperand o, const TbcFacts *f, int32_t *
   int32_t vr = irop_get_vreg(o);
   if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
     return 0;
-  if (irop_get_tag(o) != IROP_TAG_VREG || o.is_lval || o.is_llocal)
+  if (irop_get_tag(o) != IROP_TAG_VREG || o.is_lval || irop_is_llocal(o))
     return 0;
   if (irop_get_btype(o) != IROP_BTYPE_INT32)
     return 0;
@@ -236,7 +236,7 @@ int ssa_opt_tmp_block_const(IRSSAOptCtx *ctx)
         int32_t vr = irop_get_vreg(o);
         if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
           continue;
-        if (irop_get_tag(o) != IROP_TAG_VREG || o.is_lval || o.is_llocal)
+        if (irop_get_tag(o) != IROP_TAG_VREG || o.is_lval || irop_is_llocal(o))
           continue;
         if (irop_get_btype(o) != IROP_BTYPE_INT32)
           continue;

@@ -654,17 +654,17 @@ UT_TEST(test_narrow_float_demote_rename_fails_no_mutation)
   ssa_add_instr3(&c, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(0, I32),
                  utb_imm((int32_t)TCCIR_ENCODE_PARAM(id_f2d, 0), I32));
   int i_f2d = ssa_add_instr3(&c, TCCIR_OP_FUNCCALLVAL, utb_temp(1, I64),
-                             irop_make_symref(0, tcc_ir_pool_add_symref(c.ir, &f2d_sym, 0, 0), 0, 0, 0, I32),
+                             irop_make_symref(0, tcc_ir_pool_add_symref(c.ir, &f2d_sym, 0, 0), 0, I32),
                              utb_imm((int32_t)TCCIR_ENCODE_CALL(id_f2d, 1), I32));
   ssa_add_instr3(&c, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(1, I64),
                  utb_imm((int32_t)TCCIR_ENCODE_PARAM(id_floor, 0), I32));
   int i_floor = ssa_add_instr3(&c, TCCIR_OP_FUNCCALLVAL, utb_temp(2, I64),
-                               irop_make_symref(0, tcc_ir_pool_add_symref(c.ir, &floor_sym, 0, 0), 0, 0, 0, I32),
+                               irop_make_symref(0, tcc_ir_pool_add_symref(c.ir, &floor_sym, 0, 0), 0, I32),
                                utb_imm((int32_t)TCCIR_ENCODE_CALL(id_floor, 1), I32));
   ssa_add_instr3(&c, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(2, I64),
                  utb_imm((int32_t)TCCIR_ENCODE_PARAM(id_d2f, 0), I32));
   int i_d2f = ssa_add_instr3(&c, TCCIR_OP_FUNCCALLVAL, utb_temp(3, I32),
-                             irop_make_symref(0, tcc_ir_pool_add_symref(c.ir, &d2f_sym, 0, 0), 0, 0, 0, I32),
+                             irop_make_symref(0, tcc_ir_pool_add_symref(c.ir, &d2f_sym, 0, 0), 0, I32),
                              utb_imm((int32_t)TCCIR_ENCODE_CALL(id_d2f, 1), I32));
   ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I32));
 

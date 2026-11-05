@@ -26,6 +26,91 @@
 /* XXX: handle correctly stab (debug) info */
 static Section *find_existing_section(TCCState *s1, const char *name);
 
+/* A file of names for the linker: one per line, '#' starts a comment.  Sorted:
+ * it is asked once per input section, thousands of times on the device. */
+static int name_list_cmp(const void *a, const void *b)
+{
+  return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+ST_FUNC void tcc_name_list_sort(char **names, int count)
+{
+  if (count)
+    tcc_qsort(names, count, sizeof(*names), name_list_cmp);
+}
+
+ST_FUNC char **tcc_name_list_read(TCCState *s1, const char *path, const char *option, int *count)
+{
+  FILE *f = fopen(path, "r");
+  char line[256];
+  char **names = NULL;
+  int n = 0;
+  *count = 0;
+  if (!f)
+  {
+    tcc_error_noabort("%s: cannot read '%s'", option, path);
+    return NULL;
+  }
+  while (fgets(line, sizeof(line), f))
+  {
+    line[strcspn(line, " \t\r\n#")] = 0;
+    if (line[0])
+      dynarray_add(&names, &n, tcc_strdup(line));
+  }
+  fclose(f);
+  tcc_name_list_sort(names, n);
+  *count = n;
+  return names;
+}
+
+ST_FUNC int tcc_name_list_has(char **names, int count, const char *name, size_t len)
+{
+  int lo = 0, hi = count - 1;
+  while (lo <= hi)
+  {
+    const int mid = (lo + hi) / 2;
+    int c = strncmp(name, names[mid], len);
+    if (!c)
+      c = -(unsigned char)names[mid][len];
+    if (!c)
+      return 1;
+    if (c < 0)
+      hi = mid - 1;
+    else
+      lo = mid + 1;
+  }
+  return 0;
+}
+
+/* --ram-text: a listed function's section goes where the linker script runs
+ * functions from RAM, as if the source had asked for it.  Zig's C backend numbers
+ * its functions (name__1234) differently on every change, so the list names them
+ * without the number.  Returns the new name, kept until tcc_delete, or NULL. */
+static const char *ram_text_section_name(TCCState *s1, const char *sh_name)
+{
+  const int rel = !strncmp(sh_name, ".rel.text.", 10);
+  const char *fn = rel ? sh_name + 10 : sh_name + 6;
+  size_t len, stripped;
+  char *renamed;
+  if (!s1->ram_text_file || (!rel && strncmp(sh_name, ".text.", 6)) || *fn == '.')
+    return NULL;
+  len = strlen(fn);
+  stripped = len;
+  while (stripped && fn[stripped - 1] >= '0' && fn[stripped - 1] <= '9')
+    stripped--;
+  if (stripped == len || stripped < 3 || fn[stripped - 1] != '_' || fn[stripped - 2] != '_')
+    stripped = len;
+  else
+    stripped -= 2;
+  if (!tcc_name_list_has(s1->ram_text_names, s1->nb_ram_text_names, fn, stripped) &&
+      !tcc_name_list_has(s1->ram_text_names, s1->nb_ram_text_names, fn, len))
+    return NULL;
+  renamed = tcc_malloc(len + 32);
+  snprintf(renamed, len + 32, "%s.time_critical.%s", rel ? ".rel" : "", fn);
+  dynarray_add(&s1->ram_text_section_names, &s1->nb_ram_text_section_names, renamed);
+  return renamed;
+}
+
 ST_FUNC ssize_t full_read(int fd, void *buf, size_t count)
 {
   char *cbuf = buf;
@@ -110,7 +195,8 @@ static const char *get_merged_section_name(TCCState *s1, const char *name)
    * is conservative.  Survivors are folded back into one .text after GC by
    * coalesce_split_sections().  Data sections never get here under GC: see
    * gc_private_input_section. */
-  int keep_text_split = gc_keeps_input_sections(s1);
+  /* --hot-text picks functions by these sections too, with or without GC. */
+  int keep_text_split = gc_keeps_input_sections(s1) || s1->hot_text_file;
   if (name[0] != '.')
     return name;
   switch (name[1])
@@ -183,6 +269,66 @@ ST_FUNC int tcc_object_type(int fd, ElfW(Ehdr) * h)
   return 0;
 }
 
+/* A function's bytes are read by nothing until coalesce_split_sections folds it
+ * into .text: --gc-sections walks relocations.  Left on disk until then, they
+ * are in memory once rather than twice, and a collected function not at all. */
+static int defer_split_text(TCCState *s1, const Section *s, const ElfW(Shdr) * sh)
+{
+  const char *path = s1->current_archive_path ? s1->current_archive_path : s1->current_filename;
+
+  return (s1->output_type == TCC_OUTPUT_EXE || s1->output_type == TCC_OUTPUT_DLL) && (sh->sh_flags & SHF_EXECINSTR) &&
+         sh->sh_size && !strncmp(s->name, ".text.", 6) && path && strcmp(path, "-");
+}
+
+/* One block for what a link holds only until coalesce_split_sections: the Section
+ * of each function and its relocations, a third of the heap at that point.
+ * Freed one by one they leave holes of a few KB that .text, the largest block of a
+ * link, cannot use, and it goes on top of them; freed as one they are the hole
+ * .text goes in.  Sized from the objects' section headers, plus a margin for
+ * archive members, which are not known yet: anything that does not fit is
+ * allocated as usual, so a wrong estimate costs only some of the gain. */
+#define LINK_ARENA_MIN (128 * 1024)
+ST_FUNC void tcc_link_arena_prepare(TCCState *s1)
+{
+  unsigned long total = 0;
+  int n;
+
+  if (s1->output_type != TCC_OUTPUT_EXE && s1->output_type != TCC_OUTPUT_DLL)
+    return;
+  for (n = 0; n < s1->nb_files; n++)
+  {
+    ElfW(Ehdr) ehdr;
+    ElfW(Shdr) * shdr;
+    int i, fd = s1->files[n]->name[0] == '-' ? -1 : open(s1->files[n]->name, O_RDONLY | O_BINARY);
+
+    if (fd < 0)
+      continue;
+    if (full_read(fd, &ehdr, sizeof ehdr) == sizeof ehdr && !memcmp(ehdr.e_ident, ELFMAG, 4) &&
+        ehdr.e_type == ET_REL && ehdr.e_shentsize == sizeof(ElfW(Shdr)) && ehdr.e_shnum)
+    {
+      shdr = tcc_malloc(sizeof(ElfW(Shdr)) * ehdr.e_shnum);
+      lseek(fd, ehdr.e_shoff, SEEK_SET);
+      if (full_read(fd, shdr, sizeof(ElfW(Shdr)) * ehdr.e_shnum) == sizeof(ElfW(Shdr)) * ehdr.e_shnum)
+        for (i = 1; i < ehdr.e_shnum; i++)
+        {
+          /* The name is a guess: the string table is not worth reading for it. */
+          if (shdr[i].sh_type == SHT_RELX)
+            total += sizeof(Section) + 40 + ((shdr[i].sh_size + 7) & ~7ul);
+          else if (shdr[i].sh_type == SHT_PROGBITS && (shdr[i].sh_flags & SHF_EXECINSTR))
+            total += sizeof(Section) + 40;
+        }
+      tcc_free(shdr);
+    }
+    close(fd);
+  }
+  total += total / 8;
+  if (total < LINK_ARENA_MIN)
+    return;
+  s1->link_arena = tcc_malloc(total);
+  s1->link_arena_size = total;
+  s1->link_arena_used = 0;
+}
+
 ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset)
 {
   ElfW(Ehdr) ehdr;
@@ -224,6 +370,14 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
   {
   invalid:
     return tcc_error_noabort("invalid object file");
+  }
+  /* Here: an error while linking has to fail this file, the count is reset later. */
+  if (s1->ram_text_file && !s1->ram_text_read)
+  {
+    s1->ram_text_read = 1;
+    s1->ram_text_names = tcc_name_list_read(s1, s1->ram_text_file, "--ram-text", &s1->nb_ram_text_names);
+    if (s1->nb_errors)
+      return -1;
   }
   /* read sections */
   shdr = load_data(fd, file_offset + ehdr.e_shoff, sizeof(ElfW(Shdr)) * ehdr.e_shnum);
@@ -319,7 +473,9 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
     }
     else
     {
-      const char *lookup_name = get_merged_section_name(s1, sh_name);
+      const char *lookup_name = ram_text_section_name(s1, sh_name);
+      if (!lookup_name)
+        lookup_name = get_merged_section_name(s1, sh_name);
       s = NULL;
       if (lookup_name == last_lookup_name)
       {
@@ -354,7 +510,10 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
         goto found;
       }
       /* not found: create new section with merged name */
-      s = new_section(s1, lookup_name, sh->sh_type, sh->sh_flags & ~SHF_GROUP);
+      if (!strncmp(lookup_name, ".text.", 6) || !strncmp(lookup_name, ".rel.text.", 10))
+        s = new_input_section(s1, lookup_name, sh->sh_type, sh->sh_flags & ~SHF_GROUP);
+      else
+        s = new_section(s1, lookup_name, sh->sh_type, sh->sh_flags & ~SHF_GROUP);
       /* take as much info as possible from the section. sh_link and
          sh_info will be updated later */
       s->sh_addralign = sh->sh_addralign;
@@ -377,7 +536,7 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
     size = sh->sh_size;
     if (sh->sh_type != SHT_NOBITS)
     {
-      if (should_defer_section(sh_name, sh->sh_type))
+      if (should_defer_section(sh_name, sh->sh_type) || defer_split_text(s1, s, sh))
       {
         /* Lazy loading: just record position for debug sections */
         unsigned long dest_off = s->data_offset;
@@ -395,7 +554,10 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
       {
         /* Immediate loading */
         unsigned char *ptr;
-        /* section_ptr_add will handle allocation as needed */
+        /* Most sections are one object's, or a function's: no room to grow.
+         * section_ptr_add will handle allocation as needed */
+        if (sm_table[i].new_section)
+          section_reserve_exact(s, size);
         ptr = section_ptr_add(s, size);
         if (size)
         {
@@ -515,18 +677,6 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
         rel->r_info = ELFW(R_INFO)(sym_index, type);
         /* offset the relocation offset */
         rel->r_offset += offseti;
-#ifdef TCC_TARGET_ARM
-        /* Jumps and branches from a Thumb code to a PLT entry need
-           special handling since PLT entries are ARM code.
-           Unconditional bl instructions referencing PLT entries are
-           handled by converting these instructions into blx
-           instructions. Other case of instructions referencing a PLT
-           entry require to add a Thumb stub before the PLT entry to
-           switch to ARM mode. We set bit plt_thumb_stub of the
-           attribute of a symbol to indicate such a case. */
-        if (type == R_ARM_THM_JUMP24)
-          get_sym_attr(s1, sym_index, 1)->plt_thumb_stub = 1;
-#endif
       }
       break;
     default:

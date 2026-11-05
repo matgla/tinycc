@@ -65,7 +65,7 @@ int tcc_ir_opt_lea_rmw_fold(TCCIRState *ir)
     IROperand lea_src = tcc_ir_op_get_src1(ir, lea_q);
     if (irop_get_tag(lea_src) != IROP_TAG_STACKOFF)
       continue;
-    if (lea_src.is_lval || lea_src.is_llocal)
+    if (lea_src.is_lval || irop_is_llocal(lea_src))
       continue;
     if (irop_get_vreg(lea_src) != -1) /* vreg-backed spill slot — see lea_fold */
       continue;
@@ -246,11 +246,10 @@ int tcc_ir_opt_lea_rmw_fold(TCCIRState *ir)
                          : (which == 2) ? tcc_ir_op_get_src2(ir, cq)
                                         : tcc_ir_op_get_dest(ir, cq);
       int32_t folded_off = base_offset + rw_off[r];
-      IROperand new_op = irop_make_stackoff(-1, folded_off, /*is_lval*/ 1, /*is_llocal*/ 0,
+      IROperand new_op = irop_make_stackoff(-1, folded_off, /*is_lval*/ 1,
                                             /*is_param_flag*/ (int)lea_src.is_param, old_op.btype);
       new_op.is_unsigned = old_op.is_unsigned;
       new_op.is_complex = old_op.is_complex;
-      new_op.is_static = lea_src.is_static;
       irop_carry_access_marks(&new_op, old_op); /* same access: same volatility */
       if (which == 1)
         tcc_ir_op_set_src1(ir, cq, new_op);
