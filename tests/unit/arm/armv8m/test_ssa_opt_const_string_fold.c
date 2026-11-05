@@ -36,7 +36,7 @@ static IROperand csf_callee(TCCIRState *ir, Sym *sym, int tok)
 {
   sym->v = tok;
   uint32_t sidx = tcc_ir_pool_add_symref(ir, sym, 0, 0);
-  return irop_make_symref(0, sidx, 0, 0, 0, I32);
+  return irop_make_symref(0, sidx, 0, I32);
 }
 
 /* Emit `strlen(&stackbuf)` where stackbuf already holds `bytes` (incl. NUL).
@@ -46,8 +46,8 @@ static int emit_stack_strlen_call(TCCIRState *ir, const char *bytes, int n, int 
   for (int k = 0; k < n; k++)
     utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(k, 1, 0, 0, I8),
              utb_imm((unsigned char)bytes[k], I8), UTB_NONE);
-  IROperand buf = irop_make_stackoff(-1, 0, 0, 0, 0, I32);
-  buf.is_local = 1;
+  IROperand buf = irop_make_stackoff(-1, 0, 0, 0, I32);
+  buf.tag = IROP_TAG_STACKOFF;
   utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, buf,
            utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 0), I32));
   return utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), UTB_NONE,
@@ -118,8 +118,8 @@ UT_TEST(test_csf_strlen_stack_jump_boundary_no_fold)
    * the pre-call scan range, which unconditionally bails the stack scan. */
   int i_jump = utb_emit(ir, TCCIR_OP_JUMP, utb_imm(3, I32), UTB_NONE, UTB_NONE);
 
-  IROperand buf = irop_make_stackoff(-1, 0, 0, 0, 0, I32);
-  buf.is_local = 1;
+  IROperand buf = irop_make_stackoff(-1, 0, 0, 0, I32);
+  buf.tag = IROP_TAG_STACKOFF;
   utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, buf,
            utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
   int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), UTB_NONE,
@@ -271,8 +271,8 @@ UT_TEST(test_csf_strcpy_nonconst_src_no_fold)
   TCCIRState *ir = utb_new();
   utb_pools_init(ir);
 
-  IROperand dst = irop_make_stackoff(-1, 0, 0, 0, 0, I32);
-  dst.is_local = 1;
+  IROperand dst = irop_make_stackoff(-1, 0, 0, 0, I32);
+  dst.tag = IROP_TAG_STACKOFF;
   utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, dst,
            utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
   utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(1, I32),

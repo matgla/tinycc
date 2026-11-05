@@ -8,7 +8,7 @@
  *    - T_vreg-deref forwarding: forward stores through TEMP pointer derefs
  *    - LOAD_INDEXED CSE: dedup indexed loads with constant idx/scale
  *    - Invalidation: calls, stores to overlapping addresses
- *    - Extended section (end of file): vslot VAR value forwarding, ALU-operand
+ *    - Extended section (end of file): ALU-operand
  *      deref forwarding, STORE-src forwarding, deref-load CSE canonical keys,
  *      iload byte-range/VAR/PARAM precision, window limits, redefinition
  *      kills, and two pinned bugs (is_lval store src tracked as stored value)
@@ -86,7 +86,7 @@ static inline void ssa_init_sym(Sym *s, int tok, int vt_flags)
 static inline IROperand ssa_symref_lval(ssa_ctx *c, Sym *sym, int32_t addend, int btype)
 {
   uint32_t sidx = tcc_ir_pool_add_symref(c->ir, sym, addend, 0);
-  return irop_make_symref(0, sidx, /*is_lval*/ 1, /*is_local*/ 0, /*is_const*/ 0, btype);
+  return irop_make_symref(0, sidx, /*is_lval*/ 1, btype);
 }
 
 /* Allocate a VAR vreg and mark it address-taken. */
@@ -987,8 +987,6 @@ UT_TEST(test_unresolved_store_kills_global_state)
  * Extended coverage
  *
  * Paths not exercised by the tests above:
- *   - vslot VAR value forwarding (var_fwd): `V <- value` tracked and forwarded
- *     into V reads (vslot_track_store / vslot_forward_reads)
  *   - deref forwarding into ALU operands: global-deref, direct StackLoc, and
  *     LEA-resolved TEMP-deref forms (the non-LOAD/STORE side loop)
  *   - STORE-src forwarding: tracked stack store forwarded into a
@@ -998,149 +996,6 @@ UT_TEST(test_unresolved_store_kills_global_state)
  *   - window limits (SSTORE_MAX) and redefinition kills (*_remove_vr family)
  *   - two pinned bugs: is_lval store sources tracked as stored values
  * ======================================================================== */
-
-/* ========================================================================
- * vslot forwarding: `V <- #imm` forwarded into a later ALU read (src1 side)
- * ======================================================================== */
-
-UT_TEST(test_vslot_fwd_imm_alu_src1)
-{
-  setup_tcc_state();
-  ssa_ctx c = ssa_ctx_new_full(1, 6);
-  /* V0 = #7; t0 = V0 + #3 -> t0 = #7 + #3 */
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(7, I32));
-  int add_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(0, I32),
-                             utb_var(0, I32), utb_imm(3, I32));
-
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_load_cse(c.ctx);
-  UT_ASSERT(changed >= 1);
-  UT_ASSERT_EQ(utb_op(c.ir, add_i), TCCIR_OP_ADD);
-  UT_ASSERT(irop_is_immediate(utb_src1(c.ir, add_i)));
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(c.ir, utb_src1(c.ir, add_i)), 7);
-
-  ssa_ctx_free(&c);
-  teardown_tcc_state();
-  return 0;
-}
-
-/* ========================================================================
- * vslot forwarding: `V <- TEMP` forwarded into a later ALU read (src2 side)
- * ======================================================================== */
-
-UT_TEST(test_vslot_fwd_temp_alu_src2)
-{
-  setup_tcc_state();
-  ssa_ctx c = ssa_ctx_new_full(1, 6);
-  /* V0 = t5; t0 = #3 + V0 -> t0 = #3 + t5 */
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_temp(5, I32));
-  int add_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(0, I32),
-                             utb_imm(3, I32), utb_var(0, I32));
-
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_load_cse(c.ctx);
-  UT_ASSERT(changed >= 1);
-  UT_ASSERT_EQ(utb_op(c.ir, add_i), TCCIR_OP_ADD);
-  UT_ASSERT_EQ(utb_vreg(utb_src2(c.ir, add_i)), VR_TMP(5));
-
-  ssa_ctx_free(&c);
-  teardown_tcc_state();
-  return 0;
-}
-
-/* ========================================================================
- * vslot guard: a LEA-source TEMP is not tracked (downstream stack DSE guard)
- * ======================================================================== */
-
-UT_TEST(test_vslot_lea_source_guard)
-{
-  setup_tcc_state();
-  ssa_ctx c = ssa_ctx_new_full(1, 6);
-  /* t5 = &StackLoc[0]; V0 = t5; t0 = V0 + #3 -> no fwd */
-  ssa_add_instr(&c, TCCIR_OP_LEA, utb_temp(5, I32), utb_stackoff(0, 0, 0, 0, I32));
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_temp(5, I32));
-  int add_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(0, I32),
-                             utb_var(0, I32), utb_imm(3, I32));
-
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_load_cse(c.ctx);
-  UT_ASSERT_EQ(changed, 0);
-  UT_ASSERT_EQ(utb_vreg(utb_src1(c.ir, add_i)), VR_VAR(0));
-
-  ssa_ctx_free(&c);
-  teardown_tcc_state();
-  return 0;
-}
-
-/* ========================================================================
- * vslot ordering: a self-read sees the prior value; the non-ASSIGN write
- * then kills the slot, so later reads are not forwarded
- * ======================================================================== */
-
-UT_TEST(test_vslot_self_read_then_killed)
-{
-  setup_tcc_state();
-  ssa_ctx c = ssa_ctx_new_full(1, 6);
-  /* V0 = #7; V0 = V0 + #1; t0 = V0 + #3
-   * -> first ADD reads the prior #7; its VAR dest write kills the slot,
-   *    so the second ADD keeps the V0 read. */
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(7, I32));
-  int add1 = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_var(0, I32),
-                            utb_var(0, I32), utb_imm(1, I32));
-  int add2 = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(0, I32),
-                            utb_var(0, I32), utb_imm(3, I32));
-
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_load_cse(c.ctx);
-  UT_ASSERT_EQ(changed, 1);
-  UT_ASSERT(irop_is_immediate(utb_src1(c.ir, add1)));
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(c.ir, utb_src1(c.ir, add1)), 7);
-  UT_ASSERT_EQ(utb_vreg(utb_src1(c.ir, add2)), VR_VAR(0));
-
-  ssa_ctx_free(&c);
-  teardown_tcc_state();
-  return 0;
-}
-
-/* ========================================================================
- * vslot tracking: STORE with a non-lval VAR dest is a register-form write
- * and seeds the same forwarding as ASSIGN
- * ======================================================================== */
-
-UT_TEST(test_vslot_store_form_def)
-{
-  setup_tcc_state();
-  ssa_ctx c = ssa_ctx_new_full(1, 6);
-  /* STORE V0 <- #7 (non-lval VAR dest = value copy); t0 = V0 + #3 -> #7 + #3 */
-  ssa_add_instr(&c, TCCIR_OP_STORE, utb_var(0, I32), utb_imm(7, I32));
-  int add_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(0, I32),
-                             utb_var(0, I32), utb_imm(3, I32));
-
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_load_cse(c.ctx);
-  UT_ASSERT(changed >= 1);
-  UT_ASSERT(irop_is_immediate(utb_src1(c.ir, add_i)));
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(c.ir, utb_src1(c.ir, add_i)), 7);
-
-  ssa_ctx_free(&c);
-  teardown_tcc_state();
-  return 0;
-}
 
 /* ========================================================================
  * ALU-operand global deref: reuse an earlier load, then a tracked store
@@ -1783,7 +1638,7 @@ UT_TEST(test_cmp_load_exposed_and_reused_across_branch)
 UT_TEST(test_cmp_load_exposure_rejects_unprofitable_or_volatile_reads)
 {
   setup_tcc_state();
-  for (int kind = 0; kind < 5; kind++) {
+  for (int kind = 0; kind < 4; kind++) {
     ssa_ctx c = ssa_ctx_new_full(1, 4);
     IROperand src = utb_lval(utb_temp(0, I32));
     if (kind == 1)
@@ -1791,9 +1646,7 @@ UT_TEST(test_cmp_load_exposure_rejects_unprofitable_or_volatile_reads)
     if (kind == 2)
       src.btype = I8;
     if (kind == 3)
-      src.is_local = 1;
-    if (kind == 4)
-      src.is_llocal = 1;
+      src.tag = IROP_TAG_STACKOFF;
     ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, src, utb_imm(1000, I32));
     if (kind)
       ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(1, I32), src);

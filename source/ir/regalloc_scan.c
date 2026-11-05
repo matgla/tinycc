@@ -681,7 +681,7 @@ void ra_alive_build(TCCIRState *ir, RaAliveInfo *info, int max_vreg_pos)
  * block (blocks entered only that way are not in the RPO, so such a function
  * is iterated over all blocks).  A function whose bit sets would be too large
  * to be worth their memory falls back to ra_widen_intervals_by_loops.  */
-#define RA_WIDEN_MAX_WORDS (1 << 19) /* uint64 words over all five per-block matrices: 4 MiB */
+#define RA_WIDEN_MAX_WORDS (1 << 19) /* uint64 words over the three per-block matrices live at once: 4 MiB */
 
 /* Conservative stand-in for the liveness widening: a value can leave its linear
  * range forward and re-enter it backward only through a backward edge whose
@@ -738,6 +738,76 @@ static void ra_widen_intervals_by_loops(TCCIRState *ir, const RaVregIdx *vx, uin
       }
     }
   }
+}
+
+/* A vreg read in some block before that block defines it is the only kind that
+ * can be live across a block boundary.  Everything else -- most temporaries --
+ * has no bit in any live-in set, so it needs no row in the matrices below.  On a
+ * big function that is most of them, and the matrices are the compile's largest
+ * allocations: 3 MB of a device's 8 MB on the worst tinycc TU.  Clears
+ * dense[idx] for the others and renumbers the rest; returns how many remain. */
+static int ra_widen_keep_exposed(TCCIRState *ir, const RaVregIdx *vx, const IRCFG *cfg, const int *call_param_head,
+                                 const int *param_sibling, int *dense)
+{
+  const int vsize = vx->size;
+  const int n = ir->next_instruction_index;
+  int *def_block = tcc_malloc(sizeof(int) * (vsize + 1));
+  uint8_t *exposed = tcc_mallocz(vsize + 1);
+  for (int idx = 0; idx <= vsize; idx++)
+    def_block[idx] = -1;
+
+  #define W_MARK_USE(vr)                                                                                               \
+    do                                                                                                                 \
+    {                                                                                                                  \
+      if (tcc_ir_vreg_is_valid(ir, (vr)))                                                                              \
+      {                                                                                                                \
+        const int vi = ra_vidx(vx, (vr));                                                                              \
+        if (def_block[vi] != b) exposed[vi] = 1;                                                                       \
+      }                                                                                                                \
+    } while (0)
+
+  for (int b = 0; b < cfg->num_blocks; b++)
+  {
+    int s = cfg->blocks[b].start_idx, e = cfg->blocks[b].end_idx;
+    for (int i = s; i < e && i < n; i++)
+    {
+      int32_t def = -1, hd = 0, uses[4], nu = 0;
+      ra_co_ops(ir, &ir->compact_instructions[i], &def, &hd, uses, &nu);
+      for (int k = 0; k < nu; k++)
+        W_MARK_USE(uses[k]);
+      for (int p = call_param_head[i]; p >= 0; p = param_sibling[p])
+        W_MARK_USE(irop_get_vreg(tcc_ir_op_get_src1(ir, &ir->compact_instructions[p])));
+      if (hd && tcc_ir_vreg_is_valid(ir, def))
+        def_block[ra_vidx(vx, def)] = b;
+    }
+  }
+  #undef W_MARK_USE
+
+  int nd = 0;
+  for (int idx = 0; idx < vsize; idx++)
+    if (dense[idx] >= 0)
+      dense[idx] = exposed[idx] ? nd++ : -1;
+  tcc_free(exposed);
+  tcc_free(def_block);
+  return nd;
+}
+
+/* out[b] = union of in[] over b's successors. */
+static void ra_widen_live_out(const IRCFG *cfg, int b, const uint64_t *in_b, int bw, const uint8_t *is_ijump,
+                              const int *xsucc, uint64_t *out)
+{
+  const int nb = cfg->num_blocks;
+  tcc_bitspan_zero(out, bw);
+  if (is_ijump[b])
+    for (int sb = 0; sb < nb; sb++)
+      tcc_bitspan_or(out, in_b + (size_t)sb * bw, bw);
+  for (int si = 0; si < cfg->blocks[b].num_succs; si++)
+  {
+    int sb = cfg->blocks[b].succs[si];
+    if (sb >= 0 && sb < nb) tcc_bitspan_or(out, in_b + (size_t)sb * bw, bw);
+  }
+  if (xsucc[b] >= 0)
+    tcc_bitspan_or(out, in_b + (size_t)xsucc[b] * bw, bw);
 }
 
 void ra_widen_intervals_by_liveness(TCCIRState *ir, const RaVregIdx *vx, uint32_t *starts, uint32_t *ends,
@@ -810,14 +880,25 @@ void ra_widen_intervals_by_liveness(TCCIRState *ir, const RaVregIdx *vx, uint32_
   }
   tcc_ir_cfg_compute_rpo(cfg);
   const int nb = cfg->num_blocks;
+  int *call_param_head = NULL, *param_sibling = NULL;
+  ra_param_use_lists(ir, n, &call_param_head, &param_sibling);
+  nd = ra_widen_keep_exposed(ir, vx, cfg, call_param_head, param_sibling, dense);
+  if (nd == 0)
+  {
+    tcc_free(call_param_head); tcc_free(param_sibling);
+    tcc_ir_cfg_free(cfg);
+    tcc_free(dense);
+    return;
+  }
   const int bw = (nd + 63) / 64;
   size_t max_words = RA_WIDEN_MAX_WORDS;
 #ifdef CONFIG_TCC_DEBUG
   if (getenv("TCC_RA_WIDEN_MAX_WORDS"))
     max_words = (size_t)strtoul(getenv("TCC_RA_WIDEN_MAX_WORDS"), NULL, 10);
 #endif
-  if (nb <= 0 || (size_t)5 * (size_t)nb * (size_t)bw > max_words)
+  if (nb <= 0 || (size_t)3 * (size_t)nb * (size_t)bw > max_words)
   {
+    tcc_free(call_param_head); tcc_free(param_sibling);
     tcc_ir_cfg_free(cfg);
     tcc_free(dense);
     ra_widen_intervals_by_loops(ir, vx, starts, ends, live_in_at_start);
@@ -861,16 +942,12 @@ void ra_widen_intervals_by_liveness(TCCIRState *ir, const RaVregIdx *vx, uint32_
     }
   }
 
-  int *call_param_head = NULL, *param_sibling = NULL;
-  ra_param_use_lists(ir, n, &call_param_head, &param_sibling);
-
   const size_t mat = (size_t)nb * bw;
   uint64_t *use_b = tcc_mallocz(sizeof(uint64_t) * mat);
   uint64_t *def_b = tcc_mallocz(sizeof(uint64_t) * mat);
   uint64_t *in_b = tcc_mallocz(sizeof(uint64_t) * mat);
-  uint64_t *out_b = tcc_mallocz(sizeof(uint64_t) * mat);
-  uint64_t *reach_b = tcc_mallocz(sizeof(uint64_t) * mat); /* possibly-defined at block exit */
   uint64_t *row = tcc_malloc(sizeof(uint64_t) * bw);
+  uint64_t *lo = tcc_malloc(sizeof(uint64_t) * bw);        /* live-out of one block */
   uint64_t *seed = tcc_mallocz(sizeof(uint64_t) * bw);     /* defined on entry: the parameters */
 
   #define W_ROW(vr) (tcc_ir_vreg_is_valid(ir, (vr)) ? dense[ra_vidx(vx, (vr))] : -1)
@@ -912,23 +989,16 @@ void ra_widen_intervals_by_liveness(TCCIRState *ir, const RaVregIdx *vx, uint32_
     for (int ri = norder - 1; ri >= 0; ri--)
     {
       int b = order[ri];
-      uint64_t *lo = out_b + (size_t)b * bw, *li = in_b + (size_t)b * bw;
-      tcc_bitspan_zero(lo, bw);
-      if (is_ijump[b])
-        for (int sb = 0; sb < nb; sb++)
-          tcc_bitspan_or(lo, in_b + (size_t)sb * bw, bw);
-      for (int si = 0; si < cfg->blocks[b].num_succs; si++)
-      {
-        int sb = cfg->blocks[b].succs[si];
-        if (sb >= 0 && sb < nb) tcc_bitspan_or(lo, in_b + (size_t)sb * bw, bw);
-      }
-      if (xsucc[b] >= 0)
-        tcc_bitspan_or(lo, in_b + (size_t)xsucc[b] * bw, bw);
+      uint64_t *li = in_b + (size_t)b * bw;
+      ra_widen_live_out(cfg, b, in_b, bw, is_ijump, xsucc, lo);
       changed |= tcc_bitspan_or_andnot(li, use_b + (size_t)b * bw, lo, def_b + (size_t)b * bw, bw);
     }
   }
 
+  tcc_free(use_b);
+
   /* Possibly-defined, forward: reach_b[b] = (entry seed or any pred's reach) | defs(b). */
+  uint64_t *reach_b = tcc_mallocz(sizeof(uint64_t) * mat); /* possibly-defined at block exit */
   for (int changed = 1, guard = 0; changed && (has_ijump || guard++ < nb + 4);)
   {
     changed = 0;
@@ -954,6 +1024,8 @@ void ra_widen_intervals_by_liveness(TCCIRState *ir, const RaVregIdx *vx, uint32_
       }
     }
   }
+
+  tcc_free(def_b);
 
   /* Widen: live-in (and possibly defined) at a block covers its first
    * instruction, live-out covers its last.  Live-in without a use or live-out
@@ -981,7 +1053,8 @@ void ra_widen_intervals_by_liveness(TCCIRState *ir, const RaVregIdx *vx, uint32_
       int pb = cfg->blocks[b].preds[pi];
       if (pb >= 0 && pb < nb) tcc_bitspan_or(row, reach_b + (size_t)pb * bw, bw);
     }
-    const uint64_t *li = in_b + (size_t)b * bw, *lo = out_b + (size_t)b * bw, *rb = reach_b + (size_t)b * bw;
+    ra_widen_live_out(cfg, b, in_b, bw, is_ijump, xsucc, lo);
+    const uint64_t *li = in_b + (size_t)b * bw, *rb = reach_b + (size_t)b * bw;
     for (int w = 0; w < bw; w++)
     {
       for (int pass = 0; pass < 2; pass++)
@@ -990,7 +1063,7 @@ void ra_widen_intervals_by_liveness(TCCIRState *ir, const RaVregIdx *vx, uint32_
         const uint32_t at = pass == 0 ? first : last;
         for (; bits; bits &= bits - 1)
         {
-          int k = w * 64 + __builtin_ctzll(bits);
+          int k = w * 64 + tcc_bitspan_ctz64(bits);
           if (k >= nd) break;
           int idx = idx_of[k];
           if (starts[idx] > at) { starts[idx] = at; widened++; }
@@ -1010,8 +1083,9 @@ void ra_widen_intervals_by_liveness(TCCIRState *ir, const RaVregIdx *vx, uint32_
   #undef W_ROW
   tcc_free(idx_of);
   tcc_free(seed);
+  tcc_free(lo);
   tcc_free(row);
-  tcc_free(use_b); tcc_free(def_b); tcc_free(in_b); tcc_free(out_b); tcc_free(reach_b);
+  tcc_free(in_b); tcc_free(reach_b);
   tcc_free(call_param_head); tcc_free(param_sibling);
   tcc_free(xsucc);
   tcc_free(is_ijump);
@@ -1249,6 +1323,61 @@ static int ra_pair_victim_ok(const SSAInterval *a, const SSAInterval *cur, const
   return 1;
 }
 
+/* For ra_o0_direct.  seg[i] counts the block starts at or before instruction i, so
+ * a value whose range holds one crosses control flow.  That covers a value defined
+ * on several paths, and a variable defined only on some: the range holds a start. */
+static int *ra_o0_blocks(TCCIRState *ir)
+{
+  const int n = ir->next_instruction_index;
+  uint8_t *start = tcc_mallocz(n + 2);
+  int *seg = tcc_malloc(sizeof(int) * (n + 2));
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
+      int t = (int)tcc_ir_op_dest_imm(ir, q);
+      if (t >= 0 && t <= n)
+        start[t] = 1;
+      start[i + 1] = 1;
+    } else if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_SWITCH_LOAD) {
+      start[i + 1] = 1;
+    }
+    if (q->is_jump_target)
+      start[i] = 1;
+  }
+  for (int t = 0; t < ir->num_switch_tables; t++) {
+    TCCIRSwitchTable *tb = &ir->switch_tables[t];
+    if (tb->default_target >= 0 && tb->default_target <= n)
+      start[tb->default_target] = 1;
+    for (int e = 0; tb->targets && e < tb->num_entries; e++)
+      if (tb->targets[e] >= 0 && tb->targets[e] <= n)
+        start[tb->targets[e]] = 1;
+  }
+  /* An asm goto names labels; one whose address is taken can be reached from anywhere. */
+  for (int k = 0; k < ir->label_count; k++) {
+    const int p = ir->label_pos[IR_LABEL_WORDS * k + 1];
+    if (p >= 0 && p <= n)
+      start[p] = 1;
+  }
+  if (ir->func_has_label_addr)
+    memset(start, 1, n + 2);
+  int c = 0;
+  for (int i = 0; i <= n; i++) {
+    c += start[i];
+    seg[i] = c;
+  }
+  tcc_free(start);
+  return seg;
+}
+
+static int ra_o0_in_memory(const SSAInterval *iv, const int *seg, int n)
+{
+  const int e = (int)iv->end < n ? (int)iv->end : n;
+  const int s = (int)iv->start < n ? (int)iv->start : n;
+  /* A range from 0 may be live on entry, a parameter or a value read before it is
+   * written: it comes from before instruction 0, which can itself be a loop head. */
+  return (s == 0 ? 0 : seg[s]) != seg[e];
+}
+
 void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
                            const RegAllocTarget *target, int spill_base,
                            uint64_t *out_dirty_int, uint64_t *out_dirty_fp,
@@ -1367,6 +1496,12 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
   int n_mem = 0;
   for (int i = 0; i < count; i++)
     n_mem += intervals[i].addrtaken || intervals[i].is_volatile;
+  int *o0_seg = NULL;
+  const int n_instr = ir->next_instruction_index;
+  if (ra_o0_direct(ir)) {
+    n_mem = count;
+    o0_seg = ra_o0_blocks(ir);
+  }
   /* Only memory-forced intervals enter it (and free_slots_4 below): size both
    * by their number, not by every interval. */
   SSAInterval **active_addrtaken = tcc_malloc(sizeof(SSAInterval *) * (n_mem > 0 ? n_mem : 1));
@@ -1420,7 +1555,7 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
   int spill_loc = spill_base;
   RaSpillPool spool = {0};
   spool.active_min_end = UINT32_MAX;
-  spool.no_reuse = ra_no_spill_reuse() || tcc_ir_calls_returns_twice(ir);
+  spool.no_reuse = ra_o0_direct(ir) || ra_no_spill_reuse() || tcc_ir_calls_returns_twice(ir);
 
   for (int i = 0; i < count; i++) {
     SSAInterval *cur = &intervals[i];
@@ -1511,7 +1646,14 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
      * list when cur expires.
      * A volatile local is forced to memory the same way: every access must
      * be a real ldr/str, so it must never occupy a register. */
-    if (cur->addrtaken || cur->is_volatile) {
+    /* See ra_o0_direct.  The static chain register is fixed by the convention. */
+    const int o0_mem = o0_seg && !(ir->has_static_chain && cur->vreg == ir->static_chain_vreg) &&
+                       ra_o0_in_memory(cur, o0_seg, n_instr);
+    if (o0_mem && !cur->addrtaken && !cur->is_volatile && cur->reg_type != LS_REG_TYPE_INT) {
+      ra_spill_pool_assign(&spool, cur, cur->reg_type == LS_REG_TYPE_FLOAT ? 4 : 8, &spill_loc);
+      continue;
+    }
+    if (o0_mem || cur->addrtaken || cur->is_volatile) {
       if (free_slots_4_count > 0 && !spool.no_reuse) {
         cur->stack_location = free_slots_4[--free_slots_4_count];
       } else {
@@ -2328,7 +2470,7 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
       if (tcc_ir_op_is_mac(dq->op) &&
           tcc_ir_op_dest_vreg(ir, dq) == cur->vreg) {
         IROperand accum = tcc_ir_op_get_accum(ir, dq);
-        if (accum.is_sym) {
+        if (irop_is_sym(accum)) {
           static const int sym_mla_order[] = {10, 11, 8, 9};
           for (int oi = 0; oi < 4; oi++) {
             int r = sym_mla_order[oi];
@@ -2508,6 +2650,7 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
   tcc_free(active);
   tcc_free(active_addrtaken);
   tcc_free(free_slots_4);
+  tcc_free(o0_seg);
   tcc_free(vreg_to_iv);
   #undef HINT_IDX
 

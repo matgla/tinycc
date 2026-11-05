@@ -114,7 +114,7 @@ static int docse_op_reads_values(TccIrOp op)
  * stack forwarding passes already track precisely). */
 static int docse_is_temp_deref(IROperand op, int32_t *out_vr)
 {
-  if (irop_get_tag(op) != IROP_TAG_VREG || !op.is_lval || op.is_local || op.is_llocal)
+  if (irop_get_tag(op) != IROP_TAG_VREG || !op.is_lval || irop_is_local(op) || irop_is_llocal(op))
     return 0;
   if (!(op.aux & IROP_AUX_NONVOLATILE))
     return 0;
@@ -357,9 +357,8 @@ int tcc_ir_opt_deref_operand_cse(TCCIRState *ir)
     return 0;
 
   /* A computed jump can land anywhere, so no region boundary is trustworthy. */
-  for (int i = 0; i < n; i++)
-    if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
-      return 0;
+  if (ir_opt_fn_features(ir) & IR_FN_IJUMP)
+    return 0;
 
   uint8_t *entry_map = docse_entry_map(ir, n);
   if (!entry_map)

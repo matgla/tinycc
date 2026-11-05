@@ -26,7 +26,7 @@ OPT_GEN_SSA(cprop_assign, TCCIR_OP_ASSIGN) {
   BIND(src1);
   GUARD(
     when(src1.tag == IROP_TAG_VREG);
-    and_not(src1.is_lval || src1.is_llocal || src1.is_local);
+    and_not(src1.is_lval || irop_is_llocal(src1) || irop_is_local(src1));
     and(vreg(dest) >= 0 && vreg(src1) >= 0);
     and(TCCIR_DECODE_VREG_TYPE(vreg(dest)) == TCCIR_VREG_TYPE_TEMP);
     and(TCCIR_DECODE_VREG_TYPE(vreg(src1)) == TCCIR_VREG_TYPE_TEMP);
@@ -108,7 +108,7 @@ static int ssa_gen_cprop_imm(IRSSAOptCtx *ctx, int idx)
     if (irop_config[uq->op].has_src1) {
       IROperand s = tcc_ir_op_get_src1(ir, uq);
       if (irop_get_vreg(s) == dest_vr) {
-        if (s.is_lval || s.is_local || s.is_llocal)
+        if (s.is_lval || irop_is_local(s) || irop_is_llocal(s))
           return 0;
         if (uq->op == TCCIR_OP_CMP &&
             !ssa_cprop_imm_other_operand_const(ir, uq, dest_vr, 1))
@@ -122,7 +122,7 @@ static int ssa_gen_cprop_imm(IRSSAOptCtx *ctx, int idx)
     if (irop_config[uq->op].has_src2) {
       IROperand s = tcc_ir_op_get_src2(ir, uq);
       if (irop_get_vreg(s) == dest_vr) {
-        if (s.is_lval || s.is_local || s.is_llocal)
+        if (s.is_lval || irop_is_local(s) || irop_is_llocal(s))
           return 0;
         if ((uq->op == TCCIR_OP_BOOL_AND || uq->op == TCCIR_OP_BOOL_OR) &&
             !ssa_cprop_imm_other_operand_const(ir, uq, dest_vr, 2))
@@ -133,7 +133,7 @@ static int ssa_gen_cprop_imm(IRSSAOptCtx *ctx, int idx)
     if (uq->op == TCCIR_OP_MLA) {
       IROperand a = tcc_ir_op_get_accum(ir, uq);
       if (irop_get_vreg(a) == dest_vr) {
-        if (a.is_lval || a.is_local || a.is_llocal)
+        if (a.is_lval || irop_is_local(a) || irop_is_llocal(a))
           return 0;
         found = 1;
       }
@@ -224,7 +224,7 @@ OPT_GEN_SSA(cprop_load_redundant, TCCIR_OP_LOAD) {
   BIND(src1);
   GUARD(
     when(cfg != NULL);
-    and_not(src1.is_llocal);
+    and_not(irop_is_llocal(src1));
     and(src1.tag == IROP_TAG_VREG || src1.tag == IROP_TAG_STACKOFF);
     and(vreg(src1) >= 0);
     and(vreg(dest) >= 0 && TCCIR_DECODE_VREG_TYPE(vreg(dest)) == TCCIR_VREG_TYPE_TEMP));
@@ -275,7 +275,7 @@ OPT_GEN_SSA(cprop_load_redundant, TCCIR_OP_LOAD) {
         return 0;
       /* Deref LOAD via pointer: a def of an address-taken VAR/PARAM writes the
        * pointed-to slot too (fuzz ptr seed 6734). */
-      if (src.is_lval && !src.is_local && pd_vr >= 0 &&
+      if (src.is_lval && !irop_is_local(src) && pd_vr >= 0 &&
           TCCIR_DECODE_VREG_TYPE(pd_vr) != TCCIR_VREG_TYPE_TEMP) {
         IRLiveInterval *pdi =
             (TCCIR_DECODE_VREG_TYPE(pd_vr) == TCCIR_VREG_TYPE_VAR ||
@@ -290,11 +290,11 @@ OPT_GEN_SSA(cprop_load_redundant, TCCIR_OP_LOAD) {
     if (pq->op != TCCIR_OP_LOAD)
       continue;
     IROperand ps = tcc_ir_op_get_src1(ir, pq);
-    if (ps.is_llocal)
+    if (irop_is_llocal(ps))
       continue;
     if (ps.tag != src.tag)
       continue;
-    if (ps.is_lval != src.is_lval || ps.is_local != src.is_local)
+    if (ps.is_lval != src.is_lval || irop_is_local(ps) != irop_is_local(src))
       continue;
     if (irop_get_vreg(ps) != src_vr)
       continue;
@@ -326,8 +326,6 @@ OPT_GEN_SSA(cprop_load_redundant, TCCIR_OP_LOAD) {
   irop_set_vreg(&new_src, prior_dest_vr);
   new_src.tag = IROP_TAG_VREG;
   new_src.is_lval = 0;
-  new_src.is_local = 0;
-  new_src.is_llocal = 0;
   if (new_src.btype == IROP_BTYPE_STRUCT)
     new_src.u.s.aux_data = 0;
   else
@@ -355,7 +353,7 @@ OPT_GEN_SSA(cprop_symref_cse, TCCIR_OP_ASSIGN) {
   GUARD(
     when(cfg != NULL);
     and(src1.tag == IROP_TAG_SYMREF);
-    and_not(src1.is_lval || src1.is_local || src1.is_llocal);
+    and_not(src1.is_lval || irop_is_local(src1) || irop_is_llocal(src1));
     and(vreg(dest) >= 0 && TCCIR_DECODE_VREG_TYPE(vreg(dest)) == TCCIR_VREG_TYPE_TEMP));
 
   IRPoolSymref *cur_sr = irop_get_symref_ex(ir, src1);
@@ -382,7 +380,7 @@ OPT_GEN_SSA(cprop_symref_cse, TCCIR_OP_ASSIGN) {
     IROperand ps = tcc_ir_op_get_src1(ir, pq);
     if (ps.tag != IROP_TAG_SYMREF)
       continue;
-    if (ps.is_lval || ps.is_local || ps.is_llocal)
+    if (ps.is_lval || irop_is_local(ps) || irop_is_llocal(ps))
       continue;
     IRPoolSymref *ps_sr = irop_get_symref_ex(ir, ps);
     if (!ps_sr || ps_sr->sym != cur_sr->sym || ps_sr->addend != cur_sr->addend)
@@ -481,7 +479,7 @@ static int ssa_gen_cprop_copy_param(IRSSAOptCtx *ctx, int idx)
   IROperand src = tcc_ir_op_get_src1(ir, q);
   IROperand dest = tcc_ir_op_get_dest(ir, q);
 
-  if (src.is_lval || src.is_local || src.is_llocal)
+  if (src.is_lval || irop_is_local(src) || irop_is_llocal(src))
     return 0;
   if (src.tag != IROP_TAG_VREG)
     return 0;
@@ -557,7 +555,7 @@ static int ssa_gen_cprop_copy_var_stackoff(IRSSAOptCtx *ctx, int idx)
 
   if (src.tag != IROP_TAG_STACKOFF)
     return 0;
-  if (!src.is_lval || !src.is_local || src.is_llocal || src.is_sym)
+  if (!src.is_lval || !irop_is_local(src) || irop_is_llocal(src) || irop_is_sym(src))
     return 0;
 
   int32_t src_vr = irop_get_vreg(src);
@@ -630,7 +628,7 @@ static int ssa_gen_cprop_copy_var_stackoff(IRSSAOptCtx *ctx, int idx)
       if (TCCIR_DECODE_VREG_POSITION(kdv) != var_pos_check)
         continue;
       IROperand kstored = tcc_ir_op_get_src1(ir, kq);
-      if (kstored.tag == IROP_TAG_STACKOFF && !kstored.is_lval && kstored.is_local)
+      if (kstored.tag == IROP_TAG_STACKOFF && !kstored.is_lval && irop_is_local(kstored))
         return 0; /* V <- Addr[StackLoc[N]] */
       int32_t kvr = irop_get_vreg(kstored);
       if (kvr >= 0 && TCCIR_DECODE_VREG_TYPE(kvr) == TCCIR_VREG_TYPE_TEMP &&
@@ -693,7 +691,7 @@ static int ssa_gen_cprop_load_any(IRSSAOptCtx *ctx, int idx)
   IRQuadCompact *q = &ir->compact_instructions[idx];
   IROperand src = tcc_ir_op_get_src1(ir, q);
 
-  if (src.tag == IROP_TAG_VREG && !src.is_lval && !src.is_local && !src.is_llocal) {
+  if (src.tag == IROP_TAG_VREG && !src.is_lval && !irop_is_local(src) && !irop_is_llocal(src)) {
     int32_t src_vr = irop_get_vreg(src);
     if (src_vr >= 0) {
       int t = TCCIR_DECODE_VREG_TYPE(src_vr);
@@ -720,7 +718,7 @@ static int ssa_gen_cprop_store_copy(IRSSAOptCtx *ctx, int idx)
   IROperand src = tcc_ir_op_get_src1(ir, q);
   if (dest.tag != IROP_TAG_VREG || src.tag != IROP_TAG_VREG)
     return 0;
-  if (dest.is_lval || dest.is_llocal || dest.is_local || src.is_lval || src.is_llocal || src.is_local)
+  if (dest.is_lval || irop_is_llocal(dest) || irop_is_local(dest) || src.is_lval || irop_is_llocal(src) || irop_is_local(src))
     return 0;
   if (irop_get_btype(dest) != irop_get_btype(src) || irop_is_64bit(dest) != irop_is_64bit(src))
     return 0;
@@ -753,7 +751,7 @@ static int ssa_opt_symref_operand_cse_rewrite_one(TCCIRState *ir, IRSSAOptCtx *c
 {
   if (opnd_io->tag != IROP_TAG_SYMREF)
     return 0;
-  if (!opnd_io->is_lval || opnd_io->is_local || opnd_io->is_llocal)
+  if (!opnd_io->is_lval || irop_is_local(*opnd_io) || irop_is_llocal(*opnd_io))
     return 0;
   IRPoolSymref *cur_sr = irop_get_symref_ex(ir, *opnd_io);
   if (!cur_sr)
@@ -771,7 +769,7 @@ static int ssa_opt_symref_operand_cse_rewrite_one(TCCIRState *ir, IRSSAOptCtx *c
     IROperand ps = tcc_ir_op_get_src1(ir, pq);
     if (ps.tag != IROP_TAG_SYMREF)
       continue;
-    if (ps.is_lval || ps.is_local || ps.is_llocal)
+    if (ps.is_lval || irop_is_local(ps) || irop_is_llocal(ps))
       continue;
     IRPoolSymref *ps_sr = irop_get_symref_ex(ir, ps);
     if (!ps_sr || ps_sr->sym != cur_sr->sym || ps_sr->addend != cur_sr->addend)
@@ -870,10 +868,10 @@ static int v2v_dominates(IRCFG *cfg, int def_blk, int use_blk)
 /* Is `stored_val` safe to fan out across multiple uses? */
 static int v2v_is_safe_value(IROperand op)
 {
-  if (op.is_lval || op.is_llocal)
+  if (op.is_lval || irop_is_llocal(op))
     return 0;
   /* Stack-address sources expose SCCP stack-load aliasing when fanned out. */
-  if (op.tag == IROP_TAG_STACKOFF && !op.is_lval && op.is_local)
+  if (op.tag == IROP_TAG_STACKOFF && !op.is_lval && irop_is_local(op))
     return 0;
   return 1;
 }
@@ -914,7 +912,7 @@ static void var_collect_facts(TCCIRState *ir, VarFacts *f)
           /* A `*V <-- val` deref STORE (is_lval && !is_local) uses V's value,
            * not its slot — mark it bad_use, not a canonical def. */
           if ((q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) &&
-              d.is_lval && !d.is_local)
+              d.is_lval && !irop_is_local(d))
             VARF_SET(f->bad_use, pos);
         }
       }
@@ -931,11 +929,11 @@ static void var_collect_facts(TCCIRState *ir, VarFacts *f)
       if (pos >= nv)
         continue;
       /* &V (address-of): is_local && !is_lval. */
-      if (s.is_local && !s.is_lval)
+      if (irop_is_local(s) && !s.is_lval)
         VARF_SET(f->addrtaken, pos);
       /* Only a VREG/is_lval/!is_local deref use is unsafe to forward (would
        * duplicate the deref); slot-reads and value reads are fine. */
-      else if (s.is_lval && s.tag == IROP_TAG_VREG && !s.is_local)
+      else if (s.is_lval && s.tag == IROP_TAG_VREG && !irop_is_local(s))
         VARF_SET(f->bad_use, pos);
     }
     if (q->op == TCCIR_OP_MLA) {
@@ -943,7 +941,7 @@ static void var_collect_facts(TCCIRState *ir, VarFacts *f)
       int32_t vr = irop_get_vreg(a);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR) {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
-        if (pos < nv && a.is_lval && a.tag == IROP_TAG_VREG && !a.is_local)
+        if (pos < nv && a.is_lval && a.tag == IROP_TAG_VREG && !irop_is_local(a))
           VARF_SET(f->bad_use, pos);
       }
     }
@@ -1238,171 +1236,6 @@ int ssa_opt_var_forward(IRSSAOptCtx *ctx)
   tcc_free(f.def_instr);
   tcc_free(f.addrtaken);
   tcc_free(f.bad_use);
-  return changes;
-}
-
-/* VAR self-update const fold: `Vx = Vx OP #imm` against a dominating prior
- * `Vx = #const` in the same block -> `Vx = #folded`, NOPing the dead prior def.
- * Catches single-block multi-def VARs the standard both-immediate fold misses. */
-
-static int ssa_var_const_fold_one(IRSSAOptCtx *ctx, int idx)
-{
-  TCCIRState *ir = ctx->ir;
-  IRCFG *cfg = ctx->cfg;
-  if (!cfg)
-    return 0;
-
-  IRQuadCompact *q = &ir->compact_instructions[idx];
-  int op = q->op;
-
-  switch (op) {
-  case TCCIR_OP_ADD: case TCCIR_OP_SUB: case TCCIR_OP_MUL:
-  case TCCIR_OP_AND: case TCCIR_OP_OR:  case TCCIR_OP_XOR:
-  case TCCIR_OP_SHL: case TCCIR_OP_SHR: case TCCIR_OP_SAR:
-    break;
-  default:
-    return 0;
-  }
-
-  IROperand src1 = tcc_ir_op_get_src1(ir, q);
-  IROperand src2 = tcc_ir_op_get_src2(ir, q);
-  IROperand dest = tcc_ir_op_get_dest(ir, q);
-
-  int32_t dest_vr = irop_get_vreg(dest);
-  int32_t src1_vr = irop_get_vreg(src1);
-  if (dest_vr < 0 || src1_vr != dest_vr)
-    return 0;
-  if (TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_VAR)
-    return 0;
-  /* An address-taken or volatile slot may be aliased between prior def and
-   * self-update; folding would drop mandated accesses. */
-  {
-    int vpos = TCCIR_DECODE_VREG_POSITION(dest_vr);
-    if (vpos < ir->variables_live_intervals_size &&
-        (ir->variables_live_intervals[vpos].addrtaken ||
-         ir->variables_live_intervals[vpos].is_volatile))
-      return 0;
-  }
-  if (src2.tag != IROP_TAG_IMM32 || src2.is_lval)
-    return 0;
-  /* src1 must read the same VAR (bare VREG or lval STACKOFF encoding). */
-  if (!(src1.tag == IROP_TAG_VREG && !src1.is_lval) &&
-      !(src1.tag == IROP_TAG_STACKOFF && src1.is_lval))
-    return 0;
-
-  int blk = cfg->instr_to_block[idx];
-  if (blk < 0 || blk >= cfg->num_blocks)
-    return 0;
-  IRBasicBlock *bb = &cfg->blocks[blk];
-
-  int prior_idx = -1;
-  int32_t prior_val = 0;
-  for (int k = idx - 1; k >= bb->start_idx; k--) {
-    IRQuadCompact *pq = &ir->compact_instructions[k];
-    if (pq->op == TCCIR_OP_NOP)
-      continue;
-
-    /* A slot STORE of our own Vx is a prior def (handled below), not an alias. */
-    if (pq->op == TCCIR_OP_STORE &&
-        irop_get_vreg(tcc_ir_op_get_dest(ir, pq)) == dest_vr) {
-    } else {
-      /* Anything that could alias Vx through memory or a call kills the fold. */
-      if (ssa_op_is_call_barrier(pq->op) ||
-          pq->op == TCCIR_OP_STORE || pq->op == TCCIR_OP_STORE_INDEXED ||
-          pq->op == TCCIR_OP_STORE_POSTINC || pq->op == TCCIR_OP_BLOCK_COPY)
-        return 0;
-    }
-
-    if (irop_config[pq->op].has_dest &&
-        pq->op != TCCIR_OP_FUNCPARAMVAL && pq->op != TCCIR_OP_FUNCPARAMVOID) {
-      IROperand pd = tcc_ir_op_get_dest(ir, pq);
-      /* Any VAR-encoded dest counts as a def (bare-vreg or lval-stackoff). */
-      if (irop_get_vreg(pd) == dest_vr) {
-        /* Capture a prior constant def (ASSIGN or slot STORE); then stop. */
-        if (pq->op == TCCIR_OP_ASSIGN || pq->op == TCCIR_OP_STORE) {
-          IROperand ps = tcc_ir_op_get_src1(ir, pq);
-          if (ps.tag == IROP_TAG_IMM32 && !ps.is_lval) {
-            prior_idx = k;
-            prior_val = ps.u.imm32;
-          }
-        }
-        break;
-      }
-    }
-  }
-
-  if (prior_idx < 0)
-    return 0;
-
-  int32_t v1 = prior_val;
-  int32_t v2 = src2.u.imm32;
-  int64_t result;
-  switch (op) {
-  case TCCIR_OP_ADD: result = (int64_t)((uint64_t)(uint32_t)v1 + (uint64_t)(uint32_t)v2); break;
-  case TCCIR_OP_SUB: result = (int64_t)((uint64_t)(uint32_t)v1 - (uint64_t)(uint32_t)v2); break;
-  case TCCIR_OP_MUL: result = (int64_t)((uint64_t)(uint32_t)v1 * (uint64_t)(uint32_t)v2); break;
-  case TCCIR_OP_AND: result = v1 & v2; break;
-  case TCCIR_OP_OR:  result = v1 | v2; break;
-  case TCCIR_OP_XOR: result = v1 ^ v2; break;
-  case TCCIR_OP_SHL:
-    if ((uint32_t)v2 >= 32) result = 0;
-    else result = (int64_t)((uint32_t)v1 << (uint32_t)v2);
-    break;
-  case TCCIR_OP_SHR:
-    if ((uint32_t)v2 >= 32) result = 0;
-    else result = (uint32_t)v1 >> (uint32_t)v2;
-    break;
-  case TCCIR_OP_SAR:
-    if ((uint32_t)v2 >= 32) result = v1 >> 31;
-    else result = v1 >> v2;
-    break;
-  default:
-    return 0;
-  }
-
-  /* Only NOP the prior def if nothing in (prior_idx, idx) reads Vx — an
-   * intervening read would otherwise see an undefined value. */
-  int prior_used = 0;
-  for (int k = prior_idx + 1; k < idx; k++) {
-    IRQuadCompact *uq = &ir->compact_instructions[k];
-    if (uq->op == TCCIR_OP_NOP)
-      continue;
-    IROperand us1 = tcc_ir_op_get_src1(ir, uq);
-    IROperand us2 = tcc_ir_op_get_src2(ir, uq);
-    if (irop_get_vreg(us1) == dest_vr || irop_get_vreg(us2) == dest_vr) {
-      prior_used = 1;
-      break;
-    }
-  }
-
-  IROperand imm = irop_make_imm32(0, (int32_t)result, dest.btype);
-  q->op = TCCIR_OP_ASSIGN;
-  tcc_ir_op_set_src1(ir, q, imm);
-  tcc_ir_op_set_src2(ir, q, IROP_NONE);
-
-  if (!prior_used)
-    ir->compact_instructions[prior_idx].op = TCCIR_OP_NOP;
-  return 1;
-}
-
-int ssa_opt_var_const_fold(IRSSAOptCtx *ctx)
-{
-  TCCIRState *ir = ctx->ir;
-
-  /* Computed goto / switch-table jumps can re-enter a block mid-body, so a
-   * backward "prior store" scan is unsound (regression 920501-3). */
-  for (int i = 0; i < ir->next_instruction_index; i++) {
-    int op = ir->compact_instructions[i].op;
-    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE)
-      return 0;
-  }
-
-  int changes = 0;
-  for (int i = 0; i < ir->next_instruction_index; i++) {
-    if (ir->compact_instructions[i].op == TCCIR_OP_NOP)
-      continue;
-    changes += ssa_var_const_fold_one(ctx, i);
-  }
   return changes;
 }
 

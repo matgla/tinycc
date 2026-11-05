@@ -15,6 +15,16 @@
 struct TCCIRState;
 struct IROperand;
 
+/* The integer binary constant fold the flat constant passes share
+ * (const_prop_tmp, known_bits, value_tracking): op over v1, v2 at the width
+ * is_64 selects, result in *out as a 64-bit value the caller narrows or masks
+ * as its own operand model wants.  Returns 0 when the fold is not defined and
+ * the instruction must stay: a shift count outside [0, width) -- the program's
+ * UB, which the ARM shift it would replace does not mask the way x86 does, so
+ * -O2 behaves as -O0 -- a division by zero or INT_MIN / -1, an op the table
+ * does not know.  UMULL/SMULL always produce a 64-bit result. */
+int ir_opt_const_binop(TccIrOp op, int is_64, int64_t v1, int64_t v2, int64_t *out);
+
 int ir_opt_eval_const_u64(struct TCCIRState *ir, IROperand op, int use_idx,
                           uint64_t *out, int depth);
 
@@ -75,6 +85,31 @@ int invert_cond_token(int tok);
 int swap_cond_token(int tok);
 int invert_condition(int cond);
 int ir_negate_condition(int cond);
+
+/* Which opcodes a function contains, for the bail prescans most flat passes
+ * open with.  One walk; cached per engine generation (see TCCIRState
+ * fn_features).  Read it before the pass mutates anything: the cache cannot
+ * see a mutation the pass has not reported yet. */
+enum
+{
+  IR_FN_IJUMP = 1u << 0,
+  IR_FN_SETJMP = 1u << 1,
+  IR_FN_LONGJMP = 1u << 2,
+  IR_FN_NL_SETJMP = 1u << 3,
+  IR_FN_NL_LONGJMP = 1u << 4,
+  IR_FN_INLINE_ASM = 1u << 5,
+  IR_FN_ASM_OPERAND = 1u << 6, /* ASM_INPUT or ASM_OUTPUT */
+  IR_FN_SET_CHAIN = 1u << 7,
+  IR_FN_INIT_CHAIN_SLOT = 1u << 8,
+  IR_FN_SWITCH_TABLE = 1u << 9,
+  IR_FN_SWITCH_LOAD = 1u << 10,
+  IR_FN_VLA_ALLOC = 1u << 11,
+  IR_FN_CALL = 1u << 12,            /* FUNCCALLVAL or FUNCCALLVOID */
+  IR_FN_JUMP = 1u << 13,            /* JUMP or JUMPIF */
+  IR_FN_MAY_BRANCH = 1u << 14,      /* an op with IROP_A_MAY_BRANCH (asm goto) */
+  IR_FN_INNER_TARGET = 1u << 15,    /* is_jump_target on an instruction other than the first */
+};
+uint32_t ir_opt_fn_features(struct TCCIRState *ir);
 
 uint8_t *ir_opt_build_merge_bitmap(struct TCCIRState *ir, int n);
 

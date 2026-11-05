@@ -308,6 +308,7 @@ int main(int argc0, char **argv0)
   FILE *ppfp = stdout;
 
   tcc_init_stamp("main entry");
+  tcc_memory_tiers_setup();
 redo:
   argc = argc0, argv = argv0;
   tcc_set_realloc(NULL);
@@ -423,6 +424,8 @@ redo:
     if (n)
       --n;
   }
+
+  tcc_link_arena_prepare(s);
 
   /* compile or add each files or library */
   first_file = NULL;

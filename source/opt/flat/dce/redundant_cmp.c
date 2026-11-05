@@ -50,7 +50,7 @@
 static int rcmp_operand_same(IROperand a, IROperand b)
 {
   return a.vr == b.vr && a.u.imm32 == b.u.imm32 && a.is_unsigned == b.is_unsigned &&
-         a.is_static == b.is_static && a.is_sym == b.is_sym && a.is_param == b.is_param &&
+         irop_is_sym(a) == irop_is_sym(b) && a.is_param == b.is_param &&
          a.aux == b.aux;
 }
 

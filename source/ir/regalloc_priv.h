@@ -42,7 +42,6 @@
 #include "bitop_const_fold.h"
 #include "opt/ssa/branch.h"
 #include "opt/ssa/fold.h"
-#include "opt/ssa/var_imm_prop.h"
 #include "opt/ssa/cprop.h"
 #include "global_addr_hoist.h"
 #include "load_cse.h"
@@ -132,6 +131,18 @@ static inline int32_t ra_vidx_vreg(const RaVregIdx *x, int idx)
 /* ============================================================================
  * SSA Live Interval
  * ============================================================================ */
+
+/* -O0 compiles as fast as it can, with no SSA, dominators or liveness dataflow.
+ * What makes that sound is that no value stays in a register across control flow:
+ * one whose range holds a block start is in memory (ra_o0_in_memory), in its own
+ * slot for the whole function, since reusing slots relied on lifetimes SSA worked
+ * out.  What is left in registers lives within one block, where an interval is
+ * simply exact.
+ * Inline asm keeps the full path: its operands need registers and constants. */
+static inline int ra_o0_direct(const TCCIRState *ir)
+{
+  return TCC_OPT(tcc_state, optimize) == 0 && !ir->inline_asm_count;
+}
 
 typedef struct SSAInterval {
   /* Widest fields first: interleaving int8 and int32 fields padded the

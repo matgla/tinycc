@@ -35,15 +35,10 @@
 #include <string.h>
 
 #ifdef CONFIG_TCC_DEBUG
-#define DUMP_IR_AFTER_PASS(ir, name) dump_ir_after_pass(ir, name)
+#define DUMP_IR_AFTER_PASS(ir, name) tcc_ir_dump_after_pass(ir, name)
 #else
 #define DUMP_IR_AFTER_PASS(ir, name) ((void)0)
 #endif
-
-static void dump_ir_after_pass(TCCIRState *ir, const char *pass_name)
-{
-  tcc_ir_dump_after_pass(ir, pass_name);
-}
 
 /* ================================================================== */
 /*  Phase 1: propagation + early CSE                                  */
@@ -168,9 +163,6 @@ static void run_store_load_fwd_passes(TCCIRState *ir)
     DUMP_IR_AFTER_PASS(ir, "ZZ_padrof");
     tcc_ir_opt_local_addrof_const_fold(ir);
     DUMP_IR_AFTER_PASS(ir, "ZZ_ladrof");
-    if (TCC_OPT(tcc_state, opt_const_prop))
-      tcc_ir_opt_addrof_var_fwd(ir);
-    DUMP_IR_AFTER_PASS(ir, "ZZ_aofvar");
     if (TCC_OPT(tcc_state, opt_store_load_fwd))
       tcc_ir_opt_global_sl_fwd(ir);
     DUMP_IR_AFTER_PASS(ir, "ZZ_gslfwd");
@@ -401,7 +393,7 @@ static void analyze_function_properties(TCCIRState *ir, Sym *sym, int func_var,
         gops[1] = call_callee ? IROP_NONE : tcc_ir_get_src1(ir, ii);
         gops[2] = tcc_ir_get_src2(ir, ii);
         for (int j = 0; j < 3; j++)
-          if (gops[j].is_sym && !gops[j].is_local)
+          if (irop_is_sym(gops[j]) && !irop_is_local(gops[j]))
           {
             reads_global = 1;
             break;

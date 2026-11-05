@@ -1089,6 +1089,65 @@ int inline_body_has_loops(TokenString *func_str)
   return 0;
 }
 
+/* About what a saved body costs its caller expanded, for a body not compiled yet
+ * (STATIC_INLINE_LEAF_EST_OPS).  -1 unless it is a leaf: a
+ * loop, a jump, asm, or a call to anything but a body that will expand too.  Its
+ * operators count, and not what its length is made of: casts, parentheses,
+ * declarations and line numbers generate nothing.  A folded constant still counts,
+ * which only keeps a body out. */
+int inline_body_leaf_ops(TokenString *func_str, int depth)
+{
+  const int *tp = tok_str_buf(func_str);
+  int ops = 0, prev = 0;
+  while (*tp)
+  {
+    int tv;
+    CValue tcv;
+    tok_get(&tv, &tp, &tcv);
+    if (tv == TOK_EOF || tv == 0)
+      break;
+    if (tv == TOK_LINENUM)
+      continue;
+    switch (tv)
+    {
+    case TOK_WHILE:
+    case TOK_FOR:
+    case TOK_DO:
+    case TOK_GOTO:
+    case TOK_SWITCH:
+    case TOK_ASM1:
+    case TOK_ASM2:
+    case TOK_ASM3:
+      return -1;
+    case '(':
+      if (prev >= TOK_UIDENT)
+      {
+        Sym *callee = sym_find(prev);
+        InlineFunc *fn = callee && callee->type.ref && callee->type.ref->f.func_auto_inline
+                             ? inline_fn_lookup(tcc_state, callee)
+                             : NULL;
+        const int more = fn && fn->func_str && depth < 4 ? inline_body_leaf_ops(fn->func_str, depth + 1) : -1;
+        if (more < 0)
+          return -1;
+        ops += more;
+      }
+      break;
+    case '+': case '-': case '*': case '/': case '%': case '&': case '|': case '^':
+    case '~': case '!': case '<': case '>': case '=': case '?': case '[':
+    case TOK_RETURN: case TOK_IF: case TOK_ARROW: case TOK_INC: case TOK_DEC:
+    case TOK_LAND: case TOK_LOR:
+      ops++;
+      break;
+    default:
+      if (TOK_ISCOND(tv) || TOK_ASSIGN(tv))
+        ops++;
+      break;
+    }
+    prev = tv;
+  }
+  return ops;
+}
+
 /* Looser variant for auto-inline candidate registration: accept bodies that
  * contain only `while` / `do` loops at statement level.  The conservative
  * `inline_body_has_loops` rejects every loop because token-replay into an

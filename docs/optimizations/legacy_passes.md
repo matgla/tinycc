@@ -34,7 +34,6 @@ Constant propagation and value analysis. The largest group — ~30 passes.
 | Pass | Flag | Description |
 |------|------|-------------|
 | `uninit_ub` | `opt_dce` | UB-exploit: fold code after undefined-local reads as unreachable |
-| `uninit_dom_ret` | `opt_dce` | Dead-code after UB that dominates a return |
 | `dce` | `opt_dce` | Dead code elimination |
 | `const_prop` | `opt_const_prop` | Constant propagation (full cascade: const_prop + const_prop_tmp + const_var_prop + value_tracking) |
 | `const_var_prop` | `opt_const_prop` | Single-def constant-immediate VAR propagation |
@@ -51,14 +50,11 @@ Constant propagation and value analysis. The largest group — ~30 passes.
 | `self_copy_elim` | `opt_const_prop` | Self-copy elimination |
 | `value_tracking` | `opt_const_prop` | Value range tracking |
 | `cmp_expr_fold` | `opt_const_prop` | Compare expression folding |
-| `self_arith` | `opt_const_prop` | Self-arith fold (x + 0, x * 1, etc.) |
 | `cmp_offset_fold` | `opt_const_prop` | Compare-constant-offset fold |
 | `switch_collapse` | `opt_const_prop` | Switch table collapse |
 | `stack_nonnull` | `opt_const_prop` | Stack address non-null fold |
 | `setif_fuse` | `opt_const_prop` | SETIF + conditional branch fuse |
 | `stack_bool` | `opt_const_prop` | Stack bool diamond fold |
-| `setif_or_taut` | `opt_const_prop` | SETIF or-tautology fold |
-| `var_tmp_fwd` | `opt_const_prop` | VAR-to-temporary forwarding |
 | `float_branch` | `opt_vrp` | Float branch folding |
 | `vrp` | `opt_vrp` | Value range propagation |
 | `single_val_tmp` | `opt_const_prop` | Single-value temporary elimination |
@@ -78,10 +74,7 @@ Memory optimization with sl_forward as trigger.
 | `stack_nonnull` | `opt_const_prop` | Stack address non-null fold |
 | `setif_fuse` | `opt_const_prop` | SETIF + conditional branch fuse |
 | `stack_bool` | `opt_const_prop` | Stack bool diamond fold |
-| `setif_or_taut` | `opt_const_prop` | SETIF or-tautology fold |
-| `var_tmp_fwd` | `opt_const_prop` | VAR-to-temporary forwarding |
 | `dce` | `opt_dce` | Dead code elimination |
-| `elim_fallthru` | `opt_jump_threading` | Eliminate fall-through jumps |
 | `kb_cascade` | `opt_const_prop` | Known-bits cascade: known_bits → const_prop → branch_fold → DCE → elim_fallthru → sl_forward fixpoint |
 
 ### fusion (1 group, 1 iteration)
@@ -104,7 +97,6 @@ Post-propagation cleanup.
 
 | Pass | Flag | Description |
 |------|------|-------------|
-| `branch_cleanup` | `opt_jump_threading` | Dead converging control flow cascade (elim_fallthru + DCE) |
 | `dead_vla_struct` | `opt_dead_store` | Dead VLA struct elimination |
 | `alloca_load_fwd` | `opt_dead_store` | Alloca load forwarding |
 | `zero_vla` | `opt_dead_store` | Zero-size VLA elimination |
@@ -114,16 +106,12 @@ Post-propagation cleanup.
 | `dead_static_store` | `opt_dead_store` | Dead static store (TU-wide) |
 | `dead_var_store` | `opt_dead_store` | Dead local variable store |
 | `dead_addrvar` | `opt_dead_store` | Dead address-taken variable store |
-| `dead_trail_addrvar` | `opt_dead_store` | Dead trailing address-taken store |
-| `dead_alloca_vreg` | `opt_dead_store` | Dead alloca VREG elimination |
 | `dead_local_slot` | `opt_dead_store` | Dead local slot elimination |
 | `dead_lea_store` | `opt_dead_store` | Dead LEA store elimination |
 | `dead_temp_local` | `opt_dead_store` | Dead temporary local elimination |
 | `redundant_assign` | `opt_dead_store` | Redundant variable assignment |
 | `inplace_arith` | `opt_redundant_store` | In-place arithmetic fold |
 | `global_base_share` | `opt_indexed_memory` | Global base pointer sharing |
-| `branch_cleanup` | `opt_jump_threading` | Second branch cleanup pass |
-| `inf_loop_simpl` | `opt_dce` | Infinite loop simplification |
 | `dead_pre_inf` | `opt_dce` | Dead code before infinite loop |
 | `return_reuse` | `opt_const_prop` | Return constant reuse |
 
@@ -136,9 +124,6 @@ Iterates 8 times: known_bits → const_prop_tmp → gens_branch → DCE → elim
 
 ### tcc_ir_opt_const_prop_cascade_ex
 Iterates 4 times: const_prop + const_prop_tmp + const_var_prop + value_tracking. Converges arbitrary-depth constant propagation.
-
-### tcc_ir_opt_branch_cleanup_cascade_ex
-Iterates 8 times: elim_fallthrough → compact → DCE. Collapses dead converging control flow.
 
 ### tcc_ir_opt_entry_store_cleanup_ex
 Single-pass cascade: const_prop → const_var_prop → stack_nonnull → redundant_loop_check → DCE → compact → sl_forward → stack_nonnull → DCE → dead_var_store → compact. Cleans up entry-store patterns.

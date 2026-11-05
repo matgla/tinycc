@@ -43,7 +43,7 @@ int tcc_ir_opt_known_bits(TCCIRState *ir);
  * pass recognizes via kb_is_direct_stackoff(). */
 static IROperand kb_stack_lval(int32_t off, int btype)
 {
-  return irop_make_stackoff(-1, off, /*is_lval*/1, /*is_llocal*/0,
+  return irop_make_stackoff(-1, off, /*is_lval*/1,
                             /*is_param*/0, btype);
 }
 

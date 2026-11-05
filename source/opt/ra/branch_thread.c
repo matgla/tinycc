@@ -157,7 +157,7 @@ static int bt_annotated(TCCIRState *ir, IRQuadCompact *q)
 static int bt_scalar_temp(IROperand o)
 {
   int32_t vr = irop_get_vreg(o);
-  if (vr < 0 || irop_get_tag(o) != IROP_TAG_VREG || o.is_lval || o.is_llocal || o.is_local ||
+  if (vr < 0 || irop_get_tag(o) != IROP_TAG_VREG || o.is_lval || irop_is_llocal(o) || irop_is_local(o) ||
       TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
     return 0;
   int bt = irop_get_btype(o);
@@ -189,7 +189,7 @@ static void bt_width_add(BTWidth *w, IROperand o)
 
 static int bt_imm(TCCIRState *ir, IROperand o, int64_t *v)
 {
-  if (irop_get_tag(o) != IROP_TAG_IMM32 || o.is_lval || o.is_sym)
+  if (irop_get_tag(o) != IROP_TAG_IMM32 || o.is_lval || irop_is_sym(o))
     return 0;
   *v = (int64_t)(int32_t)irop_get_imm64_ex(ir, o);
   return 1;
@@ -251,9 +251,9 @@ typedef struct BTState
 static int bt_movable(IROperand o, int bt)
 {
   if (irop_get_tag(o) == IROP_TAG_IMM32)
-    return !o.is_lval && !o.is_sym;
+    return !o.is_lval && !irop_is_sym(o);
   int b = irop_get_btype(o);
-  return irop_get_tag(o) == IROP_TAG_VREG && irop_get_vreg(o) >= 0 && !o.is_lval && !o.is_llocal && !o.is_local &&
+  return irop_get_tag(o) == IROP_TAG_VREG && irop_get_vreg(o) >= 0 && !o.is_lval && !irop_is_llocal(o) && !irop_is_local(o) &&
          (b == IROP_BTYPE_INT32 || b == IROP_BTYPE_INT16 || b == IROP_BTYPE_INT8) && (bt < 0 || b == bt);
 }
 
@@ -295,8 +295,8 @@ static int bt_parse_join(BTState *st, int start, BTJoin *j)
         {
           IROperand dd = tcc_ir_op_get_dest(ir, q), ss = tcc_ir_op_get_src1(ir, q);
           fprintf(stderr, "[bt] copy fail d tag%d bt%d lv%d ll%d loc%d vt%d | s tag%d bt%d lv%d ll%d loc%d vt%d ann%d\n",
-                  irop_get_tag(dd), irop_get_btype(dd), dd.is_lval, dd.is_llocal, dd.is_local, dd.vreg_type,
-                  irop_get_tag(ss), irop_get_btype(ss), ss.is_lval, ss.is_llocal, ss.is_local, ss.vreg_type, bt_annotated(ir, q));
+                  irop_get_tag(dd), irop_get_btype(dd), dd.is_lval, irop_is_llocal(dd), irop_is_local(dd), dd.vreg_type,
+                  irop_get_tag(ss), irop_get_btype(ss), ss.is_lval, irop_is_llocal(ss), irop_is_local(ss), ss.vreg_type, bt_annotated(ir, q));
         }
         return (bt_why = 1019, 0);
       }
@@ -990,7 +990,7 @@ static void bt_apply_inserts(TCCIRState *ir, BTInsert *ins, int nins, BTPadJump 
   while (size <= nn + 1)
     size <<= 1;
   IRQuadCompact *old = ir->compact_instructions;
-  IRQuadCompact *nq = tcc_mallocz(sizeof(IRQuadCompact) * size);
+  IRQuadCompact *nq = tcc_hot_mallocz(sizeof(IRQuadCompact) * size);
   int w = 0, k = 0;
   for (int i = 0; i <= n; i++)
   {
@@ -1015,7 +1015,7 @@ static void bt_apply_inserts(TCCIRState *ir, BTInsert *ins, int nins, BTPadJump 
         if (ins[k].cond >= 0)
           tcc_ir_pool_add(ir, irop_make_imm32(-1, ins[k].cond, IROP_BTYPE_INT32));
       }
-      q->orig_index = ++ir->max_orig_index;
+      q->orig_index = tcc_ir_fresh_orig_index(ir);
       q->is_jump_target = 0;
     }
     if (i < n)
@@ -1023,7 +1023,7 @@ static void bt_apply_inserts(TCCIRState *ir, BTInsert *ins, int nins, BTPadJump 
   }
 #undef BT_MAP
 #undef BT_PAD
-  tcc_free(old);
+  tcc_hot_free(old);
   ir->compact_instructions = nq;
   ir->compact_instructions_size = size;
   ir->next_instruction_index = nn;

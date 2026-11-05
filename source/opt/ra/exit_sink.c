@@ -71,8 +71,8 @@ static int ra_exit_sink_plain(IROperand o)
 {
   if (irop_is_immediate(o))
     return 1;
-  return irop_has_vreg(o) && irop_get_tag(o) == IROP_TAG_VREG && !o.is_lval && !o.is_local &&
-         !o.is_llocal && !o.is_sym && !o.is_complex;
+  return irop_has_vreg(o) && irop_get_tag(o) == IROP_TAG_VREG && !o.is_lval && !irop_is_local(o) &&
+         !irop_is_llocal(o) && !irop_is_sym(o) && !o.is_complex;
 }
 
 /* Classify instruction idx's relationship to vreg: 1 defines it, 2 reads it. */
@@ -85,7 +85,7 @@ static int ra_exit_sink_ref(TCCIRState *ir, int idx, int32_t vreg)
     IROperand d = tcc_ir_op_get_dest(ir, q);
     if (irop_has_vreg(d) && irop_get_vreg(d) == vreg) {
       /* a STORE through the vreg's deref reads it; only the frame-slot spill form defines it */
-      if (q->op == TCCIR_OP_STORE && d.is_lval && !(d.is_local && !d.is_llocal))
+      if (q->op == TCCIR_OP_STORE && d.is_lval && !(irop_is_local(d) && !irop_is_llocal(d)))
         return 2;
       return 1;
     }

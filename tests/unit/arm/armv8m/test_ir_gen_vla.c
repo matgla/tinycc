@@ -84,7 +84,7 @@ UT_TEST(test_vla_sp_save_emits_op_with_stack_dest)
   IROperand d = tcc_ir_op_get_dest(ir, &ir->compact_instructions[0]);
   UT_ASSERT_EQ(irop_get_tag(d), IROP_TAG_STACKOFF);
   UT_ASSERT_EQ(irop_get_imm32(d), -8);
-  UT_ASSERT(d.is_local);
+  UT_ASSERT(irop_is_local(d));
 
   UT_ASSERT(!irop_config[TCCIR_OP_VLA_SP_SAVE].has_src1);
   UT_ASSERT(!irop_config[TCCIR_OP_VLA_SP_SAVE].has_src2);
@@ -105,7 +105,7 @@ UT_TEST(test_vla_sp_restore_emits_op_with_stack_src)
   IROperand s1 = tcc_ir_op_get_src1(ir, &ir->compact_instructions[0]);
   UT_ASSERT_EQ(irop_get_tag(s1), IROP_TAG_STACKOFF);
   UT_ASSERT_EQ(irop_get_imm32(s1), -16);
-  UT_ASSERT(s1.is_local);
+  UT_ASSERT(irop_is_local(s1));
 
   UT_ASSERT(!irop_config[TCCIR_OP_VLA_SP_RESTORE].has_dest);
 

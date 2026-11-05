@@ -13,6 +13,51 @@
 #include "ir.h"
 #include "opt_utils.h"
 
+static uint32_t fn_features_scan(const TCCIRState *ir)
+{
+  const int n = ir->next_instruction_index;
+  uint32_t f = 0;
+  for (int i = 0; i < n; i++)
+  {
+    const IRQuadCompact *q = &ir->compact_instructions[i];
+    switch (q->op)
+    {
+    case TCCIR_OP_IJUMP: f |= IR_FN_IJUMP; break;
+    case TCCIR_OP_SETJMP: f |= IR_FN_SETJMP; break;
+    case TCCIR_OP_LONGJMP: f |= IR_FN_LONGJMP; break;
+    case TCCIR_OP_NL_SETJMP: f |= IR_FN_NL_SETJMP; break;
+    case TCCIR_OP_NL_LONGJMP: f |= IR_FN_NL_LONGJMP; break;
+    case TCCIR_OP_INLINE_ASM: f |= IR_FN_INLINE_ASM; break;
+    case TCCIR_OP_ASM_INPUT:
+    case TCCIR_OP_ASM_OUTPUT: f |= IR_FN_ASM_OPERAND; break;
+    case TCCIR_OP_SET_CHAIN: f |= IR_FN_SET_CHAIN; break;
+    case TCCIR_OP_INIT_CHAIN_SLOT: f |= IR_FN_INIT_CHAIN_SLOT; break;
+    case TCCIR_OP_SWITCH_TABLE: f |= IR_FN_SWITCH_TABLE; break;
+    case TCCIR_OP_SWITCH_LOAD: f |= IR_FN_SWITCH_LOAD; break;
+    case TCCIR_OP_VLA_ALLOC: f |= IR_FN_VLA_ALLOC; break;
+    case TCCIR_OP_FUNCCALLVAL:
+    case TCCIR_OP_FUNCCALLVOID: f |= IR_FN_CALL; break;
+    case TCCIR_OP_JUMP:
+    case TCCIR_OP_JUMPIF: f |= IR_FN_JUMP; break;
+    default: break;
+    }
+    if (ir_op_has(q->op, IROP_A_MAY_BRANCH))
+      f |= IR_FN_MAY_BRANCH;
+    if (q->is_jump_target && i > 0)
+      f |= IR_FN_INNER_TARGET;
+  }
+  return f;
+}
+
+uint32_t ir_opt_fn_features(TCCIRState *ir)
+{
+  if (ir->opt_generation && ir->fn_features_gen == ir->opt_generation)
+    return ir->fn_features;
+  ir->fn_features = fn_features_scan(ir);
+  ir->fn_features_gen = ir->opt_generation;
+  return ir->fn_features;
+}
+
 uint8_t *ir_opt_build_merge_bitmap(TCCIRState *ir, int n)
 {
   uint8_t *is_merge = tcc_mallocz((n + 7) / 8);

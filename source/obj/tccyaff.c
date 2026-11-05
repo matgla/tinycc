@@ -151,7 +151,7 @@ uint32_t tcc_get_offset_to_imported_libraries(YaffHeader *header)
 static void tcc_yaff_fill_arch_section(TCCState *s1, const YaffHeader *header, YaffArchSection *out)
 {
   memset(out, 0, sizeof(*out));
-  out->size = (uint16_t)sizeof(YaffArchSection);
+  out->size = (uint16_t)(s1->hot_text_end ? sizeof(YaffHotTextArchSection) : sizeof(YaffArchSection));
   out->arch = (uint8_t)header->arch;
   out->flags = YAFF_ARCH_FLAG_EXACT_THUMB;
 
@@ -970,6 +970,7 @@ static int tcc_yaff_write_data_relocations(TCCState *s1, FILE *f)
           case R_ARM_RODATA_OFF:
           case R_ARM_GOT_SBREL12:
           case R_ARM_YASOS_LOCAL_CALL:
+          case R_ARM_YASOS_HOT_VENEER:
           case R_ARM_GOTPC:
           case R_ARM_GOT_PREL:
           case R_ARM_PC24:
@@ -1135,6 +1136,7 @@ static int tcc_yaff_write_symbol_table_relocations(TCCState *s1, FILE *f)
           case R_ARM_RODATA_OFF:
           case R_ARM_GOT_SBREL12:
           case R_ARM_YASOS_LOCAL_CALL:
+          case R_ARM_YASOS_HOT_VENEER:
           {
             // relocations that are safe to ignore due to their PC relative
             // nature (R_ARM_RODATA_OFF is resolved at link time into the .text
@@ -1682,6 +1684,7 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
    * default sentinel here. */
   header.stack_size = s1->yaff_stack_size ? s1->yaff_stack_size : 0xFFFFFFFFu;
   header.heap_size = s1->yaff_heap_size ? s1->yaff_heap_size : 0xFFFFFFFFu;
+  header.memory_flags = s1->yaff_slow_memory ? YAFF_MEMORY_SLOW : 0;
   /* header.const_rodata_length was set in the data_length block above
    * (rodata_size when -share-rodata, else 0). */
   if (!s1->share_rodata)
@@ -1722,11 +1725,16 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
    * an image for another part is rejected before any of it is trusted. */
   header.arch_section_offset = ftell(f);
   {
+    YaffHotTextArchSection hot_arch;
     YaffArchSection arch_section;
-    uint32_t aligned_arch_len = tcc_yaff_align(&header, (uint32_t)sizeof(YaffArchSection));
+    uint32_t aligned_arch_len;
     tcc_yaff_fill_arch_section(s1, &header, &arch_section);
-    fwrite(&arch_section, 1, sizeof(YaffArchSection), f);
-    for (i = 0; i < (int)(aligned_arch_len - sizeof(YaffArchSection)); ++i)
+    aligned_arch_len = tcc_yaff_align(&header, arch_section.size);
+    hot_arch.arch = arch_section;
+    hot_arch.hot_text_offset = s1->hot_text_start;
+    hot_arch.hot_text_length = s1->hot_text_end - s1->hot_text_start;
+    fwrite(&hot_arch, 1, arch_section.size, f);
+    for (i = 0; i < (int)(aligned_arch_len - arch_section.size); ++i)
     {
       fputc(0, f);
     }

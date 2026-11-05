@@ -85,13 +85,13 @@ static const char *nrvo_callee(TCCIRState *ir, IRQuadCompact *q)
 /* A frame address operand (not an access through the frame). */
 static int nrvo_frame_addr(IROperand o)
 {
-  return irop_get_tag(o) == IROP_TAG_STACKOFF && o.is_local && !o.is_llocal && !o.is_lval && irop_get_vreg(o) < 0;
+  return irop_get_tag(o) == IROP_TAG_STACKOFF && irop_is_local(o) && !irop_is_llocal(o) && !o.is_lval && irop_get_vreg(o) < 0;
 }
 
 /* A direct access to a frame slot. */
 static int nrvo_frame_slot(IROperand o)
 {
-  return irop_get_tag(o) == IROP_TAG_STACKOFF && o.is_local && !o.is_llocal && o.is_lval && irop_get_vreg(o) < 0;
+  return irop_get_tag(o) == IROP_TAG_STACKOFF && irop_is_local(o) && !irop_is_llocal(o) && o.is_lval && irop_get_vreg(o) < 0;
 }
 
 /* While the IR is only analysed (nothing inserted, removed or rewritten), the
@@ -213,14 +213,14 @@ static int nrvo_var_frame_addr_scan(TCCIRState *ir, int32_t var, int *off)
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest || q->op == TCCIR_OP_STORE_INDEXED)
       continue;
     IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_vreg(d) != var || d.is_llocal)
+    if (irop_get_vreg(d) != var || irop_is_llocal(d))
       continue;
     int at = 0, add = 0;
     IROperand s1 = tcc_ir_op_get_src1(ir, q);
     if (q->op == TCCIR_OP_ADD)
     {
       IROperand k = tcc_ir_op_get_src2(ir, q);
-      if (irop_get_tag(k) != IROP_TAG_IMM32 || k.is_sym)
+      if (irop_get_tag(k) != IROP_TAG_IMM32 || irop_is_sym(k))
         goto fail;
       add = (int)irop_get_imm64_ex(ir, k);
     }
@@ -258,7 +258,7 @@ static int nrvo_arg_kind(TCCIRState *ir, IROperand o, int at, int32_t p0, int *o
   if (irop_get_tag(o) == IROP_TAG_SYMREF && !o.is_lval)
     return 2;
   int32_t v = irop_get_vreg(o);
-  if (v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR && !o.is_llocal && nrvo_var_frame_addr(ir, v, off))
+  if (v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR && !irop_is_llocal(o) && nrvo_var_frame_addr(ir, v, off))
     return 1;
   if (o.is_lval || v < 0)
     return 0;
@@ -273,11 +273,11 @@ static int nrvo_arg_kind(TCCIRState *ir, IROperand o, int at, int32_t p0, int *o
     /* a member's address: `T <- &obj ADD #k`, through TEMPs */
     IROperand k = tcc_ir_op_get_src2(ir, q), b = tcc_ir_op_get_src1(ir, q);
     int boff = 0;
-    if (irop_get_tag(k) != IROP_TAG_IMM32 || k.is_sym || (!nrvo_frame_addr(b) && irop_get_tag(b) != IROP_TAG_VREG))
+    if (irop_get_tag(k) != IROP_TAG_IMM32 || irop_is_sym(k) || (!nrvo_frame_addr(b) && irop_get_tag(b) != IROP_TAG_VREG))
       return 0;
     if (nrvo_frame_addr(b))
       boff = irop_get_stack_offset(b);
-    else if (b.is_lval || b.is_llocal || TCCIR_DECODE_VREG_TYPE(irop_get_vreg(b)) != TCCIR_VREG_TYPE_TEMP ||
+    else if (b.is_lval || irop_is_llocal(b) || TCCIR_DECODE_VREG_TYPE(irop_get_vreg(b)) != TCCIR_VREG_TYPE_TEMP ||
              nrvo_arg_kind(ir, b, d, p0, &boff) != 1)
       return 0;
     *off = boff + (int)irop_get_imm64_ex(ir, k);
@@ -296,7 +296,7 @@ static int nrvo_arg_kind(TCCIRState *ir, IROperand o, int at, int32_t p0, int *o
   int32_t sv = irop_get_vreg(s);
   if (!s.is_lval && sv == p0)
     return 3;
-  if (sv >= 0 && TCCIR_DECODE_VREG_TYPE(sv) == TCCIR_VREG_TYPE_VAR && !s.is_llocal && nrvo_var_frame_addr(ir, sv, off))
+  if (sv >= 0 && TCCIR_DECODE_VREG_TYPE(sv) == TCCIR_VREG_TYPE_VAR && !irop_is_llocal(s) && nrvo_var_frame_addr(ir, sv, off))
     return 1;
   /* P0's copy in a VAR, or the frontend's sret home slot */
   if (!s.is_lval && sv >= 0 && TCCIR_DECODE_VREG_TYPE(sv) == TCCIR_VREG_TYPE_VAR)
@@ -389,7 +389,7 @@ static void nrvo_set_operand(TCCIRState *ir, IRQuadCompact *q, int k, IROperand 
  * annotations). */
 static void nrvo_insert(TCCIRState *ir, int at, IRQuadCompact *q)
 {
-  q->orig_index = ++ir->max_orig_index;
+  q->orig_index = tcc_ir_fresh_orig_index(ir);
   tcc_ir_insert_instruction_before(ir, at, q);
 }
 
@@ -434,7 +434,6 @@ static void nrvo_drop_memop(TCCIRState *ir, int i, IROperand a0)
   }
   IROperand d = tcc_ir_op_get_dest(ir, q);
   a0.is_lval = 0;
-  a0.is_llocal = 0;
   if (irop_get_tag(a0) == IROP_TAG_VREG)
     a0.btype = IROP_BTYPE_INT32;
   const int base = tcc_ir_pool_add(ir, d);
@@ -553,7 +552,7 @@ static int nrvo_lower_fills(TCCIRState *ir, const NrvoObj *obj, int nobj, int32_
           continue;
         IRQuadCompact st = {0};
         st.op = TCCIR_OP_STORE;
-        st.operand_base = tcc_ir_pool_add(ir, irop_make_stackoff(-1, off + w, 1, 0, 0, IROP_BTYPE_INT32));
+        st.operand_base = tcc_ir_pool_add(ir, irop_make_stackoff(-1, off + w, 1, 0, IROP_BTYPE_INT32));
         tcc_ir_pool_add(ir, irop_make_imm32(-1, 0, IROP_BTYPE_INT32));
         int pfirst = i;
         for (int k = 0; k < 3; k++)
@@ -688,8 +687,8 @@ static void nrvo_uses(TCCIRState *ir, const NrvoRange *r, int nr, NrvoUses *u)
         continue;
       IROperand d = tcc_ir_op_get_dest(ir, q);
       int off = irop_get_stack_offset(d), lo, hi;
-      if (irop_get_tag(d) != IROP_TAG_STACKOFF || irop_get_vreg(d) >= 0 || !d.is_local || !d.is_lval ||
-          d.is_llocal || d.is_complex || d.btype != IROP_BTYPE_INT32 || !tcc_ir_frame_object_at(ir, off, &lo, &hi) || off + 4 > hi)
+      if (irop_get_tag(d) != IROP_TAG_STACKOFF || irop_get_vreg(d) >= 0 || !irop_is_local(d) || !d.is_lval ||
+          irop_is_llocal(d) || d.is_complex || d.btype != IROP_BTYPE_INT32 || !tcc_ir_frame_object_at(ir, off, &lo, &hi) || off + 4 > hi)
         continue;
       int seen = 0;
       for (size_t k = 0; k < words.size; k++)
@@ -706,7 +705,7 @@ static void nrvo_uses(TCCIRState *ir, const NrvoRange *r, int nr, NrvoUses *u)
         if (!nrvo_operand(ir, q, k, &o) || irop_get_tag(o) != IROP_TAG_STACKOFF || irop_get_vreg(o) >= 0)
           continue;
         int off = irop_get_stack_offset(o);
-        int addr = !o.is_lval && !o.is_llocal;
+        int addr = !o.is_lval && !irop_is_llocal(o);
         int size = ir_opt_store_btype_size_bytes(o.btype);
         if (o.is_complex)
           size *= 2;
@@ -737,6 +736,10 @@ static void nrvo_uses(TCCIRState *ir, const NrvoRange *r, int nr, NrvoUses *u)
     }
   }
   uint64_t *taint = tcc_mallocz(sizeof(uint64_t) * (ntemps + nvars));
+  /* This round has read it.  A value that grows before anything read it needs
+   * no further round: without this every function walked once more only to
+   * find nothing had changed. */
+  uint8_t *read = tcc_malloc(ntemps + nvars);
   int *call_at = tcc_malloc(sizeof(int) * ncalls);
   /* by call id: the addresses a copy or fill helper got as its destination,
    * which memcpy/memmove/memset hand back as their result */
@@ -758,11 +761,18 @@ static void nrvo_uses(TCCIRState *ir, const NrvoRange *r, int nr, NrvoUses *u)
    : TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR                                                                  \
        ? (TCCIR_DECODE_VREG_POSITION(v) < nvars ? ntemps + TCCIR_DECODE_VREG_POSITION(v) : -1)                         \
        : -1)
+#define NRVO_READ(x)                                                                                          \
+  do                                                                                                          \
+  {                                                                                                           \
+    if ((x) >= 0)                                                                                             \
+      read[x] = 1;                                                                                            \
+  } while (0)
   u->bad = 0;
   for (int round = 0;; round++)
   {
     int changed = 0;
     uint64_t esc = 0, sret = 0;
+    memset(read, 0, ntemps + nvars);
     if (u->ref)
     {
       memset(u->ref, 0, sizeof(uint64_t) * n);
@@ -799,7 +809,7 @@ static void nrvo_uses(TCCIRState *ir, const NrvoRange *r, int nr, NrvoUses *u)
            * end's watermark), handled as one below */
           if (v < 0)
           {
-            if (mem_cfg && (o.is_lval || o.is_llocal)) {
+            if (mem_cfg && (o.is_lval || irop_is_llocal(o))) {
               int off = irop_get_stack_offset(o);
               int size = ir_opt_store_btype_size_bytes(o.btype);
               if (o.is_complex)
@@ -810,7 +820,7 @@ static void nrvo_uses(TCCIRState *ir, const NrvoRange *r, int nr, NrvoUses *u)
               for (size_t w = 0; w < words.size; w++) {
                 if (off >= words.data[w].off + 4 || size <= 0 || off + size <= words.data[w].off)
                   continue;
-                if (k == 0 && !o.is_llocal && off == words.data[w].off && size == 4 &&
+                if (k == 0 && !irop_is_llocal(o) && off == words.data[w].off && size == 4 &&
                     (op == TCCIR_OP_STORE || op == TCCIR_OP_ASSIGN))
                   mem_def = (int)w;
                 else if (k != 0)
@@ -818,7 +828,7 @@ static void nrvo_uses(TCCIRState *ir, const NrvoRange *r, int nr, NrvoUses *u)
               }
             }
             const uint64_t m = nrvo_off_mask(r, nr, irop_get_stack_offset(o));
-            if (o.is_lval || o.is_llocal)
+            if (o.is_lval || irop_is_llocal(o))
             {
               ref |= m; /* the slot itself */
               if (k == 0)
@@ -844,12 +854,13 @@ static void nrvo_uses(TCCIRState *ir, const NrvoRange *r, int nr, NrvoUses *u)
         if (u->params && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_PARAM &&
             TCCIR_DECODE_VREG_POSITION(v) < 32)
           t |= 1ull << TCCIR_DECODE_VREG_POSITION(v);
-        if (tag == IROP_TAG_STACKOFF && !o.is_lval && !o.is_llocal)
+        if (tag == IROP_TAG_STACKOFF && !o.is_lval && !irop_is_llocal(o))
         {
           eh |= t; /* the address of the vreg's home: its value is in memory */
+          NRVO_READ(x);
           continue;
         }
-        int deref = TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR ? o.is_llocal : o.is_lval;
+        int deref = TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR ? irop_is_llocal(o) : o.is_lval;
         if (u->params)
           deref = !irop_is_vreg_value(o);
         if (k == 0 && (op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_STORE_POSTINC))
@@ -862,6 +873,7 @@ static void nrvo_uses(TCCIRState *ir, const NrvoRange *r, int nr, NrvoUses *u)
         {
           ref |= t;
           ind |= t;
+          NRVO_READ(x);
           if (k == 0)
             store_mem = 1;
           continue;
@@ -872,6 +884,7 @@ static void nrvo_uses(TCCIRState *ir, const NrvoRange *r, int nr, NrvoUses *u)
           continue;
         }
         val |= t;
+        NRVO_READ(x);
       }
       if (op == TCCIR_OP_FUNCPARAMVAL || op == TCCIR_OP_FUNCPARAMVOID)
       {
@@ -917,7 +930,7 @@ static void nrvo_uses(TCCIRState *ir, const NrvoRange *r, int nr, NrvoUses *u)
             if ((taint[def] | mr) != taint[def])
             {
               taint[def] |= mr;
-              changed = 1;
+              changed |= read[def];
             }
           }
           else if (store_mem || tcc_ir_op_dest_vreg(ir, q) >= 0)
@@ -937,7 +950,7 @@ static void nrvo_uses(TCCIRState *ir, const NrvoRange *r, int nr, NrvoUses *u)
           if ((taint[def] | val) != taint[def])
           {
             taint[def] |= val;
-            changed = 1;
+            changed |= read[def];
           }
         }
         else
@@ -975,9 +988,11 @@ static void nrvo_uses(TCCIRState *ir, const NrvoRange *r, int nr, NrvoUses *u)
       break;
     }
   }
+#undef NRVO_READ
 #undef NRVO_VIDX
   tcc_ir_cfg_free(mem_cfg);
   tcc_free(taint);
+  tcc_free(read);
   tcc_free(call_at);
   tcc_free(memret);
 }
@@ -1088,6 +1103,59 @@ static uint8_t *nrvo_reach_from(TCCIRState *ir, const uint8_t *start)
   return seen;
 }
 
+/* at[j]: the objects whose address escapes at j.  Returns, for each instruction,
+ * the objects that escaped at it or before it on some path: one walk for up to
+ * 64 objects, where one each was most of this pass on a function with many. */
+static uint64_t *nrvo_reach_bits(TCCIRState *ir, const uint64_t *at)
+{
+  const int n = ir->next_instruction_index;
+  uint64_t *reach = tcc_malloc(sizeof(uint64_t) * (n + 1));
+  uint64_t *todo = tcc_malloc(sizeof(uint64_t) * (n + 1)); /* not yet passed on */
+  int cap = 64, again = 1;
+  uint64_t everywhere = 0;
+  for (int t = 0; t < ir->num_switch_tables; t++)
+    if (ir->switch_tables[t].num_entries + 2 > cap)
+      cap = ir->switch_tables[t].num_entries + 2;
+  int *succ = tcc_malloc(sizeof(int) * cap);
+  memcpy(reach, at, sizeof(uint64_t) * n);
+  memcpy(todo, at, sizeof(uint64_t) * n);
+  /* In index order: most edges go forward, so a sweep carries a value down a
+   * whole path, and only a back edge asks for another. */
+  while (again)
+  {
+    again = 0;
+    for (int j = 0; j < n; j++)
+    {
+      const uint64_t bits = todo[j];
+      if (!bits)
+        continue;
+      todo[j] = 0;
+      const int ns = nrvo_succ(ir, j, succ, cap);
+      if (ns < 0)
+      {
+        everywhere |= bits; /* unknown control flow */
+        continue;
+      }
+      for (int k = 0; k < ns; k++)
+      {
+        const int s = succ[k];
+        if (s < 0 || s >= n || !(bits & ~reach[s]))
+          continue;
+        todo[s] |= bits & ~reach[s];
+        reach[s] |= bits;
+        if (s <= j)
+          again = 1;
+      }
+    }
+  }
+  if (everywhere)
+    for (int j = 0; j < n; j++)
+      reach[j] |= everywhere;
+  tcc_free(todo);
+  tcc_free(succ);
+  return reach;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Caller side: no struct-return buffer the callee can reach otherwise.      */
 /* ------------------------------------------------------------------------- */
@@ -1105,7 +1173,7 @@ static int nrvo_buffer_frame_off(TCCIRState *ir, IROperand o, int at, int *off)
       return 1;
     }
     int32_t v = irop_get_vreg(o);
-    if (irop_get_tag(o) != IROP_TAG_VREG || o.is_lval || o.is_llocal || v < 0)
+    if (irop_get_tag(o) != IROP_TAG_VREG || o.is_lval || irop_is_llocal(o) || v < 0)
       return 0;
     int d = nrvo_temp_def(ir, v, at);
     if (d < 0)
@@ -1141,15 +1209,15 @@ static int nrvo_reroute(TCCIRState *ir, int call, int p0i, int size)
   /* a frame address -- a parameter's home `&P1` included -- or a TEMP's one
    * value is the same after the call */
   const int stable =
-      (irop_get_tag(op) == IROP_TAG_STACKOFF && !op.is_lval && !op.is_llocal) ||
-      (irop_get_tag(op) == IROP_TAG_VREG && !op.is_lval && !op.is_llocal && v >= 0 &&
+      (irop_get_tag(op) == IROP_TAG_STACKOFF && !op.is_lval && !irop_is_llocal(op)) ||
+      (irop_get_tag(op) == IROP_TAG_VREG && !op.is_lval && !irop_is_llocal(op) && v >= 0 &&
        TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_TEMP && nrvo_temp_def(ir, v, p0i) >= 0);
   if (!stable)
   {
     /* the destination address as it is when the call is made */
     const int32_t t = tcc_ir_get_vreg_temp(ir);
-    int deref = irop_get_tag(op) == IROP_TAG_STACKOFF ? (op.is_lval || op.is_llocal)
-                : v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR ? op.is_llocal
+    int deref = irop_get_tag(op) == IROP_TAG_STACKOFF ? (op.is_lval || irop_is_llocal(op))
+                : v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR ? irop_is_llocal(op)
                                                                               : op.is_lval;
     IRQuadCompact a = {0};
     a.op = deref ? TCCIR_OP_LOAD : TCCIR_OP_ASSIGN;
@@ -1162,7 +1230,7 @@ static int nrvo_reroute(TCCIRState *ir, int call, int p0i, int size)
     shift++;
     dst = irop_make_vreg(t, IROP_BTYPE_INT32);
   }
-  tcc_ir_op_set_src1(ir, &ir->compact_instructions[p0i], irop_make_stackoff(-1, tmp, 0, 0, 0, IROP_BTYPE_INT32));
+  tcc_ir_op_set_src1(ir, &ir->compact_instructions[p0i], irop_make_stackoff(-1, tmp, 0, 0, IROP_BTYPE_INT32));
 
   /* A TEMP holding a frame address -- `T <- &P1`, a struct parameter's home,
    * which the front end hands over as `s = f(s)`'s destination -- is computed
@@ -1177,7 +1245,7 @@ static int nrvo_reroute(TCCIRState *ir, int call, int p0i, int size)
     if (d >= 0 && (ir->compact_instructions[d].op == TCCIR_OP_ASSIGN || ir->compact_instructions[d].op == TCCIR_OP_LEA))
     {
       IROperand src = tcc_ir_op_get_src1(ir, &ir->compact_instructions[d]);
-      if (irop_get_tag(src) == IROP_TAG_STACKOFF && !src.is_lval && !src.is_llocal)
+      if (irop_get_tag(src) == IROP_TAG_STACKOFF && !src.is_lval && !irop_is_llocal(src))
       {
         recompute = 1;
         addr = src;
@@ -1196,7 +1264,7 @@ static int nrvo_reroute(TCCIRState *ir, int call, int p0i, int size)
   fsv.vr = -1;
   IRQuadCompact seq[4];
   memset(seq, 0, sizeof seq);
-  const IROperand args[3] = {dst, irop_make_stackoff(-1, tmp, 0, 0, 0, IROP_BTYPE_INT32),
+  const IROperand args[3] = {dst, irop_make_stackoff(-1, tmp, 0, 0, IROP_BTYPE_INT32),
                              irop_make_imm32(-1, size, IROP_BTYPE_INT32)};
   for (int k = 0; k < 3; k++)
   {
@@ -1210,7 +1278,7 @@ static int nrvo_reroute(TCCIRState *ir, int call, int p0i, int size)
   tcc_ir_pool_add(ir, irop_make_imm32(-1, (int32_t)TCCIR_ENCODE_CALL(cid, 3), IROP_BTYPE_INT32));
   seq[3].line_num = line;
   for (int k = 3; k >= 0; k--)
-    nrvo_insert(ir, call + 1, &seq[k]);
+    seq[k].orig_index = tcc_ir_fresh_orig_index(ir);
   if (recompute)
   {
     IRQuadCompact l = {0};
@@ -1221,9 +1289,13 @@ static int nrvo_reroute(TCCIRState *ir, int call, int p0i, int size)
     const int32_t t = tcc_ir_get_vreg_temp(ir);
     IROperand nt = irop_make_vreg(t, IROP_BTYPE_INT32);
     ir->iroperand_pool[l.operand_base] = nt;
-    nrvo_insert(ir, call + 1, &l);
-    tcc_ir_op_set_src1(ir, &ir->compact_instructions[call + 2], nt); /* the copy's PARAM0 */
+    l.orig_index = tcc_ir_fresh_orig_index(ir);
+    tcc_ir_op_set_src1(ir, &seq[0], nt); /* the copy's PARAM0 */
+    tcc_ir_insert_instructions_before(ir, call + 1, &seq[0], 4);
+    tcc_ir_insert_instructions_before(ir, call + 1, &l, 1);
   }
+  else
+    tcc_ir_insert_instructions_before(ir, call + 1, &seq[0], 4);
   return shift;
 }
 
@@ -1299,8 +1371,6 @@ int tcc_ir_sret_dealias(TCCIRState *ir)
    * that one of those points reaches -- the call itself, when the address
    * is one of its own arguments -- could see its buffer through the escaped
    * pointer. */
-  uint8_t **reach = tcc_mallocz(sizeof(uint8_t *) * (nrg + 1));
-  uint8_t *bad = tcc_mallocz(nrg + 1);
   const int all = nrvo_frame_hidden_ex(ir, 1) || tcc_ir_calls_returns_twice(ir);
   for (int b = 0; b < nrg && !all; b += 64)
   {
@@ -1308,35 +1378,20 @@ int tcc_ir_sret_dealias(TCCIRState *ir)
     NrvoUses u = {0};
     u.at = tcc_malloc(sizeof(uint64_t) * (n + 1));
     nrvo_uses(ir, rg + b, m, &u);
-    uint8_t *start = tcc_malloc(n + 1);
-    for (int k = 0; k < m; k++)
+    uint64_t *reach = !u.bad && u.esc ? nrvo_reach_bits(ir, u.at) : NULL;
+    /* Decide on the original indices first. */
+    for (int s = 0; s < nsc; s++)
     {
-      if (u.bad)
-      {
-        bad[b + k] = 1;
-        continue;
-      }
-      if (!((u.esc >> k) & 1))
-        continue;
-      for (int j = 0; j < n; j++)
-        start[j] = (u.at[j] >> k) & 1;
-      reach[b + k] = nrvo_reach_from(ir, start);
+      const int r = sc[s].range;
+      if (r >= b && r < b + m && (u.bad || (reach && ((reach[sc[s].call] >> (r - b)) & 1))))
+        sc[s].range = -2; /* reroute */
     }
-    tcc_free(start);
+    tcc_free(reach);
     tcc_free(u.at);
   }
-
-  /* Decide on the original indices first. */
   for (int s = 0; s < nsc; s++)
-  {
-    const int r = sc[s].range;
-    if (all || r < 0 || bad[r] || (reach[r] && reach[r][sc[s].call]))
+    if (all || sc[s].range < 0)
       sc[s].range = -2; /* reroute */
-  }
-  for (int k = 0; k < nrg; k++)
-    tcc_free(reach[k]);
-  tcc_free(reach);
-  tcc_free(bad);
 
   nrvo_cache_end();
 
@@ -1405,14 +1460,14 @@ static int nrvo_cx(const NrvoCarriers *c, IROperand o)
 static int nrvo_p0_value(const NrvoCarriers *c, IROperand o)
 {
   if (irop_get_tag(o) == IROP_TAG_STACKOFF && irop_get_vreg(o) < 0 && irop_get_stack_offset(o) == (int)func_vc &&
-      o.is_lval && !o.is_llocal)
+      o.is_lval && !irop_is_llocal(o))
     return 1;
   if (irop_get_tag(o) == IROP_TAG_VREG && irop_get_vreg(o) == c->p0 && !o.is_lval)
     return 1;
   const int x = nrvo_cx(c, o);
   return x >= 0 && c->car[x] &&
          (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(o)) == TCCIR_VREG_TYPE_VAR
-              ? !o.is_llocal && (irop_get_tag(o) == IROP_TAG_VREG || o.is_lval)
+              ? !irop_is_llocal(o) && (irop_get_tag(o) == IROP_TAG_VREG || o.is_lval)
               : !o.is_lval);
 }
 
@@ -1438,7 +1493,7 @@ static int nrvo_p0_only_copies(TCCIRState *ir, const int *sites, int nsites, int
       IROperand d = tcc_ir_op_get_dest(ir, q), s1 = tcc_ir_op_get_src1(ir, q);
       const int32_t dv = irop_get_vreg(d);
       const int x = nrvo_cx(&cc, d);
-      const int dval = x >= 0 && (TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_VAR ? !d.is_llocal : !d.is_lval);
+      const int dval = x >= 0 && (TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_VAR ? !irop_is_llocal(d) : !d.is_lval);
       if (dval && !car[x] && nrvo_p0_value(&cc, s1))
         car[x] = changed = 1;
     }
@@ -1466,7 +1521,7 @@ static int nrvo_p0_only_copies(TCCIRState *ir, const int *sites, int nsites, int
       if (k == 0)
       {
         /* the home store, or the definition of a carrier */
-        if (home && q->op == TCCIR_OP_STORE && o.is_lval && !o.is_llocal)
+        if (home && q->op == TCCIR_OP_STORE && o.is_lval && !irop_is_llocal(o))
         {
           IROperand s1 = tcc_ir_op_get_src1(ir, q);
           ok = irop_get_tag(s1) == IROP_TAG_VREG && irop_get_vreg(s1) == p0 && !s1.is_lval;
@@ -1474,7 +1529,7 @@ static int nrvo_p0_only_copies(TCCIRState *ir, const int *sites, int nsites, int
         else
           ok = x >= 0 && car[x] && (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_STORE) &&
                nrvo_p0_value(&cc, tcc_ir_op_get_src1(ir, q)) &&
-               (TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR ? !o.is_llocal : !o.is_lval);
+               (TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR ? !irop_is_llocal(o) : !o.is_lval);
         continue;
       }
       if (k == 1 && nrvo_p0_value(&cc, o))
@@ -1762,11 +1817,11 @@ static void nrvo_access(TCCIRState *ir, const NrvoObj *obj, int nobj, const Nrvo
     /* an argument read from a frame slot (a struct passed by value) is read
      * here; an address passed is accessed at the call */
     IROperand o = tcc_ir_op_get_src1(ir, q);
-    if (irop_get_tag(o) == IROP_TAG_STACKOFF && irop_get_vreg(o) < 0 && (o.is_lval || o.is_llocal))
-      nrvo_frame_cover(obj, nobj, ov, irop_get_stack_offset(o), o.is_llocal ? 4 : nrvo_access_width(o), sp, acc->rd,
+    if (irop_get_tag(o) == IROP_TAG_STACKOFF && irop_get_vreg(o) < 0 && (o.is_lval || irop_is_llocal(o)))
+      nrvo_frame_cover(obj, nobj, ov, irop_get_stack_offset(o), irop_is_llocal(o) ? 4 : nrvo_access_width(o), sp, acc->rd,
                        NULL);
     else if (irop_get_tag(o) == IROP_TAG_VREG && irop_get_vreg(o) >= 0 &&
-             (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(o)) == TCCIR_VREG_TYPE_VAR ? o.is_llocal : o.is_lval) && unknown)
+             (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(o)) == TCCIR_VREG_TYPE_VAR ? irop_is_llocal(o) : o.is_lval) && unknown)
       NRVO_ACC_ALL(0);
     return;
   }
@@ -1783,10 +1838,10 @@ static void nrvo_access(TCCIRState *ir, const NrvoObj *obj, int nobj, const Nrvo
     const int wr = k == 0 && (op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_STORE_POSTINC);
     if (tag == IROP_TAG_STACKOFF && v < 0)
     {
-      if (!(o.is_lval || o.is_llocal))
+      if (!(o.is_lval || irop_is_llocal(o)))
         continue;
-      const int off = irop_get_stack_offset(o), w = o.is_llocal ? 4 : nrvo_access_width(o);
-      if (o.is_llocal || !wr)
+      const int off = irop_get_stack_offset(o), w = irop_is_llocal(o) ? 4 : nrvo_access_width(o);
+      if (irop_is_llocal(o) || !wr)
         nrvo_frame_cover(obj, nobj, ov, off, w, sp, acc->rd, NULL);
       else
         nrvo_frame_cover(obj, nobj, ov, off, w, sp, acc->wr, acc->kill);
@@ -1799,7 +1854,7 @@ static void nrvo_access(TCCIRState *ir, const NrvoObj *obj, int nobj, const Nrvo
     const int index_role = indexed && k == 2;
     const int deref =
         base_role || index_role ||
-        (!indexed && !postinc && (TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR ? o.is_llocal : o.is_lval));
+        (!indexed && !postinc && (TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR ? irop_is_llocal(o) : o.is_lval));
     if (!deref)
       continue;
     /* where it points: `&obj + k` through TEMPs and VARs, plus the index of
@@ -1809,13 +1864,12 @@ static void nrvo_access(TCCIRState *ir, const NrvoObj *obj, int nobj, const Nrvo
     {
       IROperand val = o;
       val.is_lval = 0;
-      val.is_llocal = 0;
       ok = nrvo_arg_kind(ir, val, j, p0, &off) == 1;
       if (ok && indexed)
       {
         IROperand ix = tcc_ir_op_get_src2(ir, q), sc = tcc_ir_op_get_scale(ir, q);
-        ok = irop_get_tag(ix) == IROP_TAG_IMM32 && !ix.is_sym &&
-             (irop_is_none(sc) || (irop_get_tag(sc) == IROP_TAG_IMM32 && !sc.is_sym));
+        ok = irop_get_tag(ix) == IROP_TAG_IMM32 && !irop_is_sym(ix) &&
+             (irop_is_none(sc) || (irop_get_tag(sc) == IROP_TAG_IMM32 && !irop_is_sym(sc)));
         if (ok)
           off += (int)irop_get_imm64_ex(ir, ix) << (irop_is_none(sc) ? 0 : (int)irop_get_imm64_ex(ir, sc));
         w = nrvo_access_width(tcc_ir_op_get_dest_or_src1(ir, q, op == TCCIR_OP_STORE_INDEXED));
@@ -2293,11 +2347,11 @@ int tcc_ir_opt_sret_nrvo(TCCIRState *ir)
       int ob = nrvo_obj_of(obj, nobj, irop_get_stack_offset(o));
       if (ob < 0)
         continue;
-      if (!o.is_local || o.is_llocal)
+      if (!irop_is_local(o) || irop_is_llocal(o))
       {
         if (nrvo_dbg())
           fprintf(stderr, "[NRVO] %s: instr %d op %s operand %d: local %d llocal %d vreg %d\n", funcname, j,
-                  tcc_ir_get_op_name(q->op), k, o.is_local, o.is_llocal, (int)irop_get_vreg(o));
+                  tcc_ir_get_op_name(q->op), k, irop_is_local(o), irop_is_llocal(o), (int)irop_get_vreg(o));
         NRVO_FAIL(); /* not a plain slot or address: not rewritten here */
       }
       if ((o.is_lval && irop_get_btype(o) == IROP_BTYPE_STRUCT) || q->op == TCCIR_OP_BLOCK_COPY || o.is_complex ||
@@ -2387,7 +2441,7 @@ int tcc_ir_opt_sret_nrvo(TCCIRState *ir)
     {
       IROperand o;
       q = &ir->compact_instructions[j];
-      if (!nrvo_operand(ir, q, k, &o) || irop_get_tag(o) != IROP_TAG_STACKOFF || !o.is_local || o.is_llocal ||
+      if (!nrvo_operand(ir, q, k, &o) || irop_get_tag(o) != IROP_TAG_STACKOFF || !irop_is_local(o) || irop_is_llocal(o) ||
           irop_get_vreg(o) >= 0)
         continue;
       int off = irop_get_stack_offset(o);

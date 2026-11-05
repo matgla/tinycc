@@ -16,6 +16,5 @@ int ssa_opt_cprop(struct IRSSAOptCtx *ctx);
 int ssa_opt_symref_operand_cse(struct IRSSAOptCtx *ctx);
 int ssa_opt_var_forward(struct IRSSAOptCtx *ctx);
 int ssa_opt_var_to_param_forward(struct IRSSAOptCtx *ctx);
-int ssa_opt_var_const_fold(struct IRSSAOptCtx *ctx);
 int ssa_opt_const_prop_tmp(struct IRSSAOptCtx *ctx);
 

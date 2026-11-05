@@ -448,19 +448,19 @@ static IRQuadCompact *ra_phi_out_instr(RAPhiOut *out)
      * only the fields they mean to set. */
     int old_cap = out->cap;
     out->cap += out->grow;
-    out->instrs = tcc_realloc(out->instrs, out->cap * sizeof(IRQuadCompact));
+    out->instrs = tcc_hot_realloc(out->instrs, out->cap * sizeof(IRQuadCompact));
     memset(out->instrs + old_cap, 0, (out->cap - old_cap) * sizeof(IRQuadCompact));
   }
   return &out->instrs[out->wp++];
 }
 
 /* Reserve n operand pool slots at pool_wp, growing the pool the way every
- * other pool writer does (doubling). */
+ * other pool writer does. */
 static int ra_phi_out_pool(TCCIRState *ir, RAPhiOut *out, int n)
 {
   while (out->pool_wp + n > ir->iroperand_pool_capacity) {
-    int nc = ir->iroperand_pool_capacity ? ir->iroperand_pool_capacity * 2 : 256;
-    ir->iroperand_pool = tcc_realloc(ir->iroperand_pool, nc * sizeof(IROperand));
+    int nc = tcc_ir_pool_capacity_for(ir->iroperand_pool_capacity, out->pool_wp + n);
+    ir->iroperand_pool = tcc_hot_realloc(ir->iroperand_pool, nc * sizeof(IROperand));
     ir->iroperand_pool_capacity = nc;
   }
   int base = out->pool_wp;
@@ -754,8 +754,11 @@ void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   RAPhiOut out;
   out.cap = old_n + total_copies + extra_jumps + 16;
   out.grow = total_copies;
-  out.instrs = tcc_mallocz(out.cap * sizeof(IRQuadCompact));
+  out.instrs = tcc_hot_mallocz(out.cap * sizeof(IRQuadCompact));
   out.wp = 0;
+  /* Every copy takes two slots and every edge jump three; growing into them one
+   * step at a time copied the pool several times over, in slow memory. */
+  tcc_ir_pool_ensure(ir, 2 * total_copies + 3 * extra_jumps);
   out.pool_wp = ir->iroperand_pool_count;
   tcc_ir_label_sync(ir);
   int *old_to_new = tcc_malloc(old_n * sizeof(int));
@@ -926,7 +929,7 @@ void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   }
 
   /* Replace instruction array */
-  tcc_free(ir->compact_instructions);
+  tcc_hot_free(ir->compact_instructions);
   ir->compact_instructions = new_instrs;
   ir->compact_instructions_size = out.cap;
   ir->next_instruction_index = wp;
@@ -1170,7 +1173,7 @@ void ra_co_ops(TCCIRState *ir, IRQuadCompact *q,
        * in-place register write of a promoted var (a pointer-deref store
        * keeps is_lval) — a DEF, matching ra_build_intervals.  Full-width
        * only: a narrow store leaves the old upper bytes live-before. */
-      int inplace_def = (q->op == TCCIR_OP_STORE && !d.is_lval && !d.is_local &&
+      int inplace_def = (q->op == TCCIR_OP_STORE && !d.is_lval && !irop_is_local(d) &&
                          TCCIR_DECODE_VREG_TYPE(irop_get_vreg(d)) == TCCIR_VREG_TYPE_TEMP &&
                          (d.btype == IROP_BTYPE_INT32 || d.btype == IROP_BTYPE_FLOAT32 ||
                           d.btype == IROP_BTYPE_INT64 || d.btype == IROP_BTYPE_FLOAT64));
@@ -1320,6 +1323,10 @@ void ra_refine_live_regs_accurate(TCCIRState *ir)
     tcc_ir_cfg_free(cfg);
     return;
   }
+  int *dense_slot = tcc_malloc(sizeof(int) * ndense);
+  for (int i = 0; i < tbl; i++)
+    if (dense[i] >= 0)
+      dense_slot[dense[i]] = i;
   int nw = (ndense + 63) / 64;
   bit_matrix(RaLiveMatrix) useb = {0};
   bit_matrix(RaLiveMatrix) defbk = {0};
@@ -1372,13 +1379,12 @@ void ra_refine_live_regs_accurate(TCCIRState *ir)
     int t = (int)tcc_ir_op_dest_u_imm32(ir, q);
     if (t < 0 || t >= bi) continue; /* not a back-edge */
     /* live-in at the loop header t: find the block starting at t. */
-    int hb = -1;
-    for (int b = 0; b < nb; b++) if (cfg->blocks[b].start_idx == t) { hb = b; break; }
-    if (hb < 0) continue;
+    int hb = cfg->instr_to_block[t];
+    if (hb < 0 || cfg->blocks[hb].start_idx != t) continue;
     uint64_t *hli = RaLiveMatrix_row(&livein, hb);
     uint32_t mask = 0;
-    for (int vi=0; vi<tbl; vi++) {
-      if (dense[vi] < 0 || !tcc_bitspan_test(hli,dense[vi])) continue;
+    tcc_bitspan_for_each_set(hli, nw, ndense, di) {
+      const int vi = dense_slot[di];
       if (vr0[vi]>=0 && vr0[vi]<16) mask |= (1u<<vr0[vi]);
       if (vr1[vi]>=0 && vr1[vi]<16) mask |= (1u<<vr1[vi]);
     }
@@ -1389,7 +1395,7 @@ void ra_refine_live_regs_accurate(TCCIRState *ir)
       ir->ls.live_regs_by_instruction[k] |= mask;
   }
   #undef DVIDX
-  tcc_free(vr0);tcc_free(vr1);tcc_free(dense);
+  tcc_free(vr0);tcc_free(vr1);tcc_free(dense);tcc_free(dense_slot);
   tcc_ir_cfg_free(cfg);
 }
 
@@ -1986,8 +1992,20 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
    * (interference = any neighbor in the other class; pressure = distinct
    * neighbor classes), so either form gives the same unions. */
   int *deg = tcc_mallocz(sizeof(int) * ncand);
-  uint64_t *live = tcc_malloc(sizeof(uint64_t) * nw);
   int rw = (ncand + 63) / 64; /* bit-matrix words per row */
+  /* Only candidates can interfere, and one word in every 64 vregs per defining
+   * instruction is what this cost before.  So the walk below keeps liveness over
+   * candidates alone, numbered by vreg index: it meets them in that same order. */
+  uint64_t *live = tcc_malloc(sizeof(uint64_t) * (rw + 1));
+  int *cand_rank = tcc_malloc(sizeof(int) * tbl);
+  int *rank_cand = tcc_malloc(sizeof(int) * (ncand + 1));
+  for (int i = 0, r = 0; i < tbl; i++)
+  {
+    cand_rank[i] = cand_id[i] >= 0 ? r : -1;
+    if (cand_id[i] >= 0)
+      rank_cand[r++] = cand_id[i];
+  }
+  #define RA_CO_LIVE_SET(vidx_) do { const int r_ = cand_rank[vidx_]; if (r_ >= 0) tcc_bitspan_set(live, r_); } while (0)
 
   for (int pass = 0; pass < 2; pass++) {
     int *adj_start = NULL, *adj = NULL, total = 0;
@@ -2014,7 +2032,7 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
           const uint64_t *row_ = imat + (size_t)(m_) * rw;                      \
           for (int w_ = 0; w_ < rw && !(stop_); w_++)                           \
             for (uint64_t b_ = row_[w_]; b_ && !(stop_); b_ &= b_ - 1) {        \
-              int x_ = (w_ << 6) + __builtin_ctzll(b_);                         \
+              int x_ = (w_ << 6) + tcc_bitspan_ctz64(b_);                       \
               body                                                              \
             }                                                                   \
         } else {                                                                \
@@ -2025,7 +2043,9 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
         }                                                                       \
       } while (0)
     for (int b = 0; b < nb; b++) {
-      RA_CO_LIVE_OUT(live, b);
+      tcc_bitspan_zero(live, rw);
+      tcc_bitspan_for_each_set(RaLiveMatrix_row(&liveout, b), ngw, ng, g_)
+        RA_CO_LIVE_SET(glob_vidx[g_]);
       int s = cfg->blocks[b].start_idx, e = cfg->blocks[b].end_idx;
       for (int i = e - 1; i >= s && i < n; i--) {
         IRQuadCompact *q = &ir->compact_instructions[i];
@@ -2048,11 +2068,11 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
           if (d >= 0 && d < tbl && cand_id[d] >= 0) {
             int cd = cand_id[d];
             int csrc = (copy_src >= 0 && tcc_ir_vreg_is_valid(ir, copy_src)) ? VIDX(copy_src) : -1;
-            tcc_bitspan_for_each_set(live, nw, tbl, vi) {
-              int c = cand_id[vi];
-              if (c < 0) continue;
-              if (vi == d) continue;
-              if (csrc >= 0 && vi == csrc) continue;
+            const int rd = cand_rank[d], rsrc = csrc >= 0 && csrc < tbl ? cand_rank[csrc] : -1;
+            tcc_bitspan_for_each_set(live, rw, ncand, ri) {
+              int c = rank_cand[ri];
+              if (ri == rd) continue;
+              if (ri == rsrc) continue;
               if (pass == 0) { deg[cd]++; deg[c]++; }
               else if (imat) {
                 imat[(size_t)cd * rw + (c >> 6)] |= 1ull << (c & 63);
@@ -2064,14 +2084,15 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
         }
         /* transition live: kill def, gen uses */
         if (hd && tcc_ir_vreg_is_valid(ir, def)) {
-          int d = VIDX(def); if (d >= 0 && d < tbl) tcc_bitspan_reset(live, d);
+          int d = VIDX(def);
+          if (d >= 0 && d < tbl && cand_rank[d] >= 0) tcc_bitspan_reset(live, cand_rank[d]);
         }
         for (int k = 0; k < nu; k++) {
           if (!tcc_ir_vreg_is_valid(ir, uses[k])) continue;
-          int u = VIDX(uses[k]); if (u >= 0 && u < tbl) tcc_bitspan_set(live, u);
+          int u = VIDX(uses[k]); if (u >= 0 && u < tbl) RA_CO_LIVE_SET(u);
         }
         RA_CO_FOR_CALL_PARAM_USES(i, vr, {
-          int u = VIDX(vr); if (u >= 0 && u < tbl) tcc_bitspan_set(live, u);
+          int u = VIDX(vr); if (u >= 0 && u < tbl) RA_CO_LIVE_SET(u);
         });
       }
     }
@@ -2294,7 +2315,7 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
   #undef ADD_CAND
   #undef VIDX
   #undef RA_CO_LIVE_OUT
-  tcc_free(deg); tcc_free(live);
+  tcc_free(deg); tcc_free(live); tcc_free(cand_rank); tcc_free(rank_cand);
   tcc_free(iv_of); tcc_free(glob_vidx);
   tcc_free(instr_block);
   tcc_free(cand_id); tcc_free(cand_vidx); tcc_free(edge_d); tcc_free(edge_s);

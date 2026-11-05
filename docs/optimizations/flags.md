@@ -149,7 +149,7 @@ Groups with `trigger_idx >= 0` use the trigger pass as a go/no-go gate:
 
 | Legacy Flag | SSA Equivalent | Notes |
 |-------------|---------------|-------|
-| `opt_const_prop` | `ssa:cprop`, `ssa:sccp`, `ssa:var_const_fold` | SSA cprop runs unconditionally at -O1+ |
+| `opt_const_prop` | `ssa:cprop`, `ssa:sccp` | SSA cprop runs unconditionally at -O1+ |
 | `opt_dce` | `ssa:dce` | SSA DCE runs at all -O levels |
 | `opt_store_load_fwd` | `ssa:load_cse` | SSA load_cse uses use-def chains, not flat IR |
 | `opt_jump_threading` | `ssa:branch` | SSA branch folding replaces flat jump threading |

@@ -508,7 +508,7 @@ UT_TEST(test_coalesce_into_real_stack_slot_sets_stackoff_tag)
   UT_ASSERT_EQ(irop_get_vreg(d), -1);
   UT_ASSERT_EQ(irop_get_tag(d), IROP_TAG_STACKOFF);
   UT_ASSERT_EQ(irop_get_imm32(d), -12);
-  UT_ASSERT(d.is_local);
+  UT_ASSERT(irop_is_local(d));
 
   tcc_ir_free(ir);
   return 0;

@@ -139,6 +139,18 @@ static IROperand ir_put_alias_mark_dest(TCCIRState *ir, TccIrOp op, IROperand op
   return opnd;
 }
 
+static void tcc_ir_function_too_large(void)
+{
+  tcc_error("function too large: more than %d IR instructions", TCC_IR_ORIG_INDEX_MAX);
+}
+
+int tcc_ir_fresh_orig_index(TCCIRState *ir)
+{
+  if (ir->max_orig_index >= TCC_IR_ORIG_INDEX_MAX)
+    tcc_ir_function_too_large();
+  return ++ir->max_orig_index;
+}
+
 int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest)
 {
   {
@@ -184,7 +196,7 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
   {
     ir->compact_instructions_size <<= 1;
     ir->compact_instructions =
-        (IRQuadCompact *)tcc_realloc(ir->compact_instructions, sizeof(IRQuadCompact) * ir->compact_instructions_size);
+        (IRQuadCompact *)tcc_hot_realloc(ir->compact_instructions, sizeof(IRQuadCompact) * ir->compact_instructions_size);
     if (!ir->compact_instructions)
     {
       fprintf(stderr, "tcc_ir_put: out of memory (compact)\n");
@@ -195,6 +207,8 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
   IRQuadCompact *cq = &ir->compact_instructions[pos];
   memset(cq, 0, sizeof(IRQuadCompact));
   cq->op = (uint8_t)op;
+  if (pos > TCC_IR_ORIG_INDEX_MAX)
+    tcc_ir_function_too_large();
   cq->orig_index = pos;
   if (pos > ir->max_orig_index)
     ir->max_orig_index = pos;
@@ -330,7 +344,7 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
   }
 
   /* Store current source line number for debug info */
-  cq->line_num = file ? file->line_num : 0;
+  cq->line_num = !file ? 0 : file->line_num > TCC_IR_LINE_MAX ? TCC_IR_LINE_MAX : file->line_num;
 
   if (ir->basic_block_start)
   {
@@ -391,8 +405,6 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
         if (new_dest_vr < 0 && irop_get_tag(dest_irop) == IROP_TAG_STACKOFF)
         {
           new_prev_dest.tag = dest_irop.tag;
-          new_prev_dest.is_local = dest_irop.is_local;
-          new_prev_dest.is_llocal = dest_irop.is_llocal;
           new_prev_dest.is_lval = dest_irop.is_lval;
           new_prev_dest.u = dest_irop.u;
           /* ... and the slot's width: the instruction now stores into it,
@@ -405,12 +417,7 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
         int prev_btype = irop_get_btype(dest_irop);
         new_prev_dest = irop_make_vreg(new_dest_vr, prev_btype);
         new_prev_dest.is_lval = prev_dest_irop.is_lval;
-        new_prev_dest.is_llocal = prev_dest_irop.is_llocal;
-        new_prev_dest.is_local = prev_dest_irop.is_local;
-        new_prev_dest.is_const = prev_dest_irop.is_const;
         new_prev_dest.is_unsigned = prev_dest_irop.is_unsigned;
-        new_prev_dest.is_static = prev_dest_irop.is_static;
-        new_prev_dest.is_sym = prev_dest_irop.is_sym;
         new_prev_dest.is_param = prev_dest_irop.is_param;
         new_prev_dest.is_complex = prev_dest_irop.is_complex; /* Phase 3: preserve complex flag */
         new_prev_dest.u = prev_dest_irop.u;

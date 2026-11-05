@@ -61,4 +61,9 @@ REDUNDANT_ASSIGN_WANT = {
 def test_redundant_assign_volatile_local(opt):
     funcs = _disassemble(_compile("bug_redundant_assign_volatile_local", [opt], ROOT / "tests/ir_tests"))
     got = {name: _mem_counts(funcs[name]) for name in REDUNDANT_ASSIGN_WANT}
-    assert got == REDUNDANT_ASSIGN_WANT, f"volatile local accesses at {opt}: {got}"
+    want = dict(REDUNDANT_ASSIGN_WANT)
+    if opt == "-O0":
+        # No discovery walk at -O0, so LR is saved to the scratch area around the
+        # 64-bit add: one load and one store that are not x's.
+        want["v_u64"] = (4, 7)
+    assert got == want, f"volatile local accesses at {opt}: {got}"

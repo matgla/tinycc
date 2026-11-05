@@ -43,7 +43,7 @@ static int memref_resolve_ptr(TCCIRState *ir, int32_t vr, int at_idx, struct Sym
       acc += (dq->op == TCCIR_OP_SUB) ? -c : c;
     }
     /* Terminal: a global &sym+addend. */
-    if (s1.is_sym && !s1.is_lval)
+    if (irop_is_sym(s1) && !s1.is_lval)
     {
       IRPoolSymref *sr = irop_get_symref_ex(ir, s1);
       if (!sr || !sr->sym)
@@ -53,7 +53,7 @@ static int memref_resolve_ptr(TCCIRState *ir, int32_t vr, int at_idx, struct Sym
       return 1;
     }
     /* Terminal: an own-frame StackLoc address. */
-    if (irop_get_tag(s1) == IROP_TAG_STACKOFF && s1.is_local && !s1.is_lval && irop_get_vreg(s1) == -1)
+    if (irop_get_tag(s1) == IROP_TAG_STACKOFF && irop_is_local(s1) && !s1.is_lval && irop_get_vreg(s1) == -1)
     {
       *sym_out = NULL;
       *off_out = (int64_t)irop_get_stack_offset(s1) + acc;
@@ -75,7 +75,7 @@ MemLoc memloc_of(TCCIRState *ir, IROperand op, int at_idx)
   m.size = sz > 0 ? sz : 0;
 
   /* Direct global symref deref: &sym+addend. */
-  if (op.is_sym && op.is_lval)
+  if (irop_is_sym(op) && op.is_lval)
   {
     IRPoolSymref *sr = irop_get_symref_ex(ir, op);
     if (sr && sr->sym)
@@ -90,7 +90,7 @@ MemLoc memloc_of(TCCIRState *ir, IROperand op, int at_idx)
   }
 
   /* Direct own-frame StackLoc. */
-  if (irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_local && irop_get_vreg(op) == -1)
+  if (irop_get_tag(op) == IROP_TAG_STACKOFF && irop_is_local(op) && irop_get_vreg(op) == -1)
   {
     m.kind = MEMLOC_FRAME;
     m.off = (int64_t)irop_get_stack_offset(op);
@@ -133,7 +133,7 @@ MemLoc memloc_of_pointer(TCCIRState *ir, IROperand op, int at_idx)
   MemLoc m = {MEMLOC_NONE, NULL, 0, 0};
 
   /* A symref operand names the address of a global, whether or not is_lval. */
-  if (op.is_sym)
+  if (irop_is_sym(op))
   {
     IRPoolSymref *sr = irop_get_symref_ex(ir, op);
     if (sr && sr->sym)
@@ -148,7 +148,7 @@ MemLoc memloc_of_pointer(TCCIRState *ir, IROperand op, int at_idx)
   }
 
   /* A direct own-frame StackLoc address value. */
-  if (irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_local && irop_get_vreg(op) == -1)
+  if (irop_get_tag(op) == IROP_TAG_STACKOFF && irop_is_local(op) && irop_get_vreg(op) == -1)
   {
     m.kind = MEMLOC_FRAME;
     m.off = (int64_t)irop_get_stack_offset(op);

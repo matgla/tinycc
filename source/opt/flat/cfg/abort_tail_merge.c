@@ -92,12 +92,8 @@ int tcc_ir_opt_abort_tail_merge(TCCIRState *ir)
     return 0;
 
   /* Un-enumerable control flow could branch into a guarded region we assume is entered only by fall-through. */
-  for (int i = 0; i < n; i++)
-  {
-    TccIrOp op = ir->compact_instructions[i].op;
-    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE || op == TCCIR_OP_SWITCH_LOAD)
-      return 0;
-  }
+  if (ir_opt_fn_features(ir) & (IR_FN_IJUMP | IR_FN_SWITCH_TABLE | IR_FN_SWITCH_LOAD))
+    return 0;
 
   enum { MAX_SINKS = 8 };
   Sym *cal[MAX_SINKS];

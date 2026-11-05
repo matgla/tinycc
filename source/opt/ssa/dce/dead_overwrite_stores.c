@@ -50,7 +50,7 @@ static int sl_resolve_store_offset(IRSSAOptCtx *ctx, int instr_idx,
   if (q->op != TCCIR_OP_STORE)
     return 0;
 
-  if (dest.tag == IROP_TAG_STACKOFF && dest.is_lval && dest.is_local && !dest.is_llocal) {
+  if (dest.tag == IROP_TAG_STACKOFF && dest.is_lval && irop_is_local(dest) && !irop_is_llocal(dest)) {
     int32_t dv = irop_get_vreg(dest);
     if (dv < 0 || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_VAR) {
       int w = sl_store_byte_width(irop_get_btype(dest));
@@ -117,7 +117,7 @@ static int sl_resolve_load_offset(IRSSAOptCtx *ctx, int instr_idx,
       !(q->op == TCCIR_OP_ASSIGN && src1.is_lval))
     return 0;
 
-  if (src1.tag == IROP_TAG_STACKOFF && src1.is_lval && src1.is_local && !src1.is_llocal) {
+  if (src1.tag == IROP_TAG_STACKOFF && src1.is_lval && irop_is_local(src1) && !irop_is_llocal(src1)) {
     int32_t sv = irop_get_vreg(src1);
     if (sv < 0 || TCCIR_DECODE_VREG_TYPE(sv) != TCCIR_VREG_TYPE_VAR) {
       int w = sl_store_byte_width(irop_get_btype(src1));
@@ -212,7 +212,7 @@ int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
           continue;
         int eff = INT_MIN;
         int width = sl_store_byte_width(irop_get_btype(s));
-        if (s.tag == IROP_TAG_STACKOFF && s.is_local && !s.is_llocal) {
+        if (s.tag == IROP_TAG_STACKOFF && irop_is_local(s) && !irop_is_llocal(s)) {
           int32_t sv = irop_get_vreg(s);
           if (sv < 0 || TCCIR_DECODE_VREG_TYPE(sv) != TCCIR_VREG_TYPE_VAR)
             eff = irop_get_stack_offset(s);

@@ -21,15 +21,16 @@
 /* Const-guard chains fold one guard per round, so iterate until branch folding runs dry. */
 int tcc_ir_ssa_opt_guard_collapse(IRSSAOptCtx *ctx)
 {
-  return tcc_ir_ssa_opt_guard_collapse_ex(ctx, 0);
+  return tcc_ir_ssa_opt_guard_collapse_ex(ctx, 0, 0);
 }
 
-int tcc_ir_ssa_opt_guard_collapse_ex(IRSSAOptCtx *ctx, int idle_cleanup)
+int tcc_ir_ssa_opt_guard_collapse_ex(IRSSAOptCtx *ctx, int idle_cleanup, int known_clean)
 {
   if (tcc_ir_opt_pass_disabled("ssa:guard_collapse"))
     return 0;
   int total = 0;
-  for (int guard = 0; guard < 4096; guard++) {
+  /* known_clean: the caller just ran these four to no effect on this very IR. */
+  for (int guard = 0; guard < 4096 && !known_clean; guard++) {
     total += ssa_opt_load_cse(ctx);
     total += ssa_opt_cprop(ctx);
     total += ssa_opt_fold(ctx);

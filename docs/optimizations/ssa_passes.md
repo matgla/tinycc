@@ -19,18 +19,16 @@ There are two SSA optimization drivers, selected per function by whether any VAR
 was promoted to SSA/phi form:
 - **Promoted path** (`had_promotable != 0`) → `tcc_ir_ssa_opt_run` (source/opt/ssa/engine/driver.c),
   the order below. Runs the broad `ssa:var_to_param_forward`.
-- **Fallback path** (nothing promotable) → the `RUN_SSA` loop in ir/regalloc.c, a
-  similar order but with `ssa:var_forward` (narrow) in place of
-  `ssa:var_to_param_forward`. `ssa_opt_vinfo`/rename are not populated here.
+- **Fallback path** (nothing promotable) → `tcc_ir_ssa_opt_run_fallback` in
+  ssa/engine/driver.c (the `ssa_fallback_passes` table), a similar order but
+  with `ssa:var_forward` (narrow) in place of `ssa:var_to_param_forward`. `ssa_opt_vinfo`/rename are not populated here.
 
 ```c
-ssa:var_const_fold
 ssa:sccp
 ssa:cprop
 ssa:var_to_param_forward   (promoted path; fallback runs ssa:var_forward instead)
 ssa:fold
 ssa:cprop              (second pass)
-ssa:var_imm_prop
 ssa:load_cse
 ssa:branch
 ssa:cmp_eq_prop
@@ -51,10 +49,6 @@ ssa:guard_collapse     (fixpoint: load_cse → cprop → fold → branch → DCE
 ```
 
 ## Pass Descriptions
-
-### ssa:var_const_fold
-Fold VAR reads that are statically known to hold a constant. Resolves
-LEA/ASSIGN chains to stack offsets and folds constant values.
 
 ### ssa:sccp
 Sparse Conditional Constant Propagation. Propagates constants through
@@ -84,10 +78,6 @@ generalized well beyond FUNCPARAMVAL sites.
 ### ssa:fold
 Arithmetic/logic folding. Simplifies expressions like `x & 0xFF`,
 `x | 0xFF`, `x ^ x`, constant arithmetic, etc.
-
-### ssa:var_imm_prop
-Variable immediate propagation. Propagates immediate values through
-variables that are defined by constant assignments.
 
 ### ssa:load_cse
 Load common subexpression elimination. Tracks memory reads through

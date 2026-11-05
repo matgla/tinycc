@@ -41,7 +41,7 @@ int tcc_ir_detect_const_result(TCCIRState *ir, int64_t *value, int *btype)
     case TCCIR_OP_ASSIGN:
       {
         IROperand dest = tcc_ir_op_get_dest(ir, q);
-        if (dest.is_lval || dest.is_llocal || irop_get_vreg(dest) < 0)
+        if (dest.is_lval || irop_is_llocal(dest) || irop_get_vreg(dest) < 0)
           return 0;
       }
       break;
@@ -60,7 +60,7 @@ int tcc_ir_detect_const_result(TCCIRState *ir, int64_t *value, int *btype)
 
   IRQuadCompact *ret_q = &ir->compact_instructions[ret_idx];
   IROperand src1 = tcc_ir_op_get_src1(ir, ret_q);
-  if (src1.is_lval || src1.is_llocal)
+  if (src1.is_lval || irop_is_llocal(src1))
     return 0;
 
   if (irop_is_immediate(src1))
@@ -260,7 +260,7 @@ static int switch_func_is_supported_btype(int btype)
 /* Decode operand as immediate or vreg-ref; 0 if anything else. */
 static int switch_func_decode_operand(TCCIRState *ir, IROperand op, int32_t *out_vreg, int64_t *out_imm)
 {
-  if (op.is_lval || op.is_llocal)
+  if (op.is_lval || irop_is_llocal(op))
     return 0;
   /* Reject 64-bit and FP/complex operands. */
   int btype = irop_get_btype(op);
@@ -286,7 +286,7 @@ static int switch_func_decode_operand(TCCIRState *ir, IROperand op, int32_t *out
 /* Detect an lval-symref operand (load/store-to-global); fills snap_op sym fields. */
 static int switch_func_decode_lval_sym(TCCIRState *ir, IROperand op, SwitchSimOp *snap_op)
 {
-  if (!op.is_lval || op.is_llocal)
+  if (!op.is_lval || irop_is_llocal(op))
     return 0;
   if (irop_get_tag(op) != IROP_TAG_SYMREF)
     return 0;
@@ -376,7 +376,7 @@ int tcc_ir_detect_switch_func(TCCIRState *ir, TCCFuncSwitchSnapshot **out)
     {
       IROperand d = tcc_ir_op_get_dest(ir, q);
       IROperand s = tcc_ir_op_get_src1(ir, q);
-      if (d.is_lval || d.is_llocal)
+      if (d.is_lval || irop_is_llocal(d))
         goto fail;
       int32_t dvr = irop_get_vreg(d);
       if (dvr < 0)
@@ -433,7 +433,7 @@ int tcc_ir_detect_switch_func(TCCIRState *ir, TCCFuncSwitchSnapshot **out)
       IROperand d = tcc_ir_op_get_dest(ir, q);
       IROperand s1 = tcc_ir_op_get_src1(ir, q);
       IROperand s2 = tcc_ir_op_get_src2(ir, q);
-      if (d.is_lval || d.is_llocal)
+      if (d.is_lval || irop_is_llocal(d))
         goto fail;
       int32_t dvr = irop_get_vreg(d);
       if (dvr < 0)
@@ -863,7 +863,7 @@ static int switch_insert_before(TCCIRState *ir, int before_idx, const IRQuadComp
   {
     int new_size = ir->compact_instructions_size << 1;
     ir->compact_instructions =
-        (IRQuadCompact *)tcc_realloc(ir->compact_instructions, sizeof(IRQuadCompact) * new_size);
+        (IRQuadCompact *)tcc_hot_realloc(ir->compact_instructions, sizeof(IRQuadCompact) * new_size);
     if (!ir->compact_instructions)
       return 0;
     ir->compact_instructions_size = new_size;
@@ -952,7 +952,7 @@ static int emit_replay_op(TCCIRState *ir, VregMap *m, const TCCFuncSwitchSnapsho
     {
       /* LOAD form: build a fresh symref operand in the caller's pool. */
       uint32_t sidx = tcc_ir_pool_add_symref(ir, o->sym, o->sym_addend, o->sym_flags);
-      src1 = irop_make_symref(-1, sidx, 1 /* is_lval */, 0, 0, o->sym_btype);
+      src1 = irop_make_symref(-1, sidx, 1 /* is_lval */, o->sym_btype);
     }
     else if (!build_caller_src1(ir, m, o, sim_env, btype, &src1))
       return 0;
@@ -965,7 +965,7 @@ static int emit_replay_op(TCCIRState *ir, VregMap *m, const TCCFuncSwitchSnapsho
     /* dest is lval-symref; src1 is value (vreg or imm). */
     int btype = o->sym_btype;
     uint32_t sidx = tcc_ir_pool_add_symref(ir, o->sym, o->sym_addend, o->sym_flags);
-    IROperand dest = irop_make_symref(-1, sidx, 1, 0, 0, btype);
+    IROperand dest = irop_make_symref(-1, sidx, 1, btype);
     IROperand src1;
     if (!build_caller_src1(ir, m, o, sim_env, btype, &src1))
       return 0;

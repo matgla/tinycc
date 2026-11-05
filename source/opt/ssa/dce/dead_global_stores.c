@@ -104,7 +104,7 @@ static int gs_resolve_global_base(IRSSAOptCtx *ctx, int32_t vr,
     if (dq->op == TCCIR_OP_LEA || dq->op == TCCIR_OP_ASSIGN ||
         (dq->op == TCCIR_OP_STORE && !tcc_ir_op_dest_is_lval(ir, dq))) {
       IROperand src = tcc_ir_op_get_src1(ir, dq);
-      if (src.is_sym && !src.is_lval) {
+      if (irop_is_sym(src) && !src.is_lval) {
         IRPoolSymref *sr = irop_get_symref_ex(ir, src);
         if (!sr || !sr->sym)
           return 0;
@@ -144,7 +144,7 @@ static int gs_classify_read_op(IRSSAOptCtx *ctx, IROperand s, GsRef *r)
   if (!s.is_lval)
     return 0;
   TCCIRState *ir = ctx->ir;
-  if (s.is_sym) {
+  if (irop_is_sym(s)) {
     IRPoolSymref *sr = irop_get_symref_ex(ir, s);
     if (!sr || !sr->sym)
       return -1;
@@ -236,7 +236,7 @@ static int gs_classify_store(IRSSAOptCtx *ctx, const IRQuadCompact *q, GsRef *r)
     return 0;
   if (tcc_ir_access_is_volatile(ir, dest))
     return -1;
-  if (dest.is_sym) {
+  if (irop_is_sym(dest)) {
     IRPoolSymref *sr = irop_get_symref_ex(ir, dest);
     if (!sr || !sr->sym)
       return -1;

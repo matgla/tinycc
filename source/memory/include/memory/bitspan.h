@@ -82,6 +82,14 @@ static inline int tcc_bitspan_test(const uint64_t *words, size_t bit)
   return (int)((words[bit >> 6] >> (bit & 63)) & 1);
 }
 
+/* __builtin_ctzll is a library call on a 32-bit target, and a bit-at-a-time one
+ * in YasOS libc; the word form is two instructions there.  bits != 0. */
+static inline int tcc_bitspan_ctz64(uint64_t bits)
+{
+  uint32_t lo = (uint32_t)bits;
+  return lo ? __builtin_ctz(lo) : 32 + __builtin_ctz((uint32_t)(bits >> 32));
+}
+
 /* Iterate the set-bit indices of `words[0..n)` in ascending order, binding each
  * to `idx` for the following statement/block. Indices >= `limit` are skipped
  * (indices are ascending, so this bounds the scan to the logical bit count).
@@ -90,6 +98,6 @@ static inline int tcc_bitspan_test(const uint64_t *words, size_t bit)
   for (size_t tcc_bitspan_word_ = 0; tcc_bitspan_word_ < (size_t)(n); tcc_bitspan_word_++)                          \
     for (uint64_t tcc_bitspan_bits_ = (words)[tcc_bitspan_word_]; tcc_bitspan_bits_;                                \
          tcc_bitspan_bits_ &= tcc_bitspan_bits_ - 1)                                                                \
-      for (int idx = (int)(tcc_bitspan_word_ << 6) + __builtin_ctzll(tcc_bitspan_bits_),                            \
+      for (int idx = (int)(tcc_bitspan_word_ << 6) + tcc_bitspan_ctz64(tcc_bitspan_bits_),                            \
                tcc_bitspan_go_ = (idx) < (int)(limit);                                                              \
            tcc_bitspan_go_; tcc_bitspan_go_ = 0)

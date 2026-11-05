@@ -291,7 +291,7 @@ int iv_read_reachable_outside(TCCIRState *ir, IRLoop *loop, int32_t iv_vr)
       IROperand d = tcc_ir_op_get_dest(ir, q);
       if (irop_get_vreg(d) == iv_vr)
       {
-        int direct = !d.is_lval || (TCCIR_DECODE_VREG_TYPE(iv_vr) == TCCIR_VREG_TYPE_VAR && d.is_local);
+        int direct = !d.is_lval || (TCCIR_DECODE_VREG_TYPE(iv_vr) == TCCIR_VREG_TYPE_VAR && irop_is_local(d));
         if (!direct)
         {
           result = 1; /* the IV used as an address */
@@ -598,17 +598,22 @@ static int iv_find_through_copy(TCCIRState *ir, const InductionVar *ivs, int num
 }
 
 /* Source reads of vr outside instruction skip; with_store_dest also counts a store's dest. */
-static int iv_vreg_use_count(TCCIRState *ir, int32_t vr, int skip, int with_store_dest)
+static int iv_vreg_use_count(TCCIRState *ir, int32_t vr, int skip, int with_store_dest, int enough)
 {
   int uses = 0;
-  for (int j = 0; j < ir->next_instruction_index; j++)
+  /* Up to `enough`, which is all the callers ask.  A use mostly follows closely, so
+   * start there: from instruction 0 this was a walk of the function per candidate. */
+  const int n = ir->next_instruction_index;
+  const int real = tcc_ir_vreg_is_real(vr);
+  for (int k = 0; k < n && uses < enough; k++)
   {
+    const int j = skip + 1 + k < n ? skip + 1 + k : skip + 1 + k - n;
     if (j == skip)
       continue;
     IRQuadCompact *uq = &ir->compact_instructions[j];
-    if (tcc_ir_op_src1_vreg(ir, uq) == vr)
+    if (IR_SLOT_HOLDS(src1, ir, uq, vr, real))
       uses++;
-    if (tcc_ir_op_src2_vreg(ir, uq) == vr)
+    if (IR_SLOT_HOLDS(src2, ir, uq, vr, real))
       uses++;
     if (with_store_dest &&
         (uq->op == TCCIR_OP_STORE || uq->op == TCCIR_OP_STORE_INDEXED || uq->op == TCCIR_OP_STORE_POSTINC) &&
@@ -856,13 +861,13 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
 
     /* ADD result must be used (dead-code check); multiple uses are fine */
     int dest_vr = irop_get_vreg(dest);
-    int use_count = iv_vreg_use_count(ir, dest_vr, i, 1);
+    int use_count = iv_vreg_use_count(ir, dest_vr, i, 1, 1);
 
     if (use_count < 1)
       continue; /* Dead code — skip */
 
     /* SHL result must be used only by this ADD, else we can't NOP it */
-    int shl_vr_uses = iv_vreg_use_count(ir, shl_vr, shl_idx, 0);
+    int shl_vr_uses = iv_vreg_use_count(ir, shl_vr, shl_idx, 0, 2);
 
     if (shl_vr_uses != 1)
     {
@@ -1001,7 +1006,7 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
 
     /* Dead-code check: must have at least one use of this MLA's dest. */
     int dest_vr = irop_get_vreg(dest);
-    int use_count = iv_vreg_use_count(ir, dest_vr, i, 1);
+    int use_count = iv_vreg_use_count(ir, dest_vr, i, 1, 1);
     if (use_count < 1)
       continue;
 
@@ -1232,7 +1237,7 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
        * plain "fetch the variable" form, not a dereference, and exactly how
        * the IV appears here. */
       if (cand_vr < 0 ||
-          (cand.is_lval && !(TCCIR_DECODE_VREG_TYPE(cand_vr) == TCCIR_VREG_TYPE_VAR && cand.is_local)))
+          (cand.is_lval && !(TCCIR_DECODE_VREG_TYPE(cand_vr) == TCCIR_VREG_TYPE_VAR && irop_is_local(cand))))
         continue;
       if (irop_is_immediate(other))
         continue;

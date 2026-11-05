@@ -112,10 +112,17 @@ static void ir_vreg_intervals_grow(IRLiveInterval **intervals, int *size, int ne
 }
 
 /* Allocate a temporary virtual register */
+static void ir_vreg_check_position(int next)
+{
+  if (next > TCCIR_VREG_POSITION_MASK)
+    tcc_error("function too large: more than %d virtual registers of one kind", TCCIR_VREG_POSITION_MASK);
+}
+
 int tcc_ir_vreg_alloc_temp(TCCIRState *ir)
 {
   if (ir == NULL)
     return -1;
+  ir_vreg_check_position(ir->next_temporary_variable);
 
   if (ir->next_temporary_variable >= ir->temporary_variables_live_intervals_size)
     ir_vreg_intervals_grow(&ir->temporary_variables_live_intervals, &ir->temporary_variables_live_intervals_size,
@@ -131,6 +138,7 @@ int tcc_ir_vreg_alloc_var(TCCIRState *ir)
 {
   if (ir == NULL)
     return -1;
+  ir_vreg_check_position(ir->next_local_variable);
 
   if (ir->next_local_variable >= ir->variables_live_intervals_size)
     ir_vreg_intervals_grow(&ir->variables_live_intervals, &ir->variables_live_intervals_size,
@@ -144,6 +152,7 @@ int tcc_ir_vreg_alloc_var(TCCIRState *ir)
 /* Allocate a parameter virtual register */
 int tcc_ir_vreg_alloc_param(TCCIRState *ir)
 {
+  ir_vreg_check_position(ir->next_parameter);
   if (ir->next_parameter >= ir->parameters_live_intervals_size)
     ir_vreg_intervals_grow(&ir->parameters_live_intervals, &ir->parameters_live_intervals_size,
                            ir->next_parameter + 1);

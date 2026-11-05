@@ -28,13 +28,8 @@ int tcc_ir_opt_zero_vla_elim(TCCIRState *ir)
   if (n == 0)
     return 0;
 
-  for (int i = 0; i < n; i++)
-  {
-    TccIrOp op = ir->compact_instructions[i].op;
-    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SETJMP || op == TCCIR_OP_LONGJMP ||
-        op == TCCIR_OP_INLINE_ASM)
-      return 0;
-  }
+  if (ir_opt_fn_features(ir) & (IR_FN_IJUMP | IR_FN_SETJMP | IR_FN_LONGJMP | IR_FN_INLINE_ASM))
+    return 0;
 
   int changed = 0;
   int eliminated_any = 0;

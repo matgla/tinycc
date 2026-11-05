@@ -97,7 +97,7 @@ int tcc_ir_opt_small_global_memset_to_store(TCCIRState *ir)
       continue;
 
     /* Dest must be a global symbol address (symref LEA form: is_lval=0, is_local=0). */
-    if (irop_get_tag(p_dst) != IROP_TAG_SYMREF || p_dst.is_lval || p_dst.is_local)
+    if (irop_get_tag(p_dst) != IROP_TAG_SYMREF || p_dst.is_lval || irop_is_local(p_dst))
       continue;
     IRPoolSymref *sr = irop_get_symref_ex(ir, p_dst);
     if (!sr || !sr->sym)
@@ -137,7 +137,7 @@ int tcc_ir_opt_small_global_memset_to_store(TCCIRState *ir)
     /* Repurpose the CALL slot itself as the STORE; NOP the call's PARAMs. */
     int call_id = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q));
     uint32_t sidx = tcc_ir_pool_add_symref(ir, sr->sym, base_addend, sr->flags);
-    IROperand st_dest = irop_make_symref(-1, sidx, /*is_lval*/ 1, /*is_local*/ 0, /*is_const*/ 0, btype);
+    IROperand st_dest = irop_make_symref(-1, sidx, /*is_lval*/ 1, btype);
     IROperand st_src = irop_make_imm32(-1, 0, btype);
     int pool_base = tcc_ir_iroperand_pool_add(ir, st_dest);
     tcc_ir_iroperand_pool_add(ir, st_src);

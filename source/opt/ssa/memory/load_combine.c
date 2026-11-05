@@ -55,7 +55,7 @@ static int lc_def_of(LcCtx *c, int32_t vr)
 /* A plain value read of a TEMP: a VREG operand, not dereferenced. */
 static int lc_plain_temp(IROperand o, int32_t *vr)
 {
-  if (irop_get_tag(o) != IROP_TAG_VREG || o.is_lval || o.is_llocal || o.is_local)
+  if (irop_get_tag(o) != IROP_TAG_VREG || o.is_lval || irop_is_llocal(o) || irop_is_local(o))
     return 0;
   int32_t v = irop_get_vreg(o);
   if (v < 0 || TCCIR_DECODE_VREG_TYPE(v) != TCCIR_VREG_TYPE_TEMP)
@@ -137,7 +137,7 @@ static int lc_byte_leaf(LcCtx *c, int32_t v, int any_sign, LcTerm *t, int depth)
   {
     IROperand s = tcc_ir_op_get_src1(ir, q);
     IROperand dst = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_tag(s) == IROP_TAG_STACKOFF && s.is_lval && !s.is_llocal && !s.is_param &&
+    if (irop_get_tag(s) == IROP_TAG_STACKOFF && s.is_lval && !irop_is_llocal(s) && !s.is_param &&
         irop_get_vreg(s) < 0 && irop_get_btype(s) == IROP_BTYPE_INT8 &&
         (any_sign || (s.is_unsigned && dst.is_unsigned)) && !tcc_ir_access_is_volatile(ir, s))
     {
@@ -148,7 +148,7 @@ static int lc_byte_leaf(LcCtx *c, int32_t v, int any_sign, LcTerm *t, int depth)
       t->indexed = 0;
       return 1;
     }
-    if (irop_get_tag(s) != IROP_TAG_VREG || !s.is_lval || s.is_llocal || s.is_local || irop_get_btype(s) != IROP_BTYPE_INT8)
+    if (irop_get_tag(s) != IROP_TAG_VREG || !s.is_lval || irop_is_llocal(s) || irop_is_local(s) || irop_get_btype(s) != IROP_BTYPE_INT8)
       return 0;
     /* Lowerings pick LDRB/LDRSB from either operand's flag: both must agree. */
     if (!any_sign && !(s.is_unsigned && dst.is_unsigned))
@@ -175,7 +175,7 @@ static int lc_byte_leaf(LcCtx *c, int32_t v, int any_sign, LcTerm *t, int depth)
       return 0;
     if (!any_sign && !dst.is_unsigned)
       return 0;
-    if (irop_get_tag(b) != IROP_TAG_VREG || b.is_lval || b.is_llocal || b.is_local)
+    if (irop_get_tag(b) != IROP_TAG_VREG || b.is_lval || irop_is_llocal(b) || irop_is_local(b))
       return 0;
     /* An index register with a fused shift is not the immediate it reads as. */
     if (ir->barrel_shifts && q->orig_index >= 0 && q->orig_index < ir->barrel_shifts_len &&
@@ -382,7 +382,7 @@ static int lc_try_root(LcCtx *c, int r)
   q->operand_base = base_idx;
   /* A new instruction: a fresh orig_index, or it would inherit the OR's
    * side-table annotations (a fused `lsl` on src2 = the index). */
-  q->orig_index = ++ir->max_orig_index;
+  q->orig_index = tcc_ir_fresh_orig_index(ir);
   return 1;
 }
 

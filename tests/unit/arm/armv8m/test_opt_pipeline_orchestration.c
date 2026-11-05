@@ -53,7 +53,7 @@ static TCCIRState *utb_pool_new(void)
 static IROperand utb_callee_ref(TCCIRState *ir, Sym *sym)
 {
   uint32_t sidx = tcc_ir_pool_add_symref(ir, sym, 0, 0);
-  return irop_make_symref(0, sidx, 0, 0, 0, I32);
+  return irop_make_symref(0, sidx, 0, I32);
 }
 
 /* A TEMP_LOCAL slot operand (anonymous compiler-generated stack temp),
@@ -63,7 +63,7 @@ static IROperand utb_callee_ref(TCCIRState *ir, Sym *sym)
  * matching LOAD/STORE operand that later reads it back. */
 static IROperand utb_templocal(int32_t vreg, int32_t off, int is_lval, int btype)
 {
-  return irop_make_stackoff(vreg, off, is_lval, /*is_llocal*/ 0, /*is_param*/ 0, btype);
+  return irop_make_stackoff(vreg, off, is_lval, /*is_param*/ 0, btype);
 }
 
 /* Runs a gens table through tcc_ir_opt_run_gens with a fresh ctx. */

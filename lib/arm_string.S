@@ -22,6 +22,8 @@
  *   r0 = dst (returned)
  *   r1 = src
  * ======================================================================== */
+.section .text.__tcc_strcpy,"ax",%progbits
+.align 2
 .global __tcc_strcpy
 .type __tcc_strcpy, %function
 __tcc_strcpy:
@@ -87,6 +89,8 @@ __tcc_strcpy:
  *   r1 = s2
  *   returns: <0, 0, or >0
  * ======================================================================== */
+.section .text.__tcc_strcmp,"ax",%progbits
+.align 2
 .global __tcc_strcmp
 .type __tcc_strcmp, %function
 __tcc_strcmp:
@@ -175,6 +179,8 @@ __tcc_strcmp:
  *   r0 = s
  *   returns: length (unsigned long)
  * ======================================================================== */
+.section .text.__tcc_strlen,"ax",%progbits
+.align 2
 .global __tcc_strlen
 .type __tcc_strlen, %function
 __tcc_strlen:

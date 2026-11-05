@@ -94,18 +94,15 @@ void lcs_collect_header_members(IRCFG *cfg, int header_b, uint8_t *member,
                                        uint8_t *scratch)
 {
   memset(member, 0, (size_t)cfg->num_blocks);
-  for (int b = 0; b < cfg->num_blocks; b++) {
-    IRBasicBlock *bb = &cfg->blocks[b];
-    for (int si = 0; si < bb->num_succs; si++) {
-      if (bb->succs[si] != header_b)
-        continue;
-      if (!tcc_ir_cfg_dominates(cfg, header_b, b))
-        continue;
-      fie_collect_members(cfg, header_b, b, scratch);
-      for (int k = 0; k < cfg->num_blocks; k++)
-        if (scratch[k])
-          member[k] = 1;
-    }
+  const IRBasicBlock *hb = &cfg->blocks[header_b];
+  for (int pi = 0; pi < hb->num_preds; pi++) {
+    const int b = hb->preds[pi];
+    if (!tcc_ir_cfg_dominates(cfg, header_b, b))
+      continue;
+    fie_collect_members(cfg, header_b, b, scratch);
+    for (int k = 0; k < cfg->num_blocks; k++)
+      if (scratch[k])
+        member[k] = 1;
   }
 }
 
@@ -193,21 +190,24 @@ int lcs_run_outermost(TCCIRState *ir, int max_passes, int stop_first,
 
     uint8_t *member = tcc_malloc((size_t)nb);
     uint8_t *scratch = tcc_malloc((size_t)nb);
-    uint8_t *other = tcc_malloc((size_t)nb);
+    uint8_t *inner = tcc_mallocz((size_t)nb);
+
+    /* Once per header, not once per pair: nothing below changes the CFG. */
+    int headers = 0;
+    for (int h = 0; h < nb; h++)
+      headers += is_header[h];
+    for (int h2 = 0; h2 < nb && headers > 1; h2++) {
+      if (!is_header[h2])
+        continue;
+      lcs_collect_header_members(cfg, h2, member, scratch);
+      for (int h = 0; h < nb; h++)
+        if (h != h2 && is_header[h] && member[h])
+          inner[h] = 1;
+    }
 
     int fired = 0;
     for (int h = 0; h < nb && !(stop_first && fired); h++) {
-      if (!is_header[h])
-        continue;
-      int inner = 0;
-      for (int h2 = 0; h2 < nb && !inner; h2++) {
-        if (h2 == h || !is_header[h2])
-          continue;
-        lcs_collect_header_members(cfg, h2, other, scratch);
-        if (other[h])
-          inner = 1;
-      }
-      if (inner)
+      if (!is_header[h] || inner[h])
         continue;
       if (fn(ir, cfg, h, member, scratch))
         fired++;
@@ -216,7 +216,7 @@ int lcs_run_outermost(TCCIRState *ir, int max_passes, int stop_first,
     tcc_free(is_header);
     tcc_free(member);
     tcc_free(scratch);
-    tcc_free(other);
+    tcc_free(inner);
     tcc_ir_cfg_free(cfg);
 
     total += fired;

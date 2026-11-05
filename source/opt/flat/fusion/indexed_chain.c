@@ -43,7 +43,7 @@ OPT_GEN_FLAT(indexed_chain, TCCIR_OP_LOAD_INDEXED)
   int32_t base_vr = irop_get_vreg(base_op);
   if (base_vr < 0)
     return 0;
-  if (base_op.is_local || base_op.is_llocal || base_op.is_lval)
+  if (irop_is_local(base_op) || irop_is_llocal(base_op) || base_op.is_lval)
     return 0;
 
   int add_idx = ir_opt_du_def(du, base_vr, i);
@@ -73,7 +73,7 @@ OPT_GEN_FLAT(indexed_chain, TCCIR_OP_LOAD_INDEXED)
   /* An lval operand is a memory read: `T <- P***DEREF*** ADD #k` adds k to the
    * value stored at P, not to P.  Folding it would drop that load and address
    * P + k -- `l.ptr[1].f` became a read of the frame slot `&l + 2096`. */
-  if (new_base.is_local || new_base.is_llocal || new_base.is_lval)
+  if (irop_is_local(new_base) || irop_is_llocal(new_base) || new_base.is_lval)
     return 0;
 
   long long imm_total = (long long)imm1 + imm2;

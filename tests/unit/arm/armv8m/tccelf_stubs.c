@@ -153,6 +153,11 @@ void _tcc_warning(const char *fmt, ...)
 /* -------------------------------------------------------------------------- */
 /* dynarray helpers (real algorithm from libtcc.c). */
 
+void tcc_qsort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *))
+{
+  qsort(base, n, size, cmp);
+}
+
 void dynarray_add(void *ptab, int *nb_ptr, void *data)
 {
   int nb, nb_alloc;

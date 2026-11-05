@@ -508,30 +508,6 @@ UT_TEST(test_reassoc_inner_lval_src1)
 }
 
 /* ========================================================================
- * No reassociation when inner src1 is a local (is_local)
- * ======================================================================== */
-
-UT_TEST(test_reassoc_inner_local_src1)
-{
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
-  /* t0 = local(0); t1 = t0 + #2; t2 = t1 + #3 */
-  IROperand local = utb_llocal(utb_temp(0, I32));
-  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(1, I32), local,
-                 utb_imm(2, I32));
-  reassoc_emit_imm(&c, TCCIR_OP_ADD, 2, 1, 3);
-
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_reassoc(c.ctx);
-  UT_ASSERT_EQ(changed, 0);
-
-  ssa_ctx_free(&c);
-  return 0;
-}
-
-/* ========================================================================
  * No reassociation when inner src2 is not an immediate
  * ======================================================================== */
 
@@ -975,7 +951,7 @@ UT_TEST(test_reassoc_no_vinfo_inner)
 static IROperand reassoc_symref_addend(TCCIRState *ir, Sym *sym, int32_t addend)
 {
   uint32_t sidx = tcc_ir_pool_add_symref(ir, sym, addend, 0);
-  return irop_make_symref(-1, sidx, 0, 0, 0, I32);
+  return irop_make_symref(-1, sidx, 0, I32);
 }
 
 UT_TEST(test_reassoc_symref_def_add)

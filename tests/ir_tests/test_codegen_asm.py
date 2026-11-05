@@ -1413,7 +1413,9 @@ def test_volatile_access_not_duplicated(opt):
     for name, insns in sorted(cases):
         mult = copies if name[0] == "r" else 1
         want_loads, want_stores = (int(x) * mult for x in name.rsplit("_", 2)[1:])
-        loads, stores = _mem_counts(insns)
+        # The volatile objects are globals: a value that crosses a block at -O0 has
+        # a frame slot, and its loads and stores are not theirs.
+        loads, stores = _mem_counts([i for i in insns if "[sp" not in i[1]])
         if loads != want_loads or stores != want_stores:
             failures.append(f"{name}: want exactly {want_loads} ldr / {want_stores} str, got {loads}/{stores}")
     assert not failures, f"wrong number of volatile accesses at {opt}:\n  " + "\n  ".join(failures)

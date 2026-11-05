@@ -1141,6 +1141,21 @@ ST_FUNC void vstore(void)
         vtop->type = saved_struct_type;
         goto vstore_done;
       }
+      if ((src_deref || src_slot) && (dst_deref || dst_slot) && !vtop[0].volatile_access && !vtop[-1].volatile_access &&
+          !type_has_volatile(&vtop[0].type, 0) && !type_has_volatile(&vtop[-1].type, 0))
+      {
+        chunks = small_unaligned_copy_plan(&saved_struct_type, size, align, &w, covered);
+        if (chunks > 0 && chunks <= small_aggregate_copy_max_chunks())
+        {
+          SValue src = vtop[0];
+          SValue dst = vtop[-1];
+          vtop--; /* pop src; vtop = dst (kept as result lvalue) */
+          if (!(IS_LOCAL_LVAL(src.r) && IS_LOCAL_LVAL(dst.r) && src.c.i == dst.c.i))
+            ir_emit_small_unaligned_copy(&src, src_deref, &dst, dst_deref, size, covered);
+          vtop->type = saved_struct_type;
+          goto vstore_done;
+        }
+      }
     }
     /* A copy of a frame slot onto itself: `t = f();` returns f's struct through
      * the hidden result pointer straight into t's slot, then the store copies

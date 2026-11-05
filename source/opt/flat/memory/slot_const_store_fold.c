@@ -58,7 +58,7 @@ static int scsf_width(int btype)
 /* A concrete slot of this function's own frame. */
 static int scsf_slot(IROperand op, int32_t *off)
 {
-  if (irop_is_none(op) || irop_get_tag(op) != IROP_TAG_STACKOFF || !op.is_local || op.is_param || op.is_llocal ||
+  if (irop_is_none(op) || irop_get_tag(op) != IROP_TAG_STACKOFF || !irop_is_local(op) || op.is_param || irop_is_llocal(op) ||
       irop_get_vreg(op) >= 0)
     return 0;
   *off = irop_get_stack_offset(op);

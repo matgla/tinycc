@@ -268,7 +268,7 @@ UT_TEST(test_pack64_stack_stores_var_spill_alias_no_fire)
    * passes vreg=0 / vreg_type=0, so the aliasing shape is constructed here by
    * hand to mirror production's VAR-with-STACKOFF-tag encoding). */
   IROperand slot_base_load_var_alias = irop_make_stackoff(
-      TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 7), 16, /*is_lval=*/1, /*is_llocal=*/0, /*is_param=*/0, I64);
+      TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 7), 16, /*is_lval=*/1, /*is_param=*/0, I64);
 
   int i_store_lo = utb_emit(ir, TCCIR_OP_STORE, slot_lo, utb_temp(0, I32), UTB_NONE);
   int i_store_hi = utb_emit(ir, TCCIR_OP_STORE, slot_hi, utb_temp(1, I32), UTB_NONE);

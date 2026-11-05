@@ -439,7 +439,7 @@ int tcc_ir_opt_inline_param_copy_elim(TCCIRState *ir)
            * frame word (libsoftfp fmul: subnormal products came back 0). */
           if (!(src1_is_address && forwarding_temp) && irop_get_btype(s) == irop_get_btype(lsrc) &&
               s.is_unsigned == lsrc.is_unsigned && (forwarding_temp || s.is_lval == lsrc.is_lval) &&
-              !s.is_llocal)
+              !irop_is_llocal(s))
           {
             tcc_ir_set_src1(ir, j, lsrc);
             ipc_span_note(span, max_var, src_vr, j);
@@ -454,7 +454,7 @@ int tcc_ir_opt_inline_param_copy_elim(TCCIRState *ir)
         IROperand s = tcc_ir_op_get_src2(ir, u);
         if (irop_get_vreg(s) == dst_vr && irop_get_btype(s) == irop_get_btype(lsrc) &&
             s.is_unsigned == lsrc.is_unsigned && (forwarding_temp || s.is_lval == lsrc.is_lval) &&
-            !s.is_llocal)
+            !irop_is_llocal(s))
         {
           tcc_ir_set_src2(ir, j, lsrc);
           ipc_span_note(span, max_var, src_vr, j);

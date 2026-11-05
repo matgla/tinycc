@@ -70,6 +70,18 @@ static void section_ht_insert(TCCState *s1, Section *sec)
   s1->section_ht[idx] = sec;
   s1->section_ht_count++;
 }
+/* After sections were freed: only those still in s1->sections stay findable. */
+ST_FUNC void section_ht_rebuild(TCCState *s1)
+{
+  int i;
+  tcc_free(s1->section_ht);
+  s1->section_ht = NULL;
+  s1->section_ht_mask = 0;
+  s1->section_ht_count = 0;
+  for (i = 1; i < s1->nb_sections; i++)
+    section_ht_insert(s1, s1->sections[i]);
+}
+
 Section *section_ht_find(TCCState *s1, const char *name)
 {
   unsigned int idx;
@@ -88,11 +100,41 @@ Section *section_ht_find(TCCState *s1, const char *name)
 
 /* ---- End section name hash table ---- */
 
+/* Memory from the link arena, zeroed, or NULL if there is none left. */
+ST_FUNC void *link_arena_alloc(TCCState *s1, unsigned long size)
+{
+  void *p;
+  size = (size + 7) & ~7ul;
+  if (size > s1->link_arena_size - s1->link_arena_used)
+    return NULL;
+  p = s1->link_arena + s1->link_arena_used;
+  s1->link_arena_used += size;
+  memset(p, 0, size);
+  return p;
+}
+
+ST_FUNC int link_arena_owns(const TCCState *s1, const void *p)
+{
+  const unsigned char *c = p;
+  return s1->link_arena && c >= s1->link_arena && c < s1->link_arena + s1->link_arena_size;
+}
+
+static Section *new_section_at(TCCState *s1, Section *sec, const char *name, int sh_type, int sh_flags);
+
 ST_FUNC Section *new_section(TCCState *s1, const char *name, int sh_type, int sh_flags)
 {
-  Section *sec;
+  return new_section_at(s1, tcc_mallocz(sizeof(Section) + strlen(name)), name, sh_type, sh_flags);
+}
 
-  sec = tcc_mallocz(sizeof(Section) + strlen(name));
+/* A section coalesce_split_sections will free: from the arena if it has room. */
+ST_FUNC Section *new_input_section(TCCState *s1, const char *name, int sh_type, int sh_flags)
+{
+  Section *sec = link_arena_alloc(s1, sizeof(Section) + strlen(name));
+  return sec ? new_section_at(s1, sec, name, sh_type, sh_flags) : new_section(s1, name, sh_type, sh_flags);
+}
+
+static Section *new_section_at(TCCState *s1, Section *sec, const char *name, int sh_type, int sh_flags)
+{
   sec->s1 = s1;
   strcpy(sec->name, name);
   sec->sh_type = sh_type;
@@ -164,6 +206,17 @@ ST_FUNC Section *new_symtab(TCCState *s1, const char *symtab_name, int sh_type, 
 }
 
 /* realloc section and set its content to zero */
+/* Bytes in the link arena cannot be realloc'ed: they move out to grow. */
+static unsigned char *section_grow_data(Section *sec, unsigned long size)
+{
+  unsigned char *data;
+  if (!sec->data || !link_arena_owns(sec->s1, sec->data))
+    return tcc_realloc(sec->data, size);
+  data = tcc_malloc(size);
+  memcpy(data, sec->data, sec->data_allocated);
+  return data;
+}
+
 ST_FUNC void section_realloc(Section *sec, unsigned long new_size)
 {
   unsigned long size;
@@ -183,10 +236,42 @@ ST_FUNC void section_realloc(Section *sec, unsigned long new_size)
     while (size < new_size)
       size = size * 2;
   }
-  data = tcc_realloc(sec->data, size);
+  data = section_grow_data(sec, size);
   memset(data + sec->data_allocated, 0, size - sec->data_allocated);
   sec->data = data;
   sec->data_allocated = size;
+}
+
+/* Capacity of exactly `size` bytes, for a section whose size is known: growing
+ * to it through section_realloc costs up to twice as much, on a device where a
+ * link's sections are most of the memory there is. */
+ST_FUNC void section_reserve_exact(Section *sec, unsigned long size)
+{
+  unsigned char *data;
+
+  if (size <= sec->data_allocated)
+    return;
+  /* An input section's relocations, freed together with the arena. */
+  if (!sec->data && sec->sh_type == SHT_RELX && link_arena_owns(sec->s1, sec) &&
+      (data = link_arena_alloc(sec->s1, size)) != NULL)
+  {
+    sec->data = data;
+    sec->data_allocated = size;
+    return;
+  }
+  data = section_grow_data(sec, size);
+  memset(data + sec->data_allocated, 0, size - sec->data_allocated);
+  sec->data = data;
+  sec->data_allocated = size;
+}
+
+/* Give back a section's bytes once nothing will read them again. */
+ST_FUNC void section_release(Section *sec)
+{
+  if (!link_arena_owns(sec->s1, sec->data))
+    tcc_free(sec->data);
+  sec->data = NULL;
+  sec->data_allocated = sec->data_offset = 0;
 }
 
 /* reserve at least 'size' bytes aligned per 'align' in section
@@ -788,10 +873,29 @@ ST_FUNC int set_elf_sym(Section *s, addr_t value, unsigned long size, int info, 
 }
 
 /* put relocation */
+/* s's relocation section, created if it has none yet */
+ST_FUNC Section *section_reloc(Section *symtab, Section *s)
+{
+  char buf[256];
+  Section *sr = s->reloc;
+
+  if (!sr)
+  {
+    snprintf(buf, sizeof(buf), REL_SECTION_FMT, s->name);
+    /* if the symtab is allocated, then we consider the relocation
+       are also */
+    sr = new_section(s->s1, buf, SHT_RELX, symtab->sh_flags);
+    sr->sh_entsize = sizeof(ElfW_Rel);
+    sr->link = symtab;
+    sr->sh_info = s->sh_num;
+    s->reloc = sr;
+  }
+  return sr;
+}
+
 ST_FUNC void put_elf_reloca(Section *symtab, Section *s, unsigned long offset, int type, int symbol, addr_t addend)
 {
   TCCState *s1 = s->s1;
-  char buf[256];
   Section *sr;
   ElfW_Rel *rel;
 
@@ -809,19 +913,7 @@ ST_FUNC void put_elf_reloca(Section *symtab, Section *s, unsigned long offset, i
     }
   }
 
-  sr = s->reloc;
-  if (!sr)
-  {
-    /* if no relocation section, create it */
-    snprintf(buf, sizeof(buf), REL_SECTION_FMT, s->name);
-    /* if the symtab is allocated, then we consider the relocation
-       are also */
-    sr = new_section(s->s1, buf, SHT_RELX, symtab->sh_flags);
-    sr->sh_entsize = sizeof(ElfW_Rel);
-    sr->link = symtab;
-    sr->sh_info = s->sh_num;
-    s->reloc = sr;
-  }
+  sr = section_reloc(symtab, s);
   rel = section_ptr_add(sr, sizeof(ElfW_Rel));
   rel->r_offset = offset;
   rel->r_info = ELFW(R_INFO)(symbol, type);
@@ -837,25 +929,30 @@ ST_FUNC void put_elf_reloc(Section *symtab, Section *s, unsigned long offset, in
   put_elf_reloca(symtab, s, offset, type, symbol, 0);
 }
 
+/* One small block per 1024 symbols, made when a symbol in it first needs one.
+ * The table is wanted last in a link, after .text, and one array of it was half
+ * a megabyte of contiguous memory that no longer existed.  Attributes do not
+ * move once handed out.  Without alloc a symbol that has none reads entry 0,
+ * which stays zero. */
+#define SYM_ATTR_CHUNK_BITS 10
 ST_FUNC struct sym_attr *get_sym_attr(TCCState *s1, int index, int alloc)
 {
-  int n;
-  struct sym_attr *tab;
+  int chunk = index >> SYM_ATTR_CHUNK_BITS;
 
-  if (index >= s1->nb_sym_attrs)
+  if (chunk >= s1->nb_sym_attr_chunks || !s1->sym_attr_chunks[chunk])
   {
     if (!alloc)
-      return s1->sym_attrs;
-    /* find immediately bigger power of 2 and reallocate array */
-    n = 1;
-    while (index >= n)
-      n *= 2;
-    tab = tcc_realloc(s1->sym_attrs, n * sizeof(*s1->sym_attrs));
-    s1->sym_attrs = tab;
-    memset(s1->sym_attrs + s1->nb_sym_attrs, 0, (n - s1->nb_sym_attrs) * sizeof(*s1->sym_attrs));
-    s1->nb_sym_attrs = n;
+      return s1->sym_attr_chunks[0];
+    if (chunk >= s1->nb_sym_attr_chunks)
+    {
+      s1->sym_attr_chunks = tcc_realloc(s1->sym_attr_chunks, (chunk + 1) * sizeof(*s1->sym_attr_chunks));
+      memset(s1->sym_attr_chunks + s1->nb_sym_attr_chunks, 0,
+             (chunk + 1 - s1->nb_sym_attr_chunks) * sizeof(*s1->sym_attr_chunks));
+      s1->nb_sym_attr_chunks = chunk + 1;
+    }
+    s1->sym_attr_chunks[chunk] = tcc_mallocz(sizeof(struct sym_attr) << SYM_ATTR_CHUNK_BITS);
   }
-  return &s1->sym_attrs[index];
+  return &s1->sym_attr_chunks[chunk][index & ((1 << SYM_ATTR_CHUNK_BITS) - 1)];
 }
 void update_relocs(TCCState *s1, Section *s, int *old_to_new_syms, int first_sym)
 {

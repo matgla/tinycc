@@ -56,7 +56,7 @@ static IROperand utb_callee_named(TCCIRState *ir, Sym *sym, int tok)
   memset(sym, 0, sizeof(*sym));
   sym->v = tok;
   uint32_t sidx = tcc_ir_pool_add_symref(ir, sym, 0, 0);
-  return irop_make_symref(0, sidx, 0, 0, 0, I32);
+  return irop_make_symref(0, sidx, 0, I32);
 }
 
 /* =========================================================================
@@ -1033,8 +1033,8 @@ UT_TEST(test_nonvreg_expr_equal_symref_same_sym_and_addend)
   s.v = 60;
   uint32_t idx1 = tcc_ir_pool_add_symref(ir, &s, /*addend*/ 4, 0);
   uint32_t idx2 = tcc_ir_pool_add_symref(ir, &s, /*addend*/ 4, 0);
-  IROperand a = irop_make_symref(0, idx1, 1, 0, 0, I32);
-  IROperand b = irop_make_symref(0, idx2, 1, 0, 0, I32);
+  IROperand a = irop_make_symref(0, idx1, 1, I32);
+  IROperand b = irop_make_symref(0, idx2, 1, I32);
   UT_ASSERT_EQ(ir_opt_nonvreg_expr_equal(ir, a, b), 1);
   utb_free(ir);
   return 0;
@@ -1049,8 +1049,8 @@ UT_TEST(test_nonvreg_expr_equal_symref_different_addend)
   s.v = 61;
   uint32_t idx1 = tcc_ir_pool_add_symref(ir, &s, 0, 0);
   uint32_t idx2 = tcc_ir_pool_add_symref(ir, &s, 4, 0);
-  IROperand a = irop_make_symref(0, idx1, 1, 0, 0, I32);
-  IROperand b = irop_make_symref(0, idx2, 1, 0, 0, I32);
+  IROperand a = irop_make_symref(0, idx1, 1, I32);
+  IROperand b = irop_make_symref(0, idx2, 1, I32);
   UT_ASSERT_EQ(ir_opt_nonvreg_expr_equal(ir, a, b), 0);
   utb_free(ir);
   return 0;
@@ -1067,8 +1067,8 @@ UT_TEST(test_nonvreg_expr_equal_symref_different_sym)
   s2.v = 63;
   uint32_t idx1 = tcc_ir_pool_add_symref(ir, &s1, 0, 0);
   uint32_t idx2 = tcc_ir_pool_add_symref(ir, &s2, 0, 0);
-  IROperand a = irop_make_symref(0, idx1, 1, 0, 0, I32);
-  IROperand b = irop_make_symref(0, idx2, 1, 0, 0, I32);
+  IROperand a = irop_make_symref(0, idx1, 1, I32);
+  IROperand b = irop_make_symref(0, idx2, 1, I32);
   UT_ASSERT_EQ(ir_opt_nonvreg_expr_equal(ir, a, b), 0);
   utb_free(ir);
   return 0;
@@ -1645,7 +1645,7 @@ UT_TEST(test_get_constant_string_from_symref_no_elf_state_returns_null)
   memset(&s, 0, sizeof(s));
   s.v = 90;
   uint32_t idx = tcc_ir_pool_add_symref(ir, &s, /*addend*/ 0, 0);
-  IROperand op = irop_make_symref(0, idx, 0, 0, 1, I32);
+  IROperand op = irop_make_symref(0, idx, 0, I32);
 
   const char *out = ir_opt_get_constant_string_from_symref(ir, op);
   UT_ASSERT(out == NULL);
@@ -1681,7 +1681,7 @@ UT_TEST(test_get_constant_string_from_symref_negative_addend_returns_null)
   memset(&s, 0, sizeof(s));
   s.v = 91;
   uint32_t idx = tcc_ir_pool_add_symref(ir, &s, /*addend*/ -1, 0);
-  IROperand op = irop_make_symref(0, idx, 0, 0, 1, I32);
+  IROperand op = irop_make_symref(0, idx, 0, I32);
 
   UT_ASSERT(ir_opt_get_constant_string_from_symref(ir, op) == NULL);
 
@@ -1754,7 +1754,7 @@ UT_TEST(test_change_callee_sym_keep_type_null_sym_returns_0)
   utb_pools_init(ir);
 
   uint32_t idx = tcc_ir_pool_add_symref(ir, NULL, 0, 0);
-  IROperand fn = irop_make_symref(0, idx, 0, 0, 0, I32);
+  IROperand fn = irop_make_symref(0, idx, 0, I32);
   int call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), fn,
                       utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 0), I32));
 
@@ -2102,5 +2102,57 @@ UT_TEST(test_softfp_cmp3_is_double_selects_interpretation)
   UT_ASSERT_EQ(is_nan, 1); /* double: unordered */
   UT_ASSERT_EQ(ir_softfp_cmp3(0, 0x7FF8000000000000LL, 0LL, &is_nan), 0);
   UT_ASSERT_EQ(is_nan, 0); /* float: +0.0f == +0.0f, NOT NaN */
+  return 0;
+}
+
+/* ================================================================ ir_opt_fn_features */
+
+/* Every bit the prescans ask for is set by the op that defines it, and only
+ * by it: an ordinary body reports none. */
+UT_TEST(test_fn_features_bits_follow_the_body)
+{
+  TCCIRState *ir = utb_new();
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(0, I32), UTB_NONE);
+  UT_ASSERT_EQ(ir_opt_fn_features(ir), 0u);
+
+  int j = utb_emit(ir, TCCIR_OP_JUMP, utb_imm(0, I32), UTB_NONE, UTB_NONE);
+  ir->compact_instructions[j].is_jump_target = 1;
+  UT_ASSERT_EQ(ir_opt_fn_features(ir), (uint32_t)(IR_FN_JUMP | IR_FN_INNER_TARGET));
+
+  utb_emit(ir, TCCIR_OP_IJUMP, UTB_NONE, utb_temp(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_FUNCCALLVOID, UTB_NONE, utb_temp(0, I32), UTB_NONE);
+  uint32_t f = ir_opt_fn_features(ir);
+  UT_ASSERT(f & IR_FN_IJUMP);
+  UT_ASSERT(f & IR_FN_CALL);
+  UT_ASSERT(!(f & (IR_FN_SETJMP | IR_FN_INLINE_ASM | IR_FN_SWITCH_TABLE | IR_FN_SET_CHAIN)));
+
+  /* A target on the first instruction is the function entry, not an inner label. */
+  TCCIRState *ir2 = utb_new();
+  int e = utb_emit(ir2, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir2->compact_instructions[e].is_jump_target = 1;
+  UT_ASSERT_EQ(ir_opt_fn_features(ir2), 0u);
+  return 0;
+}
+
+/* The cache serves a body only while the engine's generation token names it:
+ * with the token clear every call scans, with it set a stale value is kept
+ * until the token moves (which the engine does on every reported change). */
+UT_TEST(test_fn_features_cache_keyed_on_opt_generation)
+{
+  TCCIRState *ir = utb_new();
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+  UT_ASSERT_EQ(ir_opt_fn_features(ir), 0u);
+  int i = utb_emit(ir, TCCIR_OP_IJUMP, UTB_NONE, utb_temp(0, I32), UTB_NONE);
+  UT_ASSERT_EQ(ir_opt_fn_features(ir), (uint32_t)IR_FN_IJUMP); /* no token: rescanned */
+
+  ir->opt_generation = 7;
+  UT_ASSERT_EQ(ir_opt_fn_features(ir), (uint32_t)IR_FN_IJUMP);
+  ir->compact_instructions[i].op = TCCIR_OP_NOP;
+  UT_ASSERT_EQ(ir_opt_fn_features(ir), (uint32_t)IR_FN_IJUMP); /* same token: cached */
+  ir->opt_generation = 8;
+  UT_ASSERT_EQ(ir_opt_fn_features(ir), 0u);                     /* token moved: rescanned */
+  ir->opt_generation = 0;
+  UT_ASSERT_EQ(ir_opt_fn_features(ir), 0u);
   return 0;
 }

@@ -77,7 +77,7 @@ static int piv_is_def_of(TCCIRState *ir, IRQuadCompact *q, int32_t vr, int *out_
   IROperand dest = tcc_ir_op_get_dest(ir, q);
   if (irop_get_vreg(dest) != vr)
     return 0;
-  if (q->op == TCCIR_OP_STORE && dest.is_lval && !dest.is_local)
+  if (q->op == TCCIR_OP_STORE && dest.is_lval && !irop_is_local(dest))
     return 0;
   *out_lval = dest.is_lval;
   return 1;
@@ -97,10 +97,10 @@ static int ptr_iv_find_init(TCCIRState *ir, int vreg, int preheader_idx,
     if (q->op != TCCIR_OP_ASSIGN)
       return 0;
     IROperand src1 = tcc_ir_op_get_src1(ir, q);
-    if (irop_get_tag(src1) != IROP_TAG_STACKOFF || src1.is_lval || !src1.is_local)
+    if (irop_get_tag(src1) != IROP_TAG_STACKOFF || src1.is_lval || !irop_is_local(src1))
       return 0;
     *out_off = (int)irop_get_imm64_ex(ir, src1);
-    *out_is_llocal = src1.is_llocal;
+    *out_is_llocal = irop_is_llocal(src1);
     *out_is_param = src1.is_param;
     *out_init_idx = j;
     *out_btype = irop_get_btype(src1);
@@ -150,7 +150,7 @@ static int piv_resolve_frame_addr(TCCIRState *ir, IROperand op, int exit_target,
     return 0;
 
   if (irop_get_tag(op) == IROP_TAG_STACKOFF && irop_get_vreg(op) == -1 &&
-      !op.is_lval && op.is_local) {
+      !op.is_lval && irop_is_local(op)) {
     *out_off = (int32_t)irop_get_imm64_ex(ir, op);
     *out_is_param = op.is_param;
     return 1;
@@ -170,7 +170,7 @@ static int piv_resolve_frame_addr(TCCIRState *ir, IROperand op, int exit_target,
     if (q->op == TCCIR_OP_LEA) {
       IROperand src = tcc_ir_op_get_src1(ir, q);
       if (irop_get_tag(src) != IROP_TAG_STACKOFF || irop_get_vreg(src) != -1 ||
-          src.is_lval || !src.is_local)
+          src.is_lval || !irop_is_local(src))
         return 0;
       *out_off = (int32_t)irop_get_imm64_ex(ir, src);
       *out_is_param = src.is_param;
@@ -395,8 +395,7 @@ static int ptr_iv_exit_subst_loop(TCCIRState *ir, IRLoop *loop,
       if (!live[p]) continue;
       int32_t final_off = (int32_t)((int64_t)pivs[p].init_off +
                                     (int64_t)pivs[p].step * (int64_t)trip_count);
-      IROperand repl = irop_make_stackoff(-1, final_off, /*is_lval*/ 0,
-                                          pivs[p].is_llocal, pivs[p].is_param,
+      IROperand repl = irop_make_stackoff(-1, final_off, /*is_lval*/ 0, pivs[p].is_param,
                                           pivs[p].btype);
       subs_here += ptr_iv_subst_uses_in_instr(ir, j, pivs[p].vreg, repl);
     }
@@ -412,7 +411,7 @@ static int ptr_iv_exit_subst_loop(TCCIRState *ir, IRLoop *loop,
     /* A STORE through a vreg-deref does not redefine it. */
     if (irop_config[q->op].has_dest) {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
-      if (!(q->op == TCCIR_OP_STORE && dest.is_lval && !dest.is_local)) {
+      if (!(q->op == TCCIR_OP_STORE && dest.is_lval && !irop_is_local(dest))) {
         int32_t dvr = irop_get_vreg(dest);
         if (dvr >= 0) {
           for (int p = 0; p < n_pivs; p++) {

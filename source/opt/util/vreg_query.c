@@ -35,6 +35,7 @@ int tcc_ir_vreg_has_single_def(TCCIRState *ir, int32_t vreg)
     return defs == 1;
   int def_count = 0;
   int n = ir->next_instruction_index;
+  const int real = tcc_ir_vreg_is_real(vreg);
 
   for (int i = 0; i < n; ++i)
   {
@@ -43,7 +44,7 @@ int tcc_ir_vreg_has_single_def(TCCIRState *ir, int32_t vreg)
       continue;
     if (!irop_config[q->op].has_dest)
       continue;
-    if (tcc_ir_op_dest_vreg(ir, q) == vreg)
+    if (IR_SLOT_HOLDS(dest, ir, q, vreg, real))
     {
       def_count++;
       if (def_count > 1)

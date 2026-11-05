@@ -122,7 +122,7 @@ int tcc_ir_opt_noreturn_collapse(TCCIRState *ir)
           continue;
         op = tcc_ir_op_get_src2(ir, q);
       }
-      if (op.is_sym)
+      if (irop_is_sym(op))
       {
         Sym *sym = irop_get_sym_ex(ir, op);
         if (sym && (sym->type.t & VT_VOLATILE))

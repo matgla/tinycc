@@ -27,7 +27,6 @@
 /* Pass entry points (declared in ir/opt.h; forward-declared to avoid pulling in
  * the optimizer engine headers). */
 int tcc_ir_opt_uninit_local_ub(TCCIRState *ir);
-int tcc_ir_opt_uninit_dominates_return(TCCIRState *ir);
 
 #define I32 IROP_BTYPE_INT32
 
@@ -49,7 +48,7 @@ static void reset_optimize(void)
 static IROperand utb_var_addr(int pos, int btype)
 {
   IROperand op = utb_var(pos, btype);
-  op.is_local = 1;
+  op.tag = IROP_TAG_STACKOFF;
   return op;
 }
 
@@ -228,118 +227,6 @@ UT_TEST(test_uninit_ub_optimize_gate)
   return 0;
 }
 
-/* ===================================================== uninit_dominates_return */
-
-/* POSITIVE: the first read of uninit V0 dominates the only RETURNVALUE and there
- * are no observable side effects.  The body collapses to a self-jump.
- *   i0: T0 = V0 ADD #1   ->  JUMP -> 0
- *   i1: RETURNVALUE #0
- */
-UT_TEST(test_uninit_dom_ret_read_dominates_return_collapses)
-{
-  TCCIRState *ir = utb_new();
-  setup_optimize();
-
-  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_var(0, I32), utb_imm(1, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_uninit_dominates_return(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_JUMP);
-  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
-
-  utb_free(ir);
-  reset_optimize();
-  return 0;
-}
-
-/* GUARD: a return block that is not dominated by the uninit read prevents
- * collapse.  The early return on the fall-through path is reachable without
- * executing the read.
- *   i0: JUMPIF -> 2, cond T0
- *   i1: RETURNVALUE #1
- *   i2: T0 = V0 ADD #1
- *   i3: RETURNVALUE #0
- */
-UT_TEST(test_uninit_dom_ret_return_not_dominated_no_change)
-{
-  TCCIRState *ir = utb_new();
-  setup_optimize();
-
-  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(2, I32), utb_temp(0, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_var(0, I32), utb_imm(1, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_uninit_dominates_return(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_JUMPIF);
-  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_RETURNVALUE);
-  UT_ASSERT_EQ(utb_op(ir, 2), TCCIR_OP_ADD);
-  UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_RETURNVALUE);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
-
-  utb_free(ir);
-  reset_optimize();
-  return 0;
-}
-
-/* GUARD: observable side effects before the dominated return keep the body
- * intact.
- *   i0: T0 = V0 ADD #1
- *   i1: FUNCCALLVOID foo
- *   i2: RETURNVALUE #0
- */
-UT_TEST(test_uninit_dom_ret_side_effects_no_change)
-{
-  TCCIRState *ir = utb_new();
-  setup_optimize();
-
-  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_var(0, I32), utb_imm(1, I32));
-  utb_emit(ir, TCCIR_OP_FUNCCALLVOID, UTB_NONE, utb_imm(0, I32), utb_imm(0, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_uninit_dominates_return(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_ADD);
-  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_FUNCCALLVOID);
-  UT_ASSERT_EQ(utb_op(ir, 2), TCCIR_OP_RETURNVALUE);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
-
-  utb_free(ir);
-  reset_optimize();
-  return 0;
-}
-
-/* GUARD: if the function has no explicit or implicit return, the pass has
- * nothing to dominate and returns 0 (the case is handled by uninit_local_ub).
- *   i0: T0 = V0 ADD #1
- *   i1: JUMP -> 1
- */
-UT_TEST(test_uninit_dom_ret_no_returns_no_change)
-{
-  TCCIRState *ir = utb_new();
-  setup_optimize();
-
-  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_var(0, I32), utb_imm(1, I32));
-  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(1, I32), UTB_NONE, UTB_NONE);
-
-  int changes = tcc_ir_opt_uninit_dominates_return(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_ADD);
-  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_JUMP);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
-
-  utb_free(ir);
-  reset_optimize();
-  return 0;
-}
-
 UT_TEST(test_uninit_local_ub_direct_call)
 {
   TCCIRState *ir = utb_new();
@@ -358,25 +245,4 @@ UT_TEST(test_uninit_local_ub_direct_call)
   return 0;
 }
 
-UT_TEST(test_uninit_dominates_return_direct_call)
-{
-  TCCIRState *ir = utb_new();
-  setup_optimize();
-
-  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_var(0, I32), utb_imm(1, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_uninit_dominates_return(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_JUMP);
-  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
-
-  utb_free(ir);
-  reset_optimize();
-  return 0;
-}
-
 UT_COVERS("uninit_ub");
-UT_COVERS("uninit_dom_ret");

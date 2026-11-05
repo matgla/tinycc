@@ -225,25 +225,6 @@ static int cef_xor_cancel(TCCIRState *ir, const uint8_t *dc, int dc_stride)
   return changes;
 }
 
-/* Standalone entry: the fusion group is what turns the embedded derefs of
- * `(*p ^ *q) == *q` into the plain-register XOR/CMP form this fold matches, so
- * it must also run after that group, not only inside cmp_expr_fold. */
-int tcc_ir_opt_cmp_xor_cancel(TCCIRState *ir)
-{
-  int n = ir->next_instruction_index;
-  if (n < 2 || n > 4000)
-    return 0;
-
-  int dc_stride = 0;
-  uint8_t *dc = ir_opt_build_def_count(ir, n, &dc_stride);
-  int changes = cef_xor_cancel(ir, dc, dc_stride);
-  tcc_free(dc);
-
-  if (changes)
-    changes += tcc_ir_opt_dce(ir);
-  return changes;
-}
-
 
 /* Pre-SSA: naming a vreg does not mean naming one value.  True only when `vr`
  * has exactly one definition in this function and that definition precedes
@@ -310,17 +291,17 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
       is_equal = ir_opt_nonvreg_expr_equal(ir, src1, src2);
       /* Floats excluded (NaN != NaN). */
       if (!is_equal && irop_is_immediate(src1) && irop_is_immediate(src2) &&
-          !src1.is_sym && !src2.is_sym &&
+          !irop_is_sym(src1) && !irop_is_sym(src2) &&
           irop_get_btype(src1) != IROP_BTYPE_FLOAT32 && irop_get_btype(src1) != IROP_BTYPE_FLOAT64 &&
           irop_get_btype(src2) != IROP_BTYPE_FLOAT32 && irop_get_btype(src2) != IROP_BTYPE_FLOAT64)
         is_equal = irop_get_imm64_ex(ir, src1) == irop_get_imm64_ex(ir, src2);
-      if (!is_equal && src1.is_sym && src2.is_sym && !src1.is_lval && !src2.is_lval)
+      if (!is_equal && irop_is_sym(src1) && irop_is_sym(src2) && !src1.is_lval && !src2.is_lval)
       {
         if (cef_symref_same(ir, src1, src2))
           is_equal = 1;
       }
       /* Non-volatile globals only; skip floats (NaN != NaN). */
-      if (!is_equal && src1.is_sym && src2.is_sym && src1.is_lval && src2.is_lval)
+      if (!is_equal && irop_is_sym(src1) && irop_is_sym(src2) && src1.is_lval && src2.is_lval)
       {
         if (cef_symref_same(ir, src1, src2))
         {
@@ -356,14 +337,14 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
               if (irop_get_vreg(vs) < 0)
               {
                 is_equal = ir_opt_nonvreg_expr_equal(ir, vs, other);
-                if (!is_equal && vs.is_sym && other.is_sym &&
+                if (!is_equal && irop_is_sym(vs) && irop_is_sym(other) &&
                     !vs.is_lval && !other.is_lval)
                 {
                   if (cef_symref_same(ir, vs, other))
                     is_equal = 1;
                 }
                 if (!is_equal && irop_is_immediate(vs) && irop_is_immediate(other) &&
-                    !vs.is_sym && !other.is_sym)
+                    !irop_is_sym(vs) && !irop_is_sym(other))
                 {
                   is_equal = irop_get_imm64_ex(ir, vs) == irop_get_imm64_ex(ir, other);
                 }

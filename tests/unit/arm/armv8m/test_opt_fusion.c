@@ -137,7 +137,7 @@ static IROperand utb_jtarget_fusion(int target)
  * "no vreg"), so lea_cse's own target shape needs this dedicated builder. */
 static IROperand utb_stackoff_vreg(int32_t vreg, int32_t offset, int btype)
 {
-  return irop_make_stackoff(vreg, offset, /*is_lval*/ 0, /*is_llocal*/ 0, /*is_param*/ 0, btype);
+  return irop_make_stackoff(vreg, offset, /*is_lval*/ 0, /*is_param*/ 0, btype);
 }
 
 /* ================================================================== bool_simplify */
@@ -1171,7 +1171,7 @@ UT_TEST(test_barrel_shift_fusion_shared_address_local_value)
       TCCIRState *ir = utb_fusion_new(6);
       ir->variables_live_intervals_size = 1;
       ir->variables_live_intervals = tcc_mallocz(sizeof(IRLiveInterval));
-      IROperand index = irop_make_stackoff(irop_get_vreg(utb_var(0, I32)), -4, 1, 0, 0, I32);
+      IROperand index = irop_make_stackoff(irop_get_vreg(utb_var(0, I32)), -4, 1, 0, I32);
       int shl = utb_emit(ir, TCCIR_OP_SHL, utb_temp(1, I32), index, utb_imm(amount, I32));
       int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32),
                          utb_temp(swap ? 1 : 0, I32), utb_temp(swap ? 0 : 1, I32));
@@ -1212,15 +1212,15 @@ UT_TEST(test_barrel_shift_fusion_single_use_address_kept)
 
 UT_TEST(test_barrel_shift_fusion_adjacent_memory_source_kept)
 {
-  for (int kind = 0; kind < 5; kind++) {
+  for (int kind = 0; kind < 4; kind++) {
     TCCIRState *ir = utb_fusion_new(4);
     ir->variables_live_intervals_size = 1;
     ir->variables_live_intervals = tcc_mallocz(sizeof(IRLiveInterval));
     IROperand source = utb_deref_temp(0, I32);
     if (kind > 0) {
-      source = irop_make_stackoff(irop_get_vreg(utb_var(0, I32)), -4, kind != 1, kind == 2, 0, I32);
-      ir->variables_live_intervals[0].addrtaken = kind == 3;
-      ir->variables_live_intervals[0].is_volatile = kind == 4;
+      source = irop_make_stackoff(irop_get_vreg(utb_var(0, I32)), -4, kind != 1, 0, I32);
+      ir->variables_live_intervals[0].addrtaken = kind == 2;
+      ir->variables_live_intervals[0].is_volatile = kind == 3;
     }
     int shr = utb_emit(ir, TCCIR_OP_SHR, utb_temp(1, I32), source, utb_imm(5, I32));
     int sub = utb_emit(ir, TCCIR_OP_SUB, utb_temp(2, I32), utb_temp(3, I32), utb_temp(1, I32));

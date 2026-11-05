@@ -485,34 +485,35 @@ UT_TEST(test_set_elf_sym_detects_duplicate_global_definition)
  * Symbol attributes
  * ============================================================================ */
 
-UT_TEST(test_get_sym_attr_grows_array_and_zeroes_new_entries)
+UT_TEST(test_get_sym_attr_blocks_are_zeroed_and_entries_stay_put)
 {
   ut_elf_reset_state();
 
   struct sym_attr *attr0 = get_sym_attr(tcc_state, 0, 1);
   UT_ASSERT(attr0 != NULL);
-  UT_ASSERT_EQ(tcc_state->nb_sym_attrs, 1);
+  UT_ASSERT_EQ(tcc_state->nb_sym_attr_chunks, 1);
   attr0->got_offset = 0xdeadbeef;
 
   struct sym_attr *attr3 = get_sym_attr(tcc_state, 3, 1);
-  UT_ASSERT(attr3 != NULL);
-  UT_ASSERT_EQ(tcc_state->nb_sym_attrs, 4);
+  UT_ASSERT(attr3 == attr0 + 3);
   UT_ASSERT_EQ(attr3->got_offset, 0);
 
-  /* Re-fetch attr0 after the realloc that may have moved the array. */
-  attr0 = &tcc_state->sym_attrs[0];
+  /* Another block leaves the first where it was, and the gap unmade. */
+  struct sym_attr *far = get_sym_attr(tcc_state, 5000, 1);
+  UT_ASSERT(far != NULL);
+  UT_ASSERT_EQ(far->got_offset, 0);
+  UT_ASSERT_EQ(tcc_state->nb_sym_attr_chunks, 5);
+  UT_ASSERT(tcc_state->sym_attr_chunks[1] == NULL);
+  UT_ASSERT(get_sym_attr(tcc_state, 0, 0) == attr0);
   UT_ASSERT_EQ(attr0->got_offset, 0xdeadbeef);
 
-  struct sym_attr *attr5 = get_sym_attr(tcc_state, 5, 1);
-  UT_ASSERT(attr5 != NULL);
-  UT_ASSERT_EQ(tcc_state->nb_sym_attrs, 8);
+  /* Without alloc, a symbol in no block reads entry 0 and makes nothing. */
+  UT_ASSERT(get_sym_attr(tcc_state, 1500, 0) == attr0);
+  UT_ASSERT(tcc_state->sym_attr_chunks[1] == NULL);
+  UT_ASSERT(get_sym_attr(tcc_state, 90000, 0) == attr0);
+  UT_ASSERT_EQ(tcc_state->nb_sym_attr_chunks, 5);
 
-  struct sym_attr *attr10 = get_sym_attr(tcc_state, 10, 0);
-  UT_ASSERT(attr10 == tcc_state->sym_attrs); /* no alloc, returns base */
-
-  tcc_free(tcc_state->sym_attrs);
-  tcc_state->sym_attrs = NULL;
-  tcc_state->nb_sym_attrs = 0;
+  tccelf_delete(tcc_state);
   return 0;
 }
 
@@ -920,7 +921,7 @@ UT_TEST(test_tccelf_delete_frees_all_sections)
   return 0;
 }
 
-/* Regression lock: tccelf_delete frees sym_attrs but leaves sym_attrs/nb_sym_attrs
+/* Regression lock: tccelf_delete frees the attribute blocks but leaves their table
  * stale.  This is a known lifecycle bug; the test documents the current behavior
  * so a future fix must update both the code and this assertion. */
 UT_TEST(test_tccelf_delete_resets_sym_attrs)
@@ -928,15 +929,15 @@ UT_TEST(test_tccelf_delete_resets_sym_attrs)
   ut_elf_reset_state();
   tccelf_new(tcc_state);
   (void)get_sym_attr(tcc_state, 0, 1);
-  UT_ASSERT(tcc_state->sym_attrs != NULL);
-  UT_ASSERT_EQ(tcc_state->nb_sym_attrs, 1);
+  UT_ASSERT(tcc_state->sym_attr_chunks != NULL);
+  UT_ASSERT_EQ(tcc_state->nb_sym_attr_chunks, 1);
 
   tccelf_delete(tcc_state);
 
-  /* tccelf_delete() resets sym_attrs/nb_sym_attrs so a reused TCCState does
+  /* tccelf_delete() resets sym_attr_chunks and its count so a reused TCCState does
    * not read through a freed allocation. */
-  UT_ASSERT(tcc_state->sym_attrs == NULL);
-  UT_ASSERT_EQ(tcc_state->nb_sym_attrs, 0);
+  UT_ASSERT(tcc_state->sym_attr_chunks == NULL);
+  UT_ASSERT_EQ(tcc_state->nb_sym_attr_chunks, 0);
   return 0;
 }
 

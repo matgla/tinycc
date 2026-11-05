@@ -177,38 +177,6 @@ UT_TEST(test_machine_defaults)
 /* -------------------------------------------------------------------------- */
 /* Atomic-style memory operands: spilled pointer with double indirection      */
 /* -------------------------------------------------------------------------- */
-
-UT_TEST(test_atomic_style_llocal_operand)
-{
-  TCCIRState *ir = tcc_ir_alloc();
-  setup_tcc_state();
-
-  int t = tcc_ir_vreg_alloc_temp(ir);
-  SValue s_t = sv_var(t);
-  SValue s_zero = sv_const(0);
-  tcc_ir_put(ir, TCCIR_OP_ASSIGN, &s_zero, NULL, &s_t);
-  tcc_ir_put(ir, TCCIR_OP_RETURNVALUE, &s_t, NULL, NULL);
-
-  tcc_ir_ssa_regalloc(ir, arm_get_regalloc_target(), 0);
-
-  IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, t);
-  UT_ASSERT(li != NULL);
-
-  /* Construct a stackoff operand that represents a spilled pointer with
-   * double indirection (the value loaded from the spill slot is itself an
-   * address that must be dereferenced).  This is the shape used by atomic
-   * loads/stores when the pointer has been spilled. */
-  IROperand op = irop_make_stackoff(-1, li->allocation.offset, 1, 1, 0, IROP_BTYPE_INT32);
-  MachineOperand m = machine_op_from_ir(ir, &op);
-
-  UT_ASSERT(m.kind == MACH_OP_SPILL);
-  UT_ASSERT(m.needs_deref);
-
-  tcc_ir_free(ir);
-  return 0;
-}
-
-/* -------------------------------------------------------------------------- */
 /* Stack-passed parameter operand used as atomic pointer                       */
 /* -------------------------------------------------------------------------- */
 
@@ -228,7 +196,7 @@ UT_TEST(test_atomic_style_param_operand)
   UT_ASSERT(li != NULL);
 
   /* A stack-passed pointer parameter appears as PARAM_STACK with lval set. */
-  IROperand op = irop_make_stackoff(-1, li->original_offset, 1, 0, 1, IROP_BTYPE_INT32);
+  IROperand op = irop_make_stackoff(-1, li->original_offset, 1, 1, IROP_BTYPE_INT32);
   op.is_param = 1;
   MachineOperand m = machine_op_from_ir(ir, &op);
 

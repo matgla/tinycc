@@ -849,6 +849,8 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
       if (iv)
       {
         iv->is_volatile = (type->t & VT_VOLATILE) != 0;
+        if (iv->is_volatile)
+          tcc_state->ir->func_has_volatile_local = 1;
         iv->is_struct = (type->t & VT_BTYPE) == VT_STRUCT;
       }
     }
@@ -885,7 +887,11 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
         tcc_ir_assign_physical_register(tcc_state->ir, vreg, c, -1, -1);
         tcc_ir_set_original_offset(tcc_state->ir, vreg, c);
         if (iv)
+        {
           iv->is_volatile = (type->t & VT_VOLATILE) != 0;
+          if (iv->is_volatile)
+            tcc_state->ir->func_has_volatile_local = 1;
+        }
       }
       /* Mark float/double variables */
       if (is_float(type->t))

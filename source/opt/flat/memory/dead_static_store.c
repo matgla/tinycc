@@ -110,13 +110,13 @@ static void dss_build_vreg_map(TCCIRState *ir, DssVregEntry *map, int *count)
     if (irop_config[q->op].has_src1)
     {
       IROperand s1 = tcc_ir_op_get_src1(ir, q);
-      if (s1.is_sym && !s1.is_lval)
+      if (irop_is_sym(s1) && !s1.is_lval)
         derived_sym = dss_symref_sym(ir, s1);
     }
     if (!derived_sym && (q->op == TCCIR_OP_MLA))
     {
       IROperand acc = tcc_ir_op_get_accum(ir, q);
-      if (acc.is_sym && !acc.is_lval)
+      if (irop_is_sym(acc) && !acc.is_lval)
         derived_sym = dss_symref_sym(ir, acc);
     }
     if (!derived_sym &&
@@ -134,7 +134,7 @@ static void dss_build_vreg_map(TCCIRState *ir, DssVregEntry *map, int *count)
     {
       IROperand acc = tcc_ir_op_get_accum(ir, q);
       int32_t avr = irop_get_vreg(acc);
-      if (avr >= 0 && !acc.is_sym)
+      if (avr >= 0 && !irop_is_sym(acc))
         derived_sym = dss_vreg_map_lookup(map, *count, avr);
     }
 
@@ -149,7 +149,7 @@ static Sym *dss_resolve_store_dest_sym(TCCIRState *ir, IRQuadCompact *q,
 {
   IROperand dest = tcc_ir_op_get_dest(ir, q);
 
-  if (dest.is_sym)
+  if (irop_is_sym(dest))
   {
     /* STORE requires an lval dest; INDEXED/POSTINC may have lval cleared. */
     if (!dest.is_lval && q->op == TCCIR_OP_STORE)
@@ -193,7 +193,7 @@ static Sym *dss_resolve_store_dest_sym(TCCIRState *ir, IRQuadCompact *q,
         dq->op != TCCIR_OP_ASSIGN)
       return NULL;
     IROperand s1 = tcc_ir_op_get_src1(ir, dq);
-    if (!s1.is_sym || s1.is_lval)
+    if (!irop_is_sym(s1) || s1.is_lval)
       return NULL;
     return dss_symref_sym(ir, s1);
   }

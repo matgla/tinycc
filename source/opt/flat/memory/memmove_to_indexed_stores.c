@@ -19,7 +19,11 @@
 
 
 
-/* Trace the address held in trace_vr back from instruction j -- at most 8
+/* Kept apart from ir_opt_addr_walk (opt_alias.h): this scan is block-local (it
+ * stops at a jump or a join), needs no single-def TEMP, follows no TEMP copy,
+ * and its caller wants the LEA's index back.
+ *
+ * Trace the address held in trace_vr back from instruction j -- at most 8
  * defining instructions, never across a join or a jump -- through ADDs of an
  * immediate (accumulated onto trace_add) to a LEA/ASSIGN of a local StackLoc.  On
  * success *off is that slot's offset plus the adds and the LEA's index is
@@ -50,7 +54,7 @@ static int mtis_trace_stack_addr(TCCIRState *ir, int j, int32_t trace_vr, int tr
     }
     if (kq->op != TCCIR_OP_LEA && kq->op != TCCIR_OP_ASSIGN) break;
     IROperand ks = tcc_ir_op_get_src1(ir, kq);
-    if (irop_get_tag(ks) != IROP_TAG_STACKOFF || !ks.is_local || ks.is_lval) break;
+    if (irop_get_tag(ks) != IROP_TAG_STACKOFF || !irop_is_local(ks) || ks.is_lval) break;
     *off = (int)irop_get_imm64_ex(ir, ks) + trace_add;
     return k;
   }
@@ -102,7 +106,7 @@ static int mtis_object_addr_taken(TCCIRState *ir, int lo, int hi, int call_id)
       if (!has)
         continue;
       IROperand o = tcc_ir_op_get_slot(ir, sq, si);
-      if (irop_get_tag(o) != IROP_TAG_STACKOFF || !o.is_local || o.is_lval)
+      if (irop_get_tag(o) != IROP_TAG_STACKOFF || !irop_is_local(o) || o.is_lval)
         continue;
       int off = (int)irop_get_imm64_ex(ir, o);
       if (off >= lo && off < hi)
@@ -137,9 +141,9 @@ static int mtis_may_touch_dst(TCCIRState *ir, IRQuadCompact *sq, int dst_is_stac
     IROperand o = tcc_ir_op_get_slot(ir, sq, si);
     int tag = irop_get_tag(o);
     int32_t vr = irop_get_vreg(o);
-    if (tag == IROP_TAG_STACKOFF && o.is_local)
+    if (tag == IROP_TAG_STACKOFF && irop_is_local(o))
     {
-      if (o.is_llocal)
+      if (irop_is_llocal(o))
       {
         if (indirect_hits)
           return 1; /* through the pointer held in the slot */
@@ -182,7 +186,7 @@ static int mtis_may_touch_dst(TCCIRState *ir, IRQuadCompact *sq, int dst_is_stac
         return 1;
       continue;
     }
-    if (o.is_sym && o.is_lval && !dst_is_stackoff)
+    if (irop_is_sym(o) && o.is_lval && !dst_is_stackoff)
       return 1; /* a global the pointer may point to */
   }
   return 0;
@@ -268,7 +272,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
     /* Source is a local stack address: direct STACKOFF, or a vreg set by an earlier LEA. */
     int tmp_base;
     int lea_idx = -1; /* instruction index of the LEA that produced p_src, if any */
-    if (irop_get_tag(p_src) == IROP_TAG_STACKOFF && p_src.is_local && !p_src.is_lval)
+    if (irop_get_tag(p_src) == IROP_TAG_STACKOFF && irop_is_local(p_src) && !p_src.is_lval)
     {
       tmp_base = (int)irop_get_imm64_ex(ir, p_src);
     }
@@ -300,7 +304,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
         if (lq->op != TCCIR_OP_LEA && lq->op != TCCIR_OP_ASSIGN)
           break;
         IROperand ls = tcc_ir_op_get_src1(ir, lq);
-        if (irop_get_tag(ls) != IROP_TAG_STACKOFF || !ls.is_local || ls.is_lval)
+        if (irop_get_tag(ls) != IROP_TAG_STACKOFF || !irop_is_local(ls) || ls.is_lval)
           break;
         tmp_base = (int)irop_get_imm64_ex(ir, ls);
         lea_idx = j;
@@ -327,7 +331,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
      * The mirror image of the named-VAR source-store guard further down. */
     IROperand dst_name_op = p_dst;
     int dst_named = 0;
-    if (irop_get_tag(p_dst) == IROP_TAG_STACKOFF && p_dst.is_local && !p_dst.is_lval)
+    if (irop_get_tag(p_dst) == IROP_TAG_STACKOFF && irop_is_local(p_dst) && !p_dst.is_lval)
     {
       dst_is_stackoff = 1;
       dst_base = (int)irop_get_imm64_ex(ir, p_dst);
@@ -340,7 +344,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
       if (dst_base + total_size > tmp_base && dst_base < tmp_base + total_size)
         continue;
     }
-    else if (irop_get_tag(p_dst) == IROP_TAG_VREG && !p_dst.is_lval && !p_dst.is_local && !p_dst.is_const)
+    else if (irop_get_tag(p_dst) == IROP_TAG_VREG && !p_dst.is_lval && !irop_is_local(p_dst) && !irop_is_const(p_dst))
     {
       if (!irop_has_vreg(p_dst))
         continue;
@@ -371,7 +375,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
           if (lq->op == TCCIR_OP_LEA || lq->op == TCCIR_OP_ASSIGN)
           {
             IROperand ls = tcc_ir_op_get_src1(ir, lq);
-            if (irop_get_tag(ls) == IROP_TAG_STACKOFF && ls.is_local && !ls.is_lval)
+            if (irop_get_tag(ls) == IROP_TAG_STACKOFF && irop_is_local(ls) && !ls.is_lval)
             {
               dst_is_stackoff = 1;
               dst_base = (int)irop_get_imm64_ex(ir, ls) + trace_add;
@@ -478,7 +482,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
             IROperand ms_val = is_aeabi ? ms_p2 : ms_p1;
             IROperand ms_len = is_aeabi ? ms_p1 : ms_p2;
             if (ok &&
-                irop_get_tag(ms_p0) == IROP_TAG_STACKOFF && ms_p0.is_local && !ms_p0.is_lval &&
+                irop_get_tag(ms_p0) == IROP_TAG_STACKOFF && irop_is_local(ms_p0) && !ms_p0.is_lval &&
                 irop_get_tag(ms_val) == IROP_TAG_IMM32 && irop_get_imm64_ex(ir, ms_val) == 0 &&
                 irop_get_tag(ms_len) == IROP_TAG_IMM32)
             {
@@ -528,7 +532,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
         if (irop_config[sq->op].has_dest)
         {
           IROperand d = tcc_ir_op_get_dest(ir, sq);
-          if (irop_get_tag(d) == IROP_TAG_STACKOFF && d.is_local && d.is_lval)
+          if (irop_get_tag(d) == IROP_TAG_STACKOFF && irop_is_local(d) && d.is_lval)
           {
             int doff = (int)irop_get_imm64_ex(ir, d);
             if (doff >= tmp_base && doff < tmp_base + total_size)
@@ -552,7 +556,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
       if (sq->op == TCCIR_OP_STORE)
       {
         st_src = tcc_ir_op_get_src1(ir, sq);
-        if (irop_get_tag(st_dest) == IROP_TAG_STACKOFF && st_dest.is_local && st_dest.is_lval)
+        if (irop_get_tag(st_dest) == IROP_TAG_STACKOFF && irop_is_local(st_dest) && st_dest.is_lval)
         {
           /* A named VAR/PARAM vreg on the STACKOFF dest keys the backend store, so it cannot be relocated by offset alone. */
           int32_t dvr = irop_get_vreg(st_dest);
@@ -734,7 +738,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
       if (sq->op == TCCIR_OP_STORE && j < earliest_contrib_idx)
       {
         IROperand sd = tcc_ir_op_get_dest(ir, sq);
-        if (irop_get_tag(sd) == IROP_TAG_STACKOFF && sd.is_local && sd.is_lval)
+        if (irop_get_tag(sd) == IROP_TAG_STACKOFF && irop_is_local(sd) && sd.is_lval)
         {
           int sd_off = (int)irop_get_imm64_ex(ir, sd);
           int sd_size = ir_opt_store_btype_size_bytes(irop_get_btype(sd));
@@ -761,7 +765,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
           continue;
         if (irop_get_tag(op) != IROP_TAG_STACKOFF)
           continue;
-        if (!op.is_local)
+        if (!irop_is_local(op))
           continue;
         int off = (int)irop_get_imm64_ex(ir, op);
         if (off < tmp_base || off >= tmp_base + total_size)
@@ -938,7 +942,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
           sq->op = TCCIR_OP_STORE;
           sq->operand_base = new_pool;
         }
-        else if (irop_get_tag(st_dest_old) == IROP_TAG_STACKOFF && st_dest_old.is_local &&
+        else if (irop_get_tag(st_dest_old) == IROP_TAG_STACKOFF && irop_is_local(st_dest_old) &&
             sq->op == TCCIR_OP_STORE)
         {
           IROperand new_dest = st_dest_old;
@@ -951,7 +955,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
                             ? irop_get_btype(st_src)
                             : irop_get_btype(st_dest_old);
           IROperand new_dest = irop_make_stackoff(-1, dst_base + offset,
-                                                  /*is_lval*/ 1, /*is_llocal*/ 0,
+                                                  /*is_lval*/ 1,
                                                   /*is_param*/ 0, store_btype);
           new_dest.aux |= IROP_AUX_NONVOLATILE; /* a memmove's store: no volatile access */
           tcc_ir_pool_ensure(ir, 2);

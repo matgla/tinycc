@@ -34,11 +34,11 @@ static int refresh_stale_var_addrtaken(TCCIRState *ir)
   /* Static-chain plumbing lets a nested callee read captured locals without a visible LEA. */
   int max_var = -1;
   int max_tmp = -1;
+  if (ir_opt_fn_features(ir) & (IR_FN_SET_CHAIN | IR_FN_INIT_CHAIN_SLOT))
+    return 0;
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_SET_CHAIN || q->op == TCCIR_OP_INIT_CHAIN_SLOT)
-      return 0;
     if (q->op == TCCIR_OP_NOP)
       continue;
     for (int k = 0; k < 3; k++)
@@ -157,7 +157,7 @@ static int refresh_stale_var_addrtaken(TCCIRState *ir)
           continue;
         IROperand o = k == 3 ? ir->iroperand_pool[q->operand_base + 3] : tcc_ir_op_get_slot(ir, q, k);
         int32_t v = irop_get_vreg(o);
-        if (irop_get_tag(o) != IROP_TAG_STACKOFF || !o.is_local || o.is_lval || o.is_llocal ||
+        if (irop_get_tag(o) != IROP_TAG_STACKOFF || !irop_is_local(o) || o.is_lval || irop_is_llocal(o) ||
             v < 0 || TCCIR_DECODE_VREG_TYPE(v) != TCCIR_VREG_TYPE_VAR)
           continue;
         int p = TCCIR_DECODE_VREG_POSITION(v);
@@ -277,8 +277,6 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
     uint8_t is_constant : 1;
     uint8_t is_sym : 1;
     uint8_t sym_is_lval : 1;
-    uint8_t sym_is_local : 1;
-    uint8_t sym_is_const : 1;
     uint8_t def_count;
     uint8_t use_count;
     int64_t value; /* immediate value, or pool_idx for symrefs */
@@ -332,7 +330,7 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
     if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_STORE)
     {
       IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      if (irop_is_immediate(src1) && !src1.is_sym && !src1.is_lval && !src1.is_local && var_info[pos].def_count == 1)
+      if (irop_is_immediate(src1) && !irop_is_sym(src1) && !src1.is_lval && !irop_is_local(src1) && var_info[pos].def_count == 1)
       {
         var_info[pos].is_constant = 1;
         var_info[pos].def_index = i;
@@ -343,15 +341,13 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
       }
       /* Symref values (`int *p = &g`): ASSIGN source only — STORE-of-symref to a stack VAR
        * would need extra reasoning about the destination's storage. */
-      else if (q->op == TCCIR_OP_ASSIGN && src1.is_sym && !src1.is_lval &&
+      else if (q->op == TCCIR_OP_ASSIGN && irop_is_sym(src1) && !src1.is_lval &&
                var_info[pos].def_count == 1)
       {
         var_info[pos].is_constant = 1;
         var_info[pos].def_index = i;
         var_info[pos].is_sym = 1;
         var_info[pos].sym_is_lval = src1.is_lval;
-        var_info[pos].sym_is_local = src1.is_local;
-        var_info[pos].sym_is_const = src1.is_const;
         var_info[pos].value = (int64_t)src1.u.pool_idx;
         var_info[pos].btype = irop_get_btype(src1);
         var_info[pos].is_unsigned = src1.is_unsigned;
@@ -515,7 +511,6 @@ skip_dominance_guard:;
           if (var_info[pos].is_sym)
           {
             new_src1 = irop_make_symref(-1, (uint32_t)var_info[pos].value, var_info[pos].sym_is_lval,
-                                        var_info[pos].sym_is_local, var_info[pos].sym_is_const,
                                         var_info[pos].btype);
           }
           else
@@ -546,7 +541,7 @@ skip_dominance_guard:;
     {
       IROperand src2 = tcc_ir_op_get_src2(ir, q);
       int32_t src2_vr = irop_get_vreg(src2);
-      if (src2_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src2_vr) == TCCIR_VREG_TYPE_VAR && !(src2.is_local && !src2.is_lval))
+      if (src2_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src2_vr) == TCCIR_VREG_TYPE_VAR && !(irop_is_local(src2) && !src2.is_lval))
       {
         int pos = TCCIR_DECODE_VREG_POSITION(src2_vr);
         if (pos <= max_var_pos && var_info[pos].is_constant &&
@@ -556,7 +551,6 @@ skip_dominance_guard:;
           if (var_info[pos].is_sym)
           {
             new_src2 = irop_make_symref(-1, (uint32_t)var_info[pos].value, var_info[pos].sym_is_lval,
-                                        var_info[pos].sym_is_local, var_info[pos].sym_is_const,
                                         var_info[pos].btype);
           }
           else
@@ -673,7 +667,7 @@ neg_vreg_phase:
         IROperand src1 = tcc_ir_op_get_src1(ir, q);
         /* LOADs may read individual 32-bit halves of a 64-bit neg vreg; only propagate when
          * the value is zero (both halves 0) or the type is 32-bit. */
-        if (irop_is_immediate(src1) && !src1.is_sym && nvi[idx].def_count == 1 &&
+        if (irop_is_immediate(src1) && !irop_is_sym(src1) && nvi[idx].def_count == 1 &&
             (irop_get_btype(src1) != IROP_BTYPE_INT64 || irop_get_imm64_ex(ir, src1) == 0))
         {
           nvi[idx].is_constant = 1;

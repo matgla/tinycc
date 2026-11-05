@@ -67,14 +67,14 @@ static int sd_check_case_body(TCCIRState *ir, int target,
     if (dest.is_lval)
       return 1;
   } else {
-    if (!dest.is_lval || irop_get_vreg(dest) < 0 || dest.is_llocal ||
+    if (!dest.is_lval || irop_get_vreg(dest) < 0 || irop_is_llocal(dest) ||
         (irop_get_tag(dest) != IROP_TAG_STACKOFF && irop_get_tag(dest) != IROP_TAG_VREG))
       return 1;
   }
   int tag = src.tag;
   if (tag != IROP_TAG_IMM32 && tag != IROP_TAG_SYMREF)
     return 1;
-  if (src.is_lval || src.is_llocal)
+  if (src.is_lval || irop_is_llocal(src))
     return 1;
 
   int dbt = irop_get_btype(dest);
@@ -384,7 +384,7 @@ int tcc_ir_opt_switch_to_data(TCCIRState *ir)
             continue;
           if (!op2.is_lval)
             ok = 0; /* its address escapes */
-          else if (jq2->op == TCCIR_OP_LOAD && s2 >= 1 && !op2.is_llocal) {
+          else if (jq2->op == TCCIR_OP_LOAD && s2 >= 1 && !irop_is_llocal(op2)) {
             nload++;
             join_load_idx = j;
           } else if (jq2->op == TCCIR_OP_STORE && s2 == 0) {

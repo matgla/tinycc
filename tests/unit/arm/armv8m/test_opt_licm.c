@@ -40,12 +40,11 @@
  *      (well-known table / attributes / cache / conservative default).
  *    - tcc_ir_infer_func_purity(): purity inference from a function's own
  *      IR body (stack-only stores/loads, calls, opaque ops, VLA_ALLOC).
- *  tcc_ir_hoist_pure_calls() (re-enabled by default 2026-07-02 after the
- *  ninth defect fix — docs/bugs.md #7, resolved) is exercised end-to-end
- *  via tcc_ir_opt_licm_ex() by test_licm_hoists_const_call_* and
- *  test_licm_no_hoist_pure_call_when_loop_writes_memory below.  The disabled
- *  pattern-based hoist_from_loop()/hoist_const_exprs_from_loop() internals are
- *  still dead (unreachable early-return) and not covered.
+ *  The pure-call hoist (tcc_ir_hoist_pure_calls, docs/bugs.md #7) was removed
+ *  2026-11-04: disabled, it changed no object over the test corpora, tinycc's
+ *  own units and the kernel C (docs/plans/opt_pass_merge_and_loop_reduction.md,
+ *  A4b).  The disabled pattern-based hoist_from_loop()/hoist_const_exprs_from_loop()
+ *  internals are still dead (unreachable early-return) and not covered.
  */
 
 #include "ir_build.h"
@@ -216,105 +215,6 @@ UT_TEST(test_ssa_opt_licm_hoists_invariant)
   return 0;
 }
 
-/* POSITIVE (docs/bugs.md #7, re-enabled): a CONST function call in a loop whose
- * argument is loop-invariant is hoisted into the preheader by
- * tcc_ir_hoist_pure_calls (run first inside tcc_ir_opt_licm_ex).  The original
- * call site becomes `T1 = ASSIGN <hoisted temp>`; the surviving FUNCCALLVAL is
- * lifted ahead of the loop header.  ("abs" is CONST in the pure-func table, so
- * the loop's `T2 += 1` store/update does not block it.) */
-UT_TEST(test_licm_hoists_const_call_with_invariant_arg)
-{
-  static Sym fn;
-  ut_init_func_sym(&fn, TOK_IDENT + 40);
-  utb_set_tok_str(fn.v, "abs"); /* abs is CONST in pure_func_table */
-
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);                          /* needed for the callee SYMREF */
-  ir->compact_instructions_size = UTB_MAX_INSTR;
-  ir->next_temporary_variable = 10;            /* room for the hoister's fresh temp */
-  ir->next_call_id = 2;
-
-  IROperand callee = utb_symref(ir, &fn, 0, 0, 0, I32);
-
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(42, I32), UTB_NONE);      /* 0 preheader */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(0, I32),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));                        /* 1 header */
-  utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(1, I32), callee,
-           utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));                         /* 2 call */
-  utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(2, I32), utb_imm(1, I32));  /* 3 varying */
-  utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget(1), utb_temp(3, I32), UTB_NONE);        /* 4 back-edge */
-  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);                  /* 5 exit */
-
-  int n_before = ir->next_instruction_index;
-  int loops = tcc_ir_opt_licm(ir);
-  UT_ASSERT(loops >= 1);
-  UT_ASSERT(ir->next_instruction_index > n_before);
-
-  int t1_assign = find_def(ir, TCCIR_OP_ASSIGN, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, 1));
-  UT_ASSERT(t1_assign >= 0);
-
-  int num_calls = 0, call_idx = -1, jmp_idx = -1;
-  for (int i = 0; i < ir->next_instruction_index; i++)
-  {
-    if (ir->compact_instructions[i].op == TCCIR_OP_FUNCCALLVAL) { num_calls++; call_idx = i; }
-    if (ir->compact_instructions[i].op == TCCIR_OP_JUMPIF && jmp_idx < 0) jmp_idx = i;
-  }
-  UT_ASSERT_EQ(num_calls, 1);
-  UT_ASSERT(jmp_idx >= 0);
-  int header = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, &ir->compact_instructions[jmp_idx]));
-  UT_ASSERT(call_idx < header); /* call lifted ahead of the loop header */
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (docs/bugs.md #7 / PR20100): a merely-PURE function (reads memory)
- * must NOT be hoisted when the loop modifies memory it could read.  Here the
- * loop contains a STORE, so the PURE call stays in the loop body (its
- * FUNCCALLVAL remains after the loop header). */
-UT_TEST(test_licm_no_hoist_pure_call_when_loop_writes_memory)
-{
-  static Sym fn;
-  ut_init_func_sym(&fn, TOK_IDENT + 41);
-  utb_set_tok_str(fn.v, "some_pure_reader");
-  fn.f.func_pure = 1; /* PURE (reads memory), not CONST */
-
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-  ir->compact_instructions_size = UTB_MAX_INSTR;
-  ir->next_temporary_variable = 10;
-  ir->next_call_id = 2;
-
-  IROperand callee = utb_symref(ir, &fn, 0, 0, 0, I32);
-
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(0, I32), UTB_NONE);       /* 0 preheader */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVOID, UTB_NONE, UTB_NONE,
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));                        /* 1 header: void arg marker */
-  utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(1, I32), callee,
-           utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 0), I32));                         /* 2 PURE call, no args */
-  utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_stackoff(100, 1, 0, 0, I32)),
-           utb_temp(1, I32), UTB_NONE);                                            /* 3 STORE in loop */
-  utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget(1), utb_temp(3, I32), UTB_NONE);        /* 4 back-edge */
-  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);                  /* 5 exit */
-
-  int loops = tcc_ir_opt_licm(ir);
-  UT_ASSERT(loops >= 1);
-
-  /* The PURE call must remain inside the loop (after the header), not hoisted. */
-  int call_idx = -1, jmp_idx = -1;
-  for (int i = 0; i < ir->next_instruction_index; i++)
-  {
-    if (ir->compact_instructions[i].op == TCCIR_OP_FUNCCALLVAL && call_idx < 0) call_idx = i;
-    if (ir->compact_instructions[i].op == TCCIR_OP_JUMPIF && jmp_idx < 0) jmp_idx = i;
-  }
-  UT_ASSERT(call_idx >= 0);
-  UT_ASSERT(jmp_idx >= 0);
-  int header = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, &ir->compact_instructions[jmp_idx]));
-  UT_ASSERT(call_idx >= header); /* NOT hoisted: call is still in the loop body */
-
-  utb_free(ir);
-  return 0;
-}
 
 /* NEGATIVE (no loop): a straight-line sequence has no back-edge, so no loop is
  * detected, nothing is hoisted, and the IR is left byte-for-byte intact. */

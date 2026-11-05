@@ -38,7 +38,6 @@
 
 /* Pass entry points (defined in ir/opt_memory.c; forward-declared here to
  * avoid pulling in the optimizer engine headers). */
-int tcc_ir_opt_addrof_var_fwd(TCCIRState *ir);
 int tcc_ir_opt_invariant_global_load_hoist(TCCIRState *ir);
 int tcc_ir_opt_rmw_byte_clear(TCCIRState *ir);
 int tcc_ir_opt_struct_copy_roundtrip_elim(TCCIRState *ir);
@@ -55,12 +54,12 @@ int tcc_ir_opt_deref_operand_cse(TCCIRState *ir);
 
 static IROperand utb_slot_lval(int32_t off, int btype)
 {
-  return irop_make_stackoff(0, off, /*is_lval*/ 1, /*is_llocal*/ 0, /*is_param*/ 0, btype);
+  return irop_make_stackoff(0, off, /*is_lval*/ 1, /*is_param*/ 0, btype);
 }
 
 static IROperand utb_slot_addr(int32_t off, int btype)
 {
-  return irop_make_stackoff(0, off, /*is_lval*/ 0, /*is_llocal*/ 0, /*is_param*/ 0, btype);
+  return irop_make_stackoff(0, off, /*is_lval*/ 0, /*is_param*/ 0, btype);
 }
 
 static IROperand utb_deref_temp(int pos, int btype)
@@ -86,7 +85,7 @@ static IROperand utb_callee(TCCIRState *ir, Sym *sym, int tok)
 {
   sym->v = tok;
   uint32_t sidx = tcc_ir_pool_add_symref(ir, sym, 0, 0);
-  return irop_make_symref(0, sidx, 0, 0, 0, I32);
+  return irop_make_symref(0, sidx, 0, I32);
 }
 
 /* tcc_ir_opt_deref_operand_cse inserts a new ASSIGN (tcc_ir_pool_add
@@ -121,55 +120,6 @@ static int emit_call3(TCCIRState *ir, IROperand callee, int call_id,
                   utb_imm((int32_t)TCCIR_ENCODE_CALL(call_id, 3), I32));
 }
 
-/* ================================================================ addrof_var_fwd */
-
-/* POSITIVE: V0 <- #77 [ASSIGN]; T0 = LEA &V0; T1 = T0***DEREF*** ADD #1 -- the
- * deref of T0 (which holds &V0) must resolve to the known constant #77. */
-UT_TEST(test_addrof_var_fwd_lea_deref_resolves_to_constant)
-{
-  TCCIRState *ir = utb_new();
-
-  int vset = utb_emit(ir, TCCIR_OP_ASSIGN, utb_var_lval(0, I32), utb_imm(77, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
-  int use = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_deref_temp(0, I32), utb_imm(1, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_addrof_var_fwd(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, vset), TCCIR_OP_ASSIGN); /* the original write is untouched */
-  IROperand s1 = utb_src1(ir, use);
-  UT_ASSERT(irop_is_immediate(s1));
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, s1), 77);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (guard): V0 is redefined between the LEA and the deref use, so the
- * tracked alias must be invalidated -- the deref use is left untouched. */
-UT_TEST(test_addrof_var_fwd_redefinition_blocks_forward)
-{
-  TCCIRState *ir = utb_new();
-
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var_lval(0, I32), utb_imm(77, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
-  /* V0 is written again (e.g. by some other statement) before the deref. */
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var_lval(0, I32), utb_imm(99, I32), UTB_NONE);
-  int use = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_deref_temp(0, I32), utb_imm(1, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_addrof_var_fwd(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  IROperand s1 = utb_src1(ir, use);
-  UT_ASSERT(s1.is_lval);
-  UT_ASSERT_EQ(utb_vreg(s1), utb_vreg(utb_temp(0, I32)));
-
-  utb_free(ir);
-  return 0;
-}
-
 /* ================================================================ invariant_global_load_hoist */
 
 /* POSITIVE: the same non-volatile, never-directly-stored global is loaded
@@ -185,9 +135,9 @@ UT_TEST(test_invariant_global_load_hoist_second_load_becomes_assign)
   sym_g.type.t = I32;
 
   uint32_t sidx1 = tcc_ir_pool_add_symref(ir, &sym_g, 0, 0);
-  IROperand g1 = irop_make_symref(0, sidx1, 1, 0, 0, I32);
+  IROperand g1 = irop_make_symref(0, sidx1, 1, I32);
   uint32_t sidx2 = tcc_ir_pool_add_symref(ir, &sym_g, 0, 0);
-  IROperand g2 = irop_make_symref(0, sidx2, 1, 0, 0, I32);
+  IROperand g2 = irop_make_symref(0, sidx2, 1, I32);
 
   int load1 = utb_emit(ir, TCCIR_OP_LOAD, utb_temp(0, I32), g1, UTB_NONE);
   utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(1, I32));
@@ -218,11 +168,11 @@ UT_TEST(test_invariant_global_load_hoist_written_global_kept)
   sym_g.type.t = I32;
 
   uint32_t sidx1 = tcc_ir_pool_add_symref(ir, &sym_g, 0, 0);
-  IROperand g1 = irop_make_symref(0, sidx1, 1, 0, 0, I32);
+  IROperand g1 = irop_make_symref(0, sidx1, 1, I32);
   uint32_t sidx2 = tcc_ir_pool_add_symref(ir, &sym_g, 0, 0);
-  IROperand g2 = irop_make_symref(0, sidx2, 1, 0, 0, I32);
+  IROperand g2 = irop_make_symref(0, sidx2, 1, I32);
   uint32_t sidx3 = tcc_ir_pool_add_symref(ir, &sym_g, 0, 0);
-  IROperand g3 = irop_make_symref(0, sidx3, 1, 0, 0, I32);
+  IROperand g3 = irop_make_symref(0, sidx3, 1, I32);
 
   utb_emit(ir, TCCIR_OP_LOAD, utb_temp(0, I32), g1, UTB_NONE);
   utb_emit(ir, TCCIR_OP_STORE, g3, utb_imm(9, I32), UTB_NONE);

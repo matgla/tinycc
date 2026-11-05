@@ -124,10 +124,10 @@ int tcc_ir_opt_pack64_from_stack_stores(TCCIRState *ir)
       continue;
 
     IROperand src = tcc_ir_op_get_src1(ir, q);
-    if (src.tag != IROP_TAG_STACKOFF || !src.is_local || !src.is_lval)
+    if (src.tag != IROP_TAG_STACKOFF || !irop_is_local(src) || !src.is_lval)
       continue;
     /* Must be a plain stack-slot read, not a deref through a vreg/sym. */
-    if (src.is_llocal || src.is_sym)
+    if (irop_is_llocal(src) || irop_is_sym(src))
       continue;
     /* A STACKOFF is a *direct* slot read only when it has no vreg (get_vreg
      * == -1).  A VAR/PARAM spill encoding also has tag==STACKOFF/is_local/
@@ -167,8 +167,8 @@ int tcc_ir_opt_pack64_from_stack_stores(TCCIRState *ir)
           jq->op == TCCIR_OP_STORE_POSTINC || jq->op == TCCIR_OP_BLOCK_COPY)
       {
         IROperand jdst = tcc_ir_op_get_dest(ir, jq);
-        if (jq->op == TCCIR_OP_STORE && jdst.tag == IROP_TAG_STACKOFF && jdst.is_local && jdst.is_lval &&
-            !jdst.is_llocal && !jdst.is_sym && irop_get_vreg(jdst) == -1 && irop_get_btype(jdst) == IROP_BTYPE_INT32)
+        if (jq->op == TCCIR_OP_STORE && jdst.tag == IROP_TAG_STACKOFF && irop_is_local(jdst) && jdst.is_lval &&
+            !irop_is_llocal(jdst) && !irop_is_sym(jdst) && irop_get_vreg(jdst) == -1 && irop_get_btype(jdst) == IROP_BTYPE_INT32)
         {
           int64_t joff = irop_get_imm64_ex(ir, jdst);
           IROperand jsrc = tcc_ir_op_get_src1(ir, jq);
@@ -354,7 +354,7 @@ static int pack64_operand_resolves_const(TCCIRState *ir, IROptDU *du, int n,
       *out = var_imm;
       return 1;
     }
-    if (ds.is_lval || ds.is_local || ds.is_llocal)
+    if (ds.is_lval || irop_is_local(ds) || irop_is_llocal(ds))
       return 0;
     op = ds;
   }
@@ -394,7 +394,7 @@ int tcc_ir_opt_pack64_implicit(TCCIRState *ir)
       int32_t shl_vr = irop_get_vreg(shl_op);
       if (TCCIR_DECODE_VREG_TYPE(shl_vr) != TCCIR_VREG_TYPE_TEMP)
         continue;
-      if (shl_op.is_lval || shl_op.is_sym)
+      if (shl_op.is_lval || irop_is_sym(shl_op))
         continue;
       if (ir_opt_du_uses(&du, shl_vr) != 1 || !ir_opt_du_is_single_def(&du, shl_vr))
         continue;

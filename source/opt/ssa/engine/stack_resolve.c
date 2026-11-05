@@ -36,7 +36,7 @@ int ssa_opt_resolve_lea_stackloc_ex(IRSSAOptCtx *ctx, int32_t vr, int32_t *out_b
 
     if (dq->op == TCCIR_OP_LEA) {
       IROperand src = tcc_ir_op_get_src1(ir, dq);
-      if (src.tag == IROP_TAG_STACKOFF || src.is_local) {
+      if (src.tag == IROP_TAG_STACKOFF || irop_is_local(src)) {
         if (out_base_var)
           *out_base_var = irop_get_vreg(src);
         return irop_get_stack_offset(src) + acc;
@@ -124,17 +124,17 @@ int ssa_opt_resolve_temp_to_base_off(IRSSAOptCtx *ctx, int32_t vr,
       if (sv < 0)
         return 0;
       int svt = TCCIR_DECODE_VREG_TYPE(sv);
-      if (svt == TCCIR_VREG_TYPE_TEMP && !src.is_lval && !src.is_local &&
-          !src.is_llocal && src.tag == IROP_TAG_VREG) {
+      if (svt == TCCIR_VREG_TYPE_TEMP && !src.is_lval && !irop_is_local(src) &&
+          !irop_is_llocal(src) && src.tag == IROP_TAG_VREG) {
         vr = sv;
         continue;
       }
       /* A VAR/PARAM read appears in either encoding: register form or slot form. */
       if (svt == TCCIR_VREG_TYPE_VAR || svt == TCCIR_VREG_TYPE_PARAM) {
         int reg_form = (src.tag == IROP_TAG_VREG && !src.is_lval &&
-                        !src.is_local && !src.is_llocal);
+                        !irop_is_local(src) && !irop_is_llocal(src));
         int slot_form = (src.tag == IROP_TAG_STACKOFF && src.is_lval &&
-                          src.is_local && !src.is_llocal);
+                          irop_is_local(src) && !irop_is_llocal(src));
         if (reg_form || slot_form) {
           *out_base = sv;
           return 1;
@@ -206,7 +206,7 @@ int ssa_opt_indirect_stack_offset_ex(IRSSAOptCtx *ctx, const IRQuadCompact *q, i
     }
   }
 
-  if (base.tag != IROP_TAG_VREG || base.is_local)
+  if (base.tag != IROP_TAG_VREG || irop_is_local(base))
     return INT_MIN;
   if (require_lval && !base.is_lval)
     return INT_MIN;
@@ -251,9 +251,9 @@ static int sdf_resolve(IRSSAOptCtx *ctx, int32_t vr, int *out_off, int32_t *out_
       return 0;
     IRQuadCompact *dq = &ir->compact_instructions[vi->def_instr];
     IROperand src = tcc_ir_op_get_src1(ir, dq);
-    int direct = irop_get_tag(src) == IROP_TAG_STACKOFF && irop_get_vreg(src) < 0 && src.is_local &&
-                 !src.is_lval && !src.is_llocal && !src.is_param;
-    int copy = irop_get_tag(src) == IROP_TAG_VREG && !src.is_lval && !src.is_local && !src.is_llocal;
+    int direct = irop_get_tag(src) == IROP_TAG_STACKOFF && irop_get_vreg(src) < 0 && irop_is_local(src) &&
+                 !src.is_lval && !irop_is_llocal(src) && !src.is_param;
+    int copy = irop_get_tag(src) == IROP_TAG_VREG && !src.is_lval && !irop_is_local(src) && !irop_is_llocal(src);
     if (dq->op == TCCIR_OP_ASSIGN || dq->op == TCCIR_OP_LEA) {
       if (direct) {
         *out_off = irop_get_stack_offset(src) + acc;
@@ -299,7 +299,7 @@ int ssa_opt_stack_deref_fold(IRSSAOptCtx *ctx)
     int is_store = op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED;
     int indexed = op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_LOAD_INDEXED;
     IROperand base = tcc_ir_op_get_dest_or_src1(ir, q, !is_store);
-    if (irop_get_tag(base) != IROP_TAG_VREG || base.is_local || base.is_llocal || base.is_lval == indexed)
+    if (irop_get_tag(base) != IROP_TAG_VREG || irop_is_local(base) || irop_is_llocal(base) || base.is_lval == indexed)
       continue;
     int32_t bvr = irop_get_vreg(base), slot_vr;
     int off;
@@ -326,7 +326,7 @@ int ssa_opt_stack_deref_fold(IRSSAOptCtx *ctx)
 
     /* Keep the slot's own identity: a frontend temporary slot carries a
      * negative vreg (VR_TEMP_LOCAL), which passes match its accesses by. */
-    IROperand slot = irop_make_stackoff(slot_vr, off, 1, 0, 0, irop_get_btype(acc));
+    IROperand slot = irop_make_stackoff(slot_vr, off, 1, 0, irop_get_btype(acc));
     slot.is_unsigned = acc.is_unsigned;
     slot.aux = acc.aux;
     if (indexed)

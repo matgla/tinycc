@@ -200,6 +200,7 @@ SELFHOST_COMPILE_SOURCES = [
     "source/frontend/gen/value/strlit_pool.c",
     "source/frontend/gen/value/vstack.c",
     # source/memory/
+    "source/memory/hot_arena.c",
     "source/memory/sort.c",
     "source/memory/unique_ptr.c",
     "source/memory/vector.c",
@@ -207,6 +208,7 @@ SELFHOST_COMPILE_SOURCES = [
     "source/opt/function_pipeline.c",
     # source/opt/analysis/
     "source/opt/analysis/alias.c",
+    "source/opt/analysis/frame_ptr.c",
     "source/opt/analysis/du_chains.c",
     "source/opt/analysis/mem_ssa.c",
     "source/opt/analysis/memref.c",
@@ -234,9 +236,7 @@ SELFHOST_COMPILE_SOURCES = [
     "source/opt/flat/dce/const_return_uninit_elide.c",
     "source/opt/flat/dce/dce.c",
     "source/opt/flat/dce/dead_addrvar_elim.c",
-    "source/opt/flat/dce/dead_trailing_addrvar_store.c",
     "source/opt/flat/dce/dead_vla.c",
-    "source/opt/flat/dce/infinite_loop_simplify.c",
     "source/opt/flat/dce/infinite_self_recursion.c",
     "source/opt/flat/dce/noreturn_call_epilogue.c",
     "source/opt/flat/dce/noreturn_collapse.c",
@@ -296,7 +296,6 @@ SELFHOST_COMPILE_SOURCES = [
     "source/opt/flat/loop/seq_guard_elim.c",
     "source/opt/flat/loop/stack_param_promote.c",
     # source/opt/flat/memory/
-    "source/opt/flat/memory/addrof_var_fwd.c",
     "source/opt/flat/memory/bitfield_unit_narrow.c",
     "source/opt/flat/memory/block_copy_init.c",
     "source/opt/flat/memory/byte_store_merge.c",
@@ -430,7 +429,6 @@ SELFHOST_COMPILE_SOURCES = [
     "source/opt/ssa/scalar/setif_or_taut.c",
     "source/opt/ssa/scalar/strength.c",
     "source/opt/ssa/scalar/tmp_block_const.c",
-    "source/opt/ssa/scalar/var_imm_prop.c",
     # source/opt/ssa/string/
     "source/opt/ssa/string/const_string_fold.c",
     "source/opt/ssa/string/str_memchr.c",

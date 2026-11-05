@@ -63,7 +63,7 @@ int tcc_ir_opt_small_memset_to_store(TCCIRState *ir)
       continue;
 
     /* Dest must be a stack address (LEA form: is_lval=0, is_local=1) */
-    if (irop_get_tag(p_dst) != IROP_TAG_STACKOFF || !p_dst.is_local || p_dst.is_lval)
+    if (irop_get_tag(p_dst) != IROP_TAG_STACKOFF || !irop_is_local(p_dst) || p_dst.is_lval)
       continue;
     int base_offset = (int)irop_get_imm64_ex(ir, p_dst);
 
@@ -130,7 +130,7 @@ int tcc_ir_opt_small_memset_to_store(TCCIRState *ir)
 
     /* STORE pool layout is [dest, src1]. */
     /* A memset is no volatile access, whatever the object's type. */
-    IROperand st_dest0 = irop_make_stackoff(-1, chunk_off[0], /*is_lval*/ 1, /*is_llocal*/ 0, /*is_param*/ 0,
+    IROperand st_dest0 = irop_make_stackoff(-1, chunk_off[0], /*is_lval*/ 1, /*is_param*/ 0,
                                             chunk_btype[0]);
     st_dest0.aux |= IROP_AUX_NONVOLATILE;
     IROperand st_src0 = irop_make_imm32(-1, 0, chunk_btype[0]);
@@ -141,7 +141,7 @@ int tcc_ir_opt_small_memset_to_store(TCCIRState *ir)
 
     if (nchunks == 2)
     {
-      IROperand st_dest1 = irop_make_stackoff(-1, chunk_off[1], /*is_lval*/ 1, /*is_llocal*/ 0, /*is_param*/ 0,
+      IROperand st_dest1 = irop_make_stackoff(-1, chunk_off[1], /*is_lval*/ 1, /*is_param*/ 0,
                                               chunk_btype[1]);
       st_dest1.aux |= IROP_AUX_NONVOLATILE;
       IROperand st_src1 = irop_make_imm32(-1, 0, chunk_btype[1]);

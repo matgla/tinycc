@@ -25,7 +25,6 @@
  * O0-only compiler (PASS_GATED below). */
 static int tcc_ir_opt_known_bits_cascade_ex(IROptCtx *ctx) __attribute__((unused));
 static int tcc_ir_opt_const_prop_cascade_ex(IROptCtx *ctx) __attribute__((unused));
-static int tcc_ir_opt_branch_cleanup_cascade_ex(IROptCtx *ctx) __attribute__((unused));
 static int tcc_ir_opt_memory_trigger_ex(IROptCtx *ctx) __attribute__((unused));
 static int tcc_ir_opt_entry_store_cleanup_ex(IROptCtx *ctx) __attribute__((unused));
 #endif
@@ -92,24 +91,6 @@ static int tcc_ir_opt_const_prop_cascade_ex(IROptCtx *ctx)
   return total;
 }
 
-/* Needed because elim_fallthrough otherwise only runs in the memory group, skipped when sl_forward finds nothing. */
-static int tcc_ir_opt_branch_cleanup_cascade_ex(IROptCtx *ctx)
-{
-  TCCIRState *ir = ctx->ir;
-  int total = 0, silent = 0;
-  for (int i = 0; i < 8; i++) {
-    int ch = 0;
-    ch += tcc_ir_opt_eliminate_fallthrough(ir);
-    if (ch)
-      silent += tcc_ir_opt_compact_nops(ir);
-    ch += tcc_ir_opt_dce(ir);
-    if (!ch)
-      break;
-    total += ch;
-  }
-  CASCADE_END(ctx, total, silent);
-}
-
 /* PASS/PASS_GATED take a TCCIRState* pass, the _CTX forms an IROptCtx* one. */
 #define PASS(nm, f) { .name = nm, .fn.run_ir = f, .takes_ir = 1 }
 /* An O0-only compiler never runs a gated pass (pipeline_run.c treats every
@@ -126,7 +107,6 @@ static int tcc_ir_opt_branch_cleanup_cascade_ex(IROptCtx *ctx)
 static const IROptPass propagation_passes[] = {
   /* Runs first so later passes don't work on a body that is about to collapse. */
   PASS_GATED("uninit_ub", tcc_ir_opt_uninit_local_ub, FLAG(opt_dce)),
-  PASS_GATED("uninit_dom_ret", tcc_ir_opt_uninit_dominates_return, FLAG(opt_dce)),
   /* Before dce, which then takes the compares and counters the folded branches read. */
   PASS_GATED("unreachable_fold", tcc_ir_opt_unreachable_fold, FLAG(opt_jump_threading)),
   PASS_GATED("dce", tcc_ir_opt_dce, FLAG(opt_dce)),
@@ -156,13 +136,9 @@ static const IROptPass propagation_passes[] = {
   PASS_GATED_CTX("self_copy_elim", tcc_ir_opt_self_copy_elim_ex, FLAG(opt_const_prop)),
   PASS_GATED("value_tracking", tcc_ir_opt_value_tracking, FLAG(opt_const_prop)),
   PASS_GATED("cmp_expr_fold", tcc_ir_opt_cmp_expr_fold, FLAG(opt_const_prop)),
-  PASS_GATED_CTX("self_arith", tcc_ir_opt_self_arith_fold_ex, FLAG(opt_const_prop)),
   PASS_GATED("switch_collapse", tcc_ir_opt_switch_collapse, FLAG(opt_const_prop)),
   PASS_GATED("setif_fuse", tcc_ir_opt_setif_branch_fuse, FLAG(opt_const_prop)),
   PASS_GATED("stack_bool", tcc_ir_opt_stack_bool_diamond, FLAG(opt_const_prop)),
-  PASS_GATED_CTX("var_tmp_fwd", tcc_ir_opt_var_tmp_fwd_ex, FLAG(opt_const_prop)),
-  /* Restored after b9b1be1a dropped it; same gate as the pre-refactor table. */
-  PASS_GATED("var_to_tmp", tcc_ir_opt_var_to_tmp, FLAG(opt_copy_prop)),
   PASS_GATED("inline_param_copy", tcc_ir_opt_inline_param_copy_elim, FLAG(opt_copy_prop)),
 };
 
@@ -186,10 +162,8 @@ static const IROptPass memory_passes[] = {
   PASS_GATED_CTX("const_cascade", tcc_ir_opt_const_prop_cascade_ex, FLAG(opt_const_prop)),
   PASS_GATED("setif_fuse", tcc_ir_opt_setif_branch_fuse, FLAG(opt_const_prop)),
   PASS_GATED("stack_bool", tcc_ir_opt_stack_bool_diamond, FLAG(opt_const_prop)),
-  PASS_GATED_CTX("var_tmp_fwd", tcc_ir_opt_var_tmp_fwd_ex, FLAG(opt_const_prop)),
-  PASS_GATED("dce", tcc_ir_opt_dce, FLAG(opt_dce)),
-  PASS_GATED("elim_fallthru", tcc_ir_opt_eliminate_fallthrough, FLAG(opt_jump_threading)),
   /* Internal fixpoint: the outer memory loop's sl_forward trigger can stall mid-cascade and skip later iterations. */
+  PASS_GATED("dce", tcc_ir_opt_dce, FLAG(opt_dce)),
   PASS_GATED_CTX("kb_cascade", tcc_ir_opt_known_bits_cascade_ex, FLAG(opt_const_prop)),
 };
 
@@ -200,12 +174,6 @@ static const IROptPass late_cleanup_passes[] = {
    * survived forwarding, into a slot whose address escapes, becomes one
    * helper call instead of 2W scalar quads. */
   PASS("escape_copy_call", tcc_ir_opt_escape_copy_call),
-  /* `(x^y) cmp y -> x cmp 0`: the plain-register XOR/CMP shape it matches only
-   * exists once the fusion group has pulled the derefs out into LOAD_INDEXED,
-   * which happens after both the propagation and memory groups have finished. */
-  PASS_GATED("cmp_xor_cancel", tcc_ir_opt_cmp_xor_cancel, FLAG(opt_const_prop)),
-  /* Runs first so the dead-store passes below see the simplified CFG. */
-  PASS_GATED_CTX("branch_cleanup", tcc_ir_opt_branch_cleanup_cascade_ex, FLAG(opt_jump_threading)),
   /* Must precede zero_vla so the orphaned outer SP_SAVE/RESTORE pair collapses in the same round. */
   PASS_GATED("dead_vla_struct", tcc_ir_opt_dead_vla_struct_elim, FLAG(opt_dead_store)),
   PASS_GATED("alloca_load_fwd", tcc_ir_opt_alloca_load_fwd, FLAG(opt_dead_store)),
@@ -219,10 +187,6 @@ static const IROptPass late_cleanup_passes[] = {
   PASS_GATED("dead_static_store", tcc_ir_opt_dead_static_store_elim, FLAG(opt_dead_store)),
   PASS_GATED("dead_var_store", tcc_ir_opt_dead_var_store_elim, FLAG(opt_dead_store)),
   PASS_GATED("dead_addrvar", tcc_ir_opt_dead_addrvar_elim, FLAG(opt_dead_store)),
-  /* Trailing writes to addr-taken VARs read earlier but never after the dead write; dead_addrvar misses those. */
-  PASS_GATED("dead_trail_addrvar", tcc_ir_opt_dead_trailing_addrvar_store_elim, FLAG(opt_dead_store)),
-  /* VREG-target VLA_SP_SAVE — the shape produced by alloca_load_fwd. */
-  PASS_GATED("dead_alloca_vreg", tcc_ir_opt_dead_alloca_vreg_elim, FLAG(opt_dead_store)),
   PASS_GATED("dead_local_slot", tcc_ir_opt_dead_local_slot_elim, FLAG(opt_dead_store)),
   PASS_GATED("dead_lea_store", tcc_ir_opt_dead_lea_store_elim, FLAG(opt_dead_store)),
   PASS_GATED("dead_temp_local", tcc_ir_opt_dead_temp_local_elim, FLAG(opt_dead_store)),
@@ -235,11 +199,18 @@ static const IROptPass late_cleanup_passes[] = {
   PASS_GATED("setif_fuse", tcc_ir_opt_setif_branch_fuse, FLAG(opt_const_prop)),
   PASS_GATED("inplace_arith", tcc_ir_opt_store_inplace_arith, FLAG(opt_redundant_store)),
   PASS_GATED("global_base_share", tcc_ir_opt_global_base_share, FLAG(opt_indexed_memory)),
-  /* Second run: the dead-store passes above expose new dead CMP/jump diamonds. */
-  PASS_GATED_CTX("branch_cleanup", tcc_ir_opt_branch_cleanup_cascade_ex, FLAG(opt_jump_threading)),
-  PASS_GATED("inf_loop_simpl", tcc_ir_opt_infinite_loop_simplify, FLAG(opt_dce)),
-  /* Must follow inf_loop_simpl: NOPs the unobservable work preceding a collapsed never-returning self-jump. */
+  /* NOPs the unobservable work preceding a never-returning self-jump. */
   PASS_GATED("dead_pre_inf", tcc_ir_opt_dead_before_infinite_loop, FLAG(opt_dce)),
+};
+
+/* The same cleanup, again during register allocation, on what the SSA passes left.
+ * Only these three change code size then: without the other 23, .text is identical
+ * over 4113 compiles of the test suites and 6 bytes smaller over tinycc's own units.
+ * Measure before adding one back: this runs for every function. */
+static const IROptPass ra_late_cleanup_passes[] = {
+  PASS_GATED("dse", tcc_ir_opt_dse, FLAG(opt_dead_store)),
+  PASS_GATED("redundant_assign", tcc_ir_opt_redundant_var_assign, FLAG(opt_dead_store)),
+  PASS_GATED("inplace_arith", tcc_ir_opt_store_inplace_arith, FLAG(opt_redundant_store)),
 };
 
 static int tcc_ir_opt_entry_store_cleanup_ex(IROptCtx *ctx)
@@ -292,4 +263,8 @@ const IRPassGroup memory_group = {
 
 const IRPassGroup late_cleanup_group = {
   "late_cleanup", late_cleanup_passes, COUNTOF(late_cleanup_passes), 2, 1, -1
+};
+
+const IRPassGroup ra_late_cleanup_group = {
+  "ra_late_cleanup", ra_late_cleanup_passes, COUNTOF(ra_late_cleanup_passes), 2, 1, -1
 };

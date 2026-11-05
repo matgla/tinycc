@@ -112,7 +112,7 @@ static int ssa_store_slot_def_pos(TCCIRState *ir, IRQuadCompact *q,
   if ((d.btype == IROP_BTYPE_INT8 || d.btype == IROP_BTYPE_INT16) &&
       irop_get_tag(s) == IROP_TAG_IMM32 && !s.is_lval)
     bytes = d.btype == IROP_BTYPE_INT8 ? 1 : 2;
-  if (!d.is_local || !bytes)
+  if (!irop_is_local(d) || !bytes)
     return -1;
   int pos = TCCIR_DECODE_VREG_POSITION(dvr);
   if (pos >= num_vars || store_def_ok[pos] > bytes)
@@ -319,7 +319,7 @@ static void ssa_scan_dominating_defs(TCCIRState *ir, IRCFG *cfg, SSAVarInfo *inf
     IROperand d = tcc_ir_op_get_dest(ir, q);
     if ((v = DD_VAR(d)) < 0)
       continue;
-    if (q->op == TCCIR_OP_STORE_INDEXED || ((q->op == TCCIR_OP_STORE) && !d.is_local))
+    if (q->op == TCCIR_OP_STORE_INDEXED || ((q->op == TCCIR_OP_STORE) && !irop_is_local(d)))
       continue; /* a store THROUGH the VAR's value reads it */
     int clean = q->op != TCCIR_OP_STORE_POSTINC &&
                 (q->op != TCCIR_OP_STORE || ssa_store_slot_def_pos(ir, q, info->store_def_ok, num_vars) >= 0);
@@ -475,7 +475,7 @@ static void ssa_scan_var_global(TCCIRState *ir, IRCFG *cfg, SSAVarInfo *info,
       ssa_global_read_width(&gs, tcc_ir_op_get_accum(ir, q));
     if (is_store) {
       IROperand d = tcc_ir_op_get_dest(ir, q);
-      if (q->op != TCCIR_OP_STORE || !d.is_local) {
+      if (q->op != TCCIR_OP_STORE || !irop_is_local(d)) {
         ssa_global_read_width(&gs, d); /* deref/postinc base: reads the var's value */
       } else if (ssa_btype_read_bytes(d.btype) == 0) {
         int pos = ssa_global_var_pos(irop_get_vreg(d), num_vars);
@@ -509,7 +509,7 @@ static void ssa_scan_var_global(TCCIRState *ir, IRCFG *cfg, SSAVarInfo *info,
       int pos = ssa_global_var_pos(irop_get_vreg(d), num_vars);
       if (pos < 0)
         continue;
-      if (q->op != TCCIR_OP_STORE || !d.is_local) {
+      if (q->op != TCCIR_OP_STORE || !irop_is_local(d)) {
         /* Deref through the var's value / postinc pointer update: a read. */
         if (blk < 0 || gs.killed[pos] != blk + 1)
           SSABitset_set(gs.global, pos);
@@ -1027,12 +1027,11 @@ static int ssa_rename_use(IROperand *op, int num_vars, const uint8_t *is_promota
    * `*cur` still loads/stores through it.  Only a var-SLOT access (is_local)
    * collapses to a plain register value.  Without this, `(vv=call())->m0=c`
    * lowered `*vv=c` to `vv=c`, dropping the store and clobbering the pointer. */
-  int deref_through_value = op->is_lval && !op->is_local;
+  int deref_through_value = op->is_lval && !irop_is_local(*op);
   irop_set_vreg(op, cur);
   op->tag = IROP_TAG_VREG;
   if (!deref_through_value) {
     op->is_lval = 0;
-    op->is_local = 0;
   }
   op->u.imm32 = 0;
   return deref_through_value ? 2 : 1;
@@ -1124,7 +1123,6 @@ static void ssa_rename_block_instrs(TCCIRState *ir, IRSSAState *ssa, IRBasicBloc
           irop_set_vreg(&d, new_name);
           d.tag = IROP_TAG_VREG;
           d.is_lval = 0;
-          d.is_local = 0;
           d.u.imm32 = 0;
           tcc_ir_op_set_dest(ir, q, d);
         }

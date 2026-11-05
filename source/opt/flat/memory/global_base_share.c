@@ -105,12 +105,8 @@ int tcc_ir_opt_global_base_share(TCCIRState *ir)
 
   /* Indirect jumps can target any IR position; inserting a LEA before a labeled
    * STORE would break orig_ir_to_code_mapping. Disable for such functions. */
-  for (int i = 0; i < n; i++)
-  {
-    TccIrOp op = ir->compact_instructions[i].op;
-    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE || op == TCCIR_OP_SWITCH_LOAD)
-      return 0;
-  }
+  if (ir_opt_fn_features(ir) & (IR_FN_IJUMP | IR_FN_SWITCH_TABLE | IR_FN_SWITCH_LOAD))
+    return 0;
 
   uint8_t *targets = gbs_jump_targets(ir);
 #define GBS_IS_TARGET(idx) (ir->compact_instructions[idx].is_jump_target || (targets[(idx) / 8] & (1 << ((idx) % 8))))
@@ -190,8 +186,7 @@ int tcc_ir_opt_global_base_share(TCCIRState *ir)
 
     uint32_t sym_pool = tcc_ir_pool_add_symref(ir, anchor_sr->sym,
                                                (int32_t)anchor_sr->addend, anchor_sr->flags);
-    IROperand lea_src = irop_make_symref(-1, sym_pool, 0 /* is_lval */, 0 /* is_local */,
-                                          0 /* is_const */, IROP_BTYPE_INT32);
+    IROperand lea_src = irop_make_symref(-1, sym_pool, 0 /* is_lval */, IROP_BTYPE_INT32);
     IROperand lea_dest = irop_make_vreg(base_vreg, IROP_BTYPE_INT32);
     IROperand null_op = {0};
 

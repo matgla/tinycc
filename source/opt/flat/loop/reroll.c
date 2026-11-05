@@ -159,14 +159,13 @@ static int operand_equiv(TCCIRState *ir, IROperand a, IROperand b,
 
   if (tag_a != tag_b) return 0;
   if (a.is_lval != b.is_lval) return 0;
-  if (a.is_llocal != b.is_llocal) return 0;
-  if (a.is_local != b.is_local) return 0;
-  if (a.is_const != b.is_const) return 0;
+  if (irop_is_llocal(a) != irop_is_llocal(b)) return 0;
+  if (irop_is_local(a) != irop_is_local(b)) return 0;
+  if (irop_is_const(a) != irop_is_const(b)) return 0;
   if (a.btype != b.btype) return 0;
   if (a.vreg_type != b.vreg_type) return 0;
   if (a.is_unsigned != b.is_unsigned) return 0;
-  if (a.is_static != b.is_static) return 0;
-  if (a.is_sym != b.is_sym) return 0;
+  if (irop_is_sym(a) != irop_is_sym(b)) return 0;
   if (a.is_param != b.is_param) return 0;
 
   switch (tag_a) {
@@ -285,6 +284,25 @@ static void body_safe_periods(TCCIRState *ir, int base, int max_P, uint8_t *safe
     }
     safe[i + 1] = n_open == 0; /* still-open group ends past the body boundary -> split */
   }
+}
+
+/* An upper bound on count_repeats: consecutive blocks whose opcodes alone
+ * repeat the body's.  A byte compare per instruction, no operand copies, no
+ * rename map; the full count below can only be smaller. */
+static int count_op_repeats(TCCIRState *ir, int base, int P)
+{
+  int n = ir->next_instruction_index;
+  int reps = 1;
+  while (base + (reps + 1) * P <= n) {
+    const IRQuadCompact *qa = &ir->compact_instructions[base];
+    const IRQuadCompact *qb = &ir->compact_instructions[base + reps * P];
+    int k = 0;
+    while (k < P && qa[k].op == qb[k].op)
+      k++;
+    if (k < P) break;
+    reps++;
+  }
+  return reps;
 }
 
 static int count_repeats(TCCIRState *ir, int base, int P,
@@ -546,6 +564,14 @@ int tcc_ir_opt_reroll(TCCIRState *ir)
        * `a += b; b -= a;`) that walk at every position made this pass
        * quadratic, ~9 s of an on-device -O2 compile. */
       if (reroll_body_moves_only_data(ir, i, P))
+        continue;
+      /* A run of period P also opcode-matches at 2P, 3P, ... and every one of
+       * those candidates re-walked the whole run with the full matcher (a
+       * 262K-instruction function in tests2/101_cleanup walked 2M
+       * instructions for one re-roll).  Its score cannot beat a smaller
+       * period's unless its opcode-only repeat count says so: bound first. */
+      int reps_ub = count_op_repeats(ir, i, P);
+      if (reps_ub < REROLL_MIN_REPEATS || reps_ub * P <= best_score)
         continue;
       collect_body_defs(ir, i, P, &defs);
       int reps = count_repeats(ir, i, P, &map, &defs);

@@ -29,7 +29,7 @@
 /* Anonymous stack-location operand (vreg -1, is_local=1). */
 static inline IROperand gsl_anon(int32_t off, int is_lval, int btype)
 {
-  return irop_make_stackoff(-1, off, is_lval, 0, 0, btype);
+  return irop_make_stackoff(-1, off, is_lval, 0, btype);
 }
 
 static int run_dce(IRSSAOptCtx *ctx)

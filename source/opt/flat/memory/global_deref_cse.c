@@ -93,7 +93,7 @@ static int gdcse_op_reads_values(TccIrOp op)
 /* A global (non-stack) memory read: SYMREF, lvalue, not local. */
 static int gdcse_is_global_read(TCCIRState *ir, IROperand op, IRPoolSymref **out)
 {
-  if (irop_get_tag(op) != IROP_TAG_SYMREF || !op.is_lval || op.is_local)
+  if (irop_get_tag(op) != IROP_TAG_SYMREF || !op.is_lval || irop_is_local(op))
     return 0;
   /* Integer reads only.  INT64 is admitted as a pair TEMP (the plain
    * `unsigned long long x = g` load shape) — it is the storage-unit read of
@@ -148,7 +148,7 @@ static int gdcse_clobbers(TCCIRState *ir, IRQuadCompact *q)
        * the bitfield RMW shape ends its region at its own store anyway, so
        * the extra precision buys nothing here. */
       IROperand dest = tcc_ir_op_get_dest(ir, q);
-      return !dest.is_local || dest.is_llocal;
+      return !irop_is_local(dest) || irop_is_llocal(dest);
     }
     default:
       return 0;

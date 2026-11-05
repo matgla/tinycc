@@ -212,7 +212,7 @@ static int is_stack_or_param_addr(TCCIRState *ir, IROperand op)
 /* A source operand that reads memory other than the function's own frame. */
 static int reads_outside_frame(IROperand op)
 {
-  return op.is_lval && !op.is_llocal && irop_get_tag(op) != IROP_TAG_STACKOFF;
+  return op.is_lval && !irop_is_llocal(op) && irop_get_tag(op) != IROP_TAG_STACKOFF;
 }
 
 TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)

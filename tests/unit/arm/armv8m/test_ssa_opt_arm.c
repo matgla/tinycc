@@ -1033,7 +1033,7 @@ UT_TEST(test_store_add_imm_no_fuse_local_dest)
   TCCIRState *ir = utb_ssa_new(4);
   int lea = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(20, I32));
   IROperand d = utb_lval(utb_temp(1, I32));
-  d.is_local = 1;
+  d.tag = IROP_TAG_STACKOFF;
   int st = utb_emit(ir, TCCIR_OP_STORE, d, utb_temp(2, I32), UTB_NONE);
   (void)lea;
 

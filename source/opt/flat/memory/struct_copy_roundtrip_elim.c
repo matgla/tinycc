@@ -115,7 +115,10 @@ static int scre_def_count(TCCIRState *ir, int32_t vr)
   return scre_defs.cnt[scre_def_slot(vr)];
 }
 
-/* Resolve a call-param operand to a stack-slot address.  The operand is either
+/* Kept apart from ir_opt_addr_walk (opt_alias.h): one hop, no ADD, an ASSIGN
+ * must have no src2, and a non-local StackLoc is accepted (is_local reported).
+ *
+ * Resolve a call-param operand to a stack-slot address.  The operand is either
  * a direct `Addr[StackLoc[off]]` (is_lval=0) or a TEMP whose single prior def
  * is `T <- Addr[StackLoc[off]]` (LEA / ASSIGN-with-no-src2).  Returns 1 and
  * fills *off / *is_local on success. */
@@ -124,7 +127,7 @@ static int scre_resolve_slot_addr(TCCIRState *ir, IROperand op, int before_idx, 
   if (irop_get_tag(op) == IROP_TAG_STACKOFF && !op.is_lval)
   {
     *off = irop_get_stack_offset(op);
-    *is_local = op.is_local;
+    *is_local = irop_is_local(op);
     return 1;
   }
   if (!irop_has_vreg(op))
@@ -159,7 +162,7 @@ static int scre_resolve_slot_addr(TCCIRState *ir, IROperand op, int before_idx, 
     if (irop_get_tag(ds1) != IROP_TAG_STACKOFF || ds1.is_lval)
       return 0;
     *off = irop_get_stack_offset(ds1);
-    *is_local = ds1.is_local;
+    *is_local = irop_is_local(ds1);
     return 1;
   }
   return 0;
@@ -212,7 +215,7 @@ static int scre_touches_region(TCCIRState *ir, IRQuadCompact *q, int32_t lo, int
   for (int k = 0; k < nops; k++)
   {
     IROperand o = ops[k];
-    if (irop_get_tag(o) != IROP_TAG_STACKOFF || !o.is_local)
+    if (irop_get_tag(o) != IROP_TAG_STACKOFF || !irop_is_local(o))
       continue;
     int32_t off = irop_get_stack_offset(o);
     if (off < lo + sz && off + 4 > lo) /* conservative 4-byte footprint */
@@ -473,7 +476,7 @@ static int mglf_btype_width(int btype)
  * Handles the direct `GlobalSym` operand and a TEMP defined by `T = LEA sym`. */
 static int mglf_resolve_global_src(TCCIRState *ir, IROperand op, int before_idx, IRPoolSymref **out)
 {
-  if (irop_get_tag(op) == IROP_TAG_SYMREF && !op.is_lval && !op.is_local)
+  if (irop_get_tag(op) == IROP_TAG_SYMREF && !op.is_lval && !irop_is_local(op))
   {
     *out = irop_get_symref_ex(ir, op);
     return *out != NULL;
@@ -497,7 +500,7 @@ static int mglf_resolve_global_src(TCCIRState *ir, IROperand op, int before_idx,
     IROperand ds1 = tcc_ir_op_get_src1(ir, dq);
     if (dq->op == TCCIR_OP_ASSIGN && !tcc_ir_op_src2_is_none(ir, dq))
       return 0;
-    if (irop_get_tag(ds1) != IROP_TAG_SYMREF || ds1.is_lval || ds1.is_local)
+    if (irop_get_tag(ds1) != IROP_TAG_SYMREF || ds1.is_lval || irop_is_local(ds1))
       return 0;
     *out = irop_get_symref_ex(ir, ds1);
     return *out != NULL;
@@ -621,7 +624,7 @@ int tcc_ir_opt_memmove_global_load_fwd(TCCIRState *ir)
       IROperand s1 = tcc_ir_op_get_src1(ir, q);
       if (q->op == TCCIR_OP_ASSIGN && !tcc_ir_op_src2_is_none(ir, q))
         continue;
-      if (irop_get_tag(s1) != IROP_TAG_STACKOFF || s1.is_lval || !s1.is_local)
+      if (irop_get_tag(s1) != IROP_TAG_STACKOFF || s1.is_lval || !irop_is_local(s1))
         continue;
       int32_t off = irop_get_stack_offset(s1);
       if (off < dbase || off >= dbase + N)
@@ -789,7 +792,7 @@ int tcc_ir_opt_memmove_global_load_fwd(TCCIRState *ir)
       for (int p = 0; p < np && ok; p++)
       {
         IROperand o = ops3[p];
-        if (irop_get_tag(o) != IROP_TAG_STACKOFF || !o.is_local)
+        if (irop_get_tag(o) != IROP_TAG_STACKOFF || !irop_is_local(o))
           continue;
         int32_t off = irop_get_stack_offset(o);
         if (off < dbase || off >= dbase + N)
@@ -889,7 +892,7 @@ int tcc_ir_opt_memmove_global_load_fwd(TCCIRState *ir)
       else
         old = tcc_ir_op_get_src1(ir, lq);
       uint32_t pool = tcc_ir_pool_add_symref(ir, gsym, gaddend + ld_delta[r], gflags);
-      IROperand g = irop_make_symref(-1, pool, /*is_lval*/ 1, /*is_local*/ 0, /*is_const*/ 0,
+      IROperand g = irop_make_symref(-1, pool, /*is_lval*/ 1,
                                      irop_get_btype(old));
       g.is_unsigned = old.is_unsigned;
       if (ld_which[r] == 2)

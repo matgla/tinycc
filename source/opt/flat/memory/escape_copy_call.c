@@ -60,7 +60,7 @@ static int ecc_addr_taken_in(TCCIRState *ir, int lo, int hi)
     for (int s = 0; s < nops; s++)
     {
       IROperand op = ir->iroperand_pool[q->operand_base + s];
-      if (irop_get_tag(op) != IROP_TAG_STACKOFF || op.is_lval || op.is_llocal)
+      if (irop_get_tag(op) != IROP_TAG_STACKOFF || op.is_lval || irop_is_llocal(op))
         continue;
       int32_t off = irop_get_stack_offset(op);
       if (off >= lo && off < hi)
@@ -109,7 +109,7 @@ int tcc_ir_opt_escape_copy_call(TCCIRState *ir)
 
     /* Word 0: LOAD of a stack-passed parameter home word. */
     IROperand src0 = tcc_ir_op_get_src1(ir, lq);
-    if (irop_get_tag(src0) != IROP_TAG_STACKOFF || !src0.is_lval || src0.is_llocal ||
+    if (irop_get_tag(src0) != IROP_TAG_STACKOFF || !src0.is_lval || irop_is_llocal(src0) ||
         !src0.is_param || irop_is_64bit(src0) || irop_get_btype(src0) != IROP_BTYPE_INT32 ||
         tcc_ir_access_is_volatile(ir, src0))
       continue;
@@ -134,11 +134,11 @@ int tcc_ir_opt_escape_copy_call(TCCIRState *ir)
       IROperand ls = tcc_ir_op_get_src1(ir, L);
       IROperand sd = tcc_ir_op_get_dest(ir, S);
       IROperand ss = tcc_ir_op_get_src1(ir, S);
-      if (irop_get_tag(ls) != IROP_TAG_STACKOFF || !ls.is_lval || ls.is_llocal || !ls.is_param ||
+      if (irop_get_tag(ls) != IROP_TAG_STACKOFF || !ls.is_lval || irop_is_llocal(ls) || !ls.is_param ||
           irop_get_vreg(ls) != param_vr || irop_is_64bit(ls) ||
           irop_get_btype(ls) != IROP_BTYPE_INT32 || tcc_ir_access_is_volatile(ir, ls))
         break;
-      if (irop_get_tag(sd) != IROP_TAG_STACKOFF || !sd.is_lval || sd.is_llocal || !sd.is_local ||
+      if (irop_get_tag(sd) != IROP_TAG_STACKOFF || !sd.is_lval || irop_is_llocal(sd) || !irop_is_local(sd) ||
           sd.is_param || irop_get_vreg(sd) >= 0 || irop_is_64bit(sd) ||
           irop_get_btype(sd) != IROP_BTYPE_INT32 || tcc_ir_access_is_volatile(ir, sd))
         break;
@@ -221,7 +221,7 @@ int tcc_ir_opt_escape_copy_call(TCCIRState *ir)
 
     IRQuadCompact *cq = &ir->compact_instructions[store_idx[1]];
     uint32_t sym_pool = tcc_ir_pool_add_symref(ir, helper, 0, 0);
-    int cb = tcc_ir_iroperand_pool_add(ir, irop_make_symref(-1, sym_pool, 0, 0, 0, IROP_BTYPE_FUNC));
+    int cb = tcc_ir_iroperand_pool_add(ir, irop_make_symref(-1, sym_pool, 0, IROP_BTYPE_FUNC));
     tcc_ir_iroperand_pool_add(ir, irop_make_imm32(-1, TCCIR_ENCODE_CALL(call_id, 3), IROP_BTYPE_INT32));
     cq->op = TCCIR_OP_FUNCCALLVOID;
     cq->operand_base = cb;

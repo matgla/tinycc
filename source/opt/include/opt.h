@@ -33,7 +33,6 @@ int tcc_ir_opt_useless_function_body(struct TCCIRState *ir);
 int tcc_ir_opt_noreturn_collapse(struct TCCIRState *ir);
 
 /* Collapses infinite loops with no externally-observable side effects to self-jumps. */
-int tcc_ir_opt_infinite_loop_simplify(struct TCCIRState *ir);
 
 /* Stores preceding a side-effect-free infinite loop are unobservable: reroute entry edges to the loop sink. */
 int tcc_ir_opt_dead_before_infinite_loop(struct TCCIRState *ir);
@@ -51,7 +50,6 @@ int tcc_ir_opt_dead_vla_struct_elim(struct TCCIRState *ir);
 int tcc_ir_opt_alloca_load_fwd(struct TCCIRState *ir);
 
 /* Companion to dead_vla_struct_elim for the VREG-target VLA_SP_SAVE shape alloca_load_fwd produces. */
-int tcc_ir_opt_dead_alloca_vreg_elim(struct TCCIRState *ir);
 
 /* Unconditional self-call before any return path never returns: collapse body to `b .`. */
 int tcc_ir_opt_infinite_self_recursion(struct TCCIRState *ir, struct Sym *func_sym);
@@ -65,7 +63,6 @@ int tcc_ir_opt_dead_addrvar_elim(struct TCCIRState *ir);
 int tcc_ir_opt_dead_var_store_elim(struct TCCIRState *ir);
 
 /* Addr-taken VAR writes following the LAST read, which addrvar misses because the VAR looks live overall. */
-int tcc_ir_opt_dead_trailing_addrvar_store_elim(struct TCCIRState *ir);
 
 /* Kills VAR assigns overwritten before the next read. */
 int tcc_ir_opt_redundant_var_assign(struct TCCIRState *ir);
@@ -113,7 +110,6 @@ int tcc_ir_opt_cmp_stack_addr_fold(struct TCCIRState *ir);
 int tcc_ir_opt_stack_addr_simplify(struct TCCIRState *ir);
 
 int tcc_ir_opt_cmp_expr_fold(struct TCCIRState *ir);
-int tcc_ir_opt_cmp_xor_cancel(struct TCCIRState *ir);
 
 /* ZEXT + SHL #32 + ZEXT + OR -> PACK64. */
 int tcc_ir_opt_pack64(struct TCCIRState *ir);
@@ -181,7 +177,6 @@ int tcc_ir_opt_cmp_field_fuse(struct TCCIRState *ir);
 int tcc_ir_opt_sl_forward(struct TCCIRState *ir);
 
 /* Forwards a const ASSIGN to a VAR through its &V LEA into deref uses (the addr-taken shape var_to_tmp skips). */
-int tcc_ir_opt_addrof_var_fwd(struct TCCIRState *ir);
 
 /* Rewrites derefs through single-def entry-block `P = &V` pointer VARs (and their TEMP copies) to direct V accesses. */
 int tcc_ir_opt_ptr_local_fwd(struct TCCIRState *ir);
@@ -335,7 +330,6 @@ int tcc_ir_opt_switch_collapse(struct TCCIRState *ir);
 /* Branches whose one side can only run into __builtin_unreachable fold to the other side. */
 int tcc_ir_opt_unreachable_fold(struct TCCIRState *ir);
 int tcc_ir_opt_uninit_local_ub(struct TCCIRState *ir);
-int tcc_ir_opt_uninit_dominates_return(struct TCCIRState *ir);
 int tcc_ir_opt_ub_only_body_elide(struct TCCIRState *ir);
 int tcc_ir_opt_local_only_body_elide(struct TCCIRState *ir);
 int tcc_ir_opt_const_return_uninit_elide(struct TCCIRState *ir);
@@ -391,6 +385,7 @@ int tcc_ir_vreg_index_defs(struct TCCIRState *ir, int32_t vreg);
 int tcc_ir_vreg_coalesced(struct TCCIRState *ir, int32_t vreg);
 
 /* Inserts a quad before an index, renumbering jump + switch-table targets. */
+int tcc_ir_insert_instructions_before(struct TCCIRState *ir, int before_idx, struct IRQuadCompact *new_q, int count);
 int tcc_ir_insert_instruction_before(struct TCCIRState *ir, int before_idx, struct IRQuadCompact *new_q);
 
 /* Returns 1 and fills value/btype when the optimized IR reduces to a constant return value. */

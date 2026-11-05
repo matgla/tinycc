@@ -472,23 +472,31 @@ typedef struct TCCMachineScratchRegs
 #define TCC_MACHINE_SCRATCH_ALLOW_REUSE (1u << 2)
 /* Exclude ABI arg registers (e.g. R0-R3 on ARM) from scratch allocation. */
 #define TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS (1u << 3)
+#include "small_ir.h"
+
 /* Exclude "permanent scratch" regs (e.g. R11/R12 on ARM) from scratch allocation. */
 #define TCC_MACHINE_SCRATCH_AVOID_PERM_SCRATCH (1u << 4)
 
-/* Compact IR instruction - stores operand indices instead of full SValues */
 typedef struct IRQuadCompact
 {
+#if TCC_IR_SMALL_QUAD
+  uint16_t operand_base;
+  uint8_t op;
+#define IR_QUAD_FLAG uint8_t
+#else
   int orig_index;               /* Original IR index (stable across DCE) */
   TccIrOp op;                   /* Operation code */
   uint32_t operand_base;        /* Index into svalue_pool */
   uint32_t line_num : 28;       /* Source line for debug info (non-negative, 28 bits = up to 268M lines) */
+#define IR_QUAD_FLAG uint32_t
+#endif
   /* TRAP only: __builtin_unreachable().  Emits no code, and a path that can
    * only end here may be assumed never taken (tcc_ir_opt_unreachable_fold).
    * Every other pass sees an ordinary TRAP -- a terminator with no successor
    * and a side effect -- which is the conservative reading. */
-  uint32_t unreachable : 1;
-  uint32_t is_jump_target : 1;  /* Set when at least one JUMP/JUMPIF targets this instruction */
-  uint32_t no_unroll : 1;       /* Set on rerolled back-edges to prevent re-unrolling */
+  IR_QUAD_FLAG unreachable : 1;
+  IR_QUAD_FLAG is_jump_target : 1;  /* Set when at least one JUMP/JUMPIF targets this instruction */
+  IR_QUAD_FLAG no_unroll : 1;       /* Set on rerolled back-edges to prevent re-unrolling */
   /* Emit a 2-byte NOP ahead of this instruction when the code offset is not
    * 4-aligned.  Measured on RP2350 silicon: a BACKWARD-branch target at
    * `addr % 4 == 2` costs about a cycle per iteration, because the M33 fetches
@@ -504,8 +512,16 @@ typedef struct IRQuadCompact
    *
    * Set by ssa:loop_bottom_test on the heads it makes bottom-tested, and by
    * tcc_ir_codegen_generate on every backward-branch target (TCC_ALIGN_LOOPS). */
-  uint32_t align_target : 1;
+  IR_QUAD_FLAG align_target : 1;
+#if TCC_IR_SMALL_QUAD
+  uint16_t orig_index;
+  uint16_t line_num;
+#endif
 } IRQuadCompact;
+#undef IR_QUAD_FLAG
+#if TCC_IR_SMALL_QUAD
+typedef char ir_quad_compact_is_8_bytes[sizeof(IRQuadCompact) == 8 ? 1 : -1];
+#endif
 
 /* Per-operation operand configuration (defined in tccir.c) */
 typedef struct IRRegistersConfig
@@ -766,6 +782,17 @@ typedef struct TCCIRState
    * synthesized without the (proven-non-volatile) mark.  See
    * tcc_ir_access_is_volatile below and IROP_AUX_NONVOLATILE. */
   int func_has_volatile_access;
+  int func_has_volatile_local; /* a local or parameter declared volatile */
+
+  /* ir_opt_fn_features (opt_utils.h): the opcode-presence bits of this body,
+   * valid while fn_features_gen == opt_generation != 0.  The flat engine sets
+   * opt_generation to its change counter around each plain pass call and
+   * clears it after, so passes it runs share one scan per generation and
+   * every other caller scans afresh. */
+  uint32_t fn_features, fn_features_gen, opt_generation;
+  /* ir_opt_frame_ptr (opt_alias.h): the points-to facts, same validity rule. */
+  void *frame_ptr;
+  uint32_t frame_ptr_gen;
 
   LSLiveIntervalState ls;
 
@@ -899,6 +926,9 @@ static inline int tcc_ir_opt_pass_disabled(const char *name)
 }
 #endif
 
+/* analysis/frame_ptr.c: drops the cached points-to facts (opt_alias.h). */
+void ir_opt_frame_ptr_free(TCCIRState *ir);
+
 TCCIRState *tcc_ir_allocate_block();
 
 /* If the value is an lvalue (memory reference), emit an IR load so the
@@ -977,7 +1007,6 @@ int tcc_ir_cross_jump_alloc(TCCIRState *ir);
 int tcc_ir_region_merge(TCCIRState *ir);
 int tcc_ir_branch_tidy(TCCIRState *ir);
 int tcc_ir_drop_jumpif_to_next(TCCIRState *ir);
-int tcc_ir_setif_test_chain_fold(TCCIRState *ir);
 int tcc_ir_self_store(TCCIRState *ir);
 int tcc_ir_dead_def(TCCIRState *ir);
 struct IRSSAState;
@@ -1018,7 +1047,11 @@ void tcc_ir_dump_set_show_physical_regs(int show);
 /* -dump-ir-passes= helpers (shared by the legacy optimize loop in tccgen.c and
  * the SSA optimizer driver in ir/opt/ssa_opt.c). */
 int tcc_ir_dump_passes_match(TCCState *s, const char *pass_name);
+#ifdef CONFIG_TCC_DEBUG
 void tcc_ir_dump_after_pass(TCCIRState *ir, const char *pass_name);
+#else
+#define tcc_ir_dump_after_pass(ir, pass_name) ((void)(ir))
+#endif
 /* The same dump, printed the way SSA is written down: one section per basic
  * block, the phi nodes at the head of it, then that block's instructions.  A
  * phi is NOT in the instruction array -- it lives in IRSSAState.block_phis --
@@ -1100,8 +1133,28 @@ static inline IROperand tcc_ir_op_get_src2(const TCCIRState *ir, const IRQuadCom
   return ir->iroperand_pool[q->operand_base + off];
 }
 #else
-IROperand tcc_ir_op_get_dest(const TCCIRState *ir, const IRQuadCompact *q);
+/* An IROperand is 8 bytes, which AAPCS returns through memory: a stack slot in each
+ * caller, a store here and a load there, 443 million times in a self-compile at -O2.
+ * A reference needs none of it, and a caller that reads one field loads one word.
+ * The expression is still a copy wherever one is taken. */
+const IROperand *tcc_ir_op_dest_ref(const TCCIRState *ir, const IRQuadCompact *q);
+#define tcc_ir_op_get_dest(ir, q) (*tcc_ir_op_dest_ref((ir), (q)))
 #endif
+
+/* A scan of a whole function for one vreg can compare words instead of copying each
+ * operand out: irop_get_vreg(op) == vr, for a real vreg vr, means exactly
+ * IROP_VREG_BITS(op) == vr (position in bits 0-16, type in bits 28-31). */
+#define IROP_VREG_BITS(op) ((uint32_t)(op).vr & (((uint32_t)7 << TCCIR_VREG_TYPE_SHIFT) | TCCIR_VREG_POSITION_MASK))
+
+/* How many of q's pool slots hold its dest, src1, src2 and MLA's accumulator. */
+static inline int tcc_ir_quad_operand_words(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  const IRRegistersConfig cfg = irop_config[q->op];
+  int n = q->op == TCCIR_OP_MLA ? 4 : cfg.has_dest + cfg.has_src1 + cfg.has_src2;
+  if ((int)q->operand_base + n > ir->iroperand_pool_count)
+    n = ir->iroperand_pool_count - (int)q->operand_base;
+  return n;
+}
 
 IROperand tcc_ir_get_dest(const TCCIRState *ir, int index);
 
@@ -1123,16 +1176,59 @@ uint8_t tcc_ir_zero_half64_at(const TCCIRState *ir, const IRQuadCompact *q);
 uint16_t tcc_ir_bfi_params_at(const TCCIRState *ir, const IRQuadCompact *q);
 
 #ifndef TCC_IROP_INLINE_ACCESSORS
-IROperand tcc_ir_op_get_src1(const TCCIRState *ir, const IRQuadCompact *q);
+const IROperand *tcc_ir_op_src1_ref(const TCCIRState *ir, const IRQuadCompact *q);
+#define tcc_ir_op_get_src1(ir, q) (*tcc_ir_op_src1_ref((ir), (q)))
 #endif
 
 IROperand tcc_ir_get_src1(const TCCIRState *ir, int index);
 
 #ifndef TCC_IROP_INLINE_ACCESSORS
-IROperand tcc_ir_op_get_src2(const TCCIRState *ir, const IRQuadCompact *q);
+const IROperand *tcc_ir_op_src2_ref(const TCCIRState *ir, const IRQuadCompact *q);
+#define tcc_ir_op_get_src2(ir, q) (*tcc_ir_op_src2_ref((ir), (q)))
 #endif
 
 IROperand tcc_ir_get_src2(const TCCIRState *ir, int index);
+
+/* Does this slot hold vreg V?  For scans over a function's quads, which ask nothing else:
+ * no call, and no decoding, since a real vreg is the operand's type and position bits
+ * as they stand.  V must be real: an operand with no vreg decodes to -1 or lower, and a
+ * value with no type bits would match the words of a constant.  What irop_get_vreg
+ * returned, once tested >= 0, is real; a scan that cannot say so uses IR_SLOT_HOLDS. */
+#define IROP_VREG_WORD_MASK (((uint32_t)7 << TCCIR_VREG_TYPE_SHIFT) | (uint32_t)TCCIR_VREG_POSITION_MASK)
+
+static inline int tcc_ir_vreg_is_real(int32_t v)
+{
+  const uint32_t type = (uint32_t)v >> TCCIR_VREG_TYPE_SHIFT;
+  return type - 1u < 3u && ((uint32_t)v & ~IROP_VREG_WORD_MASK) == 0; /* VAR, TEMP, PARAM */
+}
+
+/* irop_config[op] as the byte it is: has_dest, has_src1, has_src2 from bit 0. */
+#define IROP_CFG_BYTE(op) (((const uint8_t *)irop_config)[op])
+
+#define IROP_SLOT_HOLDS(ir, at, v) (((uint32_t)(ir)->iroperand_pool[at].vr & IROP_VREG_WORD_MASK) == (uint32_t)(v))
+
+static inline int tcc_ir_op_dest_is_vreg(const TCCIRState *ir, const IRQuadCompact *q, int32_t v)
+{
+  const uint32_t at = q->operand_base;
+  return (IROP_CFG_BYTE(q->op) & 1) && IROP_SLOT_HOLDS(ir, at, v);
+}
+
+static inline int tcc_ir_op_src1_is_vreg(const TCCIRState *ir, const IRQuadCompact *q, int32_t v)
+{
+  const unsigned cfg = IROP_CFG_BYTE(q->op);
+  const uint32_t at = q->operand_base + (cfg & 1);
+  return (cfg & 2) && IROP_SLOT_HOLDS(ir, at, v);
+}
+
+static inline int tcc_ir_op_src2_is_vreg(const TCCIRState *ir, const IRQuadCompact *q, int32_t v)
+{
+  const unsigned cfg = IROP_CFG_BYTE(q->op);
+  const uint32_t at = q->operand_base + (cfg & 1) + ((cfg >> 1) & 1);
+  return (cfg & 4) && IROP_SLOT_HOLDS(ir, at, v);
+}
+
+#define IR_SLOT_HOLDS(slot, ir, q, v, real)                                            \
+  ((real) ? tcc_ir_op_##slot##_is_vreg((ir), (q), (v)) : tcc_ir_op_##slot##_vreg((ir), (q)) == (v))
 
 /* irop_get_vreg of an operand slot, without the by-value IROperand round trip at the call site. */
 #ifdef TCC_IROP_INLINE_ACCESSORS
@@ -1244,22 +1340,22 @@ static inline int tcc_ir_op_src2_is_lval(const TCCIRState *ir, const IRQuadCompa
 
 static inline int tcc_ir_op_src1_is_sym(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return tcc_ir_op_get_src1(ir, q).is_sym;
+  return irop_is_sym(tcc_ir_op_get_src1(ir, q));
 }
 
 static inline int tcc_ir_op_src2_is_sym(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return tcc_ir_op_get_src2(ir, q).is_sym;
+  return irop_is_sym(tcc_ir_op_get_src2(ir, q));
 }
 
 static inline int tcc_ir_op_dest_is_local(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return tcc_ir_op_get_dest(ir, q).is_local;
+  return irop_is_local(tcc_ir_op_get_dest(ir, q));
 }
 
 static inline int tcc_ir_op_src1_is_local(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return tcc_ir_op_get_src1(ir, q).is_local;
+  return irop_is_local(tcc_ir_op_get_src1(ir, q));
 }
 
 /* The raw u.imm32 word of the dest slot (a jump target index). */

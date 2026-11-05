@@ -22,6 +22,10 @@
 #include "tcc.h"
 
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <dirent.h>
+#include <errno.h>
+#endif
 
 #ifdef TCC_TARGET_ARM_ARCHV8M
 #include "arm-thumb-defs.h"
@@ -1160,15 +1164,24 @@ static uint8_t *parse_comment(uint8_t *p)
     {
       uint8_t *found = file->buf_end;
 
+      /* Each search stops at what the one before it found: without that, a
+         comment line costs a walk of the rest of the I/O buffer for the '\\'
+         that is almost never there. */
       len = file->buf_end - q;
       r = memchr(q, '\n', len);
-      if (r && r < found)
+      if (r)
+      {
         found = r;
+        len = r - q;
+      }
       r = memchr(q, '*', len);
-      if (r && r < found)
+      if (r)
+      {
         found = r;
+        len = r - q;
+      }
       r = memchr(q, '\\', len);
-      if (r && r < found)
+      if (r)
         found = r;
       p = found;
       c = (found < file->buf_end) ? *p : '\\';
@@ -2145,8 +2158,9 @@ static uint8_t *skip_logical_line(uint8_t *p)
     int c;
 
     nl = memchr(q, '\n', len);
-    bs = memchr(q, '\\', len);
-    if (!bs || (nl && nl < bs))
+    /* Only this line's: see parse_comment. */
+    bs = memchr(q, '\\', nl ? (size_t)(nl - q) : len);
+    if (!bs)
     {
       if (nl)
         return nl;
@@ -2202,6 +2216,86 @@ ST_FUNC void skip_to_eol(int warn)
 
 static CachedInclude *search_cached_include(TCCState *s1, const char *filename, int add);
 
+#ifndef _WIN32
+/* What one include directory holds, read once on the first probe. A failed open
+ * is the costly part of an include search on the device (a filesystem walk per
+ * -I directory per header), and most probes are misses. Only names that may be
+ * present get opened; a hash collision costs one open, as it did before. */
+typedef struct IncDirList
+{
+  const char *path; /* the include_paths/sysinclude_paths entry; stable */
+  int known;        /* 0: unreadable, so every name has to be tried */
+  int nb;
+  uint32_t hash[];
+} IncDirList;
+
+/* Folds case because FAT does: <STDIO.H> opens stdio.h there. */
+static uint32_t inc_name_hash(const char *name, size_t len)
+{
+  uint32_t h = 2166136261u;
+  for (size_t i = 0; i < len; i++)
+  {
+    unsigned char ch = name[i];
+    if (ch >= 'A' && ch <= 'Z')
+      ch += 'a' - 'A';
+    h = (h ^ ch) * 16777619u;
+  }
+  return h;
+}
+
+static IncDirList *inc_dir_list(TCCState *s1, const char *path)
+{
+  for (int i = 0; i < s1->nb_inc_dir_lists; i++)
+  {
+    IncDirList *known = s1->inc_dir_lists[i];
+    if (known->path == path)
+      return known;
+  }
+  int cap = 32;
+  IncDirList *list = tcc_malloc(sizeof(IncDirList) + cap * sizeof(uint32_t));
+  list->path = path;
+  list->nb = 0;
+  DIR *dir = opendir(path);
+  /* Nothing there holds nothing; a directory that will not open might. */
+  list->known = dir != NULL || errno == ENOENT || errno == ENOTDIR;
+  if (dir)
+  {
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+    {
+      if (list->nb == cap)
+      {
+        cap *= 2;
+        list = tcc_realloc(list, sizeof(IncDirList) + cap * sizeof(uint32_t));
+      }
+      list->hash[list->nb++] = inc_name_hash(entry->d_name, strlen(entry->d_name));
+    }
+    closedir(dir);
+  }
+  dynarray_add(&s1->inc_dir_lists, &s1->nb_inc_dir_lists, list);
+  return list;
+}
+
+/* May <dir>/<name> exist? For sys/types.h, that asks about sys. */
+static int inc_dir_may_hold(TCCState *s1, const char *dir, const char *name)
+{
+  const char *slash = strchr(name, '/');
+  size_t len = slash ? (size_t)(slash - name) : strlen(name);
+  if (len == 0 || (name[0] == '.' && (len == 1 || (len == 2 && name[1] == '.'))))
+    return 1;
+  IncDirList *list = inc_dir_list(s1, dir);
+  if (!list->known)
+    return 1;
+  uint32_t hash = inc_name_hash(name, len);
+  for (int i = 0; i < list->nb; i++)
+    if (list->hash[i] == hash)
+      return 1;
+  return 0;
+}
+#else
+#define inc_dir_may_hold(s1, dir, name) 1
+#endif
+
 static int parse_include(TCCState *s1, int do_next, int test)
 {
   int c, i;
@@ -2241,7 +2335,9 @@ static int parse_include(TCCState *s1, int do_next, int test)
   if (!test)
     skip_to_eol(1);
 
-  i = do_next ? file->include_next_index : -1;
+  const int first = do_next ? file->include_next_index : -1;
+  int skipped = 0, filter = 1;
+  i = first;
   for (;;)
   {
     ++i;
@@ -2267,10 +2363,23 @@ static int parse_include(TCCState *s1, int do_next, int test)
         p = s1->include_paths[j];
       else if (k < s1->nb_sysinclude_paths)
         p = s1->sysinclude_paths[k];
+      else if (skipped && filter)
+      {
+        /* A listing can miss what an open would find (a mount on a name its
+         * directory does not hold): before giving up, ask every directory. */
+        filter = 0;
+        i = first;
+        continue;
+      }
       else if (test)
         return 0;
       else
         tcc_error("include file '%s' not found", name);
+      if (filter && !inc_dir_may_hold(s1, p, name))
+      {
+        skipped = 1;
+        continue;
+      }
       pstrcpy(buf, sizeof buf, p);
       pstrcat(buf, sizeof buf, "/");
     }

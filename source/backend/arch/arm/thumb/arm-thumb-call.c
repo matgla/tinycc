@@ -843,7 +843,7 @@ static int build_reg_move_32bit(ThumbArgMove *moves, int move_count, const Machi
      * and the stack.  The generic MOP load below always reads the slot, so it
      * passed the struct's first word as the pointer.  A value read (is_lval,
      * or a PARAM vreg) still loads. */
-    if (arg && arg->is_local && !arg->is_lval && !arg->is_llocal && !mop->needs_deref)
+    if (arg && irop_is_local(*arg) && !arg->is_lval && !irop_is_llocal(*arg) && !mop->needs_deref)
     {
       moves[move_count++] = (ThumbArgMove){.kind = THUMB_ARG_MOVE_LOCAL_ADDR,
                                            .dst_reg = base_reg,
@@ -2426,11 +2426,11 @@ TCC_DBG_ENV_INT(inline_copy_max, "TCC_INLINE_COPY_MAX", 128)
  * literal's or an initialiser template's .rodata copy. */
 static int thumb_copy_arg_word_aligned(TCCIRState *ir, IROperand op)
 {
-  if (op.is_lval || op.is_llocal)
+  if (op.is_lval || irop_is_llocal(op))
     return 0;
   const int tag = irop_get_tag(op);
   if (tag == IROP_TAG_STACKOFF)
-    return op.is_local && irop_get_vreg(op) < 0 && !(irop_get_stack_offset(op) & 3);
+    return irop_is_local(op) && irop_get_vreg(op) < 0 && !(irop_get_stack_offset(op) & 3);
   if (tag != IROP_TAG_SYMREF || !ir)
     return 0;
   IRPoolSymref *sr = irop_get_symref_ex(ir, op);

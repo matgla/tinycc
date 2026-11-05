@@ -59,6 +59,8 @@ typedef struct RMWByteClearPair {
   IROperand add_base_op;
 } RMWByteClearPair;
 
+/* Kept apart from ir_opt_addr_walk (opt_alias.h): the key is (base vreg,
+ * offset) after at most one same-block ADD #imm, not a frame slot. */
 static int rmw_byte_clear_resolve_addr(TCCIRState *ir, IROperand addr_op, int before_idx,
                                        RMWByteAddr *out)
 {

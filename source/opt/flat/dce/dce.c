@@ -59,11 +59,8 @@ static int tcc_ir_opt_dce__timed(TCCIRState *ir)
    * statically determine which basic blocks are reachable from them.
    * Attempting to do DCE would incorrectly eliminate label target blocks
    * that are only reachable through the computed goto. */
-  for (int i = 0; i < n; i++)
-  {
-    if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
-      return 0;
-  }
+  if (ir_opt_fn_features(ir) & IR_FN_IJUMP)
+    return 0;
   /* This instruction worklist does not enumerate the CFG's asm-goto edges. */
   if (ir->func_has_asm_goto)
     return 0;

@@ -18,7 +18,7 @@
  *
  *  Notes used to build the IR (read from the pass + tccir_operand.h):
  *    - A LEA-temp source is a STACKOFF operand with is_local=1, is_lval=0 and
- *      no vreg: irop_make_stackoff(0, off, 0, 0, 0, btype) (arg-0 -> vreg -1).
+ *      no vreg: irop_make_stackoff(0, off, 0, 0, btype) (arg-0 -> vreg -1).
  *    - A direct slot lval is the same with is_lval=1.
  *    - The pass returns 0 immediately unless there is at least one TEMP dest
  *      (max_tmp > 0), so every fixture defines a tracked address temp.
@@ -48,13 +48,13 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir);
  * slot as a value" (what a LEA computes into a temp). */
 static inline IROperand utb_slot(int32_t off, int is_lval)
 {
-  return irop_make_stackoff(0, off, is_lval, /*is_llocal*/ 0, /*is_param*/ 0, I32);
+  return irop_make_stackoff(0, off, is_lval, /*is_param*/ 0, I32);
 }
 
 /* Build a STACKOFF operand with an explicit byte width. */
 static inline IROperand utb_slot_b(int32_t off, int is_lval, int btype)
 {
-  return irop_make_stackoff(0, off, is_lval, /*is_llocal*/ 0, /*is_param*/ 0, btype);
+  return irop_make_stackoff(0, off, is_lval, /*is_param*/ 0, btype);
 }
 
 /* A TEMP used as an lvalue (dereference of the address it holds). */

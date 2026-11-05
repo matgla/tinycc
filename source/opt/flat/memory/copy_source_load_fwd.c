@@ -96,10 +96,10 @@ static uint32_t csf_ones_mask(TCCIRState *ir, IROperand op, int at_idx, int dept
   int sz = ir_opt_store_btype_size_bytes(irop_get_btype(op));
   if (depth <= 0 || sz > 4)
     return 0xFFFFFFFFu;
-  if (irop_is_immediate(op) && !op.is_sym)
+  if (irop_is_immediate(op) && !irop_is_sym(op))
     return (uint32_t)irop_get_imm64_ex(ir, op);
   int32_t vr = irop_get_vreg(op);
-  if (vr < 0 || op.is_lval || op.is_sym || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+  if (vr < 0 || op.is_lval || irop_is_sym(op) || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
     return 0xFFFFFFFFu;
   int d = tcc_ir_find_defining_instruction(ir, vr, at_idx);
   if (d < 0)
@@ -122,7 +122,7 @@ static uint32_t csf_ones_mask(TCCIRState *ir, IROperand op, int at_idx, int dept
   case TCCIR_OP_SHL:
   case TCCIR_OP_SHR:
     s2 = tcc_ir_op_get_src2(ir, dq);
-    if (!irop_is_immediate(s2) || s2.is_sym)
+    if (!irop_is_immediate(s2) || irop_is_sym(s2))
       return 0xFFFFFFFFu;
     k = (int)irop_get_imm64_ex(ir, s2);
     if (k < 0 || k > 31)
@@ -139,7 +139,7 @@ static int csf_and_of_same_location(TCCIRState *ir, IROperand op, int at_idx,
                                     Sym *sym, int32_t addend, uint32_t *keep)
 {
   int32_t vr = irop_get_vreg(op);
-  if (vr < 0 || op.is_lval || op.is_sym)
+  if (vr < 0 || op.is_lval || irop_is_sym(op))
     return 0;
   int d = tcc_ir_find_defining_instruction(ir, vr, at_idx);
   if (d < 0)
@@ -150,12 +150,12 @@ static int csf_and_of_same_location(TCCIRState *ir, IROperand op, int at_idx,
   IROperand s1 = tcc_ir_op_get_src1(ir, dq);
   IROperand s2 = tcc_ir_op_get_src2(ir, dq);
   IROperand mem, imm;
-  if (irop_is_immediate(s2) && !s2.is_sym)
+  if (irop_is_immediate(s2) && !irop_is_sym(s2))
   {
     mem = s1;
     imm = s2;
   }
-  else if (irop_is_immediate(s1) && !s1.is_sym)
+  else if (irop_is_immediate(s1) && !irop_is_sym(s1))
   {
     mem = s2;
     imm = s1;
@@ -170,7 +170,7 @@ static int csf_and_of_same_location(TCCIRState *ir, IROperand op, int at_idx,
   if (m.kind != MEMLOC_GLOBAL || m.sym != sym || m.off != addend)
   {
     int32_t mv = irop_get_vreg(mem);
-    if (mv < 0 || mem.is_lval || mem.is_sym)
+    if (mv < 0 || mem.is_lval || irop_is_sym(mem))
       return 0;
     int md = tcc_ir_find_defining_instruction(ir, mv, d);
     if (md < 0 || ir->compact_instructions[md].op != TCCIR_OP_LOAD)
@@ -206,7 +206,7 @@ static uint32_t csf_store_changed_mask(TCCIRState *ir, int idx, Sym *sym, int32_
   if (ir_opt_store_btype_size_bytes(irop_get_btype(val)) > 4)
     return 0xFFFFFFFFu;
   int32_t vr = irop_get_vreg(val);
-  if (vr < 0 || val.is_lval || val.is_sym)
+  if (vr < 0 || val.is_lval || irop_is_sym(val))
     return 0xFFFFFFFFu;
   int d = tcc_ir_find_defining_instruction(ir, vr, idx);
   if (d < 0)
@@ -277,12 +277,12 @@ static uint64_t csf_demanded_of_input(TCCIRState *ir, int idx, int slot, int dep
   case TCCIR_OP_XOR:
     return d & in_mask;
   case TCCIR_OP_AND:
-    if (irop_config[q->op].has_src2 && irop_is_immediate(other) && !other.is_sym)
+    if (irop_config[q->op].has_src2 && irop_is_immediate(other) && !irop_is_sym(other))
       return d & (uint64_t)irop_get_imm64_ex(ir, other) & in_mask;
     return d & in_mask;
   case TCCIR_OP_SHL:
   case TCCIR_OP_SHR:
-    if (slot != 0 || !irop_is_immediate(other) || other.is_sym)
+    if (slot != 0 || !irop_is_immediate(other) || irop_is_sym(other))
       return in_mask;
     k = irop_get_imm64_ex(ir, other);
     if (k < 0 || k > 63)
@@ -301,7 +301,7 @@ static uint64_t csf_demanded_of_result(TCCIRState *ir, int idx, int depth, int *
     return CSF_ALL64;
   IROperand dest = tcc_ir_op_get_dest(ir, q);
   int32_t vr = irop_get_vreg(dest);
-  if (vr < 0 || dest.is_lval || dest.is_sym ||
+  if (vr < 0 || dest.is_lval || irop_is_sym(dest) ||
       TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
     return CSF_ALL64;
   /* A temp redefined later would need per-use reaching-def reasoning. */
@@ -388,7 +388,7 @@ static int csf_store_effect(TCCIRState *ir, int idx, Sym *gsym, int32_t gaddend,
   if (q->op == TCCIR_OP_STORE_INDEXED)
   {
     IROperand base = tcc_ir_op_get_dest(ir, q);
-    if (base.is_sym)
+    if (irop_is_sym(base))
     {
       IRPoolSymref *bref = irop_get_symref_ex(ir, base);
       if (bref && bref->sym)
@@ -398,7 +398,7 @@ static int csf_store_effect(TCCIRState *ir, int idx, Sym *gsym, int32_t gaddend,
   }
 
   /* Global symref destination. */
-  if (dest.is_sym && dest.is_lval)
+  if (irop_is_sym(dest) && dest.is_lval)
   {
     IRPoolSymref *dref = irop_get_symref_ex(ir, dest);
     if (!dref || !dref->sym)
@@ -432,7 +432,7 @@ static int csf_store_effect(TCCIRState *ir, int idx, Sym *gsym, int32_t gaddend,
    * store THROUGH a pointer is a TEMP deref and is not is_local; VT_LLOCAL is
    * a double indirection and is excluded.)  Without this, the fn3 driver bodies
    * bail on their own inlined parameter copy. */
-  if (dest.is_local && !dest.is_sym && !dest.is_llocal)
+  if (irop_is_local(dest) && !irop_is_sym(dest) && !irop_is_llocal(dest))
   {
     int32_t dvr = irop_get_vreg(dest);
     if (dvr >= 0)
@@ -549,7 +549,7 @@ static int csf_global_field_read_exists(TCCIRState *ir, Sym *sym, int32_t addend
       if (slot == 1 && !irop_config[q->op].has_src2)
         continue;
       IROperand op = tcc_ir_op_get_src1_or_2(ir, q, slot);
-      if (!op.is_sym || !op.is_lval || irop_get_btype(op) != btype)
+      if (!irop_is_sym(op) || !op.is_lval || irop_get_btype(op) != btype)
         continue;
       IRPoolSymref *r = irop_get_symref_ex(ir, op);
       if (r && r->sym == sym && r->addend == addend)
@@ -632,7 +632,7 @@ static int csf_store_forwarded_source(TCCIRState *ir, int copy_idx, int32_t vvr,
     if (jq->op != TCCIR_OP_STORE)
       continue;
     IROperand d = tcc_ir_op_get_dest(ir, jq);
-    if (!d.is_sym || !d.is_lval)
+    if (!irop_is_sym(d) || !d.is_lval)
       continue;
     IRPoolSymref *r = irop_get_symref_ex(ir, d);
     if (!r || !r->sym || (r->sym->type.t & VT_VOLATILE))
@@ -802,7 +802,7 @@ int tcc_ir_opt_copy_source_load_fwd(TCCIRState *ir)
       lsrc = tcc_ir_op_get_src1(ir, dq);
     else if (!csf_store_forwarded_source(ir, i, vvr, &lsrc, &src_load))
       continue;
-    if (!lsrc.is_sym || !lsrc.is_lval)
+    if (!irop_is_sym(lsrc) || !lsrc.is_lval)
       continue;
     IRPoolSymref *sref = irop_get_symref_ex(ir, lsrc);
     if (!sref || !sref->sym)
@@ -869,7 +869,7 @@ int tcc_ir_opt_copy_source_load_fwd(TCCIRState *ir)
       /* Only forward a local memory read; skip reads already from a global and
        * anything that is not an lvalue (an immediate, an address, a register).
        * LOAD keeps its historical shape: src1 IS the place it reads. */
-      if (addr.is_sym)
+      if (irop_is_sym(addr))
         continue;
       if (q->op != TCCIR_OP_LOAD && !addr.is_lval)
         continue;
@@ -1032,7 +1032,6 @@ int tcc_ir_opt_copy_source_load_fwd(TCCIRState *ir)
        * changes, so every other flag matches an independent `G.field` deref. */
       IROperand newop = fields[fi].src_addr;
       newop.tag = IROP_TAG_SYMREF;
-      newop.is_sym = 1;
       newop.is_lval = 1;
       newop.u.pool_idx = pool_idx;
       newop.btype = irop_get_btype(addr);

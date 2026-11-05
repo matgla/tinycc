@@ -125,7 +125,7 @@ int ra_fold_phi_const_chain(TCCIRState *ir)
     if (u_dest_vr < 0) continue;
 
     IROperand u_src = tcc_ir_op_get_src1(ir, q);
-    if (u_src.is_lval || u_src.is_llocal) continue;
+    if (u_src.is_lval || irop_is_llocal(u_src)) continue;
     int32_t src_vr = irop_get_vreg(u_src);
     if (src_vr < 0 || TCCIR_DECODE_VREG_TYPE(src_vr) != TCCIR_VREG_TYPE_TEMP) continue;
     int src_pos = TCCIR_DECODE_VREG_POSITION(src_vr);
@@ -147,7 +147,7 @@ int ra_fold_phi_const_chain(TCCIRState *ir)
 
     IROperand def_src = tcc_ir_op_get_src1(ir, def_q);
     /* Constant-like sources only: an is_lval memory read would need its load width preserved when the use's dest btype differs. */
-    if (def_src.is_lval || def_src.is_llocal) continue;
+    if (def_src.is_lval || irop_is_llocal(def_src)) continue;
     int dtag = def_src.tag;
     int safe_const = (dtag == IROP_TAG_IMM32 || dtag == IROP_TAG_F32 ||
                       dtag == IROP_TAG_I64 || dtag == IROP_TAG_F64 ||

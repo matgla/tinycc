@@ -95,7 +95,7 @@ static int unroll_residual_insns(TCCIRState *ir, const int *ops, const IROperand
     }
     else if ((op == TCCIR_OP_ASSIGN || op == TCCIR_OP_LOAD) && irop_get_vreg(src1s[b]) >= 0 &&
              !(src1s[b].is_lval && TCCIR_DECODE_VREG_TYPE(irop_get_vreg(src1s[b])) == TCCIR_VREG_TYPE_TEMP) &&
-             !src1s[b].is_llocal)
+             !irop_is_llocal(src1s[b]))
       ; /* a register copy: coalesced or a move */
     else
       residual++;
@@ -133,7 +133,7 @@ static int unroll_apply_shift(uint8_t enc, int32_t v, int32_t *out)
 static int unroll_const_symbol_temp(TCCIRState *ir, IROperand op, IROperand *symval)
 {
   int32_t vr = irop_get_vreg(op);
-  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP || op.is_lval || op.is_llocal ||
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP || op.is_lval || irop_is_llocal(op) ||
       irop_get_tag(op) != IROP_TAG_VREG)
     return 0;
   int defs = 0;

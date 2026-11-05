@@ -15,17 +15,17 @@ int ssa_opt_diamond_store_fwd_core(TCCIRState *ir);
 
 static IROperand slot_lval(int32_t off)
 {
-  return irop_make_stackoff(0, off, 1, 0, 0, I32);
+  return irop_make_stackoff(0, off, 1, 0, I32);
 }
 
 static IROperand slot_addr(int32_t off)
 {
-  return irop_make_stackoff(0, off, 0, 0, 0, I32);
+  return irop_make_stackoff(0, off, 0, 0, I32);
 }
 
 static IROperand var_slot_lval(int pos, int32_t off)
 {
-  return irop_make_stackoff(VR_VAR(pos), off, 1, 0, 0, I32);
+  return irop_make_stackoff(VR_VAR(pos), off, 1, 0, I32);
 }
 
 static void utb_alloc_var_intervals(TCCIRState *ir, int count)
@@ -306,7 +306,7 @@ UT_TEST(test_sl_forward_pure_aeabi_call_keeps_tracking)
   static Sym callee_sym;
   utb_set_tok_str(70, "__aeabi_i2f");
   uint32_t sidx = tcc_ir_pool_add_symref(ir, &callee_sym, 0, 0);
-  IROperand callee = irop_make_symref(0, sidx, 0, 0, 0, I32);
+  IROperand callee = irop_make_symref(0, sidx, 0, I32);
 
   int store = utb_emit(ir, TCCIR_OP_STORE, slot_lval(-8), utb_imm(55, I32), UTB_NONE);
   utb_emit(ir, TCCIR_OP_FUNCCALLVOID, UTB_NONE, callee, utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 0), I32));

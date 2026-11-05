@@ -221,8 +221,8 @@ int tcc_ir_opt_block_copy_init(TCCIRState *ir)
       IROperand st_dest = tcc_ir_op_get_dest(ir, sq);
       IROperand st_src = tcc_ir_op_get_src1(ir, sq);
 
-      if (irop_get_tag(st_dest) != IROP_TAG_STACKOFF || !st_dest.is_local || !st_dest.is_lval ||
-          st_dest.is_llocal || irop_get_vreg(st_dest) >= 0 || tcc_ir_access_is_volatile(ir, st_dest))
+      if (irop_get_tag(st_dest) != IROP_TAG_STACKOFF || !irop_is_local(st_dest) || !st_dest.is_lval ||
+          irop_is_llocal(st_dest) || irop_get_vreg(st_dest) >= 0 || tcc_ir_access_is_volatile(ir, st_dest))
         break;
 
       int rel_off = (int)irop_get_imm64_ex(ir, st_dest) - base_offset;
@@ -231,7 +231,7 @@ int tcc_ir_opt_block_copy_init(TCCIRState *ir)
         break;
 
       int src_tag = irop_get_tag(st_src);
-      if (st_src.is_lval || st_src.is_local || st_src.is_llocal || irop_get_vreg(st_src) >= 0)
+      if (st_src.is_lval || irop_is_local(st_src) || irop_is_llocal(st_src) || irop_get_vreg(st_src) >= 0)
         break;
       if (src_tag != IROP_TAG_SYMREF && src_tag != IROP_TAG_IMM32 && src_tag != IROP_TAG_I64 &&
           src_tag != IROP_TAG_F32 && src_tag != IROP_TAG_F64)
@@ -286,9 +286,9 @@ int tcc_ir_opt_block_copy_init(TCCIRState *ir)
     Section *block_sec = (nrel && tcc_state->share_rodata) ? data_section : rodata_section;
     Sym *rodata_sym = bci_image_sym(block_sec, image, total_size, rel, nrel);
 
-    IROperand bc_dest = irop_make_stackoff(-1, base_offset, 1, 0, 0, IROP_BTYPE_INT32);
+    IROperand bc_dest = irop_make_stackoff(-1, base_offset, 1, 0, IROP_BTYPE_INT32);
     uint32_t sym_pool_idx = tcc_ir_pool_add_symref(ir, rodata_sym, 0, 0);
-    IROperand bc_src = irop_make_symref(-1, sym_pool_idx, 0, 0, 1, IROP_BTYPE_INT32);
+    IROperand bc_src = irop_make_symref(-1, sym_pool_idx, 0, IROP_BTYPE_INT32);
     IROperand bc_size = irop_make_imm32(-1, total_size, VT_INT);
 
     int pool_base = tcc_ir_iroperand_pool_add(ir, bc_dest);

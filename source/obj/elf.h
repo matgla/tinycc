@@ -782,6 +782,7 @@ typedef Elf32_Addr Elf32_Conflict;
  * returns with its own R9 and nothing would restore ours. Never reaches the
  * YAFF writer. Uses a free value in the 130-159 ABI gap. */
 #define R_ARM_YASOS_LOCAL_CALL 139
+#define R_ARM_YASOS_HOT_VENEER 140 /* linker-internal: fills a --hot-text veneer */
 /* Keep this the last entry.  */
 #define R_ARM_NUM 256
 

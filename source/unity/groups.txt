@@ -23,12 +23,16 @@ arm_thumb_asm: backend/arch/arm/thumb/arm-thumb-asm.c
 arm_thumb_call: backend/arch/arm/thumb/arm-thumb-call*.c
 arm_thumb_emit: backend/arch/arm/thumb/arm-thumb-*.c
 
+# source/memory: hot_arena.c includes no tcc.h, so it has no USING_GLOBALS
+# mode and cannot share a TU with the s1 members (sort.c, unique_ptr.c, vector.c).
+memory_arena: memory/hot_arena.c
+
 # source/obj: the ELF writer/linker apart from debug info, ld scripts and YAFF.
 obj_elf: obj/tccelf*.c
 
 # source/opt/flat/memory
 opt_flat_memory_fwd: opt/flat/memory/sl_forward.c opt/flat/memory/copy_source_load_fwd.c
-    opt/flat/memory/entry_store_prop.c opt/flat/memory/addrof_var_fwd.c
+    opt/flat/memory/entry_store_prop.c
     opt/flat/memory/ptr_local_fwd.c opt/flat/memory/param_copy_alias.c
 opt_flat_memory_dse: opt/flat/memory/dse.c opt/flat/memory/dead_*.c
     opt/flat/memory/var_store_elim.c opt/flat/memory/byte_store_merge.c

@@ -50,7 +50,7 @@ int tcc_ir_opt_dead_temp_local_elim(TCCIRState *ir)
     if (!irop_config[q->op].has_dest)
       continue;
     IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_tag(dest) != IROP_TAG_STACKOFF || !dest.is_local)
+    if (irop_get_tag(dest) != IROP_TAG_STACKOFF || !irop_is_local(dest))
       continue;
     int32_t dest_vr = irop_get_vreg(dest);
     if (dest_vr > -2 || dest_vr < -9)
@@ -69,10 +69,27 @@ int tcc_ir_opt_dead_temp_local_elim(TCCIRState *ir)
     uint64_t live_mask = (my_w >= 64) ? ~(uint64_t)0 : ((uint64_t)1 << my_w) - 1;
     int alive = 0;
     int dead = 0;
+    /* This walks the listing, not the flow.  A later write proves this store dead
+     * only while every path from it must reach that write, so not past a branch:
+     * the next arm of `c ? a : b` also writes the result, and never runs after
+     * this one.  A branch back means a reader above the store runs later, too. */
+    int past_branch = 0;
     for (int j = i + 1; j < n && !alive && !dead; j++) {
       IRQuadCompact *p = &ir->compact_instructions[j];
       if (p->op == TCCIR_OP_NOP)
         continue;
+      if (p->op == TCCIR_OP_JUMP || p->op == TCCIR_OP_JUMPIF) {
+        if (tcc_ir_op_get_dest(ir, p).u.imm32 <= i)
+          alive = 1;
+        past_branch = 1;
+        continue;
+      }
+      if (ir_op_has(p->op, IR_HZ_BRANCH)) {
+        alive = 1; /* IJUMP, SWITCH_TABLE: could go anywhere */
+        continue;
+      }
+      if (ir_op_has(p->op, IROP_A_NO_FALLTHROUGH))
+        past_branch = 1;
       for (int k = 0; k < 3 && !alive && !dead; k++) {
         IROperand po;
         if (!dtl_read_operand(ir, p, k, &po)) continue;
@@ -99,7 +116,7 @@ int tcc_ir_opt_dead_temp_local_elim(TCCIRState *ir)
 
         if (k == 0 && irop_config[p->op].has_dest) {
           /* Subsequent write to our vreg — clobber overlapping bytes. */
-          if (lo < hi) {
+          if (lo < hi && !past_branch) {
             uint64_t mask = (hi - lo >= 64) ? ~(uint64_t)0 : ((uint64_t)1 << (hi - lo)) - 1;
             live_mask &= ~(mask << lo);
             if (live_mask == 0) dead = 1;
@@ -191,8 +208,10 @@ int tcc_ir_opt_dead_temp_local_elim(TCCIRState *ir)
         mask <<= rlo;
         if (pidx == 0) {
           /* Write through addr-of-our-slot. */
-          live_mask &= ~mask;
-          if (live_mask == 0) dead = 1;
+          if (!past_branch) {
+            live_mask &= ~mask;
+            if (live_mask == 0) dead = 1;
+          }
         } else if (live_mask & mask) {
           alive = 1;
         }

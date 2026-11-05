@@ -187,7 +187,7 @@ static int32_t sib_find_prologue_addr_temp(TCCIRState *ir, int prologue_end, int
     if (q->op != TCCIR_OP_ASSIGN)
       continue;
     IROperand s1 = tcc_ir_op_get_src1(ir, q);
-    if (irop_get_tag(s1) != IROP_TAG_STACKOFF || s1.is_lval || s1.is_llocal)
+    if (irop_get_tag(s1) != IROP_TAG_STACKOFF || s1.is_lval || irop_is_llocal(s1))
       continue;
     if (s1.u.imm32 != off)
       continue;

@@ -30,6 +30,7 @@ void tcc_ir_pool_free(struct TCCIRState *ir);
 
 /* Add IROperand to pool, return index */
 int tcc_ir_pool_add(struct TCCIRState *ir, IROperand irop);
+void tcc_ir_settle(struct TCCIRState *ir);
 
 /* Get IROperand from pool by index */
 IROperand tcc_ir_pool_get(struct TCCIRState *ir, int index);

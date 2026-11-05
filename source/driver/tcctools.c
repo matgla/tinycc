@@ -30,6 +30,8 @@
 
 #include "tcc.h"
 
+#include <limits.h>
+
 // #define ARMAG  "!<arch>\n"
 #define ARFMAG "`\n"
 
@@ -94,6 +96,12 @@ static int ar_usage(int ret)
   return ret;
 }
 
+/* An input is only as long as it was read; nothing it claims may reach past that. */
+static int ar_in_file(int fsize, uint64_t offset, uint64_t size)
+{
+  return offset <= (uint64_t)fsize && size <= (uint64_t)fsize - offset;
+}
+
 ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
 {
   static const ArHdr arhdr_init = {"/               ", "0           ", "0     ", "0     ",
@@ -108,8 +116,10 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
   ElfW(Shdr) * shdr;
   ElfW(Sym) * sym;
   int i, fsize, i_lib, i_obj;
-  char *buf, *shstr, *symtab, *strtab;
-  int symtabsize = 0; //, strtabsize = 0;
+  char *buf = NULL, *shstr, *symtab, *strtab;
+  int symtabsize = 0, strtabsize = 0, shstrsize;
+  long pos;
+  size_t got;
   char *anames = NULL;
   int *afpos = NULL;
   int istrlen, strpos = 0, fpos = 0, funccnt = 0, funcmax, hofs;
@@ -164,8 +174,7 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
       fprintf(stderr, "tcc: ar: can't open file %s\n", argv[i_lib]);
       goto finish;
     }
-    fread(stmp, 1, 8, fh);
-    if (memcmp(stmp, ARMAG, 8))
+    if (fread(stmp, 1, 8, fh) != 8 || memcmp(stmp, ARMAG, 8))
     {
     no_ar:
       fprintf(stderr, "tcc: ar: not an ar archive %s\n", argv[i_lib]);
@@ -183,8 +192,15 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
       *e = '\0';
       arhdr.ar_size[sizeof arhdr.ar_size - 1] = 0;
       fsize = atoi(arhdr.ar_size);
+      if (fsize < 0)
+        goto no_ar;
       buf = tcc_malloc(fsize + 1);
-      fread(buf, fsize, 1, fh);
+      if (fread(buf, 1, fsize, fh) != (size_t)fsize)
+      {
+        fprintf(stderr, "tcc: ar: truncated archive %s\n", argv[i_lib]);
+        tcc_free(buf);
+        goto finish;
+      }
       if (strcmp(arhdr.ar_name, "/") && strcmp(arhdr.ar_name, "/SYM64/"))
       {
         if (e > p && e[-1] == '/')
@@ -200,14 +216,25 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
             tcc_free(buf);
             goto finish;
           }
-          fwrite(buf, fsize, 1, fo);
-          fclose(fo);
+          got = fwrite(buf, 1, fsize, fo);
+          if (fclose(fo) || got != (size_t)fsize)
+          {
+            fprintf(stderr, "tcc: ar: can't write file %s\n", arhdr.ar_name);
+            remove(arhdr.ar_name);
+            tcc_free(buf);
+            goto finish;
+          }
           /* ignore date/uid/gid/mode */
         }
       }
       if (fsize & 1)
         fgetc(fh);
       tcc_free(buf);
+    }
+    if (ferror(fh))
+    {
+      fprintf(stderr, "tcc: ar: can't read file %s\n", argv[i_lib]);
+      goto finish;
     }
     ret = 0;
   finish:
@@ -253,18 +280,35 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
     if (verbose)
       printf("a - %s\n", argv[i_obj]);
 
-    fseek(fi, 0, SEEK_END);
-    fsize = ftell(fi);
-    fseek(fi, 0, SEEK_SET);
+    if (fseek(fi, 0, SEEK_END) || (pos = ftell(fi)) < 0 || pos > INT_MAX - 1 || fseek(fi, 0, SEEK_SET))
+    {
+      fclose(fi);
+      fprintf(stderr, "tcc: ar: can't read file %s\n", argv[i_obj]);
+      goto the_end;
+    }
+    fsize = pos;
     buf = tcc_malloc(fsize + 1);
-    fread(buf, fsize, 1, fi);
+    got = fread(buf, 1, fsize, fi);
     fclose(fi);
+    if (got != (size_t)fsize)
+    {
+      fprintf(stderr, "tcc: ar: can't read file %s\n", argv[i_obj]);
+      goto the_end;
+    }
+    buf[fsize] = 0; // ends any name that starts inside the file
 
     // elf header
     ehdr = (ElfW(Ehdr) *)buf;
-    if (ehdr->e_ident[4] != ELFCLASSW)
+    if (fsize < (int)sizeof(*ehdr) || ehdr->e_ident[4] != ELFCLASSW)
     {
       fprintf(stderr, "tcc: ar: Unsupported Elf Class: %s\n", argv[i_obj]);
+      goto the_end;
+    }
+    if (ehdr->e_shstrndx >= ehdr->e_shnum || ehdr->e_shentsize < sizeof(ElfW(Shdr)) ||
+        !ar_in_file(fsize, ehdr->e_shoff, (uint64_t)ehdr->e_shnum * ehdr->e_shentsize))
+    {
+    bad_obj:
+      fprintf(stderr, "tcc: ar: truncated or corrupt object: %s\n", argv[i_obj]);
       goto the_end;
     }
 
@@ -272,7 +316,10 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
       int shent_off = ehdr->e_shstrndx * ehdr->e_shentsize;
       shdr = (ElfW(Shdr) *)(buf + ehdr->e_shoff + shent_off);
     }
+    if (!ar_in_file(fsize, shdr->sh_offset, shdr->sh_size))
+      goto bad_obj;
     shstr = (char *)(buf + shdr->sh_offset);
+    shstrsize = shdr->sh_size;
     symtab = strtab = NULL;
     for (i = 0; i < ehdr->e_shnum; i++)
     {
@@ -280,6 +327,9 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
       shdr = (ElfW(Shdr) *)(buf + ehdr->e_shoff + shent_off);
       if (!shdr->sh_offset)
         continue;
+      if ((shdr->sh_type == SHT_SYMTAB || shdr->sh_type == SHT_STRTAB) &&
+          !ar_in_file(fsize, shdr->sh_offset, shdr->sh_size))
+        goto bad_obj;
       if (shdr->sh_type == SHT_SYMTAB)
       {
         symtab = (char *)(buf + shdr->sh_offset);
@@ -287,10 +337,12 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
       }
       if (shdr->sh_type == SHT_STRTAB)
       {
+        if ((uint64_t)shdr->sh_name >= (uint64_t)shstrsize)
+          goto bad_obj;
         if (!strcmp(shstr + shdr->sh_name, ".strtab"))
         {
           strtab = (char *)(buf + shdr->sh_offset);
-          // strtabsize = shdr->sh_size;
+          strtabsize = shdr->sh_size;
         }
       }
     }
@@ -308,6 +360,8 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
         {
           // printf("symtab: %2Xh %4Xh %2Xh %s\n", sym->st_info, sym->st_size,
           // sym->st_shndx, strtab + sym->st_name);
+          if ((uint64_t)sym->st_name >= (uint64_t)strtabsize)
+            goto bad_obj;
           istrlen = strlen(strtab + sym->st_name) + 1;
           anames = tcc_realloc(anames, strpos + istrlen);
           strcpy(anames + strpos, strtab + sym->st_name);
@@ -337,12 +391,19 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
     snprintf(stmp, sizeof(stmp), "%-10d", fsize);
     memcpy(&arhdro.ar_size, stmp, 10);
     fwrite(&arhdro, sizeof(arhdro), 1, fo);
-    fwrite(buf, fsize, 1, fo);
+    fwrite(buf, 1, fsize, fo);
     tcc_free(buf);
+    buf = NULL;
     i_obj++;
     fpos += (fsize + sizeof(arhdro));
     if (fpos & 1)
       fputc(0, fo), ++fpos;
+  }
+  // The stream's error flag has held every member write since the first one.
+  if (fflush(fo) || ferror(fo))
+  {
+    fprintf(stderr, "tcc: ar: can't write temporary file %s\n", tfile);
+    goto the_end;
   }
   {
     int sym_tbl_sz = (funccnt + 1) * sizeof(int);
@@ -353,48 +414,62 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
     hofs++, fpos = 1;
   // write header
   fwrite(ARMAG, 8, 1, fh);
-  // create an empty archive
-  if (!funccnt)
+  // no global symbols, no index: the members still belong in the archive
+  if (funccnt)
   {
-    ret = 0;
+    {
+      int sym_tbl_sz = (funccnt + 1) * sizeof(int);
+      snprintf(stmp, sizeof(stmp), "%-10d", (int)(strpos + sym_tbl_sz) + fpos);
+    }
+    memcpy(&arhdr.ar_size, stmp, 10);
+    fwrite(&arhdr, sizeof(arhdr), 1, fh);
+    afpos[0] = le2belong(funccnt);
+    for (i = 1; i <= funccnt; i++)
+      afpos[i] = le2belong(afpos[i] + hofs);
+    {
+      int sym_tbl_sz = (funccnt + 1) * sizeof(int);
+      fwrite(afpos, sym_tbl_sz, 1, fh);
+    }
+    fwrite(anames, strpos, 1, fh);
+    if (fpos)
+      fwrite("", 1, 1, fh);
+  }
+  // write objects
+  if (fseek(fo, 0, SEEK_END) || (pos = ftell(fo)) < 0 || pos > INT_MAX - 1 || fseek(fo, 0, SEEK_SET))
+  {
+    fprintf(stderr, "tcc: ar: can't read temporary file %s\n", tfile);
     goto the_end;
   }
-  {
-    int sym_tbl_sz = (funccnt + 1) * sizeof(int);
-    snprintf(stmp, sizeof(stmp), "%-10d", (int)(strpos + sym_tbl_sz) + fpos);
-  }
-  memcpy(&arhdr.ar_size, stmp, 10);
-  fwrite(&arhdr, sizeof(arhdr), 1, fh);
-  afpos[0] = le2belong(funccnt);
-  for (i = 1; i <= funccnt; i++)
-    afpos[i] = le2belong(afpos[i] + hofs);
-  {
-    int sym_tbl_sz = (funccnt + 1) * sizeof(int);
-    fwrite(afpos, sym_tbl_sz, 1, fh);
-  }
-  fwrite(anames, strpos, 1, fh);
-  if (fpos)
-    fwrite("", 1, 1, fh);
-  // write objects
-  fseek(fo, 0, SEEK_END);
-  fsize = ftell(fo);
-  fseek(fo, 0, SEEK_SET);
+  fsize = pos;
   buf = tcc_malloc(fsize + 1);
-  fread(buf, fsize, 1, fo);
-  fwrite(buf, fsize, 1, fh);
-  tcc_free(buf);
+  if (fread(buf, 1, fsize, fo) != (size_t)fsize)
+  {
+    fprintf(stderr, "tcc: ar: can't read temporary file %s\n", tfile);
+    goto the_end;
+  }
+  fwrite(buf, 1, fsize, fh);
+  if (fflush(fh) || ferror(fh))
+  {
+    fprintf(stderr, "tcc: ar: can't write file %s\n", argv[i_lib]);
+    goto the_end;
+  }
   ret = 0;
 the_end:
+  if (buf)
+    tcc_free(buf);
   if (anames)
     tcc_free(anames);
   if (afpos)
     tcc_free(afpos);
-  if (fh)
-    fclose(fh);
-  if (created_file && ret != 0)
-    remove(created_file);
   if (fo)
     fclose(fo), remove(tfile);
+  if (fh && fclose(fh) && ret == 0)
+  {
+    fprintf(stderr, "tcc: ar: can't write file %s\n", argv[i_lib]);
+    ret = 2;
+  }
+  if (created_file && ret != 0)
+    remove(created_file);
   return ret;
 }
 

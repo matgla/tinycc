@@ -16,7 +16,7 @@
 #undef FPH_MAX_PER_LOOP
 #undef GLH_MAX_PER_LOOP
 #undef GLH_MAX_WRITTEN
+#undef LICM_LOOP_MAY_CLOBBER
 #undef LICM_MAX_ADDR_TEMPS
 #undef LICM_MAX_MEM_PARAMS
-#undef MAX_HOISTABLE_CALLS
 #include "../opt/flat/loop/stack_param_promote.c"

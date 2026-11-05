@@ -77,7 +77,7 @@ static int seq_dest_is_direct(IROperand d)
 {
   if (!d.is_lval)
     return 1;
-  return TCCIR_DECODE_VREG_TYPE(irop_get_vreg(d)) == TCCIR_VREG_TYPE_VAR && d.is_local;
+  return TCCIR_DECODE_VREG_TYPE(irop_get_vreg(d)) == TCCIR_VREG_TYPE_VAR && irop_is_local(d);
 }
 
 static int seq_next_live(TCCIRState *ir, int i)
@@ -180,7 +180,7 @@ static int seq_vreg_escapes(TCCIRState *ir, int32_t iv)
       if (irop_get_tag(ops[k]) == IROP_TAG_STACKOFF && !ops[k].is_lval)
         return 1;
       /* a dereference *through* the IV; a direct VAR access is a plain use */
-      if (ops[k].is_lval && !(iv_kind == TCCIR_VREG_TYPE_VAR && ops[k].is_local))
+      if (ops[k].is_lval && !(iv_kind == TCCIR_VREG_TYPE_VAR && irop_is_local(ops[k])))
         return 1;
     }
   }

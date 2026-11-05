@@ -13,6 +13,73 @@
 #include "ir.h"
 #include "opt_utils.h"
 
+int ir_opt_const_binop(TccIrOp op, int is_64, int64_t v1, int64_t v2, int64_t *out)
+{
+  const int width = is_64 ? 64 : 32;
+  int64_t res;
+  switch (op)
+  {
+  case TCCIR_OP_ADD: res = (int64_t)((uint64_t)v1 + (uint64_t)v2); break;
+  case TCCIR_OP_SUB: res = (int64_t)((uint64_t)v1 - (uint64_t)v2); break;
+  case TCCIR_OP_AND: res = v1 & v2; break;
+  case TCCIR_OP_OR: res = v1 | v2; break;
+  case TCCIR_OP_XOR: res = v1 ^ v2; break;
+  case TCCIR_OP_MUL: res = (int64_t)((uint64_t)v1 * (uint64_t)v2); break;
+  case TCCIR_OP_SHL:
+  case TCCIR_OP_SHR:
+  case TCCIR_OP_SAR:
+    if (v2 < 0 || v2 >= width)
+      return 0;
+    if (op == TCCIR_OP_SHL)
+      res = (int64_t)((uint64_t)v1 << v2);
+    else if (op == TCCIR_OP_SHR)
+      res = is_64 ? (int64_t)((uint64_t)v1 >> v2) : (int64_t)((uint32_t)v1 >> v2);
+    else
+      res = is_64 ? (v1 >> v2) : (int64_t)((int32_t)v1 >> v2);
+    break;
+  case TCCIR_OP_ROR:
+  {
+    uint32_t v = (uint32_t)v1, sh = (uint32_t)v2 & 31;
+    res = (int64_t)(int32_t)((v >> sh) | (v << (32 - sh)));
+    break;
+  }
+  case TCCIR_OP_UMULL: res = (int64_t)((uint64_t)(uint32_t)v1 * (uint64_t)(uint32_t)v2); break;
+  case TCCIR_OP_SMULL: res = (int64_t)(int32_t)v1 * (int64_t)(int32_t)v2; break;
+  case TCCIR_OP_UBFX:
+  {
+    int lsb = (int)v2 & 0x1F, w = ((int)v2 >> 5) & 0x1F;
+    if (w <= 0 || w > 32)
+      return 0;
+    res = ((uint32_t)v1 >> lsb) & ((1u << w) - 1);
+    break;
+  }
+  case TCCIR_OP_DIV:
+  case TCCIR_OP_PDIV:
+  case TCCIR_OP_IMOD:
+    /* INT_MIN / -1 traps; width-specific since a 32-bit v1 arrives sign-extended. */
+    if (v2 == 0 || (v2 == -1 && (is_64 ? v1 == INT64_MIN : (int32_t)v1 == INT32_MIN)))
+      return 0;
+    if (op == TCCIR_OP_IMOD)
+      res = is_64 ? v1 % v2 : (int64_t)((int32_t)v1 % (int32_t)v2);
+    else
+      res = is_64 ? v1 / v2 : (int64_t)((int32_t)v1 / (int32_t)v2);
+    break;
+  case TCCIR_OP_UDIV:
+  case TCCIR_OP_UMOD:
+    if (v2 == 0)
+      return 0;
+    if (op == TCCIR_OP_UDIV)
+      res = is_64 ? (int64_t)((uint64_t)v1 / (uint64_t)v2) : (int64_t)((uint32_t)v1 / (uint32_t)v2);
+    else
+      res = is_64 ? (int64_t)((uint64_t)v1 % (uint64_t)v2) : (int64_t)((uint32_t)v1 % (uint32_t)v2);
+    break;
+  default:
+    return 0;
+  }
+  *out = res;
+  return 1;
+}
+
 int is_power_of_2(int64_t n)
 {
   if (n <= 0)

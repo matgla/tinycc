@@ -145,7 +145,7 @@ static int clt_store_width(IROperand dest)
 /* A direct frame operand (no vreg): the object's own bytes or address. */
 static int clt_direct_frame(IROperand op)
 {
-  return irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_local && !op.is_llocal && irop_get_vreg(op) < 0;
+  return irop_get_tag(op) == IROP_TAG_STACKOFF && irop_is_local(op) && !irop_is_llocal(op) && irop_get_vreg(op) < 0;
 }
 
 /* Operand k of q (0 dest, 1 src1, 2 src2, 3 accum), or 0 when absent. */
@@ -223,7 +223,7 @@ static int clt_const_store(TCCIRState *ir, IRQuadCompact *q, const CltObj *objs,
   if (!w || off + w > objs[k].hi)
     return -1;
   int tag = irop_get_tag(s);
-  if (s.is_lval || s.is_local || s.is_llocal || irop_get_vreg(s) >= 0)
+  if (s.is_lval || irop_is_local(s) || irop_is_llocal(s) || irop_get_vreg(s) >= 0)
     return -1;
   if (tag == IROP_TAG_SYMREF)
   {
@@ -754,7 +754,7 @@ int tcc_ir_opt_const_local_table(TCCIRState *ir)
       if (!slot || clt_find(objs, nobj, irop_get_stack_offset(s)) != ob)
         continue;
       uint32_t pidx = tcc_ir_pool_add_symref(ir, sym, irop_get_stack_offset(s) - o->lo, 0);
-      IROperand sref = irop_make_symref(-1, pidx, 0, 0, 1, IROP_BTYPE_INT32);
+      IROperand sref = irop_make_symref(-1, pidx, 0, IROP_BTYPE_INT32);
       IROperand d = tcc_ir_op_get_dest(ir, q), s1 = tcc_ir_op_get_src1(ir, q);
       const int has_src2 = q->op != TCCIR_OP_LEA && irop_config[q->op].has_src2;
       IROperand s2 = has_src2 ? tcc_ir_op_get_src2(ir, q) : s1;

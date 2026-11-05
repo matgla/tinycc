@@ -103,7 +103,7 @@ OPT_DSL_OUTLINE static inline void opt_dsl_drop_use(IRSSAOptCtx *ctx, const IROp
 /* Add a use edge for a plain (non-sym) vreg operand *op consumed by instruction i. */
 OPT_DSL_OUTLINE static inline void opt_dsl_add_use(IRSSAOptCtx *ctx, const IROperand *op, int i)
 {
-  if (op->tag != IROP_TAG_VREG || op->is_sym)
+  if (op->tag != IROP_TAG_VREG || irop_is_sym(*op))
     return;
   IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(*op));
   if (vi)

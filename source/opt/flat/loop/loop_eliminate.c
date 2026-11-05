@@ -145,7 +145,7 @@ int try_eliminate_loop_symbolic(TCCIRState *ir, IRLoop *loop)
       IROperand gsrc1 = tcc_ir_op_get_src1(ir, gq);
       IROperand gsrc2 = tcc_ir_op_get_src2(ir, gq);
       if (irop_get_vreg(gsrc1) == counter_iv->vreg && g + 1 < loop->start_idx &&
-          !gsrc2.is_lval && !gsrc2.is_sym && !gsrc2.is_complex && irop_get_vreg(gsrc2) == irop_get_vreg(limit_op))
+          !gsrc2.is_lval && !irop_is_sym(gsrc2) && !gsrc2.is_complex && irop_get_vreg(gsrc2) == irop_get_vreg(limit_op))
       {
         IRQuadCompact *gjq = &ir->compact_instructions[g + 1];
         /* Must be the zero-trip guard: skip the loop when i >= n. */

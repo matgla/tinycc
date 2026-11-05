@@ -31,10 +31,15 @@ void tcc_ir_opt_ctx_init(IROptCtx *ctx, TCCIRState *ir)
   ctx->loops_gen = 0;
   ctx->pass_state = NULL;
   ctx->changes = 0;
+  /* A fresh generation count: whatever the feature cache holds is from another life. */
+  ir->fn_features_gen = 0;
+  ir->opt_generation = 0;
 }
 
 void tcc_ir_opt_ctx_free(IROptCtx *ctx)
 {
+  ctx->ir->fn_features_gen = 0;
+  ctx->ir->opt_generation = 0;
   if (ctx->du.def) {
     tcc_free(ctx->du.def);
     ctx->du.def = NULL;

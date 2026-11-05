@@ -21,10 +21,8 @@
 int tcc_ir_opt_dead_var_store_elim(TCCIRState *ir);
 int tcc_ir_opt_dse(TCCIRState *ir);
 int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir);
-int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir);
 int tcc_ir_opt_zero_vla_elim(TCCIRState *ir);
 int tcc_ir_opt_dead_before_infinite_loop(TCCIRState *ir);
-int tcc_ir_opt_infinite_loop_simplify(TCCIRState *ir);
 
 #define I32 IROP_BTYPE_INT32
 
@@ -239,132 +237,45 @@ UT_TEST(test_dead_addrvar_var_copy_chain_escape_keeps_lea)
   return 0;
 }
 
-/* ========================================================= dead_trailing_addrvar_store_elim */
-
-/* POSITIVE: a write to V0 through its address AFTER the last read of V0 is
- * dead; an earlier write (before the read) survives.
- *   T0 = LEA &V0
- *   *T0 <- #1              (kept: read follows)
- *   T1 = *T0                (last read of V0)
- *   *T0 <- #2               (dead: no read follows)         -> NOP
- */
-UT_TEST(test_dead_trailing_addrvar_write_after_last_read_removed)
+/* NEGATIVE: V0's address is copied into a PARAM vreg, which the frame
+ * points-to facts do not follow, so V0 escapes there: nothing may go.  (The
+ * facts once took that copy for a tracked one and dse deleted a local's
+ * initialiser under a call in tinycc's decl_designator.) */
+UT_TEST(test_dead_addrvar_copy_into_param_keeps_all)
 {
   TCCIRState *ir = utb_new();
-
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0, I32), UTB_NONE); /* dummy 2nd VAR */
-  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
-  int kept_store = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(1, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_LOAD, utb_temp(1, I32), utb_deref_temp(0, I32), UTB_NONE);
-  int dead_store = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(2, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_dead_trailing_addrvar_store_elim(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, kept_store), TCCIR_OP_STORE);
-  UT_ASSERT_EQ(utb_op(ir, dead_store), TCCIR_OP_NOP);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (guard): the only write to V0 is followed by a read -> nothing
- * is trailing-dead, the store survives. */
-UT_TEST(test_dead_trailing_addrvar_write_before_read_kept)
-{
-  TCCIRState *ir = utb_new();
-
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0, I32), UTB_NONE); /* dummy 2nd VAR */
-  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
-  int store = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(1, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_LOAD, utb_temp(1, I32), utb_deref_temp(0, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_dead_trailing_addrvar_store_elim(ir);
-
+  int lea = utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
+  int init = utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(7, I32), UTB_NONE);
+  int copy = utb_emit(ir, TCCIR_OP_STORE, utb_param(1, I32), utb_temp(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_param(1, I32), UTB_NONE);
+  int changes = tcc_ir_opt_dead_addrvar_elim(ir);
   UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_STORE);
-
+  UT_ASSERT_EQ(utb_op(ir, lea), TCCIR_OP_LEA);
+  UT_ASSERT_EQ(utb_op(ir, init), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_op(ir, copy), TCCIR_OP_STORE);
   utb_free(ir);
   return 0;
 }
 
-/* A write to V0 after its last read, in a function that touches volatile
- * memory.  The write is dead; a volatile access it performs is not. */
-enum DtaVolatile
-{
-  DTA_VOL_NONE,       /* V0 <- *P0 (proven non-volatile): NOPed */
-  DTA_VOL_LOAD_SRC,   /* V0 <- *P0 (volatile) */
-  DTA_VOL_ALU_SRC,    /* V0 <- *P0 ADD #1 (volatile) */
-  DTA_VOL_VAR,        /* V0 <- #2, V0 a volatile local */
-  DTA_VOL_VAR_VIA_PTR, /* *&V0 <- #2, V0 a volatile local */
-  DTA_VOL_STORE_DEST  /* *(volatile int *)&V0 <- #2 */
-};
-
-static TCCIRState *dta_vol_fixture(enum DtaVolatile kind, int *write)
+/* POSITIVE: the address only travels through pointer arithmetic into stores,
+ * and V0 is never read: LEA, ADD, both stores go (the facts follow ADD/SUB). */
+UT_TEST(test_dead_addrvar_arith_derived_pointer_removed)
 {
   TCCIRState *ir = utb_new();
-  utb_alloc_var_intervals(ir, 2);
-  ir->func_has_volatile_access = 1;
-  if (kind == DTA_VOL_VAR || kind == DTA_VOL_VAR_VIA_PTR)
-    ir->variables_live_intervals[0].is_volatile = 1;
-  IROperand r = utb_lval(utb_param(0, I32)); /* no mark: may be volatile */
-  IROperand nv_r = r;
-  nv_r.aux |= IROP_AUX_NONVOLATILE;
-  IROperand slot = utb_deref_temp(0, I32);
-  slot.aux |= IROP_AUX_NONVOLATILE;
-
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0, I32), UTB_NONE); /* dummy 2nd VAR */
-  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_STORE, slot, utb_imm(1, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_LOAD, utb_temp(1, I32), slot, UTB_NONE); /* last read of V0 */
-  switch (kind)
-  {
-  case DTA_VOL_NONE:
-    *write = utb_emit(ir, TCCIR_OP_LOAD, utb_var(0, I32), nv_r, UTB_NONE);
-    break;
-  case DTA_VOL_LOAD_SRC:
-    *write = utb_emit(ir, TCCIR_OP_LOAD, utb_var(0, I32), r, UTB_NONE);
-    break;
-  case DTA_VOL_ALU_SRC:
-    *write = utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), r, utb_imm(1, I32));
-    break;
-  case DTA_VOL_VAR:
-    *write = utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(2, I32), UTB_NONE);
-    break;
-  case DTA_VOL_VAR_VIA_PTR:
-    *write = utb_emit(ir, TCCIR_OP_STORE, slot, utb_imm(2, I32), UTB_NONE);
-    break;
-  case DTA_VOL_STORE_DEST:
-    *write = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(2, I32), UTB_NONE);
-    break;
-  }
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
-  return ir;
-}
-
-UT_TEST(test_dead_trailing_addrvar_nonvolatile_write_in_volatile_fn_removed)
-{
-  int write;
-  TCCIRState *ir = dta_vol_fixture(DTA_VOL_NONE, &write);
-  UT_ASSERT_EQ(tcc_ir_opt_dead_trailing_addrvar_store_elim(ir), 1);
-  UT_ASSERT_EQ(utb_op(ir, write), TCCIR_OP_NOP);
+  int lea = utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
+  int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(4, I32));
+  int st0 = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(1, I32), UTB_NONE);
+  int st1 = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(1, I32), utb_imm(2, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_var(1, I32), UTB_NONE);
+  int changes = tcc_ir_opt_dead_addrvar_elim(ir);
+  UT_ASSERT_EQ(changes, 4);
+  UT_ASSERT_EQ(utb_op(ir, lea), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, add), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, st0), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, st1), TCCIR_OP_NOP);
   utb_free(ir);
-  return 0;
-}
-
-UT_TEST(test_dead_trailing_addrvar_volatile_access_kept)
-{
-  static const int ops[] = {0, TCCIR_OP_LOAD, TCCIR_OP_ADD, TCCIR_OP_ASSIGN, TCCIR_OP_STORE, TCCIR_OP_STORE};
-  for (int kind = DTA_VOL_LOAD_SRC; kind <= DTA_VOL_STORE_DEST; kind++)
-  {
-    int write;
-    TCCIRState *ir = dta_vol_fixture(kind, &write);
-    UT_ASSERT_EQ(tcc_ir_opt_dead_trailing_addrvar_store_elim(ir), 0);
-    UT_ASSERT_EQ(utb_op(ir, write), ops[kind]);
-    utb_free(ir);
-  }
   return 0;
 }
 
@@ -459,65 +370,6 @@ UT_TEST(test_dead_before_inf_loop_reachable_anchor_keeps_prologue)
   return 0;
 }
 
-/* ================================================================== infinite_loop_simplify */
-
-/* POSITIVE: a trivial infinite loop (header IS the entry, no preheader) whose
- * only body op is a constant store to a non-volatile global collapses to a
- * bare self-jump; the store can never be hoisted (no preheader exists) or
- * observed (the function never returns), so it is dropped outright.
- *   0: GlobalSym(X) <- #5   [STORE; header]
- *   1: JUMP -> 0             [back-edge]
- *   2: RETURNVOID            [unreachable filler so n >= 3]
- * -> 0: JUMP -> 0 (self-jump), 1: NOP */
-UT_TEST(test_infinite_loop_simplify_dead_global_store_collapses_to_selfjump)
-{
-  TCCIRState *ir = utb_loop_new();
-  tcc_state->optimize = 2;
-  utb_pools_init(ir);
-
-  Sym sym_x;
-  memset(&sym_x, 0, sizeof(sym_x));
-  IROperand gx = utb_symref(ir, &sym_x, /*is_lval*/ 1, /*is_local*/ 0, /*is_const*/ 0, I32);
-
-  int header = utb_emit(ir, TCCIR_OP_STORE, gx, utb_imm(5, I32), UTB_NONE);
-  int back_edge = emit_jump(ir, 0);
-  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
-
-  int changes = tcc_ir_opt_infinite_loop_simplify(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, header), TCCIR_OP_JUMP);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_dest(ir, header)), 0);
-  UT_ASSERT_EQ(utb_op(ir, back_edge), TCCIR_OP_NOP);
-
-  tcc_state->optimize = 0;
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (guard): the loop body contains a pointer store (STORE_INDEXED),
- * which the pass cannot prove dead/hoistable -- it must leave the loop
- * untouched. */
-UT_TEST(test_infinite_loop_simplify_indexed_store_blocks_collapse)
-{
-  TCCIRState *ir = utb_loop_new();
-  tcc_state->optimize = 2;
-
-  int header = utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(0, I32), utb_imm(7, I32), utb_imm(0, I32),
-                          utb_imm(1, I32));
-  int back_edge = emit_jump(ir, 0);
-  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
-
-  int changes = tcc_ir_opt_infinite_loop_simplify(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, header), TCCIR_OP_STORE_INDEXED);
-  UT_ASSERT_EQ(utb_op(ir, back_edge), TCCIR_OP_JUMP);
-
-  tcc_state->optimize = 0;
-  utb_free(ir);
-  return 0;
-}
 
 /* Dead-loop elimination is owned by the SSA pass ssa:dead_loop
  * (ir/opt/ssa_opt_dead_loop.c, exercised by test_ssa_opt_dead_loop.c and IR
@@ -563,26 +415,6 @@ UT_TEST(test_dead_addrvar_elim_direct_call)
   return 0;
 }
 
-UT_TEST(test_dead_trailing_addrvar_store_elim_direct_call)
-{
-  TCCIRState *ir = utb_new();
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
-  int kept = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(1, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_LOAD, utb_temp(1, I32), utb_deref_temp(0, I32), UTB_NONE);
-  int dead = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(2, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_dead_trailing_addrvar_store_elim(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, kept), TCCIR_OP_STORE);
-  UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);
-
-  utb_free(ir);
-  return 0;
-}
-
 UT_TEST(test_zero_vla_elim_direct_call)
 {
   TCCIRState *ir = utb_new();
@@ -609,32 +441,6 @@ UT_TEST(test_dead_before_infinite_loop_direct_call)
 
   UT_ASSERT_EQ(changes, 1);
   UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);
-
-  tcc_state->optimize = 0;
-  utb_free(ir);
-  return 0;
-}
-
-UT_TEST(test_infinite_loop_simplify_direct_call)
-{
-  TCCIRState *ir = utb_loop_new();
-  tcc_state->optimize = 2;
-  utb_pools_init(ir);
-
-  Sym sym_x;
-  memset(&sym_x, 0, sizeof(sym_x));
-  IROperand gx = utb_symref(ir, &sym_x, /*is_lval*/ 1, /*is_local*/ 0, /*is_const*/ 0, I32);
-
-  int header = utb_emit(ir, TCCIR_OP_STORE, gx, utb_imm(5, I32), UTB_NONE);
-  int back_edge = emit_jump(ir, 0);
-  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
-
-  int changes = tcc_ir_opt_infinite_loop_simplify(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, header), TCCIR_OP_JUMP);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_dest(ir, header)), 0);
-  UT_ASSERT_EQ(utb_op(ir, back_edge), TCCIR_OP_NOP);
 
   tcc_state->optimize = 0;
   utb_free(ir);
@@ -727,7 +533,5 @@ UT_TEST(test_dse_addrvar_indexed_zeroing_guards)
 
 UT_COVERS("dead_var_store");   /* alias tracked by check_pass_coverage.py normalization */
 UT_COVERS("dead_addrvar");
-UT_COVERS("dead_trail_addrvar");
 UT_COVERS("zero_vla");
 UT_COVERS("dead_pre_inf");
-UT_COVERS("inf_loop_simpl");

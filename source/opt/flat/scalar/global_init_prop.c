@@ -36,7 +36,7 @@ int tcc_ir_opt_global_init_prop(TCCIRState *ir)
     for (int slot = 0; slot < 2; slot++)
     {
       IROperand opnd = tcc_ir_op_get_src1_or_2(ir, q, slot != 0);
-      if (!opnd.is_sym || !opnd.is_lval)
+      if (!irop_is_sym(opnd) || !opnd.is_lval)
         continue;
 
       IRPoolSymref *ref = irop_get_symref_ex(ir, opnd);
@@ -198,7 +198,7 @@ int tcc_ir_opt_global_init_prop(TCCIRState *ir)
       {
         /* Fold to a symref-by-value (address constant: &TargetSym + addend). */
         uint32_t pool_idx = tcc_ir_pool_add_symref(ir, reloc_target_sym, (int32_t)reloc_data_addend, 0);
-        new_opnd = irop_make_symref(-1, pool_idx, 0 /* not lval */, 0, 1 /* is_const */, result_btype);
+        new_opnd = irop_make_symref(-1, pool_idx, 0 /* not lval */, result_btype);
         new_opnd.is_unsigned = result_is_unsigned;
       }
       else

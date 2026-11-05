@@ -82,7 +82,7 @@ static int strcpy_prepare(const StrFoldCtx *c, IROperand *out_dst, IROperand *ou
     }
   }
 
-  *out_dst = irop_make_stackoff(-1, irop_get_stack_offset(dst), 1, 0, 0, IROP_BTYPE_INT32);
+  *out_dst = irop_make_stackoff(-1, irop_get_stack_offset(dst), 1, 0, IROP_BTYPE_INT32);
   *out_src = src_sym;
   *out_size = len + 1;
   return 1;

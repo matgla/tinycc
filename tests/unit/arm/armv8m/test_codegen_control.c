@@ -237,6 +237,7 @@ UT_TEST(test_switch_operands)
 
   tcc_ir_put(ir, TCCIR_OP_RETURNVALUE, &s_idx, NULL, NULL);
 
+  tcc_state->optimize = 1; /* -O0 keeps what crosses a block in memory */
   tcc_ir_ssa_regalloc(ir, arm_get_regalloc_target(), 0);
 
   IRQuadCompact *qst2 = &ir->compact_instructions[st_idx];
@@ -888,6 +889,7 @@ UT_TEST(test_dispatch_ijump_routes_to_indirect_jump_mop)
   tcc_ir_put(ir, TCCIR_OP_IJUMP, &s_target, NULL, NULL);
   tcc_ir_put(ir, TCCIR_OP_RETURNVALUE, &s_target, NULL, NULL);
 
+  tcc_state->optimize = 1; /* -O0 keeps what crosses a block in memory */
   tcc_ir_ssa_regalloc(ir, arm_get_regalloc_target(), 0);
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
@@ -1046,6 +1048,7 @@ UT_TEST(test_dispatch_switch_load_routes_to_switch_load_mop)
   tcc_ir_put(ir, TCCIR_OP_SWITCH_LOAD, &s_idx, &s_table_id, &s_dest);
   tcc_ir_put(ir, TCCIR_OP_RETURNVALUE, &s_dest, NULL, NULL);
 
+  tcc_state->optimize = 1; /* -O0 keeps what crosses a block in memory */
   tcc_ir_ssa_regalloc(ir, arm_get_regalloc_target(), 0);
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
@@ -1089,7 +1092,7 @@ UT_TEST(test_regalloc_threads_error_tag_after_dead_frame_stores)
   utb_emit(ir, TCCIR_OP_JUMP, utb_imm(5, IROP_BTYPE_INT32), UTB_NONE, UTB_NONE);
   utb_emit(ir, TCCIR_OP_ASSIGN, e, zero, UTB_NONE);
   utb_emit(ir, TCCIR_OP_ASSIGN, c, e, UTB_NONE);
-  utb_emit(ir, TCCIR_OP_STORE, irop_make_stackoff(-1, -8, 1, 0, 0, IROP_BTYPE_INT32), c, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_STORE, irop_make_stackoff(-1, -8, 1, 0, IROP_BTYPE_INT32), c, UTB_NONE);
   utb_emit(ir, TCCIR_OP_TEST_ZERO, UTB_NONE, c, UTB_NONE);
   utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(10, IROP_BTYPE_INT32), utb_imm(TOK_EQ, IROP_BTYPE_INT32), UTB_NONE);
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, c, UTB_NONE);

@@ -12,6 +12,7 @@ ST_FUNC int code_reloc(int reloc_type)
 {
   switch (reloc_type)
   {
+  case R_ARM_YASOS_HOT_VENEER:
   case R_ARM_MOVT_ABS:
   case R_ARM_MOVW_ABS_NC:
   case R_ARM_THM_MOVT_ABS:
@@ -70,6 +71,7 @@ ST_FUNC int gotplt_entry_type(int reloc_type)
   case R_ARM_CALL:
   case R_ARM_JUMP24:
   case R_ARM_PLT32:
+  case R_ARM_YASOS_HOT_VENEER:
   case R_ARM_THM_PC22:
   case R_ARM_THM_ALU_PREL_11_0:
   case R_ARM_THM_JUMP6:
@@ -227,6 +229,8 @@ ST_FUNC void relocate_plt(TCCState *s1)
 }
 #endif
 #endif
+
+static void hot_text_fill_veneer(TCCState *s1, int sym_index, unsigned char *ptr, addr_t addr, addr_t val);
 
 ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t addr, addr_t val)
 {
@@ -514,6 +518,9 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     (*(uint16_t *)(ptr + 2)) = (uint16_t)((lo & 0xd000) | (j1 << 13) | blx_bit | (j2 << 11) | imm11);
   }
     return;
+  case R_ARM_YASOS_HOT_VENEER:
+    hot_text_fill_veneer(s1, ELFW(R_SYM)(rel->r_info), ptr, addr, val);
+    return;
   case R_ARM_YASOS_LOCAL_CALL:
   {
     /* The compiler dropped the R9 reload after the BL at this offset because
@@ -695,6 +702,243 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     LOG_RELOC("FIXME: handle reloc type %d at %x [%p] to %x", type, (unsigned)addr, ptr, (unsigned)val);
     return;
   }
+}
+
+/* --hot-text: the listed functions are the last block of .text (see
+ * coalesce_split_sections), and the loader runs that block from a copy in RAM.
+ * Within the block and within the rest, a BL still reaches, but from one to the
+ * other the distance is only known at load time: flash and SRAM are 256 MB apart.
+ *
+ * A call across goes through a veneer on the caller's side, which adds an offset
+ * known now to a base from a reserved GOT slot, R9 being valid in every function
+ * of a module.  The veneer uses only IP, which AAPCS gives to veneers.  No
+ * thunks, no slot per function, and nothing for the loader to patch: it redirects
+ * addresses in the block, and the flash copy stays valid code, so a load that
+ * finds no RAM simply runs from flash.
+ *
+ * A call out of the block to an import skips the flash PLT stub: the veneer does
+ * what the stub does.  Called only for a module with text_and_data_separation. */
+#define HOT_VENEER_SIZE 20
+#define HOT_GOT_SLOT_TEXT 4 /* raw offset 1, since 0 means "not resolved yet": flash .text | 1 */
+#define HOT_GOT_SLOT_HOT 5  /* raw offset of the block: where it runs | 1 */
+
+static int hot_text_pc_relative(int type)
+{
+  switch (type)
+  {
+  case R_ARM_THM_JUMP19:
+  case R_ARM_THM_JUMP6:
+  case R_ARM_THM_PC12:
+  case R_ARM_THM_PC8:
+  case R_ARM_THM_ALU_PREL_11_0:
+  case R_ARM_MOVT_PREL:
+  case R_ARM_MOVW_PREL_NC:
+  case R_ARM_REL32:
+  case R_ARM_PREL31:
+    return 1;
+  }
+  return 0;
+}
+
+static int hot_text_in_block(TCCState *s1, addr_t a)
+{
+  return a >= s1->hot_text_start && a < s1->hot_text_end;
+}
+
+/* What a branch from `src` to `sym` needs: 0 nothing, otherwise the side that
+ * gets a veneer, 1 the block, 2 the rest. */
+static int hot_text_branch_side(TCCState *s1, const ElfW(Sym) * sym, addr_t src)
+{
+  const int src_hot = hot_text_in_block(s1, src);
+  const int in_text = sym->st_shndx == text_section->sh_num;
+  if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
+    return 0;
+  if (!in_text)
+    return src_hot ? 1 : 0; /* an import, or another section: only the block is far from it */
+  if (src_hot == hot_text_in_block(s1, sym->st_value & ~(addr_t)1))
+    return 0;
+  if (!src_hot && s1->nb_hot_text_flash_names)
+  {
+    const char *name = (char *)symtab_section->link->data + sym->st_name;
+    if (tcc_name_list_has(s1->hot_text_flash_names, s1->nb_hot_text_flash_names, name, strlen(name)))
+      return 0;
+  }
+  return src_hot ? 1 : 2;
+}
+
+/* Bytes of veneers arm_add_hot_text_veneers will add: .text is sized once. */
+ST_FUNC unsigned long arm_hot_text_veneer_bytes(TCCState *s1)
+{
+  Section *sr = text_section->reloc;
+  unsigned long n = 0;
+  int k, nb_rels, nb_syms = symtab_section->data_offset / sizeof(ElfW(Sym));
+  unsigned char *seen;
+  if (!s1->hot_text_end || !sr)
+    return 0;
+  seen = tcc_mallocz(nb_syms);
+  nb_rels = sr->data_offset / sizeof(ElfW_Rel);
+  for (k = 0; k < nb_rels; k++)
+  {
+    ElfW_Rel *rel = (ElfW_Rel *)sr->data + k;
+    const int type = ELFW(R_TYPE)(rel->r_info), sym_index = ELFW(R_SYM)(rel->r_info);
+    int side;
+    if ((type != R_ARM_THM_PC22 && type != R_ARM_THM_JUMP24) || sym_index <= 0 || sym_index >= nb_syms)
+      continue;
+    side = hot_text_branch_side(s1, (ElfW(Sym) *)symtab_section->data + sym_index, rel->r_offset);
+    if (side && !(seen[sym_index] & side))
+    {
+      seen[sym_index] |= side;
+      n++;
+    }
+  }
+  tcc_free(seen);
+  return n * HOT_VENEER_SIZE;
+}
+
+/* The block's veneers first, so they are copied with it; the end moves over them. */
+ST_FUNC void arm_add_hot_text_veneers(TCCState *s1)
+{
+  Section *sr = text_section->reloc;
+  int side, k, nb_rels, n_veneers = 0, nb_syms;
+  const addr_t block_end = s1->hot_text_end;
+  int *veneer_of;
+  if (!s1->hot_text_end)
+    return;
+  if (!sr)
+    sr = section_reloc(symtab_section, text_section);
+  nb_rels = sr->data_offset / sizeof(ElfW_Rel); /* veneers' own relocations come after */
+  nb_syms = symtab_section->data_offset / sizeof(ElfW(Sym));
+  veneer_of = tcc_malloc(sizeof(int) * nb_syms);
+  for (side = 1; side <= 2; side++)
+  {
+    memset(veneer_of, 0, sizeof(int) * nb_syms);
+    for (k = 0; k < nb_rels; k++)
+    {
+      ElfW_Rel *rel = (ElfW_Rel *)sr->data + k;
+      const int type = ELFW(R_TYPE)(rel->r_info), sym_index = ELFW(R_SYM)(rel->r_info);
+      ElfW(Sym) *symtab = (ElfW(Sym) *)symtab_section->data, *sym;
+      const addr_t saved_end = s1->hot_text_end;
+      int want;
+      if (sym_index <= 0 || sym_index >= nb_syms)
+        continue;
+      sym = &symtab[sym_index];
+      /* Which side is decided against the block as linked, without its veneers. */
+      s1->hot_text_end = block_end;
+      if (type != R_ARM_THM_PC22 && type != R_ARM_THM_JUMP24)
+      {
+        if (side == 1 && hot_text_pc_relative(type) && sym->st_shndx != SHN_UNDEF &&
+            hot_text_in_block(s1, rel->r_offset) !=
+                (sym->st_shndx == text_section->sh_num && hot_text_in_block(s1, sym->st_value & ~(addr_t)1)))
+          tcc_error_noabort("--hot-text: relocation %d at %x reaches across the hot block ('%s')", type,
+                            (unsigned)rel->r_offset, (char *)symtab_section->link->data + sym->st_name);
+        s1->hot_text_end = saved_end;
+        continue;
+      }
+      want = hot_text_branch_side(s1, sym, rel->r_offset);
+      s1->hot_text_end = saved_end;
+      if (want != side)
+        continue;
+      if (!veneer_of[sym_index])
+      {
+        char name[48];
+        addr_t off;
+        section_ptr_add(text_section, text_section->data_offset & 1);
+        off = text_section->data_offset;
+        memset(section_ptr_add(text_section, HOT_VENEER_SIZE), 0, HOT_VENEER_SIZE);
+        put_elf_reloc(symtab_section, text_section, off, R_ARM_YASOS_HOT_VENEER, sym_index);
+        snprintf(name, sizeof(name), "__tcc_hot_veneer_%d", n_veneers++);
+        veneer_of[sym_index] = set_elf_sym(symtab_section, off | 1, HOT_VENEER_SIZE, ELFW(ST_INFO)(STB_GLOBAL, STT_FUNC),
+                                           STV_HIDDEN, text_section->sh_num, name);
+        rel = (ElfW_Rel *)sr->data + k; /* adding the relocation may have moved them */
+      }
+      rel->r_info = ELFW(R_INFO)(veneer_of[sym_index], type);
+    }
+    if (side == 1)
+      s1->hot_text_end = text_section->data_offset;
+  }
+  tcc_free(veneer_of);
+}
+
+/* The two reserved slots hold raw offsets: the loader turns them into addresses
+ * like any other local entry (loader.zig, Phase A). */
+ST_FUNC void arm_hot_text_fill_got(TCCState *s1)
+{
+  if (!s1->hot_text_end)
+    return;
+  section_materialize(s1, s1->got);
+  write32le(s1->got->data + HOT_GOT_SLOT_TEXT * PTR_SIZE * 2, text_section->sh_addr + 1);
+  write32le(s1->got->data + HOT_GOT_SLOT_HOT * PTR_SIZE * 2, text_section->sh_addr + s1->hot_text_start);
+}
+
+static void hot_put16(unsigned char **p, unsigned v)
+{
+  write16le(*p, v);
+  *p += 2;
+}
+
+/* add.w ip, ip, #v: v is at most eight bits wide, somewhere from bit 12 up. */
+static void hot_put_add_ip(unsigned char **p, unsigned v)
+{
+  int top = 31;
+  unsigned n, i, imm3, imm8;
+  if (!v)
+    return; /* the padding after bx makes up the veneer's size */
+  while (!(v & (1u << top)))
+    top--;
+  n = 39 - top; /* 1bcdefgh rotated right by n */
+  i = n >> 4;
+  imm3 = (n >> 1) & 7;
+  imm8 = ((n & 1) << 7) | ((v >> (top - 7)) & 0x7f);
+  hot_put16(p, 0xf10c | (i << 10));
+  hot_put16(p, (imm3 << 12) | (0xc << 8) | imm8);
+}
+
+static void hot_text_fill_veneer(TCCState *s1, int sym_index, unsigned char *ptr, addr_t addr, addr_t val)
+{
+  unsigned char *p = ptr;
+  const addr_t text = text_section->sh_addr;
+  const int src_hot = hot_text_in_block(s1, addr - text);
+  if (src_hot && s1->plt && val >= s1->plt->sh_addr && val < s1->plt->sh_addr + s1->plt->data_offset)
+  {
+    /* The PLT stub, without fetching it from flash.  Its GOT offset is in the
+     * entry (relocate_plt): this relocation already names the PLT's symbol. */
+    const unsigned off = read32le(s1->plt->data + ((val - s1->plt->sh_addr) & ~(addr_t)31) + 28);
+    if (off > 0xffff)
+      tcc_error_noabort("--hot-text: GOT offset %x of an import is out of range", off);
+    hot_put16(&p, 0xf240 | ((off >> 1) & 0x400) | (off >> 12));                /* movw ip, #off */
+    hot_put16(&p, ((off >> 8 & 7) << 12) | (0xc << 8) | (off & 0xff));
+    hot_put16(&p, 0x44cc);                                                     /* add ip, r9 */
+    hot_put16(&p, 0xf8dc);                                                     /* ldr.w r9, [ip, #4] */
+    hot_put16(&p, 0x9004);
+    hot_put16(&p, 0xf8dc);                                                     /* ldr.w pc, [ip] */
+    hot_put16(&p, 0xf000);
+  }
+  else
+  {
+    const unsigned slot = (src_hot ? HOT_GOT_SLOT_TEXT : HOT_GOT_SLOT_HOT) * PTR_SIZE * 2;
+    const addr_t base = text + (src_hot ? 0 : s1->hot_text_start);
+    const addr_t target = val & ~(addr_t)1;
+    const unsigned off = target - base;
+    /* A veneer from flash only ever goes to the block, which is after it or not,
+     * so it must be the block's start the offset counts from. */
+    if (target < base || off >= 1u << 28 || (off & 1) || (!src_hot && !hot_text_in_block(s1, target - text)) ||
+        (src_hot && target >= text + text_section->data_offset))
+    {
+      tcc_error_noabort("--hot-text: cannot reach '%s' from a veneer at %x",
+                        (char *)symtab_section->link->data + ((ElfW(Sym) *)symtab_section->data)[sym_index].st_name,
+                        (unsigned)addr);
+      return;
+    }
+    hot_put16(&p, 0xf8d9); /* ldr.w ip, [r9, #slot]: the base, with the Thumb bit */
+    hot_put16(&p, 0xc000 | slot);
+    hot_put16(&p, 0xf20c | ((off >> 1) & 0x400)); /* addw ip, ip, #bits 0-11 */
+    hot_put16(&p, ((off >> 8 & 7) << 12) | (0xc << 8) | (off & 0xff));
+    hot_put_add_ip(&p, off & 0x000ff000);
+    hot_put_add_ip(&p, off & 0x0ff00000);
+    hot_put16(&p, 0x4760); /* bx ip */
+  }
+  while (p < ptr + HOT_VENEER_SIZE)
+    hot_put16(&p, 0xbf00);
 }
 
 /* Range-extension veneers for Thumb BL / B.W (R_ARM_THM_PC22 / JUMP24).

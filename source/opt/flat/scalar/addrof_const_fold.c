@@ -114,14 +114,8 @@ int tcc_ir_opt_param_addrof_const_fold(TCCIRState *ir)
     return 0;
 
   /* Single-BB restriction: no dominance analysis. */
-  for (int i = 0; i < n; i++)
-  {
-    int op = ir->compact_instructions[i].op;
-    if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF || op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE)
-      return 0;
-    if (ir->compact_instructions[i].is_jump_target && i > 0)
-      return 0;
-  }
+  if (ir_opt_fn_features(ir) & (IR_FN_JUMP | IR_FN_IJUMP | IR_FN_SWITCH_TABLE | IR_FN_INNER_TARGET))
+    return 0;
 
   typedef struct
   {
@@ -176,7 +170,7 @@ int tcc_ir_opt_param_addrof_const_fold(TCCIRState *ir)
     int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
     int32_t svr = irop_get_vreg(src1);
 
-    if (!src1.is_local || src1.is_lval)
+    if (!irop_is_local(src1) || src1.is_lval)
       continue;
     if (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_PARAM)
       continue;
@@ -350,7 +344,7 @@ int tcc_ir_opt_param_addrof_const_fold(TCCIRState *ir)
       /* Replace post-STORE refs to P (spill-slot LOAD or direct PARAM ref) with stored value. */
       int32_t s1vr = irop_get_vreg(src1);
       if (s1vr >= 0 && TCCIR_DECODE_VREG_TYPE(s1vr) == TCCIR_VREG_TYPE_PARAM &&
-          TCCIR_DECODE_VREG_POSITION(s1vr) == p && !(src1.is_lval && !src1.is_local))
+          TCCIR_DECODE_VREG_POSITION(s1vr) == p && !(src1.is_lval && !irop_is_local(src1)))
       {
         IROperand newop = store_val;
         newop.btype = src1.btype;
@@ -363,7 +357,7 @@ int tcc_ir_opt_param_addrof_const_fold(TCCIRState *ir)
 
       int32_t s2vr = irop_get_vreg(src2);
       if (s2vr >= 0 && TCCIR_DECODE_VREG_TYPE(s2vr) == TCCIR_VREG_TYPE_PARAM &&
-          TCCIR_DECODE_VREG_POSITION(s2vr) == p && !(src2.is_lval && !src2.is_local))
+          TCCIR_DECODE_VREG_POSITION(s2vr) == p && !(src2.is_lval && !irop_is_local(src2)))
       {
         IROperand newop = store_val;
         newop.btype = src2.btype;
@@ -435,14 +429,8 @@ int tcc_ir_opt_local_addrof_const_fold(TCCIRState *ir)
     return 0;
 
   /* Single-BB restriction. */
-  for (int i = 0; i < n; i++)
-  {
-    int op = ir->compact_instructions[i].op;
-    if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF || op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE)
-      return 0;
-    if (ir->compact_instructions[i].is_jump_target && i > 0)
-      return 0;
-  }
+  if (ir_opt_fn_features(ir) & (IR_FN_JUMP | IR_FN_IJUMP | IR_FN_SWITCH_TABLE | IR_FN_INNER_TARGET))
+    return 0;
 
   typedef struct
   {
@@ -500,7 +488,7 @@ int tcc_ir_opt_local_addrof_const_fold(TCCIRState *ir)
     int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
     int32_t svr = irop_get_vreg(src1);
 
-    if (!src1.is_local || src1.is_lval)
+    if (!irop_is_local(src1) || src1.is_lval)
       continue;
     if (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)
       continue;
@@ -720,7 +708,7 @@ int tcc_ir_opt_local_addrof_const_fold(TCCIRState *ir)
 
       int32_t s1vr = irop_get_vreg(src1);
       if (s1vr >= 0 && TCCIR_DECODE_VREG_TYPE(s1vr) == TCCIR_VREG_TYPE_VAR &&
-          TCCIR_DECODE_VREG_POSITION(s1vr) == v && !(src1.is_lval && !src1.is_local))
+          TCCIR_DECODE_VREG_POSITION(s1vr) == v && !(src1.is_lval && !irop_is_local(src1)))
       {
         IROperand newop = store_val;
         newop.btype = src1.btype;
@@ -733,7 +721,7 @@ int tcc_ir_opt_local_addrof_const_fold(TCCIRState *ir)
 
       int32_t s2vr = irop_get_vreg(src2);
       if (s2vr >= 0 && TCCIR_DECODE_VREG_TYPE(s2vr) == TCCIR_VREG_TYPE_VAR &&
-          TCCIR_DECODE_VREG_POSITION(s2vr) == v && !(src2.is_lval && !src2.is_local))
+          TCCIR_DECODE_VREG_POSITION(s2vr) == v && !(src2.is_lval && !irop_is_local(src2)))
       {
         IROperand newop = store_val;
         newop.btype = src2.btype;

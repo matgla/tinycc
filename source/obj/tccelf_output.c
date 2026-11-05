@@ -608,8 +608,8 @@ void gc_sections(TCCState *s1)
       {
         if (s1->verbose)
           printf("GC: removing unused section '%s' (%d bytes)\n", s->name, (int)s->data_offset);
-        /* Zero the section - it will be skipped in output */
-        s->data_offset = 0;
+        /* Empty the section - it will be skipped in output */
+        section_release(s);
         s->sh_size = 0;
         /* Clearing SHF_ALLOC keeps the shell out of layout AND out of
          * coalesce_split_sections, which must not fold a collected
@@ -628,7 +628,7 @@ void gc_sections(TCCState *s1)
         any_collected = 1;
         if (s->reloc)
         {
-          s->reloc->data_offset = 0;
+          section_release(s->reloc);
           s->reloc->sh_size = 0;
         }
         /* Free deferred chunks for lazy sections to save memory */
@@ -763,18 +763,43 @@ static Section *split_section_target(TCCState *s1, Section *s, Section **rodata)
  *    (tcc_debug_funcstart records dwarf_register_text_section(cur_text_section)),
  *    so bumping the section symbol's st_value by the merge base keeps every
  *    debug address correct without touching the DWARF bytes. */
-static void coalesce_split_sections(TCCState *s1)
+static int hot_text_listed(const Section *s, char **names, int count)
 {
-  int i, have_split = 0;
+  if (!count || strncmp(s->name, ".text.", 6) || s->name[6] == '.' || !(s->sh_flags & SHF_EXECINSTR))
+    return 0;
+  return tcc_name_list_has(names, count, s->name + 6, strlen(s->name + 6));
+}
+
+static int coalesce_split_sections(TCCState *s1)
+{
+  int i, g, nnew, nb_inputs = 0, have_split = 0, nb_grow = 0, fd = -1, ret = 0;
+  const char *fd_path = NULL;
   addr_t *base_of;
   Section **target_of;
   Section *rodata = NULL;
+  int *backmap;
   ElfW(Sym) * sym;
+  struct
+  {
+    Section *target;
+    unsigned long bytes, rels, end;
+  } grow[4]; /* one per canonical section, see split_section_target */
+  /* What is left of an input section once its Section is gone. */
+  struct SplitInput
+  {
+    Section *target;
+    unsigned char *data;
+    DeferredChunk *chunks;
+    unsigned long size;
+    addr_t base;
+  } *inputs, *in;
   /* Snapshot the section count: put_elf_reloc below can create .rel.text
    * mid-loop, growing s1->nb_sections past the size of the arrays.  New
    * sections are reloc sections (or the canonical .rodata), never merge
    * candidates, so the snapshot loses nothing. */
   int nb_sections = s1->nb_sections;
+  int pass, nb_hot_names = 0;
+  char **hot_names = NULL;
 
   for (i = 1; i < nb_sections && !have_split; i++)
   {
@@ -784,11 +809,63 @@ static void coalesce_split_sections(TCCState *s1)
       have_split = 1;
   }
   if (!have_split)
-    return;
+    return 0;
 
   base_of = tcc_mallocz(sizeof(addr_t) * nb_sections);
   target_of = tcc_mallocz(sizeof(Section *) * nb_sections);
 
+  /* Size the canonical sections once: doubling .text as it fills needs the old
+   * and the new block at the same time, the largest allocation of a link. */
+  for (i = 1; i < nb_sections; i++)
+  {
+    Section *s = s1->sections[i];
+    Section *t;
+    if (!s || !(t = split_section_target(s1, s, &rodata)))
+      continue;
+    nb_inputs++;
+    for (g = 0; g < nb_grow && grow[g].target != t; g++)
+      ;
+    if (g == nb_grow)
+    {
+      grow[nb_grow].target = t;
+      grow[nb_grow].bytes = grow[nb_grow].end = t->data_offset;
+      grow[nb_grow++].rels = 0;
+    }
+    grow[g].bytes += s->data_offset + (s->sh_addralign > 4 ? s->sh_addralign : 4);
+    if (s->reloc && s->reloc->data_offset)
+    {
+      /* Created here, in the order the merge below first needs them. */
+      if (!grow[g].rels)
+        grow[g].rels = section_reloc(symtab_section, t)->data_offset;
+      grow[g].rels += s->reloc->data_offset;
+    }
+  }
+  for (i = 0; i < nb_grow; i++)
+    if (grow[i].rels)
+      section_reserve_exact(grow[i].target->reloc, grow[i].rels);
+
+  /* Everything but the bytes goes first: places them, moves the relocations and
+   * frees the input Sections, which at -O0 are a quarter of a link's heap, so
+   * that .text, its largest block, is allocated with all of that gone. */
+  inputs = tcc_malloc(sizeof(*inputs) * nb_inputs);
+  in = inputs;
+  /* --hot-text: the listed functions after everything else, as one block. */
+  if (s1->hot_text_file && (s1->output_type == TCC_OUTPUT_EXE || s1->output_type == TCC_OUTPUT_DYN) &&
+      s1->text_and_data_separation)
+  {
+    hot_names = tcc_name_list_read(s1, s1->hot_text_file, "--hot-text", &nb_hot_names);
+    /* '=name': in the block, but a caller outside it calls the copy in flash, which
+     * is valid code, with no veneer.  For tiny functions called very often from flash. */
+    for (i = 0; i < nb_hot_names; i++)
+      if (hot_names[i][0] == '=')
+      {
+        memmove(hot_names[i], hot_names[i] + 1, strlen(hot_names[i]));
+        dynarray_add(&s1->hot_text_flash_names, &s1->nb_hot_text_flash_names, tcc_strdup(hot_names[i]));
+      }
+    tcc_name_list_sort(hot_names, nb_hot_names);
+    tcc_name_list_sort(s1->hot_text_flash_names, s1->nb_hot_text_flash_names);
+  }
+  for (pass = 0; pass < 2; pass++)
   for (i = 1; i < nb_sections; i++)
   {
     Section *s = s1->sections[i];
@@ -796,6 +873,10 @@ static void coalesce_split_sections(TCCState *s1)
     addr_t align;
     if (!s || !(t = split_section_target(s1, s, &rodata)))
       continue;
+    if ((t == text_section && hot_text_listed(s, hot_names, nb_hot_names)) != pass)
+      continue;
+    for (g = 0; grow[g].target != t; g++)
+      ;
 
     /* Thumb literal pools are PC-relative loads with PC aligned down to 4;
      * every function must therefore start 4-aligned, exactly as it would
@@ -804,65 +885,167 @@ static void coalesce_split_sections(TCCState *s1)
     align = s->sh_addralign ? s->sh_addralign : 1;
     if (t == text_section)
       align = strncmp(s->name, ".text..", 7) ? 4 : (align > 4 ? align : 4);
-    t->data_offset += -t->data_offset & (align - 1);
+    if (pass && !s1->hot_text_end)
+    {
+      align = 8; /* the copy keeps the literal pools' word alignment, and more */
+      grow[g].end += -grow[g].end & (align - 1);
+      s1->hot_text_start = grow[g].end;
+    }
+    grow[g].end += -grow[g].end & (align - 1);
     if (align > t->sh_addralign)
       t->sh_addralign = align;
-    base_of[i] = t->data_offset;
+    base_of[i] = grow[g].end;
     target_of[i] = t;
-    if (s->data_offset)
-    {
-      if (t->sh_type == SHT_NOBITS)
-        t->data_offset += s->data_offset;
-      else
-      {
-        void *p = section_ptr_add(t, s->data_offset);
-        memcpy(p, s->data, s->data_offset);
-      }
-    }
+    grow[g].end += s->data_offset;
+    if (pass)
+      s1->hot_text_end = grow[g].end;
 
     /* Move the section's relocations into the target's, rebased.  Addends
      * live in the copied bytes (REL format), so only r_offset changes;
      * symbol indices are global to symtab and stay valid. */
-    if (s->reloc && s->reloc->data_offset)
+    if (s->reloc)
     {
       Section *sr = s->reloc;
-      int nb = sr->data_offset / sizeof(ElfW_Rel);
-      ElfW_Rel *rel = (ElfW_Rel *)sr->data;
-      int r;
-      for (r = 0; r < nb; r++)
-        put_elf_reloc(symtab_section, t, rel[r].r_offset + base_of[i], ELFW(R_TYPE)(rel[r].r_info),
-                      ELFW(R_SYM)(rel[r].r_info));
-      sr->data_offset = 0;
+      if (sr->data_offset)
+      {
+        int nb = sr->data_offset / sizeof(ElfW_Rel);
+        ElfW_Rel *rel = (ElfW_Rel *)sr->data;
+        int r;
+        for (r = 0; r < nb; r++)
+          put_elf_reloc(symtab_section, t, rel[r].r_offset + base_of[i], ELFW(R_TYPE)(rel[r].r_info),
+                        ELFW(R_SYM)(rel[r].r_info));
+      }
+      s1->sections[sr->sh_num] = NULL;
+      free_section(sr);
+      if (!link_arena_owns(s1, sr))
+        tcc_free(sr);
+    }
+
+    in->target = t;
+    in->base = base_of[i];
+    in->size = s->data_offset;
+    in->data = s->data;
+    in->chunks = s->deferred_head;
+    in++;
+    s1->sections[i] = NULL;
+    s->data = NULL;
+    s->deferred_head = s->deferred_tail = NULL;
+    free_section(s);
+    if (!link_arena_owns(s1, s))
+      tcc_free(s);
+  }
+
+  /* gc_sections emptied the rest of the arena's sections.  Their symbols are
+   * tombstoned, and they would only have been dropped by reorder_sections. */
+  if (s1->link_arena)
+    for (i = 1; i < s1->nb_sections; i++)
+    {
+      Section *s = s1->sections[i];
+      if (s && link_arena_owns(s1, s) && !s->data_offset && !(s->sh_flags & SHF_ALLOC))
+      {
+        s1->sections[i] = NULL;
+        free_section(s);
+      }
+    }
+  /* Relocations of a section just dropped, if they did not fit in the arena. */
+  for (i = 1; i < s1->nb_sections; i++)
+  {
+    Section *s = s1->sections[i];
+    if (s && s->sh_type == SHT_RELX && !s->data_offset && !s1->sections[s->sh_info])
+    {
+      s1->sections[i] = NULL;
+      free_section(s);
+      if (!link_arena_owns(s1, s))
+        tcc_free(s);
     }
   }
 
   /* Retarget every symbol defined in a merged section: function symbols
    * (the thumb LSB tag survives the addition), $t/$d mapping markers, and
-   * the STT_SECTION symbols DWARF relocates against (st_value 0 -> base). */
+   * the STT_SECTION symbols DWARF relocates against (st_value 0 -> base).
+   * The freed sections leave the table here, as reorder_sections would have
+   * dropped them later. */
+  backmap = tcc_malloc(sizeof(int) * s1->nb_sections);
+  backmap[0] = 0;
+  for (i = 1, nnew = 1; i < s1->nb_sections; i++)
+  {
+    backmap[i] = s1->sections[i] ? nnew : 0;
+    if (s1->sections[i])
+      s1->sections[nnew++] = s1->sections[i];
+  }
   for_each_elem(symtab_section, 1, sym, ElfW(Sym))
   {
     if (sym->st_shndx < nb_sections && target_of[sym->st_shndx])
     {
       sym->st_value += base_of[sym->st_shndx];
-      sym->st_shndx = target_of[sym->st_shndx]->sh_num;
+      sym->st_shndx = backmap[target_of[sym->st_shndx]->sh_num];
     }
+    else if (sym->st_shndx < s1->nb_sections)
+      sym->st_shndx = backmap[sym->st_shndx];
   }
-
-  /* Retire the merged shells: no ALLOC flag and no size means
-   * alloc_sec_names() skips them and they never reach the output. */
-  for (i = 1; i < nb_sections; i++)
+  for (i = 1; i < nnew; i++)
   {
-    if (target_of[i])
-    {
-      Section *s = s1->sections[i];
-      s->sh_flags &= ~SHF_ALLOC;
-      s->data_offset = 0;
-      s->sh_size = 0;
-    }
+    Section *s = s1->sections[i];
+    s->sh_num = i;
+    if (s->sh_type == SHT_RELX)
+      s->sh_info = backmap[s->sh_info];
   }
-
+  s1->nb_sections = nnew;
+  section_ht_rebuild(s1);
+  tcc_free(backmap);
   tcc_free(base_of);
   tcc_free(target_of);
+
+  /* All gone, unless something kept a section in it: then it stays until exit. */
+  if (s1->link_arena)
+  {
+    for (i = 1; i < s1->nb_sections && !link_arena_owns(s1, s1->sections[i]); i++)
+      ;
+    if (i == s1->nb_sections)
+    {
+      tcc_free(s1->link_arena);
+      s1->link_arena = NULL;
+      s1->link_arena_size = s1->link_arena_used = 0;
+    }
+  }
+
+  dynarray_reset(&hot_names, &nb_hot_names);
+#ifdef TCC_TARGET_ARM
+  for (i = 0; i < nb_grow; i++)
+    if (grow[i].target == text_section)
+      grow[i].bytes += arm_hot_text_veneer_bytes(s1) + 8; /* +8: the block's alignment */
+#endif
+  for (i = 0; i < nb_grow; i++)
+    if (grow[i].target->sh_type != SHT_NOBITS)
+      section_reserve_exact(grow[i].target, grow[i].bytes);
+  for (in = inputs; in < inputs + nb_inputs; in++)
+  {
+    Section *t = in->target;
+    t->data_offset = in->base;
+    if (in->size && t->sh_type == SHT_NOBITS)
+      t->data_offset += in->size;
+    else if (in->size)
+    {
+      unsigned char *p = section_ptr_add(t, in->size);
+      if (in->chunks)
+      {
+        if (deferred_chunks_read(s1, &in->chunks, p, &fd, &fd_path) < 0)
+        {
+          ret = -1;
+          break;
+        }
+      }
+      else
+        memcpy(p, in->data, in->size);
+    }
+    tcc_free(in->data);
+  }
+  for (i = 0; ret == 0 && i < nb_grow; i++)
+    grow[i].target->data_offset = grow[i].end;
+  if (fd >= 0)
+    close(fd);
+  tcc_free(inputs);
+  return ret;
 }
 
 /* Output an elf, coff or binary file */
@@ -954,7 +1137,8 @@ static int elf_output_file(TCCState *s1, const char *filename)
    * --gc-sections) must be folded back into their canonical sections before
    * build_got/layout -- see the comment on coalesce_split_sections.  Runs
    * unconditionally: it is a no-op when no split input exists. */
-  coalesce_split_sections(s1);
+  if (coalesce_split_sections(s1) < 0)
+    goto the_end;
 
 #ifdef TCC_TARGET_ARM
   /* Thumb branches between memory regions the script puts far apart (RAM
@@ -962,6 +1146,7 @@ static int elf_output_file(TCCState *s1, const char *filename)
    * layout fixes the addresses. */
   if (s1->ld_script)
     arm_add_range_veneers(s1);
+  arm_add_hot_text_veneers(s1);
 #endif
 
   /* Inputs of a (NOLOAD) output section occupy memory but have no file
@@ -1040,6 +1225,9 @@ static int elf_output_file(TCCState *s1, const char *filename)
   {
     {
       unsigned t = s1->do_bench ? tcc_getclock_us() : 0;
+      /* The veneers' two slots, even if nothing else asks for a GOT. */
+      if (s1->hot_text_end && !s1->got)
+        build_got(s1);
       build_got_entries(s1, 0);
       if (s1->do_bench)
         s1->bench_output_got_us += tcc_getclock_us() - t;
@@ -1165,6 +1353,9 @@ static int elf_output_file(TCCState *s1, const char *filename)
         s1->bench_output_reloc_us += tcc_getclock_us() - t;
       goto the_end;
     }
+#ifdef TCC_TARGET_ARM
+    arm_hot_text_fill_got(s1);
+#endif
     relocate_sections(s1);
     if (s1->do_bench)
       s1->bench_output_reloc_us += tcc_getclock_us() - t;
@@ -1259,6 +1450,9 @@ static int elf_output_obj(TCCState *s1, const char *filename)
 
 LIBTCCAPI int tcc_output_file(TCCState *s, const char *filename)
 {
+  /* A link wants all the memory there is; it does not touch the IR. */
+  if (s->output_type != TCC_OUTPUT_OBJ)
+    tcc_hot_release();
   unsigned output_start = 0;
   int ret;
 

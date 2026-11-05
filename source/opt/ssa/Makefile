@@ -33,7 +33,6 @@ SSA_OPT_SRC = \
 	source/opt/ssa/scalar/narrow.c \
 	source/opt/ssa/scalar/fold.c \
 	source/opt/ssa/scalar/gvn.c \
-	source/opt/ssa/scalar/var_imm_prop.c \
 	source/opt/ssa/scalar/cprop.c \
 	source/opt/ssa/scalar/setif_or_taut.c \
 	source/opt/ssa/scalar/bool_norm.c \
@@ -102,7 +101,6 @@ SSA_OPT_HDRS = \
 	source/opt/ssa/include/opt/ssa/bool_norm.h \
 	source/opt/ssa/include/opt/ssa/cmp_offset_fold.h \
 	source/opt/ssa/include/opt/ssa/tmp_block_const.h \
-	source/opt/ssa/include/opt/ssa/var_imm_prop.h \
 	source/opt/ssa/include/opt/ssa/cprop.h \
 	source/opt/ssa/dce/dce_common.h \
 	source/opt/ssa/dce/dce_passes.h \

@@ -57,8 +57,8 @@ typedef struct GVNEntry {
 /* Non-lval STACKOFF without a backing vreg (Addr[StackLoc[-N]]) is a
  * compile-time-constant frame address — safe to key by offset alone. */
 #define GVN_SRC_OK(s) \
-  (!(s).is_lval && !(s).is_llocal && \
-   (!(s).is_local || ((s).tag == IROP_TAG_STACKOFF && irop_get_vreg(s) < 0)))
+  (!(s).is_lval && !irop_is_llocal((s)) && \
+   (!irop_is_local((s)) || ((s).tag == IROP_TAG_STACKOFF && irop_get_vreg(s) < 0)))
 
 static int gvn_is_pure_alu(int op)
 {
@@ -269,12 +269,12 @@ static int gvn_param_is_stable(int32_t vreg)
  *  1: block-local only */
 static int gvn_src_class(IRSSAOptCtx *ctx, IROperand s)
 {
-  if (s.is_llocal)
+  if (irop_is_llocal(s))
     return -1;
   int32_t v = irop_get_vreg(s);
   if (s.is_lval)
     return 1;
-  if (s.is_local)
+  if (irop_is_local(s))
     return (s.tag == IROP_TAG_STACKOFF && v < 0) ? 0 : 1;
   if (v >= 0) {
     int t = TCCIR_DECODE_VREG_TYPE(v);
@@ -420,11 +420,9 @@ static int gvn_try_lea(IRSSAOptCtx *ctx, GVNEntry **table, int i)
 
   if (existing) {
     IROperand new_src = dest;
-    new_src.vr = existing->result_vr;
+    irop_set_word(new_src, existing->result_vr);
     new_src.tag = IROP_TAG_VREG;
     new_src.is_lval = 0;
-    new_src.is_local = 0;
-    new_src.is_llocal = 0;
     new_src.u.imm32 = 0;
     IRSSAVregInfo *rvi = ssa_opt_vinfo(ctx, existing->result_vr);
     if (rvi) ssa_opt_add_use_instr(rvi, i);
@@ -575,7 +573,7 @@ static int gvn_try_pure_call(IRSSAOptCtx *ctx, GVNEntry **table, int i)
    * access that must not be elided, however stable the surrounding code is. */
   int args_ssa_stable = 1;
   for (int a = 0; a < nargs; a++) {
-    if (args[a].is_llocal || gvn_operand_is_volatile_var(ir, args[a]) ||
+    if (irop_is_llocal(args[a]) || gvn_operand_is_volatile_var(ir, args[a]) ||
         gvn_operand_is_volatile_deref(ir, args[a]))
       return 0;
     if (args[a].is_lval && irop_get_tag(args[a]) == IROP_TAG_SYMREF) {
@@ -658,7 +656,7 @@ static int gvn_try_assign_narrow(IRSSAOptCtx *ctx, GVNEntry **table, int i)
 
   IROperand dest = tcc_ir_op_get_dest(ir, q);
   int32_t dest_vr = irop_get_vreg(dest);
-  if (dest_vr < 0 || dest.is_lval || dest.is_llocal ||
+  if (dest_vr < 0 || dest.is_lval || irop_is_llocal(dest) ||
       TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_TEMP)
     return 0;
   /* Integer destinations only, and never a pair/complex one: this rule is
@@ -676,7 +674,7 @@ static int gvn_try_assign_narrow(IRSSAOptCtx *ctx, GVNEntry **table, int i)
     return 0;
 
   IROperand src = tcc_ir_op_get_src1(ir, q);
-  if (src.is_lval || src.is_llocal || src.is_sym || src.is_complex)
+  if (src.is_lval || irop_is_llocal(src) || irop_is_sym(src) || src.is_complex)
     return 0;
   /* Source must be an integer PAIR — same-width copies already belong to
    * cprop, and a float pair is not a low/high integer-word split. */
@@ -704,11 +702,9 @@ static int gvn_try_assign_narrow(IRSSAOptCtx *ctx, GVNEntry **table, int i)
     if (existing->result_vr == dest_vr || existing->result_vr < 0)
       return 0;
     IROperand new_src = dest;
-    new_src.vr = existing->result_vr;
+    irop_set_word(new_src, existing->result_vr);
     new_src.tag = IROP_TAG_VREG;
     new_src.is_lval = 0;
-    new_src.is_local = 0;
-    new_src.is_llocal = 0;
     new_src.u.imm32 = 0;
     IRSSAVregInfo *svi = ssa_opt_vinfo(ctx, src_vr);
     if (svi)
@@ -1036,11 +1032,9 @@ static int gvn_visit(IRSSAOptCtx *ctx, int b, void *state)
         changes += gvn_subst_64bit(ctx, i, dest_vr, le->result_vr, le->def_idx);
       } else if (le) {
         IROperand new_src = dest;
-        new_src.vr = le->result_vr;
+        irop_set_word(new_src, le->result_vr);
         new_src.tag = IROP_TAG_VREG;
         new_src.is_lval = 0;
-        new_src.is_local = 0;
-        new_src.is_llocal = 0;
         new_src.u.imm32 = 0;
         IRSSAVregInfo *s1vi = ssa_opt_vinfo(ctx, s1v);
         if (s1vi) ssa_opt_remove_use_instr(s1vi, i);
@@ -1134,11 +1128,9 @@ static int gvn_visit(IRSSAOptCtx *ctx, int b, void *state)
        * cprop will propagate the copy in the next iteration. */
       IROperand new_src;
       new_src = dest;
-      new_src.vr = existing->result_vr;
+      irop_set_word(new_src, existing->result_vr);
       new_src.tag = IROP_TAG_VREG;
       new_src.is_lval = 0;
-      new_src.is_local = 0;
-      new_src.is_llocal = 0;
       new_src.u.imm32 = 0;
 
       /* Update use-def: remove uses of old operands */
@@ -1307,7 +1299,7 @@ static int pcse_instr_clean(TCCIRState *ir, int k, int forward)
   if (hz == IR_HZ_MEM_WRITE && q->op == TCCIR_OP_STORE)
   {
     IROperand d = tcc_ir_op_get_dest(ir, q);
-    return !d.is_lval && !d.is_llocal && irop_get_tag(d) == IROP_TAG_VREG && irop_get_vreg(d) >= 0;
+    return !d.is_lval && !irop_is_llocal(d) && irop_get_tag(d) == IROP_TAG_VREG && irop_get_vreg(d) >= 0;
   }
   return hz == 0;
 }
@@ -1318,7 +1310,7 @@ static IROperand pcse_canon(IRSSAOptCtx *ctx, IROperand op, int *pos)
   for (int depth = 0; depth < 8; depth++)
   {
     int32_t vr = irop_get_vreg(op);
-    if (op.is_lval || op.is_llocal || irop_get_tag(op) != IROP_TAG_VREG || vr < 0 ||
+    if (op.is_lval || irop_is_llocal(op) || irop_get_tag(op) != IROP_TAG_VREG || vr < 0 ||
         TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
       break;
     IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
@@ -1329,7 +1321,7 @@ static IROperand pcse_canon(IRSSAOptCtx *ctx, IROperand op, int *pos)
       break;
     IROperand dst = tcc_ir_op_get_dest(ir, d);
     IROperand src = tcc_ir_op_get_src1(ir, d);
-    if (dst.is_lval || dst.is_llocal || src.is_llocal || (d->op == TCCIR_OP_LOAD && !src.is_lval) ||
+    if (dst.is_lval || irop_is_llocal(dst) || irop_is_llocal(src) || (d->op == TCCIR_OP_LOAD && !src.is_lval) ||
         (!src.is_lval && (irop_get_tag(src) != IROP_TAG_VREG || irop_get_vreg(src) < 0)) ||
         irop_get_btype(dst) != irop_get_btype(src) || (src.is_lval && dst.is_unsigned != src.is_unsigned))
       break;
@@ -1371,7 +1363,7 @@ static int pcse_vreg_unchanged(IRSSAOptCtx *ctx, int32_t vr, int a, int b)
 static int pcse_same_value(IRSSAOptCtx *ctx, IROperand a, int apos, IROperand b, int bpos, int depth, int *lo)
 {
   TCCIRState *ir = ctx->ir;
-  if (depth > 2 || a.is_llocal || b.is_llocal || a.is_lval != b.is_lval)
+  if (depth > 2 || irop_is_llocal(a) || irop_is_llocal(b) || a.is_lval != b.is_lval)
     return 0;
   if (tcc_ir_operand_names_volatile_var(ir, a) || tcc_ir_operand_names_volatile_var(ir, b))
     return 0;
@@ -1479,11 +1471,11 @@ static int pcse_forward_region(IRSSAOptCtx *ctx, int from, int to)
 
 static int pcse_stable_arg(IRSSAOptCtx *ctx, IROperand op)
 {
-  if (op.is_lval || op.is_llocal || tcc_ir_operand_names_volatile_var(ctx->ir, op))
+  if (op.is_lval || irop_is_llocal(op) || tcc_ir_operand_names_volatile_var(ctx->ir, op))
     return 0;
   if (irop_get_tag(op) == IROP_TAG_VREG)
     return pcse_single_temp(ctx, irop_get_vreg(op));
-  return irop_is_immediate(op) || (op.is_sym && op.is_local);
+  return irop_is_immediate(op) || (irop_is_sym(op) && irop_is_local(op));
 }
 
 static int pcse_match(IRSSAOptCtx *ctx, int k, int i, int argc, const IROperand *a2, const int *p2)

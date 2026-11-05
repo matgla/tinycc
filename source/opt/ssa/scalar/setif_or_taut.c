@@ -112,7 +112,7 @@ static int so_snapshot(IRSSAOptCtx *ctx, IROperand op, int32_t *out_vr, int64_t 
     return 1;
   }
   int32_t vr = irop_get_vreg(op);
-  if (vr < 0 || op.is_lval || op.is_sym || !so_stable(ctx, vr))
+  if (vr < 0 || op.is_lval || irop_is_sym(op) || !so_stable(ctx, vr))
     return 0;
   *out_vr = vr;
   *out_imm = 0;
@@ -124,7 +124,7 @@ static int so_snapshot(IRSSAOptCtx *ctx, IROperand op, int32_t *out_vr, int64_t 
 static int so_operand_same(IROperand a, IROperand b)
 {
   return irop_get_btype(a) == irop_get_btype(b) && a.is_unsigned == b.is_unsigned &&
-         a.is_lval == b.is_lval && a.is_sym == b.is_sym;
+         a.is_lval == b.is_lval && irop_is_sym(a) == irop_is_sym(b);
 }
 
 static int so_compatible(const SoBool *a, const SoBool *b)
@@ -271,7 +271,7 @@ static SoBool so_resolve_operand(IRSSAOptCtx *ctx, IROperand op, int depth)
 {
   if (op.is_lval)
     return so_fail();
-  if (irop_is_plain_imm(op) && !op.is_sym)
+  if (irop_is_plain_imm(op) && !irop_is_sym(op))
   {
     int64_t v = irop_get_imm64_ex(ctx->ir, op);
     if (v != 0 && v != 1)
@@ -284,25 +284,6 @@ static SoBool so_resolve_operand(IRSSAOptCtx *ctx, IROperand op, int depth)
     return b;
   }
   return so_resolve(ctx, irop_get_vreg(op), depth);
-}
-
-/* Whether the OR at index i folds to constant 1 (mask union covers LT|EQ|GT). */
-static int so_or_is_taut(IRSSAOptCtx *ctx, int i)
-{
-  TCCIRState *ir = ctx->ir;
-  IRQuadCompact *q = &ir->compact_instructions[i];
-  IROperand s1 = tcc_ir_op_get_src1(ir, q);
-  IROperand s2 = tcc_ir_op_get_src2(ir, q);
-  int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
-  if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_TEMP || tcc_ir_op_dest_is_lval(ir, q))
-    return 0;
-  if (s1.is_lval || s2.is_lval)
-    return 0;
-  SoBool a = so_resolve(ctx, irop_get_vreg(s1), 0);
-  SoBool b = so_resolve(ctx, irop_get_vreg(s2), 0);
-  if (!a.ok || !b.ok || !so_compatible(&a, &b))
-    return 0;
-  return (uint8_t)(a.mask | b.mask) == 0b111;
 }
 
 /* ==========================================================================
@@ -509,48 +490,5 @@ int ssa_opt_setif_mask_fold(IRSSAOptCtx *ctx)
       continue;
     changes += so_fold_cmp(ctx, i);
   }
-  return changes;
-}
-
-int ssa_opt_setif_or_taut(IRSSAOptCtx *ctx)
-{
-  TCCIRState *ir = ctx->ir;
-  int n = ir->next_instruction_index;
-  if (n < 3)
-    return 0;
-
-  /* Collect first (reading the original def-use graph), then rewrite, so an
-   * inner tautological OR feeding an outer OR still resolves. */
-  uint8_t *fold = tcc_mallocz((size_t)n);
-  int changes = 0;
-  for (int i = 0; i < n; i++)
-    if (ir->compact_instructions[i].op == TCCIR_OP_OR && so_or_is_taut(ctx, i))
-      fold[i] = 1;
-
-  for (int i = 0; i < n; i++)
-  {
-    if (!fold[i])
-      continue;
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    IROperand s1 = tcc_ir_op_get_src1(ir, q);
-    IROperand s2 = tcc_ir_op_get_src2(ir, q);
-    int btype = irop_get_btype(s1);
-    IROperand imm = irop_make_imm32(-1, 1, btype);
-    imm.is_unsigned = dest.is_unsigned;
-    q->op = TCCIR_OP_ASSIGN;
-    tcc_ir_set_src1(ir, i, imm);
-    tcc_ir_set_src2_none(ir, i);
-
-    IRSSAVregInfo *v1 = ssa_opt_vinfo(ctx, irop_get_vreg(s1));
-    if (v1)
-      ssa_opt_remove_use_instr(v1, i);
-    IRSSAVregInfo *v2 = ssa_opt_vinfo(ctx, irop_get_vreg(s2));
-    if (v2)
-      ssa_opt_remove_use_instr(v2, i);
-    changes++;
-  }
-
-  tcc_free(fold);
   return changes;
 }

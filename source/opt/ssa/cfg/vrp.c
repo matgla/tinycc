@@ -178,13 +178,13 @@ static int sv_slot(SVState *s, int32_t vr)
  * VAR-slot read (is_local && !is_llocal); any deref reads a pointee, not the slot. */
 static int sv_operand_slot(SVState *s, IROperand op)
 {
-  if (op.is_sym)
+  if (irop_is_sym(op))
     return -1;
   int32_t vr = irop_get_vreg(op);
   if (vr < 0)
     return -1;
   if (op.is_lval &&
-      (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR || !op.is_local || op.is_llocal))
+      (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR || !irop_is_local(op) || irop_is_llocal(op)))
     return -1;
   return sv_slot(s, vr);
 }
@@ -252,7 +252,7 @@ static int sv_read_cmp(SVState *s, int cmp_idx, SVCmp *out)
   IROperand cs2 = tcc_ir_op_get_src2(ir, cq);
   /* `CMP #c,x` (a rotated loop's `0 < n` guard): read as x against c; the
    * callers swap the condition token. */
-  if (!irop_is_immediate(cs2) && irop_is_immediate(cs1) && !cs1.is_sym)
+  if (!irop_is_immediate(cs2) && irop_is_immediate(cs1) && !irop_is_sym(cs1))
   {
     IROperand t = cs1;
     cs1 = cs2;
@@ -529,7 +529,7 @@ static void sv_seed_assign(SVState *s, int dslot, IROperand src1)
 /* A narrow memory read zero/sign-extends, so the loaded width bounds dest by itself. */
 static void sv_seed_width(SVState *s, int dslot, IROperand src1)
 {
-  if (!src1.is_lval || src1.is_llocal)
+  if (!src1.is_lval || irop_is_llocal(src1))
     return;
   if (src1.btype == IROP_BTYPE_INT8)
     sv_set_intersect(s, dslot, src1.is_unsigned ? 0 : -128, src1.is_unsigned ? 255 : 127);
@@ -737,7 +737,7 @@ static int sv_try_fold_mask_identity(IRSSAOptCtx *ctx, SVState *s, int idx)
   IROperand dest = tcc_ir_op_get_dest(ir, q);
   IROperand src1 = tcc_ir_op_get_src1(ir, q);
   IROperand src2 = tcc_ir_op_get_src2(ir, q);
-  if (dest.is_lval || dest.is_sym || irop_is_immediate(src1) || !irop_is_plain_imm(src2))
+  if (dest.is_lval || irop_is_sym(dest) || irop_is_immediate(src1) || !irop_is_plain_imm(src2))
     return 0;
   if (dest.btype == IROP_BTYPE_INT64 && src1.btype == IROP_BTYPE_INT64 && op != TCCIR_OP_SBFX &&
       op != TCCIR_OP_UBFX)
@@ -792,7 +792,7 @@ static void sv_seed_def(SVState *s, IRQuadCompact *q)
   if (!irop_config[op].has_dest)
     return;
   IROperand dest = tcc_ir_op_get_dest(ir, q);
-  if (dest.is_lval || dest.is_sym)
+  if (dest.is_lval || irop_is_sym(dest))
     return;
   int dslot = sv_slot(s, irop_get_vreg(dest));
   if (dslot < 0)
@@ -984,8 +984,8 @@ static int sv_try_fold_jumpif(IRSSAOptCtx *ctx, SVState *s, int cmp_idx, int jmp
 static int sv_same_operand(IROperand x, IROperand y)
 {
   int32_t vx = irop_get_vreg(x);
-  return vx >= 0 && vx == irop_get_vreg(y) && x.is_lval == y.is_lval && x.is_sym == y.is_sym &&
-         x.is_llocal == y.is_llocal && x.is_local == y.is_local;
+  return vx >= 0 && vx == irop_get_vreg(y) && x.is_lval == y.is_lval && irop_is_sym(x) == irop_is_sym(y) &&
+         irop_is_llocal(x) == irop_is_llocal(y) && irop_is_local(x) == irop_is_local(y);
 }
 
 /* Fold B's leading `CMP a,b ; JUMPIF c2` when its idom-pred ends in `CMP a,b ; JUMPIF c1` and
@@ -1138,7 +1138,7 @@ static void sv_enter_and_test(SVState *s, int cmp_idx, int eff_tok)
   }
   int32_t tvr = irop_get_vreg(t);
   int is64 = t.btype == IROP_BTYPE_INT64;
-  if (t.is_lval || t.is_sym || (t.btype != IROP_BTYPE_INT32 && !is64) ||
+  if (t.is_lval || irop_is_sym(t) || (t.btype != IROP_BTYPE_INT32 && !is64) ||
       tvr < 0 || TCCIR_DECODE_VREG_TYPE(tvr) != TCCIR_VREG_TYPE_TEMP)
     return;
   IRSSAVregInfo *vi = ssa_opt_vinfo(s->ctx, tvr);

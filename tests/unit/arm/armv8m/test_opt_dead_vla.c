@@ -11,8 +11,6 @@
  *    tcc_ir_opt_alloca_load_fwd        - VLA_SP_SAVE -> slot immediately
  *        followed by LOAD slot -> vreg, with the slot otherwise dead: retarget
  *        the SAVE's dest to the LOAD's vreg and NOP the LOAD (mov reg, sp).
- *    tcc_ir_opt_dead_alloca_vreg_elim  - same dead-store elimination but for the
- *        VREG-dest VLA_SP_SAVE shape produced after alloca_load_fwd runs.
  *
  *  Isolated tests: a hand-built IR sequence is run through the bare pass entry
  *  point and the resulting instructions are inspected directly.
@@ -26,7 +24,6 @@
  * pulling in the optimizer engine headers). */
 int tcc_ir_opt_dead_vla_struct_elim(TCCIRState *ir);
 int tcc_ir_opt_alloca_load_fwd(TCCIRState *ir);
-int tcc_ir_opt_dead_alloca_vreg_elim(TCCIRState *ir);
 
 #define I32 IROP_BTYPE_INT32
 
@@ -362,166 +359,5 @@ UT_TEST(test_alloca_load_fwd_idempotent)
   return 0;
 }
 
-/* ============================================================ dead_alloca_vreg */
-
-/* Canonical VREG-dest dead-alloca pattern (post alloca_load_fwd shape):
- *
- *   VLA_ALLOC  size, align
- *   VLA_SP_SAVE -> T0   (vreg dest = the alloca pointer)
- *   STORE  T0***DEREF*** <- #0   (write through the alloca pointer: dead)
- *
- * The alloca bytes are never read and the pointer never escapes -> NOP all. */
-UT_TEST(test_dead_alloca_vreg_basic_elim)
-{
-  TCCIRState *ir = utb_new();
-
-  int alloc = utb_emit(ir, TCCIR_OP_VLA_ALLOC, UTB_NONE, utb_imm(16, I32), utb_imm(4, I32));
-  int save = utb_emit(ir, TCCIR_OP_VLA_SP_SAVE, utb_temp(0, I32), UTB_NONE, UTB_NONE);
-  int store = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I32)), utb_imm(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_dead_alloca_vreg_elim(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, alloc), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, save), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_NOP);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* VREG-dest with a propagation link: T1 = T0 + 8, then STORE through T1.
- * Both the ADD and the STORE drain. */
-UT_TEST(test_dead_alloca_vreg_propagation_chain)
-{
-  TCCIRState *ir = utb_new();
-
-  int alloc = utb_emit(ir, TCCIR_OP_VLA_ALLOC, UTB_NONE, utb_imm(16, I32), utb_imm(4, I32));
-  int save = utb_emit(ir, TCCIR_OP_VLA_SP_SAVE, utb_temp(0, I32), UTB_NONE, UTB_NONE);
-  int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(8, I32));
-  int store = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(1, I32)), utb_imm(3, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_dead_alloca_vreg_elim(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, alloc), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, save), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, add), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_NOP);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* A FUNCCALL after the save forces a conservative bail: the alloca pointer
- * might be observed through the call.  Nothing is eliminated. */
-UT_TEST(test_dead_alloca_vreg_funccall_bails)
-{
-  TCCIRState *ir = utb_new();
-
-  int alloc = utb_emit(ir, TCCIR_OP_VLA_ALLOC, UTB_NONE, utb_imm(16, I32), utb_imm(4, I32));
-  int save = utb_emit(ir, TCCIR_OP_VLA_SP_SAVE, utb_temp(0, I32), UTB_NONE, UTB_NONE);
-  /* FUNCCALLVOID = {0,1,1}: src1=callee, src2=call_id. */
-  int call = utb_emit(ir, TCCIR_OP_FUNCCALLVOID, UTB_NONE, utb_temp(9, I32), utb_imm(0, I32));
-  int store = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I32)), utb_imm(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_dead_alloca_vreg_elim(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, alloc), TCCIR_OP_VLA_ALLOC);
-  UT_ASSERT_EQ(utb_op(ir, save), TCCIR_OP_VLA_SP_SAVE);
-  UT_ASSERT_EQ(utb_op(ir, call), TCCIR_OP_FUNCCALLVOID);
-  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_STORE);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* A LOAD that dereferences the (vreg) alloca pointer reads the bytes -> the
- * deref classification forces a bail.  Nothing is eliminated. */
-UT_TEST(test_dead_alloca_vreg_load_through_pointer_bails)
-{
-  TCCIRState *ir = utb_new();
-
-  int alloc = utb_emit(ir, TCCIR_OP_VLA_ALLOC, UTB_NONE, utb_imm(16, I32), utb_imm(4, I32));
-  int save = utb_emit(ir, TCCIR_OP_VLA_SP_SAVE, utb_temp(0, I32), UTB_NONE, UTB_NONE);
-  /* T1 = LOAD T0***DEREF*** : reads the alloca bytes via the tainted temp. */
-  int load = utb_emit(ir, TCCIR_OP_LOAD, utb_temp(1, I32), utb_lval(utb_temp(0, I32)), UTB_NONE);
-
-  int changes = tcc_ir_opt_dead_alloca_vreg_elim(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, alloc), TCCIR_OP_VLA_ALLOC);
-  UT_ASSERT_EQ(utb_op(ir, save), TCCIR_OP_VLA_SP_SAVE);
-  UT_ASSERT_EQ(utb_op(ir, load), TCCIR_OP_LOAD);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* Escape via store-as-value: the alloca pointer T0 is STORED into an unrelated
- * VAR slot (its value leaks).  Bail. */
-UT_TEST(test_dead_alloca_vreg_pointer_escape_bails)
-{
-  TCCIRState *ir = utb_new();
-
-  int alloc = utb_emit(ir, TCCIR_OP_VLA_ALLOC, UTB_NONE, utb_imm(16, I32), utb_imm(4, I32));
-  int save = utb_emit(ir, TCCIR_OP_VLA_SP_SAVE, utb_temp(0, I32), UTB_NONE, UTB_NONE);
-  /* STORE V0***DEREF*** <- T0 : dest is NOT a tainted addr, src1 IS tainted
-   * value -> escape. */
-  int store = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_var(0, I32)), utb_temp(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_dead_alloca_vreg_elim(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, alloc), TCCIR_OP_VLA_ALLOC);
-  UT_ASSERT_EQ(utb_op(ir, save), TCCIR_OP_VLA_SP_SAVE);
-  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_STORE);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* Function-wide bail: SET_CHAIN (nested-function static chain) disqualifies the
- * whole VREG-dest pass. */
-UT_TEST(test_dead_alloca_vreg_set_chain_bails)
-{
-  TCCIRState *ir = utb_new();
-
-  int alloc = utb_emit(ir, TCCIR_OP_VLA_ALLOC, UTB_NONE, utb_imm(16, I32), utb_imm(4, I32));
-  utb_emit(ir, TCCIR_OP_VLA_SP_SAVE, utb_temp(0, I32), UTB_NONE, UTB_NONE);
-  utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I32)), utb_imm(0, I32), UTB_NONE);
-  /* SET_CHAIN present anywhere -> whole pass bails. */
-  utb_emit(ir, TCCIR_OP_SET_CHAIN, UTB_NONE, utb_temp(8, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_dead_alloca_vreg_elim(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, alloc), TCCIR_OP_VLA_ALLOC);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* Idempotence: after one elimination there is no VLA_ALLOC left; a second run
- * reports 0. */
-UT_TEST(test_dead_alloca_vreg_idempotent)
-{
-  TCCIRState *ir = utb_new();
-
-  utb_emit(ir, TCCIR_OP_VLA_ALLOC, UTB_NONE, utb_imm(16, I32), utb_imm(4, I32));
-  utb_emit(ir, TCCIR_OP_VLA_SP_SAVE, utb_temp(0, I32), UTB_NONE, UTB_NONE);
-  utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I32)), utb_imm(0, I32), UTB_NONE);
-
-  int first = tcc_ir_opt_dead_alloca_vreg_elim(ir);
-  UT_ASSERT(first > 0);
-  int second = tcc_ir_opt_dead_alloca_vreg_elim(ir);
-  UT_ASSERT_EQ(second, 0);
-
-  utb_free(ir);
-  return 0;
-}
-
 UT_COVERS("dead_vla_struct_elim");
 UT_COVERS("alloca_load_fwd");
-UT_COVERS("dead_alloca_vreg_elim");

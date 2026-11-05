@@ -487,6 +487,12 @@ typedef struct Sym Sym;
 #define INLINE_NEST_MAX 32
 #define NESTED_INLINE_BUDGET 4096
 #define TINY_INLINE_TOKENS 96
+/* A leaf this small expands at every site, whatever its token length. */
+#define SMALL_LEAF_INLINE_OPS 24
+#define STATIC_INLINE_LEAF_TOKENS 512
+/* inline_body_leaf_ops counts a third over what the body compiles to: over the 567
+ * leaves of tinycc's own units, bodies estimated at 28-31 compile to 21 ops or so. */
+#define STATIC_INLINE_LEAF_EST_OPS 32
 #define PACK_STACK_SIZE 8
 #define VISIBILITY_STACK_SIZE 8
 
@@ -842,7 +848,7 @@ typedef struct RelocPatch
  * Using 32-bit sizes for compactness (object file sections are < 4GB) */
 typedef struct DeferredChunk
 {
-  const char *source_path; /* Path to source file (reference, not owned) */
+  const char *source_path; /* Path to source file (owned by s1->deferred_paths) */
   uint32_t file_offset;    /* Relative offset within source file */
   uint32_t size;           /* Size of this chunk */
   uint32_t dest_offset;    /* Offset in destination section */
@@ -1274,9 +1280,6 @@ struct sym_attr
   unsigned plt_offset;
   int plt_sym;
   int dyn_index;
-#if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
-  unsigned char plt_thumb_stub : 1;
-#endif
 };
 
 /* Cached archive symbol index for reuse across --start-group rescans.
@@ -1411,6 +1414,7 @@ struct TCCState
   unsigned char opt_reroll;           /* -freroll-blocks: re-roll N identical consecutive blocks into a loop */
   unsigned char opt_vrp;              /* -fvrp: value range propagation branch folding */
   unsigned char opt_float_narrow;     /* -ffloat-narrow: narrow double math to float when safe */
+  unsigned char opt_peephole;         /* -fpeephole: instruction fusion and code generation caches */
   unsigned char opt_jump_threading;   /* -fjump-threading: jump threading optimization */
   /* Per-caller budget for const-arg inlining of *loop* bodies; reset for each
    * function in gen_function(). See the CONST_LOOP_INLINE_BUDGET use in
@@ -1509,6 +1513,15 @@ struct TCCState
 #endif
   unsigned char text_and_data_separation; /* support for GCC
                                              -mno-pic-data-is-text-relative */
+  unsigned char yaff_slow_memory; /* -slow-memory: YAFF_MEMORY_SLOW */
+  char *hot_text_file;            /* --hot-text=FILE: names of the functions the loader runs from RAM */
+  char **hot_text_flash_names;    /* --hot-text's '=name': flash callers call its flash copy */
+  int nb_hot_text_flash_names;
+  char *ram_text_file;            /* --ram-text=FILE: functions the linker script runs from RAM */
+  char **ram_text_names, **ram_text_section_names;
+  int nb_ram_text_names, nb_ram_text_section_names;
+  unsigned char ram_text_read;
+  unsigned long hot_text_start, hot_text_end; /* that block of .text; both 0 without any */
   unsigned int yaff_stack_size; /* -stack-size=N: per-image stack hint (bytes)
                                    written into the YAFF header; 0 = default */
   unsigned int yaff_heap_size;  /* -heap-size=N: per-image heap cap (bytes)
@@ -1573,6 +1586,10 @@ struct TCCState
 
   char **sysinclude_paths;
   int nb_sysinclude_paths;
+
+  /* what each of those directories holds, read on first use (tccpp.c) */
+  struct IncDirList **inc_dir_lists;
+  int nb_inc_dir_lists;
 
   /* library paths */
   char **library_paths;
@@ -1765,8 +1782,11 @@ struct TCCState
   /* Number of archive members loaded in current group rescan pass */
   int group_rescan_loaded;
   /* extra attributes (eg. GOT/PLT value) for symtab symbols */
-  struct sym_attr *sym_attrs;
-  int nb_sym_attrs;
+  /* See tcc_link_arena_prepare. */
+  unsigned char *link_arena;
+  unsigned long link_arena_size, link_arena_used;
+  struct sym_attr **sym_attr_chunks; /* see get_sym_attr */
+  int nb_sym_attr_chunks;
   /* ptr to next reloc entry reused */
   ElfW_Rel *qrel;
 #define qrel s1->qrel
@@ -1845,6 +1865,9 @@ struct TCCState
   unsigned long current_archive_offset;
   /* Archive file path for lazy loading (NULL if not in archive) */
   const char *current_archive_path;
+  /* Paths of files with deferred section chunks, shared by those chunks. */
+  char **deferred_paths;
+  int nb_deferred_paths;
   /* Cached archive symbol tables for --start-group rescan avoidance */
   ArchiveSymbolCache *archive_sym_caches;
   int nb_archive_sym_caches;
@@ -2338,12 +2361,55 @@ PUB_FUNC char *tcc_strdup(const char *str);
    they belong to is the whole question. Only the >= 2 KiB path records
    anything, and the record is one table probe, so this is cheap enough to keep
    on: the counters it feeds already print under -bench. */
+/* CONFIG_TCC_CHECKS=0 is the device compiler (build_rootfs.sh): no record of who
+ * allocated what for -bench, no contract checks on hot paths, ICEs that stop
+ * without a message.  It runs from flash behind a 16 KB cache, where every call
+ * site's extra arguments are fetched.  The host cross keeps all of it. */
+#ifndef CONFIG_TCC_CHECKS
+#define CONFIG_TCC_CHECKS 1
+#endif
+#if CONFIG_TCC_CHECKS || defined(TCC_ALLOC_PROFILE)
+#define TCC_RECORD_ALLOC_SITES 1
+#else
+#define TCC_RECORD_ALLOC_SITES 0
+#endif
+
 #if !defined(MEM_DEBUG)
+#if TCC_RECORD_ALLOC_SITES
 #define tcc_malloc(size) tcc_malloc_at(size, __FILE__, __LINE__)
 #define tcc_mallocz(size) tcc_mallocz_at(size, __FILE__, __LINE__)
 #define tcc_realloc(ptr, size) tcc_realloc_at(ptr, size, __FILE__, __LINE__)
+#endif
 PUB_FUNC void *tcc_malloc_at(unsigned long size, const char *file, int line);
 PUB_FUNC void *tcc_mallocz_at(unsigned long size, const char *file, int line);
+/* The IR arrays every pass walks: on the board, in memory that cannot miss (see
+ * libtcc.c).  Everywhere else, the plain heap. */
+#if defined(TCC_IS_NATIVE) && defined(TARGETOS_YasOS)
+PUB_FUNC void *tcc_hot_mallocz_at(unsigned long size, const char *file, int line);
+PUB_FUNC void *tcc_hot_realloc_at(void *ptr, unsigned long size, const char *file, int line);
+PUB_FUNC void tcc_hot_free(void *ptr);
+/* Reseat a hot array at exactly `cap` bytes, keeping its first `used`: into the
+ * arena if it now fits, so doubling slack is not what decides who gets SRAM. */
+PUB_FUNC void *tcc_hot_settle_at(void *ptr, unsigned long used, unsigned long cap, const char *file, int line);
+PUB_FUNC void tcc_memory_tiers_setup(void);
+PUB_FUNC void tcc_hot_release(void);
+#if TCC_RECORD_ALLOC_SITES
+#define tcc_hot_mallocz(size) tcc_hot_mallocz_at(size, __FILE__, __LINE__)
+#define tcc_hot_realloc(ptr, size) tcc_hot_realloc_at(ptr, size, __FILE__, __LINE__)
+#define tcc_hot_settle(ptr, used, cap) tcc_hot_settle_at(ptr, used, cap, __FILE__, __LINE__)
+#else
+#define tcc_hot_mallocz(size) tcc_hot_mallocz_at(size, NULL, 0)
+#define tcc_hot_realloc(ptr, size) tcc_hot_realloc_at(ptr, size, NULL, 0)
+#define tcc_hot_settle(ptr, used, cap) tcc_hot_settle_at(ptr, used, cap, NULL, 0)
+#endif
+#else
+#define tcc_hot_mallocz(size) tcc_mallocz(size)
+#define tcc_hot_realloc(ptr, size) tcc_realloc(ptr, size)
+#define tcc_hot_free(ptr) tcc_free(ptr)
+#define tcc_hot_settle(ptr, used, cap) tcc_realloc(ptr, cap)
+#define tcc_memory_tiers_setup() ((void)0)
+#define tcc_hot_release() ((void)0)
+#endif
 PUB_FUNC void *tcc_realloc_at(void *ptr, unsigned long size, const char *file, int line);
 #endif
 
@@ -2369,6 +2435,7 @@ ST_FUNC void libc_free(void *ptr);
 PUB_FUNC int _tcc_error_noabort(const char *fmt, ...) PRINTF_LIKE(1, 2);
 PUB_FUNC NORETURN void _tcc_error(const char *fmt, ...) PRINTF_LIKE(1, 2);
 PUB_FUNC NORETURN void _tcc_ice(const char *fmt, ...) PRINTF_LIKE(1, 2);
+PUB_FUNC NORETURN void _tcc_ice_stop(void);
 PUB_FUNC void _tcc_warning(const char *fmt, ...) PRINTF_LIKE(1, 2);
 #define tcc_internal_error(msg) tcc_error("internal compiler error in %s:%d: %s", __FUNCTION__, __LINE__, msg)
 
@@ -2809,6 +2876,17 @@ ST_FUNC void tccelf_end_file(TCCState *s1);
 ST_FUNC Section *new_section(TCCState *s1, const char *name, int sh_type, int sh_flags);
 ST_FUNC void section_realloc(Section *sec, unsigned long new_size);
 ST_FUNC void section_materialize(TCCState *s1, Section *sec);
+ST_FUNC int deferred_chunks_read(TCCState *s1, DeferredChunk **chunks, unsigned char *dest, int *fd, const char **fd_path);
+ST_FUNC void section_reserve_exact(Section *sec, unsigned long size);
+ST_FUNC void section_release(Section *sec);
+ST_FUNC void *link_arena_alloc(TCCState *s1, unsigned long size);
+ST_FUNC int link_arena_owns(const TCCState *s1, const void *p);
+ST_FUNC char **tcc_name_list_read(TCCState *s1, const char *path, const char *option, int *count);
+ST_FUNC int tcc_name_list_has(char **names, int count, const char *name, size_t len);
+ST_FUNC void tcc_name_list_sort(char **names, int count);
+ST_FUNC Section *new_input_section(TCCState *s1, const char *name, int sh_type, int sh_flags);
+ST_FUNC void tcc_link_arena_prepare(TCCState *s1);
+ST_FUNC Section *section_reloc(Section *symtab, Section *s);
 ST_FUNC size_t section_add(Section *sec, addr_t size, int align);
 ST_FUNC void *section_ptr_add(Section *sec, addr_t size);
 ST_FUNC void section_prealloc(Section *sec, unsigned long size);
@@ -2835,6 +2913,9 @@ ST_FUNC void put_elf_reloc(Section *symtab, Section *s, unsigned long offset, in
 int ld_section_memory_region(TCCState *s1, const char *name, addr_t *origin);
 #ifdef TCC_TARGET_ARM
 ST_FUNC void arm_add_range_veneers(TCCState *s1);
+ST_FUNC unsigned long arm_hot_text_veneer_bytes(TCCState *s1);
+ST_FUNC void arm_add_hot_text_veneers(TCCState *s1);
+ST_FUNC void arm_hot_text_fill_got(TCCState *s1);
 #endif
 ST_FUNC void put_elf_reloca(Section *symtab, Section *s, unsigned long offset, int type, int symbol, addr_t addend);
 
@@ -3250,6 +3331,7 @@ ST_FUNC void tcc_gen_machine_bitop1_mop(MachineOperand src1, MachineOperand dest
 /* Does the active target encode clz/rbit/rev/rev16?  Front ends use this to
  * decide between the native opcode and the libgcc helper call. */
 ST_FUNC int tcc_machine_has_bit_ops(void);
+ST_FUNC int tcc_machine_has_unaligned_words(void);
 /* UMAAL (DSP extension): gates the umaal fusion; see tcc_gen_machine_umaal_mop. */
 ST_FUNC int tcc_machine_has_umaal(void);
 ST_FUNC void tcc_gen_machine_umaal_mop(MachineOperand src1, MachineOperand src2, MachineOperand accum,
@@ -3404,6 +3486,7 @@ ST_FUNC void tcc_gen_machine_reserve_pool_bytes(int upcoming_bytes);
 ST_FUNC void tcc_gen_machine_strldr_cache_reset(void);
 ST_FUNC void tcc_gen_machine_strldr_cache_set_enabled(int enabled);
 ST_FUNC void tcc_gen_machine_str_elide_set_enabled(int enabled);
+ST_FUNC void tcc_gen_machine_peepholes_set_enabled(int enabled);
 ST_FUNC void tcc_gen_machine_slot_self_copy_set_enabled(int enabled);
 ST_FUNC void tcc_gen_machine_frame_word_pair_set_enabled(int enabled);
 ST_FUNC void tcc_gen_machine_imm_cache_reset(void);
@@ -3586,7 +3669,11 @@ static inline void post_sem(TCCSem *p)
 #define gnu_ext TCC_STATE_VAR(gnu_ext)
 #define tcc_error_noabort TCC_SET_STATE(_tcc_error_noabort)
 #define tcc_error TCC_SET_STATE(_tcc_error)
+#if CONFIG_TCC_CHECKS
 #define tcc_ice TCC_SET_STATE(_tcc_ice)
+#else
+#define tcc_ice(...) TCC_SET_STATE(_tcc_ice_stop)()
+#endif
 #define tcc_warning TCC_SET_STATE(_tcc_warning)
 
 #define total_idents TCC_STATE_VAR(total_idents)

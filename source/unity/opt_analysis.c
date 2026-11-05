@@ -3,6 +3,8 @@
 #undef USING_GLOBALS
 #include "../opt/analysis/du_chains.c"
 #undef USING_GLOBALS
+#include "../opt/analysis/frame_ptr.c"
+#undef USING_GLOBALS
 #include "../opt/analysis/mem_ssa.c"
 #undef USING_GLOBALS
 #include "../opt/analysis/memref.c"

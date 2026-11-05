@@ -164,7 +164,7 @@ static int symaddr_insert_defs(TCCIRState *ir, SymaddrEntry *entries, int num_en
     if (!entry->selected)
       continue;
     uint32_t pool_idx = tcc_ir_pool_add_symref(ir, entry->sym, (int32_t)entry->addend, 0);
-    IROperand src = irop_make_symref(-1, pool_idx, 0, 0, 0, IROP_BTYPE_INT32);
+    IROperand src = irop_make_symref(-1, pool_idx, 0, IROP_BTYPE_INT32);
     IROperand dest = irop_make_vreg(entry->hoist_vreg, IROP_BTYPE_INT32);
     IRQuadCompact assign = {0};
     assign.op = TCCIR_OP_ASSIGN;
@@ -246,7 +246,7 @@ OPT_GEN_FLAT(symaddr_store, TCCIR_OP_STORE)
   SymaddrState *st = ctx->pass_state;
   if (i < st->num_hoist ||
       (!st->late && i >= st->entry_end) ||
-      irop_get_tag(dest) != IROP_TAG_SYMREF || !dest.is_lval || dest.is_local)
+      irop_get_tag(dest) != IROP_TAG_SYMREF || !dest.is_lval || irop_is_local(dest))
     return 0;
   /* Integer widths only: FLOAT32 can be a complex pair (two words behind one
    * operand — complex-5), FLOAT64/INT64 are pairs, STRUCT is a block. */
@@ -284,7 +284,7 @@ OPT_GEN_FLAT(symaddr_load, TCCIR_OP_LOAD)
   if (!st->late)
     return 0;
   if (i < st->num_hoist ||
-      irop_get_tag(src1) != IROP_TAG_SYMREF || !src1.is_lval || src1.is_local)
+      irop_get_tag(src1) != IROP_TAG_SYMREF || !src1.is_lval || irop_is_local(src1))
     return 0;
   if (src1.btype != IROP_BTYPE_INT32 && src1.btype != IROP_BTYPE_INT16 &&
       src1.btype != IROP_BTYPE_INT8)
@@ -327,7 +327,7 @@ OPT_GEN_FLAT(symaddr_ldx_base, TCCIR_OP_LOAD_INDEXED)
   if (!st->late)
     return 0;
   if (i < st->num_hoist ||
-      irop_get_tag(src1) != IROP_TAG_SYMREF || src1.is_lval || src1.is_local)
+      irop_get_tag(src1) != IROP_TAG_SYMREF || src1.is_lval || irop_is_local(src1))
     return 0;
   IRPoolSymref *sr = irop_get_symref_ex(ir, src1);
   if (!sr || !sr->sym)
@@ -379,7 +379,7 @@ OPT_GEN_FLAT(symaddr_stx_base, TCCIR_OP_STORE_INDEXED)
   if (!st->late)
     return 0;
   if (i < st->num_hoist ||
-      irop_get_tag(dest) != IROP_TAG_SYMREF || dest.is_lval || dest.is_local)
+      irop_get_tag(dest) != IROP_TAG_SYMREF || dest.is_lval || irop_is_local(dest))
     return 0;
   IRPoolSymref *sr = irop_get_symref_ex(ir, dest);
   if (!sr || !sr->sym)

@@ -345,6 +345,33 @@ int small_aggregate_copy_plan(const CType *stype, int size, int align, int src_o
   return chunks;
 }
 
+/* Plan a copy of a type whose fields are wider than its alignment (a packed
+ * struct), which small_aggregate_copy_plan cannot tile: word chunks that may be
+ * unaligned, the last one narrowed to the object's end.  Each field still sits
+ * inside one chunk.  A 3-byte tail refuses: one chunk of a power-of-two width
+ * would read past the object.  Returns the number of chunks, or 0.  tinycc's own
+ * 9-byte IROperand is what this is for: a memmove call per copy of it was a fifth
+ * of a self-compile on the board. */
+int small_unaligned_copy_plan(const CType *stype, int size, int align, int *w_out, unsigned char *covered)
+{
+  int chunks = 0;
+  if (align >= 4 || size <= 0 || size > SMALL_AGGREGATE_COPY_MAX || (size & 3) == 3 ||
+      !tcc_machine_has_unaligned_words())
+    return 0;
+  memset(covered, 0, SMALL_AGGREGATE_COPY_MAX);
+  if (!small_copy_cover(stype, 0, 4, size, covered))
+    return 0;
+  for (int p = 0; p < size; p += 4)
+  {
+    int any = 0;
+    for (int k = p; k < p + 4 && k < size; k++)
+      any |= covered[k];
+    chunks += any;
+  }
+  *w_out = 4;
+  return chunks;
+}
+
 /* Address `side` + off as an lvalue of type `ct`.  A LOCAL/GLOBAL side takes the
  * offset in c.i; a register-deref side (whose c.i the codegen does not honour)
  * gets an explicit ADD, which displacement fusion later folds into the access. */
@@ -443,6 +470,12 @@ void ir_emit_small_aggregate_copy(const SValue *src, int src_deref, const SValue
                                   int w, const unsigned char *covered)
 {
   ir_emit_small_aggregate_chunks(src, src_deref, dst, dst_deref, size, w, covered, 0);
+}
+
+void ir_emit_small_unaligned_copy(const SValue *src, int src_deref, const SValue *dst, int dst_deref, int size,
+                                  const unsigned char *covered)
+{
+  ir_emit_small_aggregate_chunks(src, src_deref, dst, dst_deref, size, 4, covered, 1);
 }
 
 int ir_emit_small_padded_local_copy(const SValue *src, const SValue *dst, const CType *stype, int size, int align)

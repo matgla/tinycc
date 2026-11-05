@@ -105,45 +105,13 @@ static uint8_t *dls_temp_defs(TCCIRState *ir, int n)
  * either address, and the def nearest the use names only one of them. */
 static int dls_vreg_frame_off(TCCIRState *ir, const uint8_t *temp_defs, int32_t vr, int before_idx, int *out_off)
 {
-  long acc = 0;
-  for (int guard = 0; guard < 32; guard++)
-  {
-    if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
-      return 0;
-    int p = TCCIR_DECODE_VREG_POSITION(vr);
-    if (p >= ir->next_temporary_variable || temp_defs[p] != 1)
-      return 0;
-    int d = tcc_ir_find_defining_instruction(ir, vr, before_idx);
-    if (d < 0)
-      return 0;
-    IRQuadCompact *dq = &ir->compact_instructions[d];
-    if (dq->op != TCCIR_OP_ADD && dq->op != TCCIR_OP_SUB &&
-        dq->op != TCCIR_OP_ASSIGN && dq->op != TCCIR_OP_LEA)
-      return 0;
-    IROperand s1 = tcc_ir_op_get_src1(ir, dq);
-    if (dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB)
-    {
-      if (!tcc_ir_op_src2_is_imm(ir, dq) || tcc_ir_op_src2_is_sym(ir, dq))
-        return 0;
-      long c = (long)tcc_ir_op_src2_imm(ir, dq);
-      acc += (dq->op == TCCIR_OP_SUB) ? -c : c;
-    }
-    /* s1 is the base: a direct Addr[StackLoc] terminates the walk, else recurse. */
-    if (irop_get_tag(s1) == IROP_TAG_STACKOFF && s1.is_local && !s1.is_lval &&
-        irop_get_vreg(s1) == -1)
-    {
-      long off = (long)irop_get_stack_offset(s1) + acc;
-      if (off < INT_MIN || off > INT_MAX)
-        return 0;
-      *out_off = (int)off;
-      return 1;
-    }
-    if (s1.is_lval || irop_get_vreg(s1) < 0)
-      return 0;
-    vr = irop_get_vreg(s1);
-    before_idx = d;
-  }
-  return 0;
+  IRAddrWalk w = {.max_hops = 32, .flags = IR_AW_SUB | IR_AW_ANY_VREG | IR_AW_LATEST_DEF,
+                  .def_count = temp_defs, .n_temps = ir->next_temporary_variable};
+  IRAddrKey k;
+  if (!ir_opt_addr_walk(ir, vr, before_idx, &w, &k) || k.off < INT_MIN || k.off > INT_MAX)
+    return 0;
+  *out_off = (int)k.off;
+  return 1;
 }
 
 /* Parallel per-slot tame state; end[] bounds a slot's extent so a non-tame
@@ -260,12 +228,12 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
   int dls_has_indexed = 0;
   /* Position-based liveness (read.pos > store.pos) is only sound in forward-only CFG; a back-edge makes a loop-carried store look dead, so it disables the relaxation. */
   int dls_has_backedge = 0;
+  if (ir_opt_fn_features(ir) & (IR_FN_IJUMP | IR_FN_SET_CHAIN | IR_FN_INIT_CHAIN_SLOT))
+    return 0;
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     int op = q->op;
-    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SET_CHAIN || op == TCCIR_OP_INIT_CHAIN_SLOT)
-      return 0;
     if (op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED ||
         op == TCCIR_OP_LOAD_POSTINC || op == TCCIR_OP_STORE_POSTINC)
       dls_has_indexed = 1;
@@ -365,7 +333,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
     if (dv < 0)
       continue;
     IROperand s1 = tcc_ir_op_get_src1(ir, q);
-    if (irop_get_tag(s1) != IROP_TAG_STACKOFF || !s1.is_local || s1.is_lval || irop_get_vreg(s1) != -1)
+    if (irop_get_tag(s1) != IROP_TAG_STACKOFF || !irop_is_local(s1) || s1.is_lval || irop_get_vreg(s1) != -1)
       continue;
     int slot = irop_get_stack_offset(s1);
     dls_tame_find_or_add(&ts, slot);
@@ -512,7 +480,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       }
       if (!has_op)
         continue;
-      if (irop_get_tag(op) != IROP_TAG_STACKOFF || !op.is_local || !op.is_lval || irop_get_vreg(op) != -1)
+      if (irop_get_tag(op) != IROP_TAG_STACKOFF || !irop_is_local(op) || !op.is_lval || irop_get_vreg(op) != -1)
         continue;
       if (q->op == TCCIR_OP_BLOCK_COPY && k == 0)
         continue;
@@ -613,7 +581,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
         continue;
 
       int slot = INT_MIN; /* sentinel for "no slot involved" */
-      if (irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_local && !op.is_lval && irop_get_vreg(op) == -1)
+      if (irop_get_tag(op) == IROP_TAG_STACKOFF && irop_is_local(op) && !op.is_lval && irop_get_vreg(op) == -1)
         slot = irop_get_stack_offset(op);
 
       int vr = irop_get_vreg(op);
@@ -737,7 +705,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
           {
             /* Address stored into a never-read local slot is dead and cannot escape. */
             IROperand sdest = tcc_ir_op_get_dest(ir, q);
-            if (irop_get_tag(sdest) == IROP_TAG_STACKOFF && sdest.is_local &&
+            if (irop_get_tag(sdest) == IROP_TAG_STACKOFF && irop_is_local(sdest) &&
                 irop_get_vreg(sdest) == -1)
             {
               int sdoff = irop_get_stack_offset(sdest);
@@ -849,7 +817,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
 
       if (irop_get_tag(op) != IROP_TAG_STACKOFF)
         continue;
-      if (!op.is_local)
+      if (!irop_is_local(op))
         continue;
       if (irop_get_vreg(op) != -1)
         continue;
@@ -903,7 +871,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       if (sz <= 0)
         continue;
       /* Direct addr-of-local source */
-      if (irop_get_tag(src_p) == IROP_TAG_STACKOFF && src_p.is_local && !src_p.is_lval &&
+      if (irop_get_tag(src_p) == IROP_TAG_STACKOFF && irop_is_local(src_p) && !src_p.is_lval &&
           irop_get_vreg(src_p) == -1)
       {
         int off = irop_get_stack_offset(src_p);
@@ -975,7 +943,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     if (irop_get_tag(dest) != IROP_TAG_STACKOFF)
       continue;
-    if (!dest.is_local || irop_get_vreg(dest) != -1)
+    if (!irop_is_local(dest) || irop_get_vreg(dest) != -1)
       continue;
     int off = irop_get_stack_offset(dest);
     int width;
@@ -1103,7 +1071,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
     if (tcc_ir_instr_access_is_volatile(ir, q))
       continue;
     IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_tag(dest) != IROP_TAG_STACKOFF || !dest.is_local || irop_get_vreg(dest) != -1)
+    if (irop_get_tag(dest) != IROP_TAG_STACKOFF || !irop_is_local(dest) || irop_get_vreg(dest) != -1)
       continue;
     if (tcc_ir_op_src2_tag(ir, q) != IROP_TAG_IMM32)
       continue;
@@ -1148,7 +1116,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
         continue;
       if (dls_writecall_is_volatile(ir, i, p0))
         continue;
-      if (irop_get_tag(p0) != IROP_TAG_STACKOFF || !p0.is_local || p0.is_lval)
+      if (irop_get_tag(p0) != IROP_TAG_STACKOFF || !irop_is_local(p0) || p0.is_lval)
         continue;
       if (irop_get_vreg(p0) != -1)
         continue;

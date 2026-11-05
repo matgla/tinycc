@@ -114,7 +114,7 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
       IROperand op;
       if (!ub_elide_get_operand(ir, q, k, &op))
         continue;
-      if (op.is_sym)
+      if (irop_is_sym(op))
       {
         Sym *sym = irop_get_sym_ex(ir, op);
         if (sym && (sym->type.t & VT_VOLATILE))
@@ -154,7 +154,7 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
       if (!ub_elide_get_operand(ir, q, k, &op))
         continue;
       /* Bare STACKOFF operand touched other than by a pure read: treat slot as initialised. */
-      if (!stack_blocked_overflow && irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_local && irop_get_vreg(op) == -1)
+      if (!stack_blocked_overflow && irop_get_tag(op) == IROP_TAG_STACKOFF && irop_is_local(op) && irop_get_vreg(op) == -1)
       {
         int block = 0;
         if (!op.is_lval)
@@ -185,7 +185,7 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
         continue;
       if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
         continue;
-      if (op.is_local && !op.is_lval)
+      if (irop_is_local(op) && !op.is_lval)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
         if (pos >= 0 && pos < UB_ELIDE_MAX_VAR_POS)
@@ -220,7 +220,7 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
 #define SRC_IS_UNINIT_READ(sop) ({                                                                                     \
     int _t = 0;                                                                                                        \
     int32_t _vr = irop_get_vreg(sop);                                                                                  \
-    if (_vr >= 0 && TCCIR_DECODE_VREG_TYPE(_vr) == TCCIR_VREG_TYPE_VAR && !((sop).is_local && !(sop).is_lval))         \
+    if (_vr >= 0 && TCCIR_DECODE_VREG_TYPE(_vr) == TCCIR_VREG_TYPE_VAR && !(irop_is_local((sop)) && !(sop).is_lval))         \
     {                                                                                                                  \
       int _p = TCCIR_DECODE_VREG_POSITION(_vr);                                                                        \
       if (_p >= 0 && _p < UB_ELIDE_MAX_VAR_POS &&                                                                      \
@@ -231,7 +231,7 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
     /* Bare stack-slot read (StackLoc[X] as a value source, vreg=-1); the     \
      * incoming argument area (is_param) holds the caller's arguments. */                                              \
     if (!_t && !stack_blocked_overflow && irop_get_tag(sop) == IROP_TAG_STACKOFF &&                                    \
-        (sop).is_local && (sop).is_lval && !(sop).is_param && irop_get_vreg(sop) == -1)                                \
+        irop_is_local((sop)) && (sop).is_lval && !(sop).is_param && irop_get_vreg(sop) == -1)                                \
     {                                                                                                                  \
       int32_t _off = irop_get_stack_offset(sop);                                                                       \
       int _blocked = 0;                                                                                                \
@@ -326,7 +326,7 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
       if (TEMP_IS_TAINTED(dop))
         tainted = 1;
     }
-    else if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR && dop.is_lval && !dop.is_local)
+    else if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR && dop.is_lval && !irop_is_local(dop))
     {
       /* Store-through a non-local VAR slot: uninit VAR means garbage address. */
       int p = TCCIR_DECODE_VREG_POSITION(dvr);

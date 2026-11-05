@@ -2161,6 +2161,10 @@ static void unary_funcall_body(void)
                              inline_body_asm_is_machine(inline_fn->func_str))) &&
         !func_has_label_addr && call_func_sym->type.ref && !skip_ipc_cached &&
         (call_func_sym->type.ref->f.func_auto_inline || eval_only_all_const) &&
+        /* Nothing runs after a call that does not return, so there is no call cost
+         * to save: the expansion only adds its arguments to the caller, at every
+         * site. always_inline does not come through here. */
+        !call_func_sym->type.ref->f.func_noreturn &&
         !call_func_sym->type.ref->f.func_noinline && (TCC_OPT(tcc_state, opt_inline_functions) || TCC_OPT(tcc_state, opt_inline_small)) &&
         !strbi_is_redirect_target(resolve_str_builtin_id(0, func_name)) &&
         /* Don't inline a nested function with parent-scope captures unless
@@ -2295,7 +2299,8 @@ static void unary_funcall_body(void)
     if (!force_always_inline && !has_addr_of_label && !func_has_label_addr && call_func_sym->a.guard_head &&
         !tcc_state->check_only && !nocode_wanted && TCC_OPT(tcc_state, optimize) >= 2 &&
         !TCC_OPT(tcc_state, optimize_size) && !tcc_ir_opt_pass_disabled("inline:guard_head") &&
-        call_func_sym->type.ref && !call_func_sym->type.ref->f.func_noinline &&
+        call_func_sym->type.ref && !call_func_sym->type.ref->f.func_noreturn &&
+        !call_func_sym->type.ref->f.func_noinline &&
         tcc_state->inline_expansion_depth < INLINE_NEST_MAX && !inline_expansion_in_progress(call_func_sym) &&
         auto_inline_param_count(call_func_sym) == (nb_args - nb_implicit_args))
     {

@@ -50,12 +50,12 @@ int dce_ret_path_frame_store(IRSSAOptCtx *ctx)
     if (q->op != TCCIR_OP_STORE)
       continue;
     IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (!dest.is_lval || dest.is_llocal)
+    if (!dest.is_lval || irop_is_llocal(dest))
       continue;
     int frame_slot = 0;
-    if (dest.is_local && irop_get_vreg(dest) < 0) {
+    if (irop_is_local(dest) && irop_get_vreg(dest) < 0) {
       frame_slot = 1;
-    } else if (!dest.is_local && !dest.is_sym && dest.tag == IROP_TAG_VREG) {
+    } else if (!irop_is_local(dest) && !irop_is_sym(dest) && dest.tag == IROP_TAG_VREG) {
       int32_t pvr = irop_get_vreg(dest);
       if (pvr >= 0 && TCCIR_DECODE_VREG_TYPE(pvr) == TCCIR_VREG_TYPE_TEMP &&
           ssa_opt_resolve_lea_stackloc(ctx, pvr) != INT_MIN)

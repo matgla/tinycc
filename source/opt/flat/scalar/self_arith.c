@@ -32,13 +32,13 @@ static int self_arith(IROptCtx *ctx, int i, int fold_val)
    * Both read at this quad, so equal vregs = identical value. Registers only
    * — exclude memory derefs (is_lval, may be volatile), symrefs, and immediates. */
   if (vreg(src1) >= 0 && vreg(src1) == vreg(src2) &&
-      !src1.is_lval && !src2.is_lval && !src1.is_sym && !src2.is_sym &&
+      !src1.is_lval && !src2.is_lval && !irop_is_sym(src1) && !irop_is_sym(src2) &&
       !irop_is_immediate(src1) && !irop_is_immediate(src2)) {
     tcc_ir_set_src2(ir, i, IROP_NONE);
     REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1(irop_make_imm32(-1, fold_val, irop_get_btype(dest))));
   }
 
-  GUARD(when(src1.is_sym && src1.is_lval && src2.is_sym && src2.is_lval));
+  GUARD(when(irop_is_sym(src1) && src1.is_lval && irop_is_sym(src2) && src2.is_lval));
 
   IRPoolSymref *a_ref = irop_get_symref_ex(ir, src1);
   IRPoolSymref *b_ref = irop_get_symref_ex(ir, src2);

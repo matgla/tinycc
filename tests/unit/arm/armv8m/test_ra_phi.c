@@ -57,6 +57,9 @@ static void setup_tcc_state(void)
 
 static void run_regalloc(TCCIRState *ir)
 {
+  /* Plain -O0 has no phis (ra_o0_direct): a function with inline asm still does,
+   * with no optimizer in the way of the copies these tests look for. */
+  ir->inline_asm_count = 1;
   setup_tcc_state();
   tcc_ir_ssa_regalloc(ir, arm_get_regalloc_target(), 0);
 }

@@ -19,7 +19,7 @@ int gsym_cse_insert_before(TCCIRState *ir, int before_idx, IRQuadCompact *new_q)
   if (ir->next_instruction_index + 1 >= ir->compact_instructions_size)
   {
     int new_size = ir->compact_instructions_size << 1;
-    ir->compact_instructions = tcc_realloc(ir->compact_instructions, sizeof(IRQuadCompact) * new_size);
+    ir->compact_instructions = tcc_hot_realloc(ir->compact_instructions, sizeof(IRQuadCompact) * new_size);
     ir->compact_instructions_size = new_size;
   }
   for (int i = ir->next_instruction_index; i > before_idx; i--)

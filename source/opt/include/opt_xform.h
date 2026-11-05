@@ -26,7 +26,7 @@ int tcc_ir_opt_store_inplace_arith(TCCIRState *ir);
 /* is_lval/is_llocal operands are fused memory reads, evaluated when the instruction runs. */
 static inline int ir_xform_operand_reads_memory(IROperand op)
 {
-  return op.is_lval || op.is_llocal;
+  return op.is_lval || irop_is_llocal(op);
 }
 
 /* 1 if (lo,hi) is straight-line and writes no memory, so a memory read may move across it. */

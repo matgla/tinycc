@@ -102,6 +102,8 @@ void tcc_ir_ssa_opt_init(IRSSAOptCtx *ctx, struct TCCIRState *ir,
 void tcc_ir_ssa_opt_rebuild(IRSSAOptCtx *ctx);
 void tcc_ir_ssa_opt_free(IRSSAOptCtx *ctx);
 int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx);
+/* The schedule for a body with nothing promotable (all variables address-taken). */
+int tcc_ir_ssa_opt_run_fallback(IRSSAOptCtx *ctx);
 /* Fixpoint over {load_cse, cprop, fold, branch, light dce} peeling
  * sequential constant-guard chains one folded branch per round. */
 int tcc_ir_ssa_opt_guard_collapse(IRSSAOptCtx *ctx);
@@ -111,7 +113,7 @@ int tcc_ir_ssa_opt_guard_collapse(IRSSAOptCtx *ctx);
  * pipeline iteration's branch/dce may have left that residue, which fences
  * global_store_dse.  Only the SSA driver passes 1; regalloc's post-SSA loop
  * must not (shape churn there exposed miscompiles). */
-int tcc_ir_ssa_opt_guard_collapse_ex(IRSSAOptCtx *ctx, int idle_cleanup);
+int tcc_ir_ssa_opt_guard_collapse_ex(IRSSAOptCtx *ctx, int idle_cleanup, int known_clean);
 /* Same-block store-store DSE for full-width stores through single-def
  * TEMP pointer derefs (bitfield RMW chains after store→load forwarding). */
 int tcc_ir_ssa_opt_ptr_store_dse(IRSSAOptCtx *ctx);

@@ -192,7 +192,7 @@ UT_TEST(test_print_operand_symref_addend_and_deref)
   /* addend is threaded through the symref pool entry, not the IROperand
    * itself -- tcc_ir_pool_add_symref(ir, sym, addend, flags). */
   uint32_t sidx = tcc_ir_pool_add_symref(ir, &sym, /*addend*/ 12, 0);
-  IROperand op = irop_make_symref(0, sidx, /*is_lval*/ 1, /*is_local*/ 0, /*is_const*/ 0, I32);
+  IROperand op = irop_make_symref(0, sidx, /*is_lval*/ 1, I32);
 
   char *s = dump_op(ir, op);
   UT_ASSERT_STREQ(s, "GlobalSym(55)+12***DEREF***");
@@ -232,13 +232,13 @@ UT_TEST(test_print_operand_stackoff_with_vreg_short_form)
   tcc_ir_dump_set_show_physical_regs(0);
 
   IROperand addr_of = irop_make_stackoff(TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 3), 0,
-                                          /*is_lval*/ 0, /*is_llocal*/ 0, /*is_param*/ 0, I32);
+                                          /*is_lval*/ 0, /*is_param*/ 0, I32);
   char *s1 = dump_op(ir, addr_of);
   UT_ASSERT_STREQ(s1, "&V3");
   libc_free(s1);
 
   IROperand deref = irop_make_stackoff(TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 3), 0,
-                                        /*is_lval*/ 1, /*is_llocal*/ 0, /*is_param*/ 0, I32);
+                                        /*is_lval*/ 1, /*is_param*/ 0, I32);
   char *s2 = dump_op(ir, deref);
   UT_ASSERT_STREQ(s2, "V3");
   libc_free(s2);
@@ -263,22 +263,6 @@ UT_TEST(test_print_operand_stackoff_no_vreg_raw_offset)
   char *s2 = dump_op(ir, deref);
   UT_ASSERT_STREQ(s2, "StackLoc[16]");
   libc_free(s2);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* STACKOFF with is_llocal set and no vreg: "VT_LLOCAL (cval=n)" (spilled
- * pointer needing double dereference, physical-reg display off). */
-UT_TEST(test_print_operand_stackoff_llocal_no_physreg)
-{
-  TCCIRState *ir = utb_new();
-  tcc_ir_dump_set_show_physical_regs(0);
-
-  IROperand op = utb_stackoff(24, /*is_lval*/ 1, /*is_llocal*/ 1, /*is_param*/ 0, I32);
-  char *s = dump_op(ir, op);
-  UT_ASSERT_STREQ(s, "VT_LLOCAL (cval=24)");
-  libc_free(s);
 
   utb_free(ir);
   return 0;

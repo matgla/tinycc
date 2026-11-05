@@ -493,7 +493,7 @@ UT_TEST(test_constproptmp_switch_table_const_index_to_default_jump)
 static IROperand utb_gsymref(TCCIRState *ir, Sym *sym, int32_t addend, int is_lval, int is_const, int btype)
 {
   uint32_t sidx = tcc_ir_pool_add_symref(ir, sym, addend, 0);
-  return irop_make_symref(0, sidx, is_lval, 0 /*is_local*/, is_const, btype);
+  return irop_make_symref(0, sidx, is_lval, btype);
 }
 
 /* NULL-IR guard. */
@@ -710,7 +710,7 @@ UT_TEST(test_symrefconstprop_propagates_into_use)
   int changes = tcc_ir_opt_symref_const_prop(ir);
   UT_ASSERT(changes > 0);
   IROperand s1 = utb_src1(ir, iuse);
-  UT_ASSERT_EQ((int)s1.is_sym, 1);
+  UT_ASSERT_EQ((int)irop_is_sym(s1), 1);
   UT_ASSERT_EQ(irop_get_sym_ex(ir, s1), &s);
   utb_free(ir);
   return 0;
@@ -734,7 +734,7 @@ UT_TEST(test_symrefconstprop_preserves_addend_and_lval)
   int changes = tcc_ir_opt_symref_const_prop(ir);
   UT_ASSERT(changes > 0);
   IROperand s1 = utb_src1(ir, iuse);
-  UT_ASSERT_EQ((int)s1.is_sym, 1);
+  UT_ASSERT_EQ((int)irop_is_sym(s1), 1);
   UT_ASSERT_EQ((int)s1.is_lval, 1);
   IRPoolSymref *ref = irop_get_symref_ex(ir, s1);
   UT_ASSERT(ref != NULL);
@@ -762,7 +762,7 @@ UT_TEST(test_symrefconstprop_lval_source_not_tracked)
   int changes = tcc_ir_opt_symref_const_prop(ir);
   UT_ASSERT_EQ(changes, 0);
   IROperand s1 = utb_src1(ir, iuse);
-  UT_ASSERT_EQ((int)s1.is_sym, 0);
+  UT_ASSERT_EQ((int)irop_is_sym(s1), 0);
   UT_ASSERT_EQ(utb_vreg(s1), VR_TMP(0));
   utb_free(ir);
   return 0;
@@ -796,7 +796,7 @@ UT_TEST(test_symrefconstprop_redef_invalidates)
   tcc_ir_opt_symref_const_prop(ir);
   /* The post-redef use of T0 must remain a plain vreg (no stale symref). */
   IROperand s1 = utb_src1(ir, iuse);
-  UT_ASSERT_EQ((int)s1.is_sym, 0);
+  UT_ASSERT_EQ((int)irop_is_sym(s1), 0);
   UT_ASSERT_EQ(utb_vreg(s1), VR_TMP(0));
   utb_free(ir);
   return 0;
@@ -829,7 +829,7 @@ UT_TEST(test_symrefconstprop_assign_redef_invalidates)
   /* No use is rewritten: the only candidate (the ADD's T0) was invalidated. */
   UT_ASSERT_EQ(changes, 0);
   IROperand s1 = utb_src1(ir, iuse);
-  UT_ASSERT_EQ((int)s1.is_sym, 0);
+  UT_ASSERT_EQ((int)irop_is_sym(s1), 0);
   UT_ASSERT_EQ(utb_vreg(s1), VR_TMP(0));
   utb_free(ir);
   return 0;
@@ -1119,7 +1119,7 @@ UT_TEST(test_valuetracking_lcmp_const_fold)
   callee_sym.v = 7;
   utb_set_tok_str(7, "__aeabi_lcmp");
   uint32_t sidx = tcc_ir_pool_add_symref(ir, &callee_sym, 0, 0);
-  IROperand callee = irop_make_symref(0, sidx, 0, 0, 0, I32);
+  IROperand callee = irop_make_symref(0, sidx, 0, I32);
 
   const int call_id = 1;
   utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_imm(10, I64),
@@ -1151,7 +1151,7 @@ UT_TEST(test_valuetracking_ulcmp_const_fold)
   callee_sym.v = 8;
   utb_set_tok_str(8, "__aeabi_ulcmp");
   uint32_t sidx = tcc_ir_pool_add_symref(ir, &callee_sym, 0, 0);
-  IROperand callee = irop_make_symref(0, sidx, 0, 0, 0, I32);
+  IROperand callee = irop_make_symref(0, sidx, 0, I32);
 
   const int call_id = 1;
   utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_imm(-1, I64),
@@ -1183,7 +1183,7 @@ UT_TEST(test_valuetracking_unknown_call_no_fold)
   static Sym callee_sym;
   callee_sym.v = 9; /* maps to "?" (no special-case name) */
   uint32_t sidx = tcc_ir_pool_add_symref(ir, &callee_sym, 0, 0);
-  IROperand callee = irop_make_symref(0, sidx, 0, 0, 0, I32);
+  IROperand callee = irop_make_symref(0, sidx, 0, I32);
 
   const int call_id = 1;
   utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_imm(10, I64),
@@ -1209,7 +1209,7 @@ static int utb_i64_helper_call(TCCIRState *ir, int tok, const char *name, IROper
   cs.v = tok;
   utb_set_tok_str(tok, name);
   uint32_t sidx = tcc_ir_pool_add_symref(ir, &cs, 0, 0);
-  IROperand callee = irop_make_symref(0, sidx, 0, 0, 0, I32);
+  IROperand callee = irop_make_symref(0, sidx, 0, I32);
   const int call_id = 1;
   utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, v0, utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 0), I32));
   utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, v1, utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 1), I32));
@@ -1367,7 +1367,7 @@ UT_TEST(test_valuetracking_bswapsi2_const_fold)
   cs.v = 47;
   utb_set_tok_str(47, "__bswapsi2");
   uint32_t sidx = tcc_ir_pool_add_symref(ir, &cs, 0, 0);
-  IROperand callee = irop_make_symref(0, sidx, 0, 0, 0, I32);
+  IROperand callee = irop_make_symref(0, sidx, 0, I32);
   utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_imm(0x11223344, I32),
            utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 0), I32));
   int icall = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), callee,

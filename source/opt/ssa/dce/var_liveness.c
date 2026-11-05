@@ -30,9 +30,9 @@ static int vl_var_pos(IROperand op, int num_vars)
 /* True only for a write to the VAR's own slot, not through a pointer held in it. */
 static int vl_store_is_slot_def(IROperand d)
 {
-  if (d.is_sym)
+  if (irop_is_sym(d))
     return 0;
-  return !d.is_lval || (d.is_local && !d.is_llocal);
+  return !d.is_lval || (irop_is_local(d) && !irop_is_llocal(d));
 }
 
 /* Every def returned must be safe to NOP when dead: side-effect ops never kill, except the STORE slot-def form. */
@@ -45,7 +45,7 @@ static int vl_def_pos(TCCIRState *ir, IRQuadCompact *q, int num_vars)
     if (q->op != TCCIR_OP_STORE || !vl_store_is_slot_def(d))
       return -1;
   } else {
-    if (d.is_sym || (d.is_lval && (!d.is_local || d.is_llocal)))
+    if (irop_is_sym(d) || (d.is_lval && (!irop_is_local(d) || irop_is_llocal(d))))
       return -1;
   }
   int p = vl_var_pos(d, num_vars);
@@ -179,7 +179,7 @@ int dce_var_liveness(IRSSAOptCtx *ctx)
       if (p < 0)
         continue;
       /* Addr[V] escapes; any VAR feeding a LEA is address-taken */
-      if ((s.is_local && !s.is_lval) || q->op == TCCIR_OP_LEA)
+      if ((irop_is_local(s) && !s.is_lval) || q->op == TCCIR_OP_LEA)
         VL_SET(excl, p);
     }
   }

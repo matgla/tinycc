@@ -827,57 +827,12 @@ static int vt_try_fold_void_float_compare(TCCIRState *ir, IRQuadCompact *q, int 
   return 0;
 }
 
-static void vt_eval_int_binop(TccIrOp op, int64_t val1, int64_t val2, int is_64, int64_t *out)
+/* The shared fold; 0 when the instruction must stay (a shift count outside
+ * [0, width), which this pass once masked the x86 way and folded `1u << 40`
+ * to 256 where the ARM shift gives 0). */
+static int vt_eval_int_binop(TccIrOp op, int64_t val1, int64_t val2, int is_64, int64_t *out)
 {
-  int64_t result;
-  int shift_mask = is_64 ? 63 : 31;
-  switch (op)
-  {
-  case TCCIR_OP_ADD: /* wraparound, computed unsigned: signed overflow is UB */
-    result = (int64_t)((uint64_t)val1 + (uint64_t)val2);
-    break;
-  case TCCIR_OP_SUB:
-    result = (int64_t)((uint64_t)val1 - (uint64_t)val2);
-    break;
-  case TCCIR_OP_XOR:
-    result = val1 ^ val2;
-    break;
-  case TCCIR_OP_AND:
-    result = val1 & val2;
-    break;
-  case TCCIR_OP_OR:
-    result = val1 | val2;
-    break;
-  case TCCIR_OP_MUL:
-    result = val1 * val2;
-    break;
-  case TCCIR_OP_SHL:
-    result = (int64_t)((uint64_t)val1 << (val2 & shift_mask));
-    break;
-  case TCCIR_OP_SHR:
-    if (is_64)
-      result = (int64_t)((uint64_t)val1 >> (val2 & 63));
-    else
-      result = (int64_t)((uint32_t)val1 >> (val2 & 31));
-    break;
-  case TCCIR_OP_SAR:
-    if (is_64)
-      result = val1 >> (val2 & 63);
-    else
-      result = (int64_t)((int32_t)val1 >> (val2 & 31));
-    break;
-  case TCCIR_OP_ROR:
-  {
-    uint32_t v = (uint32_t)val1;
-    uint32_t n = (uint32_t)val2 & 31;
-    result = (int64_t)(int32_t)((v >> n) | (v << (32 - n)));
-    break;
-  }
-  default:
-    result = 0;
-    break;
-  }
-  *out = result;
+  return ir_opt_const_binop(op, is_64, val1, val2, out);
 }
 
 static void vt_commit_binop_fold(TCCIRState *ir, IRQuadCompact *q, int i, VRegConstState *state, int max_vreg,
@@ -974,8 +929,8 @@ static int vt_handle_arithmetic(TCCIRState *ir, IRQuadCompact *q, int i, VRegCon
           btype = IROP_BTYPE_INT64;
         }
       }
-      else
-        vt_eval_int_binop(q->op, val1, val2, is_64, &result);
+      else if (!vt_eval_int_binop(q->op, val1, val2, is_64, &result))
+        fold_ok = 0;
       if (!fold_ok)
       {
         vt_clear_binop_operands(state, max_vreg, src1_pos, accum, dest_pos);
@@ -1025,10 +980,9 @@ static int vt_handle_arithmetic(TCCIRState *ir, IRQuadCompact *q, int i, VRegCon
         }
       }
 
-      if (src1_const)
+      int64_t result;
+      if (src1_const && vt_eval_int_binop(q->op, val1, val2, is_64, &result))
       {
-        int64_t result;
-        vt_eval_int_binop(q->op, val1, val2, is_64, &result);
         if (!is_64 && q->op != TCCIR_OP_SHR && q->op != TCCIR_OP_SAR)
           result = (int64_t)(int32_t)(uint32_t)result;
 
@@ -1335,7 +1289,7 @@ static void vt_step_store(VTCtx *c, int i, IROperand dest, IROperand src1, int d
     }
   }
   /* propagate LEA only for the var's own storage, not a *Vptr deref store */
-  else if (dest_pos >= 0 && !(dest.is_lval && !dest.is_local && !dest.is_llocal))
+  else if (dest_pos >= 0 && !(dest.is_lval && !irop_is_local(dest) && !irop_is_llocal(dest)))
   {
     int lea_propagated = 0;
     int32_t src_vr = irop_get_vreg(src1);

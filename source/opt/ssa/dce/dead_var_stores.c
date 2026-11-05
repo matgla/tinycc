@@ -81,7 +81,7 @@ int dce_dead_var_stores(IRSSAOptCtx *ctx)
       int pos = TCCIR_DECODE_VREG_POSITION(vr);
       if (pos >= num_vars)
         continue;
-      if (s.is_local && !s.is_lval) {
+      if (irop_is_local(s) && !s.is_lval) {
         int safe = 0;
         if (irop_config[q->op].has_dest) {
           int32_t dvr = tcc_ir_op_dest_vreg(ir, q);

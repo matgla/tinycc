@@ -139,7 +139,7 @@ static int32_t dd_root(IRSSAOptCtx *ctx, DDMatch *m, int32_t vr)
       break;
     IROperand d = tcc_ir_op_get_dest(ir, dq), s = tcc_ir_op_get_src1(ir, dq);
     int32_t sv = irop_get_vreg(s);
-    if (sv < 0 || irop_get_tag(s) != IROP_TAG_VREG || s.is_lval || s.is_local || s.is_llocal ||
+    if (sv < 0 || irop_get_tag(s) != IROP_TAG_VREG || s.is_lval || irop_is_local(s) || irop_is_llocal(s) ||
         irop_get_btype(s) != irop_get_btype(d) || !dd_stable(ctx, m, sv))
       break;
     vr = sv;
@@ -201,8 +201,8 @@ static int dd_var_slot(TCCIRState *ir, IROperand o)
   if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
     return 0;
   int pos = TCCIR_DECODE_VREG_POSITION(vr);
-  return pos < ir->variables_live_intervals_size && irop_get_tag(o) == IROP_TAG_STACKOFF && o.is_local &&
-         o.is_lval && !o.is_llocal && o.u.imm32 == ir->variables_live_intervals[pos].original_offset;
+  return pos < ir->variables_live_intervals_size && irop_get_tag(o) == IROP_TAG_STACKOFF && irop_is_local(o) &&
+         o.is_lval && !irop_is_llocal(o) && o.u.imm32 == ir->variables_live_intervals[pos].original_offset;
 }
 
 static int dd_var_ok(TCCIRState *ir, int32_t vr)
@@ -367,7 +367,7 @@ static int dd_middle_ok(TCCIRState *ir, int lo, int hi)
       if (dd_var_slot(ir, d) && dd_var_ok(ir, vr))
         allow |= DD_HZ_VAR_WRITE;
       else if (q->op == TCCIR_OP_STORE && vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP &&
-               !d.is_lval && !d.is_llocal)
+               !d.is_lval && !irop_is_llocal(d))
         allow |= IR_HZ_MEM_WRITE;
     }
     if (ir_q_hazards(ir, q, IR_HZ_ALL & ~allow))

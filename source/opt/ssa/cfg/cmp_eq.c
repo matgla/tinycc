@@ -89,7 +89,7 @@ static int fact_lookup(CmpEqState *st, const CmpEqOperands *o)
 
 static int extract_eq_operand(IROperand op, int32_t *out_vr)
 {
-  if (op.is_lval || op.is_local || op.is_llocal || op.is_sym)
+  if (op.is_lval || irop_is_local(op) || irop_is_llocal(op) || irop_is_sym(op))
     return 0;
   if (op.tag != IROP_TAG_VREG)
     return 0;
@@ -102,7 +102,7 @@ static int extract_eq_operand(IROperand op, int32_t *out_vr)
 
 static int extract_eq_imm(IROperand op, int32_t *out)
 {
-  if (irop_get_tag(op) != IROP_TAG_IMM32 || !irop_is_plain_imm(op) || op.is_local || op.is_llocal)
+  if (irop_get_tag(op) != IROP_TAG_IMM32 || !irop_is_plain_imm(op) || irop_is_local(op) || irop_is_llocal(op))
     return 0;
   *out = op.u.imm32;
   return 1;

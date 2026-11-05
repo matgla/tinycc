@@ -22,7 +22,7 @@
  * rot_lval_is_indirect below); every other lval dereferences the vreg. */
 static int rot_var_direct(IROperand op)
 {
-  return TCCIR_DECODE_VREG_TYPE(irop_get_vreg(op)) == TCCIR_VREG_TYPE_VAR && op.is_local;
+  return TCCIR_DECODE_VREG_TYPE(irop_get_vreg(op)) == TCCIR_VREG_TYPE_VAR && irop_is_local(op);
 }
 
 typedef struct
@@ -68,7 +68,7 @@ static void rot_note_def(RotCarry *c, IROperand op)
 static int rot_lval_is_indirect(IROperand op)
 {
   int32_t vr = irop_get_vreg(op);
-  return op.is_lval && vr >= 0 && !(TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && op.is_local);
+  return op.is_lval && vr >= 0 && !(TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && irop_is_local(op));
 }
 
 /* NOTE: the former rot_iv_dead_after_exit veto (reject a call-body rotation

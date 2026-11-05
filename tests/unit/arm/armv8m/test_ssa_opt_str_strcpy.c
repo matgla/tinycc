@@ -73,7 +73,7 @@ static IROperand make_const_string_symref(TCCIRState *ir, int tok, int addend)
   static Sym str_sym;
   str_sym.v = tok;
   uint32_t sidx = tcc_ir_pool_add_symref(ir, &str_sym, addend, 0);
-  IROperand op = irop_make_symref(0, sidx, 0, 0, 0, I32);
+  IROperand op = irop_make_symref(0, sidx, 0, I32);
   return op;
 }
 

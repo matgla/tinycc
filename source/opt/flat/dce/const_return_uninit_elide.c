@@ -113,7 +113,7 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
     case TCCIR_OP_STORE_POSTINC:
     {
       IROperand dop = tcc_ir_op_get_dest(ir, q);
-      if (irop_get_tag(dop) == IROP_TAG_STACKOFF && dop.is_local && !dop.is_param)
+      if (irop_get_tag(dop) == IROP_TAG_STACKOFF && irop_is_local(dop) && !dop.is_param)
       {
         int off = (int)irop_get_stack_offset(dop);
         if (n_store_offsets >= CRUE_MAX_STORE_OFFSETS)
@@ -130,7 +130,7 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
     if (irop_config[q->op].has_dest)
     {
       IROperand wdop = tcc_ir_op_get_dest(ir, q);
-      if (irop_get_tag(wdop) == IROP_TAG_STACKOFF && wdop.is_lval && wdop.is_local && !wdop.is_param)
+      if (irop_get_tag(wdop) == IROP_TAG_STACKOFF && wdop.is_lval && irop_is_local(wdop) && !wdop.is_param)
       {
         int woff = (int)irop_get_stack_offset(wdop);
         if (!crue_offset_present(store_offsets, n_store_offsets, woff))
@@ -164,9 +164,9 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
           continue;
         op = tcc_ir_op_get_src2(ir, q);
       }
-      if (irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_local && !op.is_lval && !op.is_param)
+      if (irop_get_tag(op) == IROP_TAG_STACKOFF && irop_is_local(op) && !op.is_lval && !op.is_param)
         return 0;
-      if (op.is_sym)
+      if (irop_is_sym(op))
       {
         Sym *sym = irop_get_sym_ex(ir, op);
         if (sym && (sym->type.t & VT_VOLATILE))
@@ -179,7 +179,7 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
       /* Address-of a VAR-vreg local: exclude from the uninit-VAR check (pointer alias may write it). */
       {
         int32_t vr = irop_get_vreg(op);
-        if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && op.is_local && !op.is_lval)
+        if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && irop_is_local(op) && !op.is_lval)
           crue_mark_var(var_addr_taken, vr, CRUE_MAX_VAR_POS);
       }
     }
@@ -222,7 +222,7 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
         continue;
       if (!sop.is_lval)
         continue;
-      if (!sop.is_local)
+      if (!irop_is_local(sop))
         continue;
       if (sop.is_param)
         continue;
@@ -251,7 +251,7 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
       if (TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)
         continue;
       /* Pure address-of (is_local && !is_lval) is not a value read. */
-      if (sop.is_local && !sop.is_lval)
+      if (irop_is_local(sop) && !sop.is_lval)
         continue;
       int pos = TCCIR_DECODE_VREG_POSITION(svr);
       if (pos < 0 || pos >= CRUE_MAX_VAR_POS)

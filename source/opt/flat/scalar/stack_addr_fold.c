@@ -199,7 +199,7 @@ static int ir_resolve_stack_addr_value_ex(TCCIRState *ir, IROperand op, int at_i
       {
         IROperand src = tcc_ir_op_get_src1(ir, dq);
         int direct = (irop_get_tag(src) == IROP_TAG_STACKOFF && irop_get_vreg(src) == -1 &&
-                      (dq->op == TCCIR_OP_LEA ? !src.is_llocal : !src.is_lval));
+                      (dq->op == TCCIR_OP_LEA ? !irop_is_llocal(src) : !src.is_lval));
         if (direct)
         {
           out->off = (int)irop_get_stack_offset(src);
@@ -238,6 +238,9 @@ static int ir_resolve_stack_addr_value_ex(TCCIRState *ir, IROperand op, int at_i
     if (q->op == TCCIR_OP_ASSIGN)
     {
       IROperand src = tcc_ir_op_get_src1(ir, q);
+      /* A value loaded through the operand, not the address it holds. */
+      if (src.is_lval)
+        return 0;
       return ir_resolve_stack_addr_value_ex(ir, src, j, out, depth + 1);
     }
     if (q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB)
@@ -246,6 +249,8 @@ static int ir_resolve_stack_addr_value_ex(TCCIRState *ir, IROperand op, int at_i
       IROperand s2 = tcc_ir_op_get_src2(ir, q);
       StackAddrValue base;
       int64_t c;
+      if (s1.is_lval)
+        return 0;
       if (!ir_resolve_stack_addr_value_ex(ir, s1, j, &base, depth + 1))
         return 0;
       if (!irop_is_immediate(s2))
@@ -287,12 +292,12 @@ int tcc_ir_opt_stack_addr_simplify(TCCIRState *ir)
     {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       if (dest.is_lval &&
-          !(irop_get_tag(dest) == IROP_TAG_STACKOFF && dest.is_local && !dest.is_llocal))
+          !(irop_get_tag(dest) == IROP_TAG_STACKOFF && irop_is_local(dest) && !irop_is_llocal(dest)))
       {
         StackAddrValue addr;
         if (ir_resolve_stack_addr_value_ex(ir, dest, i, &addr, 0))
         {
-          IROperand direct = irop_make_stackoff(-1, addr.off, 1, 0, addr.is_param, irop_get_btype(dest));
+          IROperand direct = irop_make_stackoff(-1, addr.off, 1, addr.is_param, irop_get_btype(dest));
           direct.is_unsigned = dest.is_unsigned;
           direct.is_complex = dest.is_complex;
           irop_carry_access_marks(&direct, dest); /* same access: same volatility */
@@ -307,12 +312,12 @@ int tcc_ir_opt_stack_addr_simplify(TCCIRState *ir)
     {
       IROperand src = tcc_ir_op_get_src1(ir, q);
       if (src.is_lval &&
-          !(irop_get_tag(src) == IROP_TAG_STACKOFF && src.is_local && !src.is_llocal))
+          !(irop_get_tag(src) == IROP_TAG_STACKOFF && irop_is_local(src) && !irop_is_llocal(src)))
       {
         StackAddrValue addr;
         if (ir_resolve_stack_addr_value_ex(ir, src, i, &addr, 0))
         {
-          IROperand direct = irop_make_stackoff(-1, addr.off, 1, 0, addr.is_param, irop_get_btype(src));
+          IROperand direct = irop_make_stackoff(-1, addr.off, 1, addr.is_param, irop_get_btype(src));
           direct.is_unsigned = src.is_unsigned;
           direct.is_complex = src.is_complex;
           irop_carry_access_marks(&direct, src); /* same access: same volatility */
@@ -330,7 +335,7 @@ int tcc_ir_opt_stack_addr_simplify(TCCIRState *ir)
       int folded = 0;
       int64_t result = 0;
 
-      if (q->op == TCCIR_OP_SUB &&
+      if (q->op == TCCIR_OP_SUB && !src1.is_lval && !src2.is_lval &&
           ir_resolve_stack_addr_value_ex(ir, src1, i, &a1, 0) &&
           ir_resolve_stack_addr_value_ex(ir, src2, i, &a2, 0) &&
           a1.is_param == a2.is_param)
@@ -363,11 +368,8 @@ int tcc_ir_opt_cmp_stack_addr_fold(TCCIRState *ir)
     return 0;
 
   /* IJUMP safety: address-taken labels aren't is_jump_target — bail. */
-  for (int i = 0; i < n; i++)
-  {
-    if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
-      return 0;
-  }
+  if (ir_opt_fn_features(ir) & IR_FN_IJUMP)
+    return 0;
 
   sav_build_def_map(ir);
 

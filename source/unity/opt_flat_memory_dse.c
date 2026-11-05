@@ -26,8 +26,6 @@
 #include "../opt/flat/memory/dse.c"
 #undef DSE_VREG_IN
 #undef DSE_VREG_SET
-#undef GET_ORIGIN
-#undef MARK_ORIGIN_READ
 #undef STACKLOC_HASH
 #undef STACKLOC_HASH_SIZE
 #undef STACKLOC_TEST

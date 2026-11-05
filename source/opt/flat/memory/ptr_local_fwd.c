@@ -411,7 +411,7 @@ int tcc_ir_opt_ptr_local_fwd(TCCIRState *ir)
       int32_t dvr = irop_get_vreg(d);
       IROperand src = tcc_ir_op_get_src1(ir, q);
       int32_t svr = irop_get_vreg(src);
-      if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP && !d.is_lval && !src.is_llocal &&
+      if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP && !d.is_lval && !irop_is_llocal(src) &&
           svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_VAR &&
           TCCIR_DECODE_VREG_POSITION(svr) < nvar && tracked[TCCIR_DECODE_VREG_POSITION(svr)])
         tidx[TCCIR_DECODE_VREG_POSITION(svr)] = 0;
@@ -483,7 +483,7 @@ int tcc_ir_opt_ptr_local_fwd(TCCIRState *ir)
         PlfEvent e = {i, -1, -1, 0};
         if (TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP)
         {
-          if (q->op == TCCIR_OP_LEA || d.is_lval || src.is_llocal || tidx[spos] < 0)
+          if (q->op == TCCIR_OP_LEA || d.is_lval || irop_is_llocal(src) || tidx[spos] < 0)
             continue;
           e.src = tidx[spos];
           vector_push_back(&ev, e);
@@ -600,7 +600,7 @@ int tcc_ir_opt_ptr_local_fwd(TCCIRState *ir)
     int pos = TCCIR_DECODE_VREG_POSITION(dvr);
     if (pos >= nvar || tmpl_ok[pos])
       continue;
-    if (!d.is_lval || d.is_llocal || irop_get_btype(d) != IROP_BTYPE_INT32)
+    if (!d.is_lval || irop_is_llocal(d) || irop_get_btype(d) != IROP_BTYPE_INT32)
       continue;
     tmpl[pos] = d;
     tmpl_ok[pos] = 1;
@@ -622,7 +622,7 @@ int tcc_ir_opt_ptr_local_fwd(TCCIRState *ir)
     int pos = TCCIR_DECODE_VREG_POSITION(dvr);
     if (pos >= nvar || tmpl_ok[pos])
       continue;
-    if (!d.is_lval || d.is_llocal || irop_get_btype(d) != IROP_BTYPE_INT64)
+    if (!d.is_lval || irop_is_llocal(d) || irop_get_btype(d) != IROP_BTYPE_INT64)
       continue;
     tmpl[pos] = d;
     tmpl_ok[pos] = 3;
@@ -652,8 +652,8 @@ int tcc_ir_opt_ptr_local_fwd(TCCIRState *ir)
         if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR || TCCIR_DECODE_VREG_POSITION(vr) >= nvar)
           continue;
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
-        int w32 = irop_get_btype(o) == IROP_BTYPE_INT32 && !o.is_llocal && !o.is_complex;
-        int w64 = irop_get_btype(o) == IROP_BTYPE_INT64 && !o.is_llocal && !o.is_complex;
+        int w32 = irop_get_btype(o) == IROP_BTYPE_INT32 && !irop_is_llocal(o) && !o.is_complex;
+        int w64 = irop_get_btype(o) == IROP_BTYPE_INT64 && !irop_is_llocal(o) && !o.is_complex;
         if (vw[pos] == 0)
           vw[pos] = w32 ? 1 : -1;
         else if (!w32)
@@ -680,12 +680,12 @@ int tcc_ir_opt_ptr_local_fwd(TCCIRState *ir)
        * only.  Mixed-width locals keep no synthesized template. */
       if (vw[pos] == 1)
       {
-        tmpl[pos] = irop_make_stackoff(v_vr, iv->original_offset, 1, 0, 0, IROP_BTYPE_INT32);
+        tmpl[pos] = irop_make_stackoff(v_vr, iv->original_offset, 1, 0, IROP_BTYPE_INT32);
         tmpl_ok[pos] = 2; /* synthesized: take the access marks from each use */
       }
       else if (vw64[pos] == 1)
       {
-        tmpl[pos] = irop_make_stackoff(v_vr, iv->original_offset, 1, 0, 0, IROP_BTYPE_INT64);
+        tmpl[pos] = irop_make_stackoff(v_vr, iv->original_offset, 1, 0, IROP_BTYPE_INT64);
         tmpl_ok[pos] = 2;
       }
     }
@@ -735,7 +735,7 @@ int tcc_ir_opt_ptr_local_fwd(TCCIRState *ir)
           IROperand s = tcc_ir_op_get_src1(ir, q);
           int32_t svr = irop_get_vreg(s);
           if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_VAR &&
-              TCCIR_DECODE_VREG_POSITION(svr) < nvar && !s.is_llocal)
+              TCCIR_DECODE_VREG_POSITION(svr) < nvar && !irop_is_llocal(s))
           {
             int32_t tgt = ptr_target[TCCIR_DECODE_VREG_POSITION(svr)];
             /* A multi-target LEA VAR: the reaching-def walk named one local
@@ -815,7 +815,7 @@ int tcc_ir_opt_ptr_local_fwd(TCCIRState *ir)
       int32_t vr = irop_get_vreg(o);
       if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
         continue;
-      if (!o.is_lval || o.is_llocal)
+      if (!o.is_lval || irop_is_llocal(o))
         continue;
       /* A volatile access through &V (`*(volatile int *)&x = v`) stays one:
        * the direct VAR access would be promoted to a register. */

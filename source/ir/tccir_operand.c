@@ -70,7 +70,7 @@ void tcc_ir_pools_init(TCCIRState *ir)
   /* IROperand pool - parallel to svalue_pool */
   ir->iroperand_pool_capacity = IRPOOL_INIT_SIZE;
   ir->iroperand_pool_count = 0;
-  ir->iroperand_pool = (IROperand *)tcc_mallocz(sizeof(IROperand) * ir->iroperand_pool_capacity);
+  ir->iroperand_pool = (IROperand *)tcc_hot_mallocz(sizeof(IROperand) * ir->iroperand_pool_capacity);
 
   if (!ir->pool_i64 || !ir->pool_f64 || !ir->pool_symref || !ir->pool_ctype || !ir->iroperand_pool)
   {
@@ -115,7 +115,7 @@ void tcc_ir_pools_free(TCCIRState *ir)
 
   if (ir->iroperand_pool)
   {
-    tcc_free(ir->iroperand_pool);
+    tcc_hot_free(ir->iroperand_pool);
     ir->iroperand_pool = NULL;
   }
   ir->iroperand_pool_count = 0;
@@ -313,7 +313,6 @@ static inline void irop_copy_svalue_info(IROperand *op, const SValue *sv)
   /* _Bool is always unsigned (0 or 1) */
   if ((sv->type.t & VT_BTYPE) == VT_BOOL)
     op->is_unsigned = 1;
-  op->is_static = (sv->type.t & VT_STATIC) ? 1 : 0;
   /* Don't overwrite is_sym, is_const, or is_param - those are set by irop_make_* */
 }
 
@@ -377,9 +376,10 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
    * member; as a plain memory operand it would be accessed little-endian. */
   if (is_lval && sv->sso_reversed)
     tcc_error("internal: byte-reversed scalar_storage_order operand reached the IR unswapped");
-  int is_llocal = (val_kind == VT_LLOCAL) ? 1 : 0;
-  int is_local = (val_kind == VT_LOCAL || val_kind == VT_LLOCAL) ? 1 : 0;
-  int is_const = (val_kind == VT_CONST) ? 1 : 0;
+  /* The frontend turns VT_LLOCAL into a load before it gets here. */
+  if (val_kind == VT_LLOCAL)
+    tcc_error("internal: VT_LLOCAL operand reached the IR");
+  int is_local = val_kind == VT_LOCAL;
   int has_sym = (sv->r & VT_SYM) ? 1 : 0;
   int vt_btype = sv->type.t & VT_BTYPE;
   int irop_bt = vt_btype_to_irop_btype(vt_btype);
@@ -390,9 +390,9 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
   /* Case 1: vreg (possibly with lval for register-indirect access)
    * Handles both pure vregs and register-indirect lvalues.
    * val_kind being a physical register (< VT_CONST) means the value is in/through that register. */
-  if (vr >= 0 && val_kind != VT_CONST && val_kind != VT_LOCAL && val_kind != VT_LLOCAL && !has_sym)
+  if (vr >= 0 && val_kind != VT_CONST && val_kind != VT_LOCAL && !has_sym)
   {
-    int is_reg_param = (sv->r & VT_PARAM) && !is_local && !is_llocal;
+    int is_reg_param = (sv->r & VT_PARAM) && !is_local;
     result = irop_make_vreg(vr, irop_bt);
     /* For register parameters, the value is directly in the register - no dereferencing needed.
      * Clear is_lval for register params since they're already values, not addresses. */
@@ -414,7 +414,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
    * Value is purely in a physical register, not tracked by IR vreg system. */
   if (vr < 0 && val_kind < VT_CONST && val_kind < 32 && !has_sym)
   {
-    int is_reg_param = (sv->r & VT_PARAM) && !is_local && !is_llocal;
+    int is_reg_param = (sv->r & VT_PARAM) && !is_local;
     result = irop_make_vreg(vr, irop_bt);
     /* For register parameters, the value is directly in the register - no dereferencing needed.
      * Clear is_lval for register params since they're already values, not addresses. */
@@ -434,17 +434,17 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
     if (is_local)
       pool_flags |= IRPOOL_SYMREF_LOCAL;
     uint32_t idx = tcc_ir_pool_add_symref(ir, irop_sym_as_address(sv), (int32_t)sv->c.i, pool_flags);
-    result = irop_make_symref(vr, idx, is_lval, is_local, is_const, irop_bt);
+    result = irop_make_symref(vr, idx, is_lval, irop_bt);
     irop_copy_svalue_info(&result, sv);
     goto done;
   }
 
-  /* Case 3: VT_LOCAL or VT_LLOCAL stack offset (no symbol) */
-  if (val_kind == VT_LOCAL || val_kind == VT_LLOCAL)
+  /* Case 3: VT_LOCAL stack offset (no symbol) */
+  if (val_kind == VT_LOCAL)
   {
     int is_param = (sv->r & VT_PARAM) ? 1 : 0;
     int offset_val = (int32_t)sv->c.i;
-    result = irop_make_stackoff(vr, offset_val, is_lval, is_llocal, is_param, irop_bt);
+    result = irop_make_stackoff(vr, offset_val, is_lval, is_param, irop_bt);
     irop_copy_svalue_info(&result, sv);
     goto done;
   }
@@ -583,8 +583,7 @@ IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
      * sym field from a previous vstack operation. */
     Sym *fallback_sym = has_sym ? irop_sym_as_address(sv) : NULL;
     uint32_t idx = tcc_ir_pool_add_symref(ir, fallback_sym, (int32_t)sv->c.i, pool_flags);
-    result = irop_make_symref(vr, idx, is_lval, is_local, is_const, irop_bt);
-    result.is_sym = has_sym; /* Only set if original had VT_SYM */
+    result = irop_make_symref(vr, idx, is_lval, irop_bt);
     irop_copy_svalue_info(&result, sv);
   }
 
@@ -652,7 +651,7 @@ done:
     int access_align;
     type_size(&sv->type, &access_align);
     if (!sv->underaligned && access_align >= 4 &&
-        (!(result.is_local || result.is_sym) || !(sv->c.i & 3)))
+        (!(irop_is_local(result) || irop_is_sym(result)) || !(sv->c.i & 3)))
       result.aux |= IROP_AUX_ALIGN4_OK;
     else if (sv->underaligned || access_align < 4)
       result.aux |= IROP_AUX_UNDERALIGN;
@@ -734,7 +733,7 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
     break;
 
   case IROP_TAG_IMM32:
-    out->r = op.is_const ? VT_CONST : 0;
+    out->r = irop_is_const(op) ? VT_CONST : 0;
     if (op.is_lval)
       out->r |= VT_LVAL;
     /* For STRUCT types, imm32 is stored in aux_data (split encoding) */
@@ -758,7 +757,7 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
   case IROP_TAG_STACKOFF:
   {
     /* VT_LOCAL or VT_LLOCAL based on bitfields */
-    if (op.is_llocal)
+    if (irop_is_llocal(op))
       out->r = VT_LLOCAL;
     else
       out->r = VT_LOCAL;
@@ -829,9 +828,9 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
     out->c.i = (int64_t)ref->addend;
 
     /* Use bitfields from op to restore r value */
-    if (op.is_local)
+    if (irop_is_local(op))
       out->r = VT_LOCAL;
-    else if (op.is_const)
+    else if (irop_is_const(op))
       out->r = VT_CONST;
     else
       out->r = 0; /* Register */
@@ -839,7 +838,7 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
     if (op.is_lval)
       out->r |= VT_LVAL;
 
-    if (op.is_sym)
+    if (irop_is_sym(op))
       out->r |= VT_SYM;
 
     break;
@@ -860,8 +859,6 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
   /* Restore type flags */
   if (op.is_unsigned)
     out->type.t |= VT_UNSIGNED;
-  if (op.is_static)
-    out->type.t |= VT_STATIC;
 
   /* For STRUCT types, restore full CType from pool (including type.ref) */
   if (irop_bt == IROP_BTYPE_STRUCT)
@@ -873,8 +870,6 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
       /* Re-apply any type flags that were set above */
       if (op.is_unsigned)
         out->type.t |= VT_UNSIGNED;
-      if (op.is_static)
-        out->type.t |= VT_STATIC;
     }
   }
 }
@@ -1143,13 +1138,51 @@ int ir_op_slot_count(TccIrOp op)
 
 /* inlined in the header for non-tcc builds; see TCC_IROP_INLINE_ACCESSORS */
 #ifndef TCC_IROP_INLINE_ACCESSORS
-IROperand tcc_ir_op_get_dest(const TCCIRState *ir, const IRQuadCompact *q)
+/* An operand slot as a pointer: the readers below want one field of it, which
+ * is one load this way and a struct built on the stack by value.  These
+ * accessors are the hottest code of a compile on the board. */
+static const IROperand ir_op_none = {.vr = IROP_NONE_WORD, .u = {.imm32 = 0}};
+
+/* irop_config[op] as the byte it is: has_dest, has_src1, has_src2 from bit 0.  Each
+ * field read separately is a load of its own, and these run hundreds of millions
+ * of times in a compile.  The bound on the pool is a contract check, and the device
+ * compiler goes without. */
+#define IROP_CFG(op) (((const uint8_t *)irop_config)[op])
+#if CONFIG_TCC_CHECKS
+#define IROP_SLOT(ir, at) ((at) >= (uint32_t)(ir)->iroperand_pool_count ? &ir_op_none : &(ir)->iroperand_pool[at])
+#else
+#define IROP_SLOT(ir, at) (&(ir)->iroperand_pool[at])
+#endif
+
+static inline const IROperand *ir_op_dest_ptr(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  if (!irop_config[q->op].has_dest)
-    return IROP_NONE;
-  if (q->operand_base >= (uint32_t)ir->iroperand_pool_count)
-    return IROP_NONE;
-  return ir->iroperand_pool[q->operand_base];
+  if (!(IROP_CFG(q->op) & 1))
+    return &ir_op_none;
+  const uint32_t at = q->operand_base;
+  return IROP_SLOT(ir, at);
+}
+
+static inline const IROperand *ir_op_src1_ptr(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  const unsigned cfg = IROP_CFG(q->op);
+  if (!(cfg & 2))
+    return &ir_op_none;
+  const uint32_t at = q->operand_base + (cfg & 1);
+  return IROP_SLOT(ir, at);
+}
+
+static inline const IROperand *ir_op_src2_ptr(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  const unsigned cfg = IROP_CFG(q->op);
+  if (!(cfg & 4))
+    return &ir_op_none;
+  const uint32_t at = q->operand_base + (cfg & 1) + ((cfg >> 1) & 1);
+  return IROP_SLOT(ir, at);
+}
+
+const IROperand *tcc_ir_op_dest_ref(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return ir_op_dest_ptr(ir, q);
 }
 #endif
 
@@ -1193,14 +1226,9 @@ uint16_t tcc_ir_bfi_params_at(const TCCIRState *ir, const IRQuadCompact *q)
 
 /* inlined in the header for non-tcc builds; see TCC_IROP_INLINE_ACCESSORS */
 #ifndef TCC_IROP_INLINE_ACCESSORS
-IROperand tcc_ir_op_get_src1(const TCCIRState *ir, const IRQuadCompact *q)
+const IROperand *tcc_ir_op_src1_ref(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  if (!irop_config[q->op].has_src1)
-    return IROP_NONE;
-  int off = irop_config[q->op].has_dest;
-  if (q->operand_base + off >= (uint32_t)ir->iroperand_pool_count)
-    return IROP_NONE;
-  return ir->iroperand_pool[q->operand_base + off];
+  return ir_op_src1_ptr(ir, q);
 }
 #endif
 
@@ -1217,136 +1245,154 @@ IROperand tcc_ir_get_src1(const TCCIRState *ir, int index)
 
 /* inlined in the header for non-tcc builds; see TCC_IROP_INLINE_ACCESSORS */
 #ifndef TCC_IROP_INLINE_ACCESSORS
-IROperand tcc_ir_op_get_src2(const TCCIRState *ir, const IRQuadCompact *q)
+const IROperand *tcc_ir_op_src2_ref(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  if (!irop_config[q->op].has_src2)
-    return IROP_NONE;
-  int off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
-  if (q->operand_base + off >= (uint32_t)ir->iroperand_pool_count)
-    return IROP_NONE;
-  return ir->iroperand_pool[q->operand_base + off];
+  return ir_op_src2_ptr(ir, q);
 }
 #endif
 
 #ifndef TCC_IROP_INLINE_ACCESSORS
+/* Most of these calls ask about a slot the operation does not have, or one with no
+ * vreg: they get their answer here, without a call. */
+#define IROP_VREG_OF(p)                                                                 \
+  do                                                                                    \
+  {                                                                                     \
+    const int32_t w_ = (p)->vr;                                                         \
+    return ((uint32_t)w_ >> TCCIR_VREG_TYPE_SHIFT) == 0 ? -1 : irop_get_vreg_w(w_);     \
+  } while (0)
+
+/* The slot test is here rather than in the ir_op_*_ptr these would call: tcc does not
+ * merge the two, and that was five more instructions per call. */
 int32_t tcc_ir_op_dest_vreg(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+  const unsigned cfg = IROP_CFG(q->op);
+  if (!(cfg & 1))
+    return -1;
+  const uint32_t at = q->operand_base;
+  IROP_VREG_OF(IROP_SLOT(ir, at));
 }
 
 int32_t tcc_ir_op_src1_vreg(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+  const unsigned cfg = IROP_CFG(q->op);
+  if (!(cfg & 2))
+    return -1;
+  const uint32_t at = q->operand_base + (cfg & 1);
+  IROP_VREG_OF(IROP_SLOT(ir, at));
 }
 
 int32_t tcc_ir_op_src2_vreg(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_get_vreg(tcc_ir_op_get_src2(ir, q));
+  const unsigned cfg = IROP_CFG(q->op);
+  if (!(cfg & 4))
+    return -1;
+  const uint32_t at = q->operand_base + (cfg & 1) + ((cfg >> 1) & 1);
+  IROP_VREG_OF(IROP_SLOT(ir, at));
 }
 
 int tcc_ir_op_dest_has_vreg(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_has_vreg(tcc_ir_op_get_dest(ir, q));
+  return irop_has_vreg((*ir_op_dest_ptr(ir, q)));
 }
 
 int tcc_ir_op_src1_has_vreg(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_has_vreg(tcc_ir_op_get_src1(ir, q));
+  return irop_has_vreg((*ir_op_src1_ptr(ir, q)));
 }
 
 int tcc_ir_op_src2_has_vreg(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_has_vreg(tcc_ir_op_get_src2(ir, q));
+  return irop_has_vreg((*ir_op_src2_ptr(ir, q)));
 }
 
 int tcc_ir_op_dest_btype(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_get_btype(tcc_ir_op_get_dest(ir, q));
+  return irop_get_btype((*ir_op_dest_ptr(ir, q)));
 }
 
 int tcc_ir_op_src1_btype(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_get_btype(tcc_ir_op_get_src1(ir, q));
+  return irop_get_btype((*ir_op_src1_ptr(ir, q)));
 }
 
 int tcc_ir_op_src2_btype(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_get_btype(tcc_ir_op_get_src2(ir, q));
+  return irop_get_btype((*ir_op_src2_ptr(ir, q)));
 }
 
 int32_t tcc_ir_op_dest_imm32(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_get_imm32(tcc_ir_op_get_dest(ir, q));
+  return irop_get_imm32((*ir_op_dest_ptr(ir, q)));
 }
 
 int32_t tcc_ir_op_src2_imm32(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_get_imm32(tcc_ir_op_get_src2(ir, q));
+  return irop_get_imm32((*ir_op_src2_ptr(ir, q)));
 }
 
 int tcc_ir_op_src2_is_none(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_is_none(tcc_ir_op_get_src2(ir, q));
+  return irop_is_none((*ir_op_src2_ptr(ir, q)));
 }
 
 int tcc_ir_op_dest_needs_pair(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_needs_pair(tcc_ir_op_get_dest(ir, q));
+  return irop_needs_pair((*ir_op_dest_ptr(ir, q)));
 }
 
 int tcc_ir_op_src2_tag(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_get_tag(tcc_ir_op_get_src2(ir, q));
+  return irop_get_tag((*ir_op_src2_ptr(ir, q)));
 }
 
 int tcc_ir_op_dest_is_lval(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return tcc_ir_op_get_dest(ir, q).is_lval;
+  return (*ir_op_dest_ptr(ir, q)).is_lval;
 }
 
 int tcc_ir_op_src1_is_lval(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return tcc_ir_op_get_src1(ir, q).is_lval;
+  return (*ir_op_src1_ptr(ir, q)).is_lval;
 }
 
 int tcc_ir_op_src2_is_lval(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return tcc_ir_op_get_src2(ir, q).is_lval;
+  return (*ir_op_src2_ptr(ir, q)).is_lval;
 }
 
 int tcc_ir_op_src1_is_sym(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return tcc_ir_op_get_src1(ir, q).is_sym;
+  return irop_is_sym(*ir_op_src1_ptr(ir, q));
 }
 
 int tcc_ir_op_src2_is_sym(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return tcc_ir_op_get_src2(ir, q).is_sym;
+  return irop_is_sym(*ir_op_src2_ptr(ir, q));
 }
 
 int tcc_ir_op_dest_is_local(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return tcc_ir_op_get_dest(ir, q).is_local;
+  return irop_is_local(*ir_op_dest_ptr(ir, q));
 }
 
 int tcc_ir_op_src1_is_local(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return tcc_ir_op_get_src1(ir, q).is_local;
+  return irop_is_local(*ir_op_src1_ptr(ir, q));
 }
 
 int32_t tcc_ir_op_dest_u_imm32(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return tcc_ir_op_get_dest(ir, q).u.imm32;
+  return (*ir_op_dest_ptr(ir, q)).u.imm32;
 }
 
 int tcc_ir_op_src1_is_imm(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_is_immediate(tcc_ir_op_get_src1(ir, q));
+  return irop_is_immediate((*ir_op_src1_ptr(ir, q)));
 }
 
 int tcc_ir_op_src2_is_imm(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_is_immediate(tcc_ir_op_get_src2(ir, q));
+  return irop_is_immediate((*ir_op_src2_ptr(ir, q)));
 }
 
 IROperand tcc_ir_op_get_src1_or_2(const TCCIRState *ir, const IRQuadCompact *q, int pick_src2)
@@ -1365,19 +1411,33 @@ IROperand tcc_ir_op_get_slot(const TCCIRState *ir, const IRQuadCompact *q, int s
 }
 #endif
 
+/* Nearly always a plain immediate: a branch target, a call's encoded id.  Twelve
+ * million of these in eight units, each two calls and a struct by value before. */
+static inline int64_t ir_op_imm(const TCCIRState *ir, const IRQuadCompact *q, int slot, int present)
+{
+  if (present && q->operand_base + slot < (uint32_t)ir->iroperand_pool_count)
+  {
+    const IROperand *o = &ir->iroperand_pool[q->operand_base + slot];
+    if (IROP_RAW_TAG_W(o->vr) == IROP_TAG_IMM32)
+      return (int64_t)o->u.imm32;
+    return irop_get_imm64_ex(ir, *o);
+  }
+  return irop_get_imm64_ex(ir, IROP_NONE);
+}
+
 int64_t tcc_ir_op_dest_imm(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+  return ir_op_imm(ir, q, 0, irop_config[q->op].has_dest);
 }
 
 int64_t tcc_ir_op_src1_imm(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, q));
+  return ir_op_imm(ir, q, irop_config[q->op].has_dest, irop_config[q->op].has_src1);
 }
 
 int64_t tcc_ir_op_src2_imm(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  return irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+  return ir_op_imm(ir, q, irop_config[q->op].has_dest + irop_config[q->op].has_src1, irop_config[q->op].has_src2);
 }
 
 struct Sym *tcc_ir_op_src1_sym(const TCCIRState *ir, const IRQuadCompact *q)
@@ -1589,9 +1649,9 @@ void tcc_ir_op_set_dest_imm32(TCCIRState *ir, const IRQuadCompact *q, int32_t va
 
 int irop_is_neg_vreg(const IROperand op)
 {
-  if (op.vr == -1)
+  if (IROP_W_IS_NONE(op.vr))
     return 0; /* IROP_NONE, not a negative vreg */
-  return op.vreg_type == 0xF && (op.position & 0x1FFF0) == IROP_NEG_VREG_SENTINEL;
+  return op.vreg_type == TCCIR_VREG_TYPE_NEG && (op.position & IROP_NEG_VREG_SENTINEL) == IROP_NEG_VREG_SENTINEL;
 }
 
 int irop_has_no_vreg(const IROperand op)
@@ -1599,31 +1659,9 @@ int irop_has_no_vreg(const IROperand op)
   return irop_get_vreg(op) == -1;
 }
 
-int irop_get_tag_w(int32_t w)
-{
-  IROperand op = {.vr = w};
-  /* IROP_NONE has vr == -1 (all bits set), return TAG_NONE for it */
-  if (op.vr == -1)
-    return IROP_TAG_NONE;
-  /* For negative vregs (encoded with sentinel), tag is still valid in bitfield */
-  if (op.position == IROP_POSITION_NONE && op.vreg_type == 0)
-    return IROP_TAG_NONE;
-  return op.tag;
-}
-
 int (irop_get_tag)(const IROperand op)
 {
   return irop_get_tag_w(op.vr);
-}
-
-int irop_get_btype_w(int32_t w)
-{
-  IROperand op = {.vr = w};
-  if (op.vr == -1)
-    return IROP_BTYPE_INT32; /* IROP_NONE default */
-  if (op.position == IROP_POSITION_NONE && op.vreg_type == 0)
-    return IROP_BTYPE_INT32; /* default */
-  return op.btype;
 }
 
 int (irop_get_btype)(const IROperand op)
@@ -1686,13 +1724,13 @@ int (irop_is_immediate)(const IROperand op)
 int irop_is_lval_imm_addr(const IROperand op)
 {
   int tag = irop_get_tag(op);
-  return op.is_lval && !op.is_sym &&
+  return op.is_lval && !irop_is_sym(op) &&
          (tag == IROP_TAG_IMM32 || tag == IROP_TAG_I64);
 }
 
 int irop_is_plain_imm(const IROperand op)
 {
-  return irop_is_immediate(op) && !op.is_sym && !op.is_lval;
+  return irop_is_immediate(op) && !irop_is_sym(op) && !op.is_lval;
 }
 
 int64_t irop_get_imm64_ex(const struct TCCIRState *ir, IROperand op)
@@ -1761,30 +1799,21 @@ IRPoolSymref *irop_get_symref_ex(const struct TCCIRState *ir, IROperand op)
 #ifndef TCC_IROP_INLINE_ACCESSORS
 int32_t irop_get_vreg_w(int32_t w)
 {
-  IROperand op = {.vr = w};
-  /* IROP_NONE (vr == -1, all bits set) must return -1 before the negative vreg
-   * sentinel check, because its bit pattern also matches the sentinel. */
-  if (op.vr == -1)
+  /* Masks, not the bit-fields: this is one instruction in nine of a compile on the
+   * device.  Type 0 (bits 28-31) is an operand with no vreg.  Type 0xF is IROP_NONE
+   * (-1), or a negative vreg when the position bits hold the sentinel: idx 0 -> -1,
+   * idx 1 -> -2, as irop_set_vreg encodes neg_idx = (-vreg) - 1. */
+  const uint32_t type = (uint32_t)w >> TCCIR_VREG_TYPE_SHIFT, position = (uint32_t)w & TCCIR_VREG_POSITION_MASK;
+  if (type == 0)
     return -1;
-  /* Check for negative vreg sentinel: vreg_type=0xF and position bits match sentinel */
-  if (op.vreg_type == 0xF && (op.position & IROP_NEG_VREG_SENTINEL) == IROP_NEG_VREG_SENTINEL)
+  if (type == TCCIR_VREG_TYPE_NEG)
   {
-    /* Decode negative vreg: idx 0 -> -1, idx 1 -> -2, etc.
-     * Matches irop_set_vreg which encodes: neg_idx = (-vreg) - 1 */
-    int neg_idx = op.position & 0xF;
-    return -(neg_idx + 1);
+    if (IROP_W_IS_NONE(w))
+      return -1;
+    if ((position & IROP_NEG_VREG_SENTINEL) == IROP_NEG_VREG_SENTINEL)
+      return ~(int32_t)(position & 0xF);
   }
-  /* A real positive vreg always carries a nonzero type (VAR/TEMP/PARAM = 1/2/3,
-   * encoded in bits 28-31); the smallest valid encoded vreg is 1<<28.  A
-   * vreg_type of 0 therefore means the operand has no associated vreg — its
-   * position bits hold unused/zero data.  This covers both the position==NONE
-   * sentinel and operands built with a 0 vreg (e.g. a symref whose SValue.vr
-   * was left 0 instead of -1), which would otherwise decode to a bogus
-   * "vreg 0" and crash later lookups. */
-  if (op.vreg_type == 0)
-    return -1;
-  /* Reconstruct vreg: type in bits 28-31, position in bits 0-16 */
-  return (op.vreg_type << 28) | op.position;
+  return (int32_t)((type << TCCIR_VREG_TYPE_SHIFT) | position);
 }
 
 int32_t (irop_get_vreg)(const IROperand op)
@@ -1796,10 +1825,18 @@ int32_t (irop_get_vreg)(const IROperand op)
 void irop_init_phys_regs(IROperand *op)
 {
   op->is_unsigned = 0;
-  op->is_static = 0;
-  op->is_sym = 0;
   op->is_param = 0;
   op->aux = 0;
+#if !TCC_IR_SMALL_QUAD
+  /* The constructors start from an uninitialised IROperand and zero only the
+   * word, so the two spare bits of the cross's flag byte (where is_static and
+   * is_sym lived until the 8-byte layout) were stack garbage: two equal `#0`
+   * immediates compared unequal byte for byte in dup_diamond, and the second
+   * capacity guard of bug_hash_map_capacity_guard survived or not with the
+   * include path.  Every operand reads alike in both layouts only if these
+   * bits are clear. */
+  op->reserved2 = 0;
+#endif
 }
 
 void irop_set_vreg(IROperand *op, int32_t vreg)
@@ -1812,19 +1849,19 @@ void irop_set_vreg(IROperand *op, int32_t vreg)
       neg_idx = 15; /* Clamp to 4 bits */
     /* Sentinel in upper bits, neg index in lower 4 bits */
     op->position = IROP_NEG_VREG_SENTINEL | (neg_idx & 0xF);
-    op->vreg_type = 0xF;
+    op->vreg_type = TCCIR_VREG_TYPE_NEG;
   }
   else
   {
     op->position = vreg & TCCIR_VREG_POSITION_MASK;
-    op->vreg_type = (vreg >> 28) & 0xF;
+    op->vreg_type = (uint32_t)vreg >> TCCIR_VREG_TYPE_SHIFT;
   }
 }
 
 IROperand irop_make_none(void)
 {
   IROperand op;
-  op.vr = -1;
+  op.vr = IROP_NONE_WORD;
   op.u.imm32 = 0;
   irop_init_phys_regs(&op);
   return op;
@@ -1837,9 +1874,6 @@ IROperand irop_make_vreg(int32_t vreg, int btype)
   irop_set_vreg(&op, vreg);
   op.tag = IROP_TAG_VREG;
   op.is_lval = 0;
-  op.is_llocal = 0;
-  op.is_local = 0;
-  op.is_const = 0;
   op.btype = btype;
   op.u.imm32 = 0;
   irop_init_phys_regs(&op);
@@ -1853,25 +1887,19 @@ IROperand irop_make_imm32(int32_t vreg, int32_t val, int btype)
   irop_set_vreg(&op, vreg);
   op.tag = IROP_TAG_IMM32;
   op.is_lval = 0;
-  op.is_llocal = 0;
-  op.is_local = 0;
-  op.is_const = 1; /* immediates are constants */
   op.btype = btype;
   op.u.imm32 = val;
   irop_init_phys_regs(&op);
   return op;
 }
 
-IROperand irop_make_stackoff(int32_t vreg, int32_t offset, int is_lval, int is_llocal, int is_param_flag, int btype)
+IROperand irop_make_stackoff(int32_t vreg, int32_t offset, int is_lval, int is_param_flag, int btype)
 {
   IROperand op;
   op.vr = 0;
   irop_set_vreg(&op, vreg);
   op.tag = IROP_TAG_STACKOFF;
   op.is_lval = is_lval;
-  op.is_llocal = is_llocal;
-  op.is_local = 1; /* stack offsets are local */
-  op.is_const = 0;
   op.btype = btype;
   op.u.imm32 = offset;
   irop_init_phys_regs(&op);
@@ -1886,9 +1914,6 @@ IROperand irop_make_f32(int32_t vreg, uint32_t bits)
   irop_set_vreg(&op, vreg);
   op.tag = IROP_TAG_F32;
   op.is_lval = 0;
-  op.is_llocal = 0;
-  op.is_local = 0;
-  op.is_const = 1;
   op.btype = IROP_BTYPE_FLOAT32;
   op.u.f32_bits = bits;
   irop_init_phys_regs(&op);
@@ -1902,9 +1927,6 @@ IROperand irop_make_i64(int32_t vreg, uint32_t pool_idx, int btype)
   irop_set_vreg(&op, vreg);
   op.tag = IROP_TAG_I64;
   op.is_lval = 0;
-  op.is_llocal = 0;
-  op.is_local = 0;
-  op.is_const = 1;
   op.btype = btype;
   op.u.pool_idx = pool_idx;
   irop_init_phys_regs(&op);
@@ -1918,37 +1940,23 @@ IROperand irop_make_f64(int32_t vreg, uint32_t pool_idx)
   irop_set_vreg(&op, vreg);
   op.tag = IROP_TAG_F64;
   op.is_lval = 0;
-  op.is_llocal = 0;
-  op.is_local = 0;
-  op.is_const = 1;
   op.btype = IROP_BTYPE_FLOAT64;
   op.u.pool_idx = pool_idx;
   irop_init_phys_regs(&op);
   return op;
 }
 
-IROperand irop_make_symref(int32_t vreg, uint32_t pool_idx, int is_lval, int is_local, int is_const, int btype)
+IROperand irop_make_symref(int32_t vreg, uint32_t pool_idx, int is_lval, int btype)
 {
   IROperand op;
   op.vr = 0;
   irop_set_vreg(&op, vreg);
   op.tag = IROP_TAG_SYMREF;
   op.is_lval = is_lval;
-  op.is_llocal = 0;
-  op.is_local = is_local;
-  op.is_const = is_const;
   op.btype = btype;
   op.u.pool_idx = pool_idx;
   irop_init_phys_regs(&op);
-  op.is_sym = 1; /* symbol reference */
   return op;
-}
-
-int irop_is_none_w(int32_t w)
-{
-  IROperand op = {.vr = w};
-  /* Check for IROP_NONE: position=max, vreg_type=0, or tag=NONE */
-  return (op.position == IROP_POSITION_NONE && op.vreg_type == 0) || irop_get_tag(op) == IROP_TAG_NONE;
 }
 
 int (irop_is_none)(const IROperand op)
@@ -2022,33 +2030,33 @@ int irop_op_is_local(const IROperand op)
 {
   if (irop_get_tag(op) == IROP_TAG_NONE)
     return 0;
-  return op.is_local;
+  return irop_is_local(op);
 }
 
 int irop_op_is_llocal(const IROperand op)
 {
   if (irop_get_tag(op) == IROP_TAG_NONE)
     return 0;
-  return op.is_llocal;
+  return irop_is_llocal(op);
 }
 
 int irop_op_is_const(const IROperand op)
 {
   if (irop_get_tag(op) == IROP_TAG_NONE)
     return 0;
-  return op.is_const;
+  return irop_is_const(op);
 }
 
 #ifndef TCC_IROP_INLINE_ACCESSORS
 int irop_is_vreg_value_w(int32_t w)
 {
   IROperand op = {.vr = w};
-  if (irop_get_vreg(op) < 0 || op.is_llocal)
+  if (irop_get_vreg(op) < 0 || irop_is_llocal(op))
     return 0;
   int tag = irop_get_tag(op);
   if (tag == IROP_TAG_VREG)
     return !op.is_lval;
-  return tag == IROP_TAG_STACKOFF && op.is_local && op.is_lval;
+  return tag == IROP_TAG_STACKOFF && irop_is_local(op) && op.is_lval;
 }
 
 int irop_dest_defines_vreg_w(int32_t w)
@@ -2060,7 +2068,7 @@ int irop_dest_defines_vreg_w(int32_t w)
   if (tag == IROP_TAG_VREG)
     return !d.is_lval;
   if (tag == IROP_TAG_STACKOFF)
-    return d.is_lval && !d.is_llocal;
+    return d.is_lval && !irop_is_llocal(d);
   return 0;
 }
 #endif

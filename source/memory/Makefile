@@ -4,12 +4,14 @@
 MEMORY_INC = -I$(TOP)/source/memory/include
 
 MEMORY_SRC = \
+	source/memory/hot_arena.c \
 	source/memory/sort.c \
 	source/memory/unique_ptr.c \
 	source/memory/vector.c
 
 MEMORY_HDRS = \
 	source/memory/include/memory/dynamic_bitset.h \
+	source/memory/include/memory/hot_arena.h \
 	source/memory/include/memory/small_sequence.h \
 	source/memory/include/memory/unique_ptr.h \
 	source/memory/include/memory/vector.h

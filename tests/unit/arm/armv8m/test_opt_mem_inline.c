@@ -38,7 +38,7 @@ static IROperand mic_callee(TCCIRState *ir, Sym *sym, int tok)
 {
   sym->v = tok;
   uint32_t sidx = tcc_ir_pool_add_symref(ir, sym, 0, 0);
-  return irop_make_symref(0, sidx, 0, 0, 0, I32);
+  return irop_make_symref(0, sidx, 0, I32);
 }
 
 /* A STACKOFF slot address in the STRUCT split encoding, exactly as
@@ -202,8 +202,7 @@ UT_TEST(test_mem_inline_pointer_vregs_in_spill_form)
     IROperand src = kind ? utb_param(0, I32) : utb_var(0, I32);
     IROperand dst = kind ? utb_param(1, I32) : utb_var(1, I32);
     src.tag = dst.tag = IROP_TAG_STACKOFF;
-    src.is_local = dst.is_local = 1;
-    src.is_lval = dst.is_lval = 1;
+        src.is_lval = dst.is_lval = 1;
     src.u.imm32 = -20;
     dst.u.imm32 = -24;
     src.aux = dst.aux = IROP_AUX_UNDERALIGN;
@@ -234,7 +233,7 @@ UT_TEST(test_mem_inline_pointer_vreg_memset)
   utb_set_tok_str(TOK_MEMSET, "memset");
   IROperand dst = utb_var(0, I32);
   dst.tag = IROP_TAG_STACKOFF;
-  dst.is_local = dst.is_lval = 1;
+  dst.is_lval = 1;
   dst.u.imm32 = -12;
   int call = mic_emit_call(ir, mic_callee(ir, &ms, TOK_MEMSET), 1, dst, utb_imm(0x5a, I32), utb_imm(4, I32));
 
@@ -248,18 +247,13 @@ UT_TEST(test_mem_inline_pointer_vreg_memset)
 
 UT_TEST(test_mem_inline_real_pointer_dereferences_still_decline)
 {
-  for (int kind = 0; kind < 3; ++kind)
+  for (int kind = 0; kind < 2; ++kind)
   {
     TCCIRState *ir = utb_new();
     utb_pools_init(ir);
     static Sym mc;
     utb_set_tok_str(TOK_MEMCPY, "memcpy");
     IROperand src = kind == 0 ? utb_stackoff(-12, 1, 0, 0, I32) : utb_lval(utb_var(0, I32));
-    if (kind == 2)
-    {
-      src.tag = IROP_TAG_STACKOFF;
-      src.is_local = src.is_llocal = 1;
-    }
     int call = mic_emit_call(ir, mic_callee(ir, &mc, TOK_MEMCPY), 1, utb_temp(0, I32), src, utb_imm(4, I32));
     UT_ASSERT_EQ(tcc_ir_opt_mem_inline(ir), 0);
     UT_ASSERT_EQ(ir->compact_instructions[call].op, TCCIR_OP_FUNCCALLVOID);

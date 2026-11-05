@@ -237,7 +237,7 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
       continue;
     if (lea_src.is_lval) /* already a deref — not an Addr[] form */
       continue;
-    if (lea_src.is_llocal) /* double-indirect; keep backend logic */
+    if (irop_is_llocal(lea_src)) /* double-indirect; keep backend logic */
       continue;
 
     /* Reject vreg-backed stack operands like `&V1` — these share the
@@ -480,12 +480,11 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
             IROperand width_op = tcc_ir_op_get_dest(ir, cq);
             if (width_op.btype != IROP_BTYPE_STRUCT)
             {
-              IROperand stack_op = irop_make_stackoff(-1, folded_off, /*is_lval*/ 1, /*is_llocal*/ 0,
+              IROperand stack_op = irop_make_stackoff(-1, folded_off, /*is_lval*/ 1,
                                                      /*is_param_flag*/ (int)lea_src.is_param,
                                                      width_op.btype);
               stack_op.is_unsigned = width_op.is_unsigned;
               stack_op.is_complex = width_op.is_complex;
-              stack_op.is_static = lea_src.is_static;
               /* An indexed access keeps its marks on the base operand. */
               irop_carry_access_marks(&stack_op, base);
 
@@ -553,25 +552,20 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
       irop_set_vreg(&new_op, -1);
       new_op.tag = IROP_TAG_STACKOFF;
       new_op.is_lval = 1;
-      new_op.is_llocal = 0;
-      new_op.is_local = 1;
-      new_op.is_const = 0;
       new_op.btype = IROP_BTYPE_STRUCT;
       new_op.u.s.aux_data = (int16_t)folded_off;
       irop_init_phys_regs(&new_op);
       new_op.is_param = lea_src.is_param;
-      new_op.is_static = lea_src.is_static;
     }
     else
     {
       /* Direct StackLoc at the folded offset (is_lval=1), built from scratch via
        * irop_make_stackoff so union members init cleanly, then copy the
        * consumer's load-width info (btype/is_unsigned) onto it. */
-      new_op = irop_make_stackoff(-1, folded_off, /*is_lval*/ 1, /*is_llocal*/ 0,
+      new_op = irop_make_stackoff(-1, folded_off, /*is_lval*/ 1,
                                   /*is_param_flag*/ (int)lea_src.is_param, old_op.btype);
       new_op.is_unsigned = old_op.is_unsigned;
       new_op.is_complex = old_op.is_complex; /* btype FLOAT32/64 + complex = two halves */
-      new_op.is_static = lea_src.is_static;
       /* The access is the same one: its volatility and alignment marks go
        * with it.  Left unmarked, it reads as volatile in any function that
        * touches volatile memory at all (tcc_ir_access_is_volatile). */

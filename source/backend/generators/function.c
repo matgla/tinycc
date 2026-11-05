@@ -72,13 +72,13 @@ static void func_vla_arg(Sym *sym);
  * lcs_span_has_memory applies, so this predicts what it will accept. */
 static int ir_operand_is_memory(IROperand op)
 {
-  if (op.is_sym || op.is_llocal)
-    return op.is_lval || op.is_local;
+  if (irop_is_sym(op) || irop_is_llocal(op))
+    return op.is_lval || irop_is_local(op);
   int32_t vr = irop_get_vreg(op);
   int is_var = (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR);
   if (op.is_lval)
-    return !(op.is_local && is_var);
-  return op.is_local;
+    return !(irop_is_local(op) && is_var);
+  return irop_is_local(op);
 }
 
 /* Whether the optimized body works purely on registers/scalars, i.e. whether a
@@ -105,7 +105,6 @@ static int ir_body_is_register_only(TCCIRState *ir)
 }
 
 /* Count live operations; see docs/inline_control_flow.md for the cycle check. */
-#define SMALL_LEAF_INLINE_OPS 24
 #define SRET_LOOP_INLINE_OPS 32
 #define SRET_LOOP_INLINE_TOKENS 2048
 
@@ -182,11 +181,11 @@ static int ir_body_is_acyclic_leaf(TCCIRState *ir)
 static int ir_operand_is_reg_value(IROperand op)
 {
   int32_t vr = irop_get_vreg(op);
-  if (vr < 0 || op.is_sym || op.is_llocal)
+  if (vr < 0 || irop_is_sym(op) || irop_is_llocal(op))
     return 0;
   if (irop_get_tag(op) == IROP_TAG_VREG)
     return !op.is_lval;
-  return irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_lval && op.is_local &&
+  return irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_lval && irop_is_local(op) &&
          TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR;
 }
 
@@ -194,7 +193,7 @@ static int ir_operand_is_reg_value(IROperand op)
 static int32_t ir_operand_deref_vreg(IROperand op)
 {
   int32_t vr = irop_get_vreg(op);
-  if (vr < 0 || op.is_sym || op.is_llocal || !op.is_lval || irop_get_tag(op) != IROP_TAG_VREG)
+  if (vr < 0 || irop_is_sym(op) || irop_is_llocal(op) || !op.is_lval || irop_get_tag(op) != IROP_TAG_VREG)
     return -1;
   return vr;
 }
@@ -204,7 +203,7 @@ static int32_t ir_operand_deref_vreg(IROperand op)
 static int ir_operand_is_arg_read(IROperand op)
 {
   int32_t vr = irop_get_vreg(op);
-  return irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_lval && op.is_local && !op.is_llocal &&
+  return irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_lval && irop_is_local(op) && !irop_is_llocal(op) &&
          (vr < 0 || op.vreg_type == 0 ? op.is_param : TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_PARAM);
 }
 
@@ -212,20 +211,20 @@ static int ir_operand_is_arg_read(IROperand op)
 static int ir_operand_is_arg_addr(IROperand op)
 {
   int32_t vr = irop_get_vreg(op);
-  return irop_get_tag(op) == IROP_TAG_STACKOFF && !op.is_lval && op.is_local && !op.is_llocal &&
+  return irop_get_tag(op) == IROP_TAG_STACKOFF && !op.is_lval && irop_is_local(op) && !irop_is_llocal(op) &&
          (vr < 0 || op.vreg_type == 0 ? op.is_param : TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_PARAM);
 }
 
 static int ir_operand_is_frame_slot(IROperand op, int lval)
 {
-  return irop_get_tag(op) == IROP_TAG_STACKOFF && op.vreg_type == 0 && op.is_local && op.is_lval == lval &&
-         !op.is_llocal;
+  return irop_get_tag(op) == IROP_TAG_STACKOFF && op.vreg_type == 0 && irop_is_local(op) && op.is_lval == lval &&
+         !irop_is_llocal(op);
 }
 
 /* Zig's `undefined`: the payload of a null optional or an error union, never read. */
 static int ir_operand_is_undefined_fill(TCCIRState *ir, IROperand op)
 {
-  return irop_is_immediate(op) && !op.is_sym && op.btype == IROP_BTYPE_INT32 &&
+  return irop_is_immediate(op) && !irop_is_sym(op) && op.btype == IROP_BTYPE_INT32 &&
          (uint32_t)irop_get_imm64_ex(ir, op) == 0xaaaaaaaau;
 }
 
@@ -263,7 +262,7 @@ static int ir_marshal_def(TCCIRState *ir, IRQuadCompact *q, const uint8_t *m, in
   {
     IROperand k = tcc_ir_op_get_src2(ir, q);
     int b = ir_operand_is_reg_value(s) ? ir_marshal_index(ir, vr, n) : -1;
-    return b >= 0 && irop_is_immediate(k) && !k.is_sym ? m[b] : 0;
+    return b >= 0 && irop_is_immediate(k) && !irop_is_sym(k) ? m[b] : 0;
   }
   if (ir_operand_is_arg_addr(s))
     return IR_MARSHAL_ARG;
@@ -442,7 +441,7 @@ static int ir_copy_is_free(TCCIRState *ir, IRQuadCompact *q)
   IROperand d = tcc_ir_op_get_dest(ir, q), s = tcc_ir_op_get_src1(ir, q);
   int32_t dv = irop_get_vreg(d), sv = irop_get_vreg(s);
   if (dv < 0 || sv < 0 || irop_get_tag(d) != IROP_TAG_VREG || irop_get_tag(s) != IROP_TAG_VREG || d.is_lval ||
-      s.is_lval || d.is_llocal || s.is_llocal || d.is_local || s.is_local ||
+      s.is_lval || irop_is_llocal(d) || irop_is_llocal(s) || irop_is_local(d) || irop_is_local(s) ||
       irop_get_btype(d) != irop_get_btype(s) || d.is_unsigned != s.is_unsigned)
     return 0;
   IRLiveInterval *di = tcc_ir_get_live_interval(ir, dv), *si = tcc_ir_get_live_interval(ir, sv);
@@ -970,6 +969,7 @@ void gen_function(Sym *sym)
    * reach some other way become fresh temporaries (sret_nrvo.c). */
   if (tcc_ir_sret_dealias(ir))
     tcc_ir_dump_after_pass(ir, "sret_dealias");
+  tcc_ir_settle(ir);
   tcc_ir_opt_run_function_pipeline(ir, sym, func_var, &nonstatic_global_copier);
 
   tcc_ir_backend_fold_pure_forward(ir, sym);
@@ -983,6 +983,7 @@ void gen_function(Sym *sym)
     phase_start = now;
   }
 
+  tcc_ir_settle(ir);
   tcc_ir_backend_regalloc_pipeline(ir, sym, func_var, &phase_start, funcname,
                                    global_label_stack_start);
 

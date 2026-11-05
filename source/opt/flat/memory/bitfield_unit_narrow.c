@@ -71,7 +71,7 @@ static int bfun_is_temp(int32_t vr)
 /* Immediate value of an operand, or 0 with *ok cleared. */
 static int64_t bfun_imm(TCCIRState *ir, IROperand op, int *ok)
 {
-  if (!irop_is_immediate(op) || op.is_sym)
+  if (!irop_is_immediate(op) || irop_is_sym(op))
   {
     *ok = 0;
     return 0;
@@ -104,7 +104,7 @@ static int bfun_same_word(TCCIRState *ir, IROperand a, IROperand b)
 {
   if (irop_get_tag(a) != IROP_TAG_SYMREF || irop_get_tag(b) != IROP_TAG_SYMREF)
     return 0;
-  if (!a.is_lval || !b.is_lval || a.is_local || b.is_local)
+  if (!a.is_lval || !b.is_lval || irop_is_local(a) || irop_is_local(b))
     return 0;
   if (a.btype != IROP_BTYPE_INT32 || b.btype != IROP_BTYPE_INT32)
     return 0;
@@ -147,7 +147,7 @@ static int bfun_region_break(TCCIRState *ir, IRQuadCompact *q)
     case TCCIR_OP_STORE:
     {
       IROperand d = tcc_ir_op_get_dest(ir, q);
-      return !d.is_local || d.is_llocal;
+      return !irop_is_local(d) || irop_is_llocal(d);
     }
     default:
       return 0;
@@ -246,7 +246,7 @@ static int bfun_fits_in_width(TCCIRState *ir, IROperand op, int width, int depth
   if (depth > 6)
     return 0;
   const uint64_t limit = 1ull << width;
-  if (irop_is_immediate(op) && !op.is_sym)
+  if (irop_is_immediate(op) && !irop_is_sym(op))
   {
     int64_t v = irop_get_imm64_ex(ir, op);
     return v >= 0 && (uint64_t)v < limit;
@@ -320,7 +320,7 @@ static IROperand bfun_unit_operand(TCCIRState *ir, IROperand word, int lsb, int 
   IRPoolSymref *sr = irop_get_symref_ex(ir, word);
   uint32_t idx = tcc_ir_pool_add_symref(ir, sr->sym, (int32_t)(sr->addend + lsb / 8), 0);
   int bt = (width == 8) ? IROP_BTYPE_INT8 : IROP_BTYPE_INT16;
-  IROperand op = irop_make_symref(-1, idx, 1 /* lval */, 0 /* not local */, 0, bt);
+  IROperand op = irop_make_symref(-1, idx, 1 /* lval */, bt);
   op.is_unsigned = 1;
   return op;
 }
@@ -332,7 +332,7 @@ static int bfun_try_one(TCCIRState *ir, int li)
     return 0;
   IROperand word = tcc_ir_op_get_src1(ir, lq);
   IROperand ldest = tcc_ir_op_get_dest(ir, lq);
-  if (irop_get_tag(word) != IROP_TAG_SYMREF || !word.is_lval || word.is_local ||
+  if (irop_get_tag(word) != IROP_TAG_SYMREF || !word.is_lval || irop_is_local(word) ||
       word.btype != IROP_BTYPE_INT32 || ldest.is_lval)
     return 0;
   IRPoolSymref *wr = irop_get_symref_ex(ir, word);

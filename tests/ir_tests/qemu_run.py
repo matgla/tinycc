@@ -23,6 +23,7 @@ import re
 import shlex
 import shutil
 import sys
+import tempfile
 import time
 import subprocess
 from dataclasses import dataclass, field
@@ -128,25 +129,37 @@ if DEFAULT_FLOAT_ABI not in VALID_FLOAT_ABIS:
     raise SystemExit(f"TCC_FLOAT_ABI={DEFAULT_FLOAT_ABI!r} invalid; want one of {VALID_FLOAT_ABIS}")
 
 
+def _normalize_newlines(data: bytes) -> str:
+    """Decode guest output; CRLF/CR become LF for more predictable matching."""
+    return data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+
+
 class SubprocessSUT:
     """Minimal pexpect-like interface for reading QEMU output without PTYs.
 
     This avoids forkpty()-related warnings and potential flakiness in
     multi-threaded test runners.
+
+    QEMU writes to an unlinked regular file, never to a pipe: -nographic makes
+    stdout O_NONBLOCK, stderr shares that open file, and a semihosting write to a
+    full pipe is dropped while the guest carries on and exits 0.  A pipe can be
+    8 KB and refuse to grow once the user passes fs.pipe-user-pages-soft.
     """
+
+    _POLL_MIN_S = 0.001
+    _POLL_MAX_S = 0.016
 
     def __init__(self, command: str):
         argv = shlex.split(command)
-        self._proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=0,
-        )
-        if self._proc.stdout is None:
-            raise RuntimeError("Failed to spawn process with stdout pipe")
-        self._fd = self._proc.stdout.fileno()
+        with tempfile.NamedTemporaryFile(prefix="qemu_output_") as out:
+            self._output = open(out.name, "rb", buffering=0)
+            self._proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                bufsize=0,
+            )
         self._buffer = ""
         self.match = None
         self.exitstatus = None
@@ -166,10 +179,7 @@ class SubprocessSUT:
             except Exception:
                 # Best-effort logging; don't break tests due to logging.
                 pass
-        text = data.decode("utf-8", errors="replace")
-        # Normalize CRLF/CR to LF for more predictable matching.
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
-        self._buffer += text
+        self._buffer += _normalize_newlines(data)
         # Keep buffer bounded (large enough for regex searching and debugging).
         if len(self._buffer) > 256_000:
             self._buffer = self._buffer[-128_000:]
@@ -180,6 +190,7 @@ class SubprocessSUT:
         regex = pattern if hasattr(pattern, "search") else re.compile(pattern)
 
         deadline = time.monotonic() + float(timeout)
+        idle = self._POLL_MIN_S
         while True:
             m = regex.search(self._buffer)
             if m is not None:
@@ -190,17 +201,13 @@ class SubprocessSUT:
                 self._buffer = self._buffer[m.end():]
                 return m
 
-            # If process exited and no more output is coming, bail out.
-            if self._proc.poll() is not None:
-                # Drain any remaining bytes.
-                try:
-                    while True:
-                        chunk = os.read(self._fd, 4096)
-                        if not chunk:
-                            break
-                        self._append_output(chunk)
-                except OSError:
-                    pass
+            # Checked before the read: an empty read after an exit means the end.
+            exited = self._proc.poll() is not None
+            chunk = self._output.read(4096)
+            if chunk:
+                self._append_output(chunk)
+                idle = self._POLL_MIN_S
+            elif exited:
                 # A last line printed without a newline still ends here.
                 if self._buffer and not self._buffer.endswith("\n"):
                     self._buffer += "\n"
@@ -211,22 +218,22 @@ class SubprocessSUT:
                     return m
                 raise TimeoutError(f"Pattern not found before process exit: {pattern!r}")
 
+            # The output of an exited process is finite; only a live one times out.
+            if exited:
+                continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"Timeout waiting for pattern: {pattern!r}")
+            if not chunk:
+                time.sleep(min(idle, remaining))
+                idle = min(idle * 2, self._POLL_MAX_S)
 
-            # Wait for stdout to become readable, then read a chunk.
-            import select
-
-            r, _, _ = select.select([self._fd], [], [], min(0.05, remaining))
-            if not r:
-                continue
-            try:
-                chunk = os.read(self._fd, 4096)
-            except OSError:
-                chunk = b""
-            if chunk:
-                self._append_output(chunk)
+    def read_remaining(self) -> str:
+        """Return all output expect() has not consumed, LF-normalised."""
+        data = self._output.read()
+        text = self._buffer + _normalize_newlines(data or b"")
+        self._buffer = ""
+        return text
 
     def wait(self, timeout: Optional[int] = None):
         rc = self._proc.wait(timeout=timeout)
@@ -250,9 +257,7 @@ class SubprocessSUT:
         # Set exitstatus from return code
         rc = self._proc.returncode
         self.exitstatus = rc if rc is not None else -1
-        # Close stdout pipe
-        if self._proc.stdout:
-            self._proc.stdout.close()
+        self._output.close()
 
 
 @dataclass

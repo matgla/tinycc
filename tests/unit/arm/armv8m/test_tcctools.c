@@ -270,7 +270,7 @@ UT_TEST(test_gen_makedeps_phony_targets)
 /* Write a minimal little-endian 32-bit ELF relocatable object with one global
  * function symbol named "myfunc". The archive tool needs only a valid
  * ELFCLASS32 Ehdr and non-empty .shstrtab/.strtab/.symtab sections. */
-static int ut_write_minimal_elf32(const char *path)
+static int ut_write_elf32_with_st_info(const char *path, unsigned char st_info)
 {
     FILE *f = fopen(path, "wb");
     if (!f)
@@ -312,7 +312,7 @@ static int ut_write_minimal_elf32(const char *path)
     write32le(symtab + 16 + 0, 1);  /* st_name */
     write32le(symtab + 16 + 4, 0);  /* st_value */
     write32le(symtab + 16 + 8, 0);  /* st_size */
-    symtab[16 + 12] = STB_GLOBAL << 4 | STT_FUNC; /* st_info = 0x21 */
+    symtab[16 + 12] = st_info;
     symtab[16 + 13] = 0;            /* st_other */
     write16le(symtab + 16 + 14, 1); /* st_shndx */
 
@@ -357,6 +357,17 @@ static int ut_write_minimal_elf32(const char *path)
     fwrite(shdr, 1, sizeof(shdr), f);
     fclose(f);
     return 0;
+}
+
+static int ut_write_minimal_elf32(const char *path)
+{
+    return ut_write_elf32_with_st_info(path, STB_GLOBAL << 4 | STT_FUNC);
+}
+
+static long ut_file_size(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) ? -1 : (long)st.st_size;
 }
 
 UT_TEST(test_tcc_tool_ar_invalid_usage)
@@ -424,5 +435,145 @@ UT_TEST(test_tcc_tool_ar_create_list_extract)
     remove(objname);
     remove(arname);
     remove(extracted);
+    return 0;
+}
+
+/* /dev/full fails every flushed write with ENOSPC, the way a full disk does.
+   Only the symlink is ever removed; the device stays. */
+UT_TEST(test_tcc_tool_ar_fails_when_the_temporary_file_cannot_be_written)
+{
+    char objname[256], arname[256], tmpname[300];
+    if (access("/dev/full", W_OK))
+        return 0;
+    UT_ASSERT_EQ(ut_make_temp_path(objname, sizeof(objname)), 0);
+    UT_ASSERT_EQ(ut_make_temp_path(arname, sizeof(arname)), 0);
+    snprintf(tmpname, sizeof(tmpname), "%s.tmp", arname);
+    UT_ASSERT_EQ(ut_write_minimal_elf32(objname), 0);
+    remove(tmpname);
+    UT_ASSERT_EQ(symlink("/dev/full", tmpname), 0);
+
+    char *argv[] = {"tcc", "-r", arname, objname};
+    int rc = tcc_tool_ar(tcc_state, 4, argv);
+    long output = ut_file_size(arname);
+
+    remove(tmpname);
+    remove(arname);
+    remove(objname);
+    UT_ASSERT(rc != 0);
+    UT_ASSERT_EQ(output, -1); /* no archive left that a later link would trust */
+    return 0;
+}
+
+UT_TEST(test_tcc_tool_ar_fails_when_the_archive_cannot_be_written)
+{
+    char objname[256], arname[256];
+    if (access("/dev/full", W_OK))
+        return 0;
+    UT_ASSERT_EQ(ut_make_temp_path(objname, sizeof(objname)), 0);
+    UT_ASSERT_EQ(ut_make_temp_path(arname, sizeof(arname)), 0);
+    UT_ASSERT_EQ(ut_write_minimal_elf32(objname), 0);
+    remove(arname);
+    UT_ASSERT_EQ(symlink("/dev/full", arname), 0);
+
+    char *argv[] = {"tcc", "-r", arname, objname};
+    int rc = tcc_tool_ar(tcc_state, 4, argv);
+
+    remove(arname);
+    remove(objname);
+    UT_ASSERT(rc != 0);
+    return 0;
+}
+
+UT_TEST(test_tcc_tool_ar_rejects_a_truncated_object)
+{
+    char objname[256], arname[256];
+    UT_ASSERT_EQ(ut_make_temp_path(objname, sizeof(objname)), 0);
+    UT_ASSERT_EQ(ut_make_temp_path(arname, sizeof(arname)), 0);
+    UT_ASSERT_EQ(ut_write_minimal_elf32(objname), 0);
+    /* the Ehdr survives; the section headers it points at do not */
+    UT_ASSERT_EQ(truncate(objname, 60), 0);
+
+    char *argv[] = {"tcc", "-r", arname, objname};
+    int rc = tcc_tool_ar(tcc_state, 4, argv);
+    long output = ut_file_size(arname);
+
+    remove(arname);
+    remove(objname);
+    UT_ASSERT(rc != 0);
+    UT_ASSERT_EQ(output, -1);
+    return 0;
+}
+
+UT_TEST(test_tcc_tool_ar_keeps_a_member_without_global_symbols)
+{
+    char objname[256], arname[256];
+    UT_ASSERT_EQ(ut_make_temp_path(objname, sizeof(objname)), 0);
+    UT_ASSERT_EQ(ut_make_temp_path(arname, sizeof(arname)), 0);
+    UT_ASSERT_EQ(ut_write_elf32_with_st_info(objname, STB_LOCAL << 4 | STT_FUNC), 0);
+
+    char *argv[] = {"tcc", "-r", arname, objname};
+    UT_ASSERT_EQ(tcc_tool_ar(tcc_state, 4, argv), 0);
+
+    /* magic + one member header + the object, padded to even; no symbol index */
+    long object = ut_file_size(objname);
+    long expected = 8 + 60 + object + (object & 1);
+    long output = ut_file_size(arname);
+
+    char *list_argv[] = {"tcc", "-t", arname};
+    int list_rc = tcc_tool_ar(tcc_state, 3, list_argv);
+
+    remove(arname);
+    remove(objname);
+    UT_ASSERT_EQ(output, expected);
+    UT_ASSERT_EQ(list_rc, 0);
+    return 0;
+}
+
+UT_TEST(test_tcc_tool_ar_list_rejects_a_truncated_archive)
+{
+    char objname[256], arname[256];
+    UT_ASSERT_EQ(ut_make_temp_path(objname, sizeof(objname)), 0);
+    UT_ASSERT_EQ(ut_make_temp_path(arname, sizeof(arname)), 0);
+    UT_ASSERT_EQ(ut_write_minimal_elf32(objname), 0);
+
+    char *argv[] = {"tcc", "-r", arname, objname};
+    UT_ASSERT_EQ(tcc_tool_ar(tcc_state, 4, argv), 0);
+    UT_ASSERT_EQ(truncate(arname, ut_file_size(arname) - 8), 0);
+
+    char *list_argv[] = {"tcc", "-t", arname};
+    int rc = tcc_tool_ar(tcc_state, 3, list_argv);
+
+    remove(arname);
+    remove(objname);
+    UT_ASSERT(rc != 0);
+    return 0;
+}
+
+UT_TEST(test_tcc_tool_ar_extract_fails_when_the_member_cannot_be_written)
+{
+    char objname[256], arname[256];
+    if (access("/dev/full", W_OK))
+        return 0;
+    UT_ASSERT_EQ(ut_make_temp_path(objname, sizeof(objname)), 0);
+    UT_ASSERT_EQ(ut_make_temp_path(arname, sizeof(arname)), 0);
+    UT_ASSERT_EQ(ut_write_minimal_elf32(objname), 0);
+
+    char *argv[] = {"tcc", "-r", arname, objname};
+    UT_ASSERT_EQ(tcc_tool_ar(tcc_state, 4, argv), 0);
+
+    const char *base = strrchr(objname, '/');
+    base = base ? base + 1 : objname;
+    char extracted[16];
+    snprintf(extracted, sizeof(extracted), "%.15s", base);
+    remove(extracted);
+    UT_ASSERT_EQ(symlink("/dev/full", extracted), 0);
+
+    char *extract_argv[] = {"tcc", "-x", arname};
+    int rc = tcc_tool_ar(tcc_state, 3, extract_argv);
+
+    remove(extracted);
+    remove(arname);
+    remove(objname);
+    UT_ASSERT(rc != 0);
     return 0;
 }

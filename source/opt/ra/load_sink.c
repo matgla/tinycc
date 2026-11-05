@@ -125,8 +125,8 @@ static void ra_ls_scan(TCCIRState *ir, RaLsInfo *li)
 /* A plain register value operand: a vreg read, not memory through it. */
 static int ra_ls_plain(IROperand o)
 {
-  return irop_get_tag(o) == IROP_TAG_VREG && irop_get_vreg(o) >= 0 && !o.is_lval && !o.is_local &&
-         !o.is_llocal && !o.is_sym && !o.is_complex;
+  return irop_get_tag(o) == IROP_TAG_VREG && irop_get_vreg(o) >= 0 && !o.is_lval && !irop_is_local(o) &&
+         !irop_is_llocal(o) && !irop_is_sym(o) && !o.is_complex;
 }
 
 /* Pointer `v` as (root, offset): through copies and constant ADDs of
@@ -202,7 +202,7 @@ static int ra_ls_access(TCCIRState *ir, IRQuadCompact *q, int32_t *base, int32_t
   if (!is_store && q->op != TCCIR_OP_LOAD && q->op != TCCIR_OP_LOAD_INDEXED)
     return 0;
   IROperand b = tcc_ir_op_get_dest_or_src1(ir, q, !is_store);
-  if (irop_get_tag(b) != IROP_TAG_VREG || irop_get_vreg(b) < 0 || b.is_local || b.is_llocal || b.is_sym ||
+  if (irop_get_tag(b) != IROP_TAG_VREG || irop_get_vreg(b) < 0 || irop_is_local(b) || irop_is_llocal(b) || irop_is_sym(b) ||
       b.is_complex || b.is_lval == indexed)
     return 0;
   *base = irop_get_vreg(b);
@@ -245,7 +245,7 @@ static int ra_ls_names(TCCIRState *ir, IRQuadCompact *q, int32_t v)
  * pointer the slot holds. */
 static int ra_ls_frame_slot(IROperand d)
 {
-  return irop_get_tag(d) == IROP_TAG_STACKOFF && d.is_local && !d.is_llocal && !d.is_sym && !d.is_complex;
+  return irop_get_tag(d) == IROP_TAG_STACKOFF && irop_is_local(d) && !irop_is_llocal(d) && !irop_is_sym(d) && !d.is_complex;
 }
 
 static int ra_ls_temp_pos(int32_t v, const RaLsInfo *li)

@@ -100,7 +100,7 @@ static inline int opt_dsl_var_imm_state_build(IRSSAOptCtx *ctx,
      * update, ALU/CALL/ASSIGN dest) redefines the VAR. */
     if (q->op == TCCIR_OP_STORE_INDEXED)
       continue;
-    if (q->op == TCCIR_OP_STORE && d.is_lval && !d.is_local)
+    if (q->op == TCCIR_OP_STORE && d.is_lval && !irop_is_local(d))
       continue;
     def_idx[pos] = i;
     if (def_cnt[pos] < 2)
@@ -185,9 +185,9 @@ static inline int opt_dsl_var_imm_match(IRSSAOptCtx *ctx,
   IROperand s = (slot == 0) ? tcc_ir_op_get_src1(ir, q)
               : (slot == 1) ? tcc_ir_op_get_src2(ir, q)
                             : tcc_ir_op_get_accum(ir, q);
-  int is_bare_vreg = (s.tag == IROP_TAG_VREG && !s.is_lval && !s.is_local &&
-                      !s.is_llocal && !s.is_sym);
-  int is_slot_read = (s.tag == IROP_TAG_STACKOFF && s.is_lval && !s.is_sym);
+  int is_bare_vreg = (s.tag == IROP_TAG_VREG && !s.is_lval && !irop_is_local(s) &&
+                      !irop_is_llocal(s) && !irop_is_sym(s));
+  int is_slot_read = (s.tag == IROP_TAG_STACKOFF && s.is_lval && !irop_is_sym(s));
   if (!is_bare_vreg && !is_slot_read)
     return 0;
   int use_bt = irop_get_btype(s);
@@ -217,7 +217,7 @@ static inline int opt_dsl_var_imm_match(IRSSAOptCtx *ctx,
   int ds_ok = (def_bt == IROP_BTYPE_INT64)
                   ? (ds.tag == IROP_TAG_IMM32 || ds.tag == IROP_TAG_I64)
                   : (ds.tag == IROP_TAG_IMM32);
-  if (!ds_ok || ds.is_lval || ds.is_local || ds.is_sym)
+  if (!ds_ok || ds.is_lval || irop_is_local(ds) || irop_is_sym(ds))
     return 0;
   /* A 64-bit constant materialises via a multi-instruction / pool-load
    * sequence, so forwarding it to more than one use trades one slot load for

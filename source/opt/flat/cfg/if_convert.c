@@ -684,7 +684,7 @@ int tcc_ir_opt_select(TCCIRState *ir)
       /* SETIF's condition must equal `then_cond` (the negation of the
        * JUMPIF's branch condition) so SETIF returns 1 precisely along the
        * fall-through (then) path and 0 along the taken (else) path. */
-      if (!irop_is_immediate(setif_cond) || setif_cond.is_sym)
+      if (!irop_is_immediate(setif_cond) || irop_is_sym(setif_cond))
         goto setif_diamond_done;
       int setif_tok = (int)irop_get_imm64_ex(ir, setif_cond);
       if (setif_tok != then_cond)
@@ -709,7 +709,7 @@ int tcc_ir_opt_select(TCCIRState *ir)
       IROperand else_val = tcc_ir_op_get_src1(ir, else_q);
       if (tcc_ir_op_dest_vreg(ir, else_q) != dest_vreg)
         goto setif_diamond_done;
-      if (!irop_is_immediate(else_val) || else_val.is_sym ||
+      if (!irop_is_immediate(else_val) || irop_is_sym(else_val) ||
           irop_get_imm64_ex(ir, else_val) != 0)
         goto setif_diamond_done;
 
