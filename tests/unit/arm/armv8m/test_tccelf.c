@@ -1595,10 +1595,10 @@ UT_TEST(test_apply_reloc_patches_during_materialize)
   values[0] = 0x12345678;
   offsets[1] = 4;
   values[1] = 0xaabbccdd;
-  sec->reloc_patch_offsets = offsets;
-  sec->reloc_patch_values = values;
-  sec->nb_reloc_patches = 2;
-  sec->alloc_reloc_patches = 2;
+  section_aux(sec)->reloc_patch_offsets = offsets;
+  section_aux(sec)->reloc_patch_values = values;
+  section_aux(sec)->nb_reloc_patches = 2;
+  section_aux(sec)->alloc_reloc_patches = 2;
 
   DeferredChunk *chunk = (DeferredChunk *)tcc_mallocz(sizeof(DeferredChunk));
   chunk->source_path = tcc_strdup(path);
@@ -3465,9 +3465,9 @@ UT_TEST(test_relocate_section_dwarf_lazy_adds_patches)
 
   /* The lazy DWARF path must have recorded one patch with the dwarf-to-dwarf
    * value (sym_value - debug_str->sh_addr). */
-  UT_ASSERT_EQ(debug_info->nb_reloc_patches, 1);
-  UT_ASSERT_EQ(debug_info->reloc_patch_offsets[0], 0u);
-  UT_ASSERT_EQ(debug_info->reloc_patch_values[0], 0x200u);
+  UT_ASSERT_EQ(SECTION_NB_PATCHES(debug_info), 1);
+  UT_ASSERT_EQ(debug_info->aux->reloc_patch_offsets[0], 0u);
+  UT_ASSERT_EQ(debug_info->aux->reloc_patch_values[0], 0x200u);
 
   /* Materializing should apply the patch to the zeroed buffer. */
   section_materialize(tcc_state, debug_info);
@@ -3504,7 +3504,7 @@ UT_TEST(test_relocate_section_dwarf_materialized_add32le)
   relocate_sections(tcc_state);
 
   /* Materialized DWARF path updates data in place. */
-  UT_ASSERT_EQ(debug_info->nb_reloc_patches, 0);
+  UT_ASSERT_EQ(SECTION_NB_PATCHES(debug_info), 0);
   UT_ASSERT_EQ(read32le(debug_info->data), 0x310u); /* 0x10 + (0x1300 - 0x1000) */
 
   tccelf_delete(tcc_state);

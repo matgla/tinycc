@@ -795,10 +795,31 @@ ST_FUNC unsigned long arm_hot_text_veneer_bytes(TCCState *s1)
   return n * HOT_VENEER_SIZE;
 }
 
+/* A veneer's relocation goes into a relocation section of its own: s->reloc was
+ * sized exactly for the inputs folded into s, and growing it past that doubled
+ * it, the largest block of a link (1.4 MB for an -O0 tinycc).  Whatever reads
+ * relocations walks every RELX section, whichever section it applies to. */
+static void put_veneer_reloc(TCCState *s1, Section *s, Section **vr, addr_t off, int type, int sym_index)
+{
+  Section *keep = s->reloc;
+  if (!*vr)
+  {
+    char buf[256];
+    snprintf(buf, sizeof(buf), REL_SECTION_FMT ".veneers", s->name);
+    *vr = new_section(s1, buf, SHT_RELX, symtab_section->sh_flags);
+    (*vr)->sh_entsize = sizeof(ElfW_Rel);
+    (*vr)->link = symtab_section;
+    (*vr)->sh_info = s->sh_num;
+  }
+  s->reloc = *vr;
+  put_elf_reloc(symtab_section, s, off, type, sym_index);
+  s->reloc = keep;
+}
+
 /* The block's veneers first, so they are copied with it; the end moves over them. */
 ST_FUNC void arm_add_hot_text_veneers(TCCState *s1)
 {
-  Section *sr = text_section->reloc;
+  Section *sr = text_section->reloc, *vr = NULL;
   int side, k, nb_rels, n_veneers = 0, nb_syms;
   const addr_t block_end = s1->hot_text_end;
   int *veneer_of;
@@ -845,7 +866,7 @@ ST_FUNC void arm_add_hot_text_veneers(TCCState *s1)
         section_ptr_add(text_section, text_section->data_offset & 1);
         off = text_section->data_offset;
         memset(section_ptr_add(text_section, HOT_VENEER_SIZE), 0, HOT_VENEER_SIZE);
-        put_elf_reloc(symtab_section, text_section, off, R_ARM_YASOS_HOT_VENEER, sym_index);
+        put_veneer_reloc(s1, text_section, &vr, off, R_ARM_YASOS_HOT_VENEER, sym_index);
         snprintf(name, sizeof(name), "__tcc_hot_veneer_%d", n_veneers++);
         veneer_of[sym_index] = set_elf_sym(symtab_section, off | 1, HOT_VENEER_SIZE, ELFW(ST_INFO)(STB_GLOBAL, STT_FUNC),
                                            STV_HIDDEN, text_section->sh_num, name);
@@ -956,7 +977,7 @@ ST_FUNC void arm_add_range_veneers(TCCState *s1)
   int i, nb_syms, n_veneers = 0;
   for (i = 1; i < s1->nb_sections; i++)
   {
-    Section *sr = s1->sections[i], *s;
+    Section *sr = s1->sections[i], *s, *vr = NULL;
     ElfW_Rel *rel;
     addr_t src_origin, dst_origin;
     int src_mr;
@@ -1004,7 +1025,7 @@ ST_FUNC void arm_add_range_veneers(TCCState *s1)
         p = section_ptr_add(s, 8);
         p[0] = 0xdf; p[1] = 0xf8; p[2] = 0x00; p[3] = 0xf0; /* ldr.w pc, [pc, #0] */
         p[4] = p[5] = p[6] = p[7] = 0;
-        put_elf_reloc(symtab_section, s, off + 4, R_ARM_ABS32, sym_index);
+        put_veneer_reloc(s1, s, &vr, off + 4, R_ARM_ABS32, sym_index);
         snprintf(name, sizeof(name), "__tcc_veneer_%d", n_veneers++);
         veneer_of[sym_index] = set_elf_sym(symtab_section, off | 1, 8, ELFW(ST_INFO)(STB_GLOBAL, STT_FUNC),
                                            STV_HIDDEN, s->sh_num, name);

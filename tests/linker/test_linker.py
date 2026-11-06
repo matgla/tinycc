@@ -1063,6 +1063,43 @@ def test_gc_sections_per_object_data(tinycc_root):
 
 
 @pytest.mark.linker
+@pytest.mark.linker_section
+def test_spilled_text_keeps_alignment_zero(tinycc_root):
+    """.text is relocated piece by piece through a file, one buffer for all.
+
+    Two static functions of the same name in two archive members are one input
+    section of two chunks with alignment between them.  The buffer still held
+    the previous piece's bytes there, so the gap came out as code from another
+    function instead of zeros.  The temporary file must not be left behind.
+    """
+    objs = [_compile_to_object(f"13_spill_gap_{n}", "sections") for n in ("big", "a", "b")]
+    lib = BUILD_DIR / "sections" / "13_spill_gap.a"
+    lib.unlink(missing_ok=True)
+    ar = subprocess.run([str(TCC), "-ar", "rcs", str(lib), *map(str, objs)], capture_output=True, text=True)
+    assert ar.returncode == 0, ar.stderr
+    out = BUILD_DIR / "sections" / "13_spill_gap.elf"
+    result, cmd = _gc_link(
+        tinycc_root,
+        ["-Wl,--whole-archive", lib, "-Wl,--no-whole-archive"],
+        out,
+        ["-Wl,--gc-sections", "-Wl,-e,entry", "-g", "-Wl,-oformat=elf32-littlearm"],
+    )
+    assert result.returncode == 0, f"link failed: {cmd}\n{result.stdout}\n{result.stderr}"
+    assert not (out.parent / (out.name + ".text.tmp")).exists()
+
+    dups = sorted((int(s["value"], 16) & ~1, s["size"]) for s in _readelf_syms(out) if s["name"] == "dup")
+    assert len(dups) == 2, dups
+    (first, first_size), (second, _) = dups
+    assert first + first_size < second, f"no alignment between the two dup: {dups}"
+    sections = subprocess.run([READELF, "-SW", str(out)], capture_output=True, text=True).stdout
+    m = re.search(r"\]\s+\.text\s+PROGBITS\s+([0-9a-f]+)\s+([0-9a-f]+)", sections)
+    addr, offset = int(m.group(1), 16), int(m.group(2), 16)
+    data = out.read_bytes()
+    gap = data[offset + first + first_size - addr : offset + second - addr]
+    assert gap == bytes(len(gap)), f"alignment between the two dup is {gap.hex()}, not zeros"
+
+
+@pytest.mark.linker
 @pytest.mark.linker_yaff
 @pytest.mark.parametrize("flags, expected", [((), 0), (("-slow-memory",), 1)])
 def test_yaff_memory_flags(tinycc_root, flags, expected):

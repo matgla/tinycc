@@ -12,10 +12,7 @@ BUILD_DIR ?= .
 CC        ?= gcc
 AR        ?= ar
 # $(AR) may be the target compiler's built-in archiver (for example
-# `armv8m-tcc -ar`).  The combined architecture archive below uses GNU/LLVM
-# ar's MRI `addmod`/`addlib` commands, which tcc -ar deliberately does not
-# implement.  Keep this as a separate host-tool setting.
-MRI_AR    ?= ar
+# `armv8m-tcc -ar`), so only what `ar rcs` means everywhere is used.
 CFLAGS    ?=
 DEFINES   ?=
 
@@ -62,15 +59,15 @@ ISA_LIBS = $(foreach d,$(ISA_DIRS),$(BUILD_DIR)/lib$(d).a)
 
 LIB = $(BUILD_DIR)/libarm.a
 
+# The order ar -M used to leave the members in.  It decides the order of .text
+# in the compiler, so keeping it keeps the layout that was measured on the board.
+reverse = $(if $(1),$(call reverse,$(wordlist 2,$(words $(1)),$(1))) $(firstword $(1)))
+
 all: $(LIB)
 
 $(LIB): $(OBJS) $(ISA_LIBS)
-	printf 'create $@\n' > $(BUILD_DIR)/_libarm.mri
-	@for o in $(OBJS); do printf 'addmod %s\n' $$o >> $(BUILD_DIR)/_libarm.mri; done
-	@for l in $(ISA_LIBS); do printf 'addlib %s\n' $$l >> $(BUILD_DIR)/_libarm.mri; done
-	@printf 'save\nend\n' >> $(BUILD_DIR)/_libarm.mri
-	$(MRI_AR) -M < $(BUILD_DIR)/_libarm.mri
-	@rm -f $(BUILD_DIR)/_libarm.mri
+	@rm -f $@
+	$(AR) rcs $@ $(call reverse,$(OBJS) $(foreach d,$(ISA_DIRS),$(shell $(MAKE) -s --no-print-directory -C $(d) list-objs TOP=$(TOP) BUILD_DIR=$(BUILD_DIR))))
 
 $(BUILD_DIR)/lib%.a: FORCE
 	$(MAKE) --no-print-directory -C $* \

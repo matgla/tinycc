@@ -126,7 +126,7 @@ void free_deferred_chunks(Section *sec)
 
 /* One copy of a path per run of chunks from that file: there can be a chunk for
  * every function of a program, and a copy each costs as much as the chunk. */
-static const char *deferred_path(TCCState *s1, const char *path)
+ST_FUNC const char *deferred_path(TCCState *s1, const char *path)
 {
   if (!path)
     return NULL;
@@ -193,6 +193,337 @@ ST_FUNC int deferred_chunks_read(TCCState *s1, DeferredChunk **chunks, unsigned 
   return 0;
 }
 
+/* ---- Relocations left on disk --------------------------------------------
+ *
+ * A function's relocations are read three times in a link -- by --gc-sections,
+ * by its check for symbols only dead code wanted, and when coalesce_split_sections
+ * moves them into .text's -- and held in between they were a third of the
+ * memory a link needed: one Section and one buffer per function.  For a
+ * function whose bytes stay in its object (defer_split_text), the loader now
+ * records where the relocations are instead (LazyRels, on the function's
+ * Section) and keeps the object's symbol remap, a word per symbol; this reads
+ * them back the way the loader would have left them. */
+
+ST_FUNC int lazy_rels_count(Section *s)
+{
+  LazyRels *lr;
+  int n = 0;
+  for (lr = s->lazy_rels; lr; lr = lr->next)
+    n += lr->count;
+  return n;
+}
+
+ST_FUNC void lazy_rels_free(Section *s)
+{
+  LazyRels *lr = s->lazy_rels, *next;
+  for (; lr; lr = next)
+  {
+    next = lr->next;
+    tcc_free(lr);
+  }
+  s->lazy_rels = NULL;
+}
+
+/* All of s's relocations, symbols global and offsets in s, in a block the
+ * caller frees.  NULL with the error reported if they cannot be read. */
+ST_FUNC ElfW_Rel *lazy_rels_read(TCCState *s1, Section *s, int *count)
+{
+  LazyRels *lr;
+  ElfW_Rel *rels, *rel;
+  const char *open_path = NULL;
+  int fd = -1, n = lazy_rels_count(s);
+
+  *count = n;
+  rels = tcc_malloc(n ? n * sizeof(ElfW_Rel) : 1);
+  rel = rels;
+  for (lr = s->lazy_rels; lr; lr = lr->next)
+  {
+    uint32_t k;
+    if (open_path != lr->path)
+    {
+      if (fd >= 0)
+        close(fd);
+      open_path = lr->path;
+      fd = open(lr->path, O_RDONLY | O_BINARY);
+      if (fd < 0)
+      {
+        tcc_error_noabort("cannot reopen '%s'", lr->path);
+        goto fail;
+      }
+    }
+    lseek(fd, lr->file_offset, SEEK_SET);
+    if (!lr->remap || full_read(fd, rel, lr->count * sizeof(ElfW_Rel)) != lr->count * sizeof(ElfW_Rel))
+    {
+      tcc_error_noabort("short read from '%s'", lr->path);
+      goto fail;
+    }
+    for (k = 0; k < lr->count; k++, rel++)
+    {
+      int type = ELFW(R_TYPE)(rel->r_info);
+      unsigned sym_index = ELFW(R_SYM)(rel->r_info);
+      if (sym_index >= lr->nb_syms)
+        goto invalid;
+      sym_index = lr->remap[sym_index];
+      if (!sym_index
+#ifdef TCC_TARGET_ARM
+          && type != R_ARM_V4BX
+#elif defined TCC_TARGET_RISCV64
+          && type != R_RISCV_ALIGN && type != R_RISCV_RELAX
+#endif
+      )
+      {
+      invalid:
+        tcc_error_noabort("Invalid relocation entry in '%s' @ %.8x", s->name, (int)rel->r_offset);
+        goto fail;
+      }
+      rel->r_info = ELFW(R_INFO)(sym_index, type);
+      rel->r_offset += lr->offset;
+    }
+  }
+  if (fd >= 0)
+    close(fd);
+  return rels;
+fail:
+  if (fd >= 0)
+    close(fd);
+  tcc_free(rels);
+  return NULL;
+}
+
+/* ---- Spilled sections --------------------------------------------------
+ *
+ * The bytes of a linked .text are its functions' bytes, which sit in the
+ * object files until then; held in memory they were the largest block of a
+ * link, and on a part without an MMU the largest block is what fails first
+ * (the heap has the room, in pieces).  So coalesce_split_sections records
+ * where each function's bytes are instead of copying them (SpillPiece), and
+ * the section keeps in memory only what is added after it (veneers), from
+ * data_base on.  relocate_section asks section_spill_ptr for the bytes under
+ * each relocation: the piece they are in is read, patched in a buffer and
+ * written to a file next to the output, and the writers copy the file.
+ *
+ * The file only ever grows at its end: a piece is written after every piece
+ * before it (and the alignment between them, as zeros), so nothing depends on
+ * how a filesystem fills a hole.  A piece relocated a second time, out of
+ * order, is read back from the file. */
+
+static int spill_read_piece(TCCState *s1, SectionSpill *sp, int k, unsigned char *dest)
+{
+  SpillPiece *p = &sp->pieces[k];
+  if (sp->written[k])
+  {
+    lseek(sp->fd, p->base, SEEK_SET);
+    if (full_read(sp->fd, dest, p->size) != p->size)
+      return tcc_error_noabort("short read from '%s'", sp->path);
+    return 0;
+  }
+  if (p->chunks)
+  {
+    /* Chunks need not cover it all: an object's .text has alignment between
+     * its functions, and the buffer is the last piece's. */
+    memset(dest, 0, p->size);
+    return deferred_chunks_read(s1, &p->chunks, dest, &sp->src_fd, &sp->src_path);
+  }
+  if (p->data)
+    memcpy(dest, p->data, p->size);
+  else
+    memset(dest, 0, p->size);
+  return 0;
+}
+
+static int spill_write(TCCState *s1, SectionSpill *sp, unsigned long at, const unsigned char *data, unsigned long size)
+{
+  lseek(sp->fd, at, SEEK_SET);
+  if (write(sp->fd, data, size) != (ssize_t)size)
+    return tcc_error_noabort("cannot write '%s'", sp->path);
+  if (at + size > sp->written_end)
+    sp->written_end = at + size;
+  return 0;
+}
+
+static int spill_buffer(SectionSpill *sp, unsigned long size)
+{
+  if (size > sp->buf_size)
+  {
+    tcc_free(sp->buf);
+    sp->buf = tcc_malloc(size);
+    sp->buf_size = size;
+  }
+  return 0;
+}
+
+/* Write everything before piece k that is not in the file yet: earlier pieces
+ * from where they are, and the gaps between them as zeros. */
+static int spill_fill_to(TCCState *s1, SectionSpill *sp, int k)
+{
+  static const unsigned char zeros[64];
+  int j;
+  for (j = 0; j < k; j++)
+    if (!sp->written[j])
+    {
+      SpillPiece *p = &sp->pieces[j];
+      unsigned char *tmp = tcc_malloc(p->size ? p->size : 1);
+      int r;
+      while (sp->written_end < p->base)
+      {
+        unsigned long n = p->base - sp->written_end;
+        if (spill_write(s1, sp, sp->written_end, zeros, n < sizeof zeros ? n : sizeof zeros) < 0)
+          return tcc_free(tmp), -1;
+      }
+      r = spill_read_piece(s1, sp, j, tmp);
+      if (r == 0)
+        r = spill_write(s1, sp, p->base, tmp, p->size);
+      tcc_free(tmp);
+      if (r < 0)
+        return -1;
+      sp->written[j] = 1;
+      tcc_free(p->data);
+      p->data = NULL;
+    }
+  if (k < sp->nb_pieces)
+    while (sp->written_end < sp->pieces[k].base)
+    {
+      unsigned long n = sp->pieces[k].base - sp->written_end;
+      if (spill_write(s1, sp, sp->written_end, zeros, n < sizeof zeros ? n : sizeof zeros) < 0)
+        return -1;
+    }
+  return 0;
+}
+
+static int spill_open(TCCState *s1, SectionSpill *sp)
+{
+  if (sp->fd >= 0)
+    return 0;
+  sp->fd = open(sp->path, O_RDWR | O_CREAT | O_TRUNC | O_BINARY, 0600);
+  if (sp->fd < 0)
+    return tcc_error_noabort("cannot create '%s'", sp->path);
+  return 0;
+}
+
+/* Put the piece in the buffer back into the file. */
+ST_FUNC int section_spill_flush(TCCState *s1, Section *s)
+{
+  SectionSpill *sp = s->spill;
+  int k;
+  if (!sp || sp->cur < 0)
+    return 0;
+  k = sp->cur;
+  sp->cur = -1;
+  if (spill_fill_to(s1, sp, k) < 0 || spill_write(s1, sp, sp->pieces[k].base, sp->buf, sp->pieces[k].size) < 0)
+    return -1;
+  sp->written[k] = 1;
+  tcc_free(sp->pieces[k].data);
+  sp->pieces[k].data = NULL;
+  return 0;
+}
+
+/* The bytes at section offset `off`, to be read and written in place until the
+ * next call.  NULL with the error reported if they cannot be had. */
+ST_FUNC unsigned char *section_spill_ptr(TCCState *s1, Section *s, unsigned long off)
+{
+  SectionSpill *sp = s->spill;
+  int lo, hi, k;
+  if (off >= s->data_base)
+    return s->data + off - s->data_base;
+  if (sp->cur >= 0 && off - sp->pieces[sp->cur].base < sp->pieces[sp->cur].size)
+    return sp->buf + off - sp->pieces[sp->cur].base;
+  if (spill_open(s1, sp) < 0 || section_spill_flush(s1, s) < 0)
+    return NULL;
+  for (lo = 0, hi = sp->nb_pieces - 1; lo < hi;)
+  {
+    int mid = (lo + hi + 1) / 2;
+    if (sp->pieces[mid].base <= off)
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  k = lo;
+  if (k >= sp->nb_pieces || off - sp->pieces[k].base >= sp->pieces[k].size)
+  {
+    tcc_error_noabort("relocation at 0x%lx of '%s' is outside its code", off, s->name);
+    return NULL;
+  }
+  spill_buffer(sp, sp->pieces[k].size);
+  if (spill_read_piece(s1, sp, k, sp->buf) < 0)
+    return NULL;
+  sp->cur = k;
+  return sp->buf + off - sp->pieces[k].base;
+}
+
+/* Write `size` bytes of the section to f: the file, the bytes from data_base,
+ * zeros after data_offset. */
+ST_FUNC int section_spill_write(TCCState *s1, Section *s, FILE *f, unsigned long size)
+{
+  SectionSpill *sp = s->spill;
+  unsigned char buf[4096];
+  unsigned long pos = 0, n, end = s->data_base;
+  if (spill_open(s1, sp) < 0 || section_spill_flush(s1, s) < 0 || spill_fill_to(s1, sp, sp->nb_pieces) < 0)
+    return -1;
+  /* the gap between the last piece and data_base */
+  while (sp->written_end < end)
+  {
+    memset(buf, 0, sizeof buf);
+    n = end - sp->written_end;
+    if (spill_write(s1, sp, sp->written_end, buf, n < sizeof buf ? n : sizeof buf) < 0)
+      return -1;
+  }
+  lseek(sp->fd, 0, SEEK_SET);
+  while (pos < end && pos < size)
+  {
+    n = end - pos;
+    if (n > sizeof buf)
+      n = sizeof buf;
+    if (n > size - pos)
+      n = size - pos;
+    if (full_read(sp->fd, buf, n) != n)
+      return tcc_error_noabort("short read from '%s'", sp->path);
+    fwrite(buf, 1, n, f);
+    pos += n;
+  }
+  if (pos < size && s->data_offset > end)
+  {
+    n = s->data_offset - end;
+    if (n > size - pos)
+      n = size - pos;
+    fwrite(s->data, 1, n, f);
+    pos += n;
+  }
+  for (; pos < size; pos++)
+    fputc(0, f);
+  return 0;
+}
+
+ST_FUNC void section_spill_free(Section *s)
+{
+  SectionSpill *sp = s->spill;
+  int k;
+  if (!sp)
+    return;
+  for (k = 0; k < sp->nb_pieces; k++)
+  {
+    DeferredChunk *c = sp->pieces[k].chunks, *next;
+    for (; c; c = next)
+    {
+      next = c->next;
+      tcc_free(c);
+    }
+    tcc_free(sp->pieces[k].data);
+  }
+  if (sp->fd >= 0)
+  {
+    close(sp->fd);
+    unlink(sp->path);
+  }
+  if (sp->src_fd >= 0)
+    close(sp->src_fd);
+  tcc_free(sp->pieces);
+  tcc_free(sp->written);
+  tcc_free(sp->buf);
+  tcc_free(sp->path);
+  tcc_free(sp);
+  s->spill = NULL;
+}
+
 /* Load all deferred data for a section */
 ST_FUNC void section_materialize(TCCState *s1, Section *sec)
 {
@@ -242,7 +573,7 @@ ST_FUNC void section_materialize(TCCState *s1, Section *sec)
   }
 
   /* Apply any relocation patches */
-  if (sec->nb_reloc_patches > 0)
+  if (SECTION_NB_PATCHES(sec) > 0)
   {
     /* Applying relocation patches */
     apply_reloc_patches(sec, sec->data, sec->data_offset);
@@ -282,9 +613,9 @@ ST_FUNC void section_ensure_loaded(TCCState *s1, Section *sec)
 static void sort_patches_by_offset(Section *sec)
 {
   int i, j;
-  int n = sec->nb_reloc_patches;
-  uint32_t *offsets = sec->reloc_patch_offsets;
-  uint32_t *values = sec->reloc_patch_values;
+  int n = SECTION_NB_PATCHES(sec);
+  uint32_t *offsets = sec->aux->reloc_patch_offsets;
+  uint32_t *values = sec->aux->reloc_patch_values;
 
   for (i = 1; i < n; i++)
   {
@@ -306,12 +637,12 @@ static void sort_patches_by_offset(Section *sec)
 static void apply_reloc_patches(Section *sec, unsigned char *data, size_t size)
 {
   int i;
-  for (i = 0; i < sec->nb_reloc_patches; i++)
+  for (i = 0; i < SECTION_NB_PATCHES(sec); i++)
   {
-    uint32_t offset = sec->reloc_patch_offsets[i];
+    uint32_t offset = sec->aux->reloc_patch_offsets[i];
     if (offset + 4 <= size)
     {
-      add32le(data + offset, sec->reloc_patch_values[i]);
+      add32le(data + offset, sec->aux->reloc_patch_values[i]);
     }
   }
 }
@@ -325,15 +656,15 @@ static int apply_patches_to_buffer(Section *sec, int *patch_idx, uint32_t buf_st
   int applied = 0;
   int i = *patch_idx;
 
-  while (i < sec->nb_reloc_patches && sec->reloc_patch_offsets[i] < buf_end)
+  while (i < SECTION_NB_PATCHES(sec) && sec->aux->reloc_patch_offsets[i] < buf_end)
   {
-    uint32_t offset = sec->reloc_patch_offsets[i];
+    uint32_t offset = sec->aux->reloc_patch_offsets[i];
     if (offset >= buf_start)
     {
       uint32_t buf_offset = offset - buf_start;
       if (buf_offset + 4 <= buf_size)
       {
-        add32le(buffer + buf_offset, sec->reloc_patch_values[i]);
+        add32le(buffer + buf_offset, sec->aux->reloc_patch_values[i]);
         applied++;
       }
     }
@@ -351,9 +682,9 @@ static size_t patch_safe_prefix(Section *sec, int patch_idx, uint32_t buf_start,
 {
   uint32_t buf_end = buf_start + n;
   int i;
-  for (i = patch_idx; i < sec->nb_reloc_patches && sec->reloc_patch_offsets[i] < buf_end; i++)
+  for (i = patch_idx; i < SECTION_NB_PATCHES(sec) && sec->aux->reloc_patch_offsets[i] < buf_end; i++)
   {
-    uint32_t offset = sec->reloc_patch_offsets[i];
+    uint32_t offset = sec->aux->reloc_patch_offsets[i];
     if (offset >= buf_start && offset + 4 > buf_end)
     {
       size_t cut = offset - buf_start;
@@ -387,7 +718,7 @@ int section_write_streaming(TCCState *s1, Section *sec, FILE *f)
   }
 
   /* If there are relocation patches, sort them by offset for efficient streaming */
-  if (sec->nb_reloc_patches > 0)
+  if (SECTION_NB_PATCHES(sec) > 0)
   {
     sort_patches_by_offset(sec);
   }
@@ -412,10 +743,10 @@ int section_write_streaming(TCCState *s1, Section *sec, FILE *f)
         while (from_data > 0)
         {
           n = from_data < sizeof(buffer) ? from_data : sizeof(buffer);
-          if (patch_idx < sec->nb_reloc_patches)
+          if (patch_idx < SECTION_NB_PATCHES(sec))
             n = patch_safe_prefix(sec, patch_idx, output_pos, n);
           memcpy(buffer, sec->data + output_pos, n);
-          if (patch_idx < sec->nb_reloc_patches)
+          if (patch_idx < SECTION_NB_PATCHES(sec))
             apply_patches_to_buffer(sec, &patch_idx, output_pos, output_pos + n, buffer, n);
           fwrite(buffer, 1, n, f);
           output_pos += n;
@@ -457,7 +788,7 @@ int section_write_streaming(TCCState *s1, Section *sec, FILE *f)
 
       /* Do not let the buffer end inside a patch: give the tail back to the
          next read so all four bytes are in memory when it is applied */
-      if (patch_idx < sec->nb_reloc_patches)
+      if (patch_idx < SECTION_NB_PATCHES(sec))
       {
         size_t keep = patch_safe_prefix(sec, patch_idx, c->dest_offset + chunk_written, n);
         if (keep < n)
@@ -468,7 +799,7 @@ int section_write_streaming(TCCState *s1, Section *sec, FILE *f)
       }
 
       /* Apply any patches that fall within this buffer */
-      if (patch_idx < sec->nb_reloc_patches)
+      if (patch_idx < SECTION_NB_PATCHES(sec))
       {
         uint32_t buf_start = c->dest_offset + chunk_written;
         uint32_t buf_end = buf_start + n;
@@ -955,20 +1286,17 @@ ST_FUNC void free_section(Section *s)
   if (!s)
     return;
   free_deferred_chunks(s);     /* Clean up lazy loading metadata */
+  section_spill_free(s);
+  lazy_rels_free(s);
   free_reloc_patches(s);       /* Clean up relocation patches */
-  tcc_free(s->str_hash);       /* Clean up string hash table */
-  tcc_free(s->hash_val_cache); /* Clean up hash value cache */
+  if (s->aux)
+    tcc_free(s->aux->hash_val_cache);
+  tcc_free(s->aux);
+  s->aux = NULL;
   if (!link_arena_owns(s->s1, s->data))
     tcc_free(s->data);
   s->data = NULL;
   s->data_allocated = s->data_offset = 0;
-  s->str_hash = NULL;
-  s->str_hash_size = 0;
-  s->str_hash_count = 0;
-  s->hash_val_cache = NULL;
-  s->hash_val_alloc = 0;
-  s->nb_reloc_patches = 0;
-  s->alloc_reloc_patches = 0;
 }
 
 ST_FUNC void tccelf_delete(TCCState *s1)
@@ -995,6 +1323,7 @@ ST_FUNC void tccelf_delete(TCCState *s1)
   }
   dynarray_reset(&s1->sections, &s1->nb_sections);
   dynarray_reset(&s1->deferred_paths, &s1->nb_deferred_paths);
+  dynarray_reset(&s1->reloc_remaps, &s1->nb_reloc_remaps);
   tcc_free(s1->section_ht);
   s1->section_ht = NULL;
   s1->section_ht_mask = 0;

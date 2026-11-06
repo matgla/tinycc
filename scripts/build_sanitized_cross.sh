@@ -12,7 +12,7 @@
 # VARIANT:
 #   asan      ASan + UBSan, -O1 -g                         (default)
 #   lowmem    asan + -DCONFIG_TCC_LOW_MEM  (the device's small tables/arenas)
-#   o0only    asan + -DCONFIG_TCC_O0_ONLY  (Pico 2 compiler; implies LOW_MEM)
+#   o0only    asan + -DCONFIG_TCC_O0_ONLY -DCONFIG_TCC_LOW_MEM  (Pico 2 compiler)
 #   valgrind  no sanitizer, -O2 -g          (the normal build, with symbols)
 #
 # The resulting compiler is used with -B<tree> so it finds the tree's include/
@@ -31,7 +31,7 @@ SAN_CC=${SAN_CC:-$(command -v clang >/dev/null 2>&1 && echo clang || echo gcc)}
 case $VARIANT in
   asan)     CONF="--enable-asan --enable-ubsan" ; XCF="-O1 -g" ;;
   lowmem)   CONF="--enable-asan --enable-ubsan" ; XCF="-O1 -g -DCONFIG_TCC_LOW_MEM" ;;
-  o0only)   CONF="--enable-asan --enable-ubsan" ; XCF="-O1 -g -DCONFIG_TCC_O0_ONLY" ;;
+  o0only)   CONF="--enable-asan --enable-ubsan" ; XCF="-O1 -g -DCONFIG_TCC_O0_ONLY -DCONFIG_TCC_LOW_MEM" ;;
   valgrind) CONF="" ;                             XCF="-O2 -g" ; SAN_CC=gcc ;;
   *) echo "unknown variant: $VARIANT" >&2; exit 2 ;;
 esac

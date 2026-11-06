@@ -450,14 +450,11 @@ typedef struct Sym Sym;
 
 /* -------------------------------------------- */
 
-/* CONFIG_TCC_LOW_MEM: size the compiler's fixed tables and first arenas for
- * a part whose processes live in a few hundred KB of SRAM (the Pico 2, no
- * PSRAM).  Growable structures start small and grow in equal steps; fixed
- * ones are just smaller.  An O0-only compiler is built for exactly such a part,
- * so it implies this. */
-#if defined CONFIG_TCC_O0_ONLY && !defined CONFIG_TCC_LOW_MEM
-#define CONFIG_TCC_LOW_MEM 1
-#endif
+/* CONFIG_TCC_LOW_MEM (./configure --enable-low-mem): size the compiler's fixed
+ * tables and first arenas for a part whose processes live in a few hundred KB
+ * of SRAM (the Pico 2, no PSRAM).  Growable structures start small and grow in
+ * equal steps; fixed ones are just smaller.  CONFIG_TCC_O0_ONLY is separate: a
+ * board with PSRAM can want a small compiler without these limits. */
 
 #define INCLUDE_STACK_SIZE 32
 #define IFDEF_STACK_SIZE 64
@@ -856,12 +853,52 @@ typedef struct DeferredChunk
   int materialized; /* 1 if this chunk has been loaded */
 } DeferredChunk;
 
+/* A section kept in a file rather than in memory (see tccelf.c, "spilled
+ * sections"): one piece per input section folded into it, read where it lies
+ * and written, relocated, to a temporary file next to the output. */
+typedef struct SpillPiece
+{
+  unsigned long base, size; /* where it goes in the section */
+  unsigned char *data;      /* its bytes, if they were in memory */
+  DeferredChunk *chunks;    /* else where they are on disk */
+} SpillPiece;
+
+typedef struct SectionSpill
+{
+  SpillPiece *pieces; /* by base, which is the order they were added in */
+  int nb_pieces, alloc_pieces;
+  unsigned char *written;    /* per piece: its bytes are in the file */
+  unsigned long written_end; /* the file holds [0, written_end) */
+  int cur;                   /* the piece in buf, or -1 */
+  unsigned char *buf;
+  unsigned long buf_size;
+  int fd, src_fd;
+  const char *src_path;
+  char *path;
+} SectionSpill;
+
+/* Where one object's relocations for a function are, and how to read them
+ * (see tccelf.c, "relocations left on disk"). */
+typedef struct LazyRels
+{
+  struct LazyRels *next;
+  const char *path;    /* owned by s1->deferred_paths */
+  uint32_t file_offset;
+  uint32_t count;
+  uint32_t offset;     /* of that object's bytes in the section */
+  uint32_t nb_syms;
+  const int *remap;    /* the object's symbol -> symtab_section index, s1->reloc_remaps */
+} LazyRels;
+
 /* section definition */
 typedef struct Section
 {
   unsigned long data_offset;    /* current data offset */
-  unsigned char *data;          /* section data */
+  unsigned char *data;          /* section data: offsets [data_base, data_base + data_allocated) */
   unsigned long data_allocated; /* used for realloc() handling */
+  unsigned long data_base;      /* 0, except in a spilled section: its pieces are below */
+  struct SectionSpill *spill;   /* NULL, or where the bytes below data_base are */
+  LazyRels *lazy_rels;          /* relocations still in the object files, in load order */
   TCCState *s1;
   int sh_name;             /* elf section name (only used during output) */
   int sh_num;              /* elf section number */
@@ -873,33 +910,36 @@ typedef struct Section
   unsigned long sh_size;   /* section size (only used during output) */
   addr_t sh_addr;          /* address at which the section is relocated */
   unsigned long sh_offset; /* file offset */
-  int nb_hashed_syms;      /* used to resize the hash table */
   struct Section *link;    /* link to another section */
   struct Section *reloc;   /* corresponding section for relocation, if any */
   struct Section *hash;    /* hash table for symbols */
   struct Section *prev;    /* previous section on section stack */
-  /* Lazy loading support - use int instead of bit fields to avoid padding issues */
-  int lazy;                     /* 1 = section uses lazy loading */
-  int materialized;             /* 1 = data has been loaded (legacy) */
-  int has_deferred_chunks;      /* 1 = has chunks not yet materialized */
-  int fully_materialized;       /* 1 = all chunks materialized */
-  DeferredChunk *deferred_head; /* List of chunks to load */
-  DeferredChunk *deferred_tail; /* For O(1) append */
-  /* Relocation patches - stored as dynamic array for memory efficiency
-   * Each patch is 8 bytes (offset+value) vs 24 bytes with linked list */
-  uint32_t *reloc_patch_offsets; /* Array of patch offsets */
-  uint32_t *reloc_patch_values;  /* Array of patch values */
-  int nb_reloc_patches;          /* Number of patches */
-  int alloc_reloc_patches;       /* Allocated size of arrays */
-  /* String table deduplication - hash table for quick lookup */
-  uint32_t *str_hash; /* Hash table: hash -> offset in data */
-  int str_hash_size;  /* Size of hash table */
-  int str_hash_count; /* Number of entries in hash */
-  /* Hash value cache for fast find_elf_sym - avoids strcmp on mismatches */
-  unsigned int *hash_val_cache; /* full hash values indexed by sym_index */
-  int hash_val_alloc;           /* allocated size of cache */
-  char name[1];                 /* section name */
+  /* Lazy loading support */
+  unsigned char lazy;                /* 1 = section uses lazy loading */
+  unsigned char materialized;        /* 1 = data has been loaded (legacy) */
+  unsigned char has_deferred_chunks; /* 1 = has chunks not yet materialized */
+  DeferredChunk *deferred_head;      /* List of chunks to load */
+  DeferredChunk *deferred_tail;      /* For O(1) append */
+  struct SectionAux *aux;            /* what few sections need: section_aux() */
+  char name[1];                      /* section name */
 } Section;
+
+/* What only a few kinds of section need, out of the Section every function of
+ * a link has (a link holds thousands, see "relocations left on disk"). */
+typedef struct SectionAux
+{
+  /* A lazy debug section: relocation patches, 8 bytes each */
+  uint32_t *reloc_patch_offsets;
+  uint32_t *reloc_patch_values;
+  int nb_reloc_patches;
+  int alloc_reloc_patches;
+  /* A symbol table's hash section: full hash values by symbol, for find_elf_sym */
+  unsigned int *hash_val_cache;
+  int hash_val_alloc;
+  int nb_hashed_syms;
+} SectionAux;
+
+#define SECTION_NB_PATCHES(s) ((s)->aux ? (s)->aux->nb_reloc_patches : 0)
 
 /* -------------------------------------------------- */
 /* Garbage Collection During Loading (Phase 2) - Lazy Section Info */
@@ -1868,6 +1908,8 @@ struct TCCState
   /* Paths of files with deferred section chunks, shared by those chunks. */
   char **deferred_paths;
   int nb_deferred_paths;
+  int **reloc_remaps; /* per object with LazyRels: its symbol remap, until coalesce */
+  int nb_reloc_remaps;
   /* Cached archive symbol tables for --start-group rescan avoidance */
   ArchiveSymbolCache *archive_sym_caches;
   int nb_archive_sym_caches;
@@ -1882,6 +1924,7 @@ struct TCCState
   int nb_files;            /* number thereof */
   int nb_libraries;        /* number of libs thereof */
   char *outfile;           /* output filename */
+  char *spill_path;        /* during a link: where a spilled .text goes, see tccelf.c */
   char *deps_outfile;      /* option -MF */
   int argc;
   char **argv;
@@ -2007,8 +2050,8 @@ struct TCCState
 };
 
 /* Reads of the optimization level and the -f<opt> flags.  A compiler built
- * with CONFIG_TCC_O0_ONLY (the native tcc for a part with no PSRAM, where only
- * -O0 fits in memory anyway) sees them all as constant 0: every pass gated on
+ * with CONFIG_TCC_O0_ONLY (./configure --disable-optimizer: a native tcc where
+ * its own size matters more than optimizing) sees them all as constant 0: every pass gated on
  * them folds out of its build and --gc-sections drops the optimizer.  -O0
  * output is unchanged, since every one of them is 0 at -O0 already. */
 #ifdef CONFIG_TCC_O0_ONLY
@@ -2879,6 +2922,15 @@ ST_FUNC void section_materialize(TCCState *s1, Section *sec);
 ST_FUNC int deferred_chunks_read(TCCState *s1, DeferredChunk **chunks, unsigned char *dest, int *fd, const char **fd_path);
 ST_FUNC void section_reserve_exact(Section *sec, unsigned long size);
 ST_FUNC void section_release(Section *sec);
+ST_FUNC unsigned char *section_spill_ptr(TCCState *s1, Section *s, unsigned long off);
+ST_FUNC int section_spill_flush(TCCState *s1, Section *s);
+ST_FUNC int section_spill_write(TCCState *s1, Section *s, FILE *f, unsigned long size);
+ST_FUNC void section_spill_free(Section *s);
+ST_FUNC SectionAux *section_aux(Section *s);
+ST_FUNC const char *deferred_path(TCCState *s1, const char *path);
+ST_FUNC ElfW_Rel *lazy_rels_read(TCCState *s1, Section *s, int *count);
+ST_FUNC int lazy_rels_count(Section *s);
+ST_FUNC void lazy_rels_free(Section *s);
 ST_FUNC void *link_arena_alloc(TCCState *s1, unsigned long size);
 ST_FUNC int link_arena_owns(const TCCState *s1, const void *p);
 ST_FUNC char **tcc_name_list_read(TCCState *s1, const char *path, const char *option, int *count);
