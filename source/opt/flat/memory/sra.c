@@ -93,49 +93,134 @@ static int sra_partial_only(int lo)
  * than the slot access it replaced; such objects then keep their memory. */
 TCC_DBG_ENV_INT(sra_var_budget, "TCC_SRA_VAR_BUDGET", 2000)
 
+/* The per-byte tables of one unit (offsets from its lo), allocated when the
+ * pass first touches them: a function lists every frame object it ever had,
+ * and most are named by no instruction -- 3,158 of the 3,988 in the largest
+ * function of Zig's kernel.c, whose units were 4.9 MB at 1.2 KB each. */
+/* Per-byte tables of a unit, one entry per byte of its extent (sra_n): most
+ * units are a zig_u128 or a slice, and 64 entries each held 1.1 KB for 16
+ * bytes of object.  Entries past the extent would stay at their initial
+ * value -- every access is checked against hi - lo -- so loops stop there. */
+typedef struct SraBytes
+{
+  int32_t *var;
+  uint16_t *nvst1; /* per offset: byte stores of a non-constant */
+  uint16_t *nvst2; /* per offset: halfword stores of a non-constant */
+  uint8_t *width;  /* per field start: bytes accessed, 0 = none */
+  uint8_t *sign;   /* per narrow field: 1 signed, 2 unsigned */
+  uint8_t *has64;  /* a 64-bit access starts here */
+  uint8_t *split;  /* a 64-bit field kept as two word VARs */
+  uint8_t *acc;    /* per offset: widths loaded (bits 0-2), stored (bits 3-5) */
+  uint8_t *sgn;    /* per offset: narrow accesses signed (1) / unsigned (2), bytes then halves */
+  uint8_t *nofit;  /* per offset: widths of narrow stores whose value may not fit the width */
+  uint8_t *stvar;  /* per offset: widths of narrow stores of a non-constant */
+  uint8_t *pmask;  /* per field start: a narrow field stored in part -- its VAR's upper
+                    * bits are not zero, so a read of the whole field masks them */
+  uint8_t *fstart; /* per byte: the start of the field holding it, 0xFF none (sra_index_fields) */
+  /* Bytes no member of its type covers (tcc_ir_frame_padding): here, not in
+   * every unit, as only units with tables read it. */
+  uint64_t pad;
+  uint64_t word_cmp; /* Word comparisons require an exact, unmasked field (set beside sra_note_field). */
+} SraBytes;
+
+static TCCIRState *sra_ir; /* the function sra_objects is working on: sra_bytes reads its frame types */
+
 typedef struct
 {
-  int lo, hi;  /* the object's extent, from tcc_ir_frame_object_at */
-  int refs;    /* every operand a live instruction names it with */
-  int ok_refs; /* those a field VAR can replace */
-  int bad;     /* two accesses overlap, or one byte offset is read two ways */
-  uint8_t width[SRA_MAX_BYTES]; /* per field start: bytes accessed, 0 = none */
-  uint8_t sign[SRA_MAX_BYTES];  /* per narrow field: 1 signed, 2 unsigned */
-  uint8_t has64[SRA_MAX_BYTES]; /* a 64-bit access starts here */
-  uint8_t split[SRA_MAX_BYTES]; /* a 64-bit field kept as two word VARs */
-  int32_t var[SRA_MAX_BYTES];
-  int param_words; /* words of it a call receives by value (sra_struct_param_words) */
-  int field_refs;  /* accesses of single fields */
-  uint8_t whole_w; /* a call writes a range of it whole (SraWhole) */
-  uint8_t whole_r; /* a call reads a range of it whole */
-  const char *why; /* TCC_SRA_DBG: the first reason the unit keeps its memory */
-  int why_op;
-  int why_at; /* TCC_SRA_DBG: that reference's instruction, or -1 */
-  uint8_t acc[SRA_MAX_BYTES]; /* per offset: widths loaded (bits 0-2), stored (bits 3-5) */
-  uint8_t sgn[SRA_MAX_BYTES]; /* per offset: narrow accesses signed (1) / unsigned (2), bytes then halves */
-  uint8_t nofit[SRA_MAX_BYTES];  /* per offset: widths of narrow stores whose value may not fit the width */
-  uint8_t stvar[SRA_MAX_BYTES];  /* per offset: widths of narrow stores of a non-constant */
-  uint8_t partial;               /* some access is a part of a wider field */
-  uint8_t pmask[SRA_MAX_BYTES];  /* per field start: a narrow field stored in part -- its VAR's upper
-                                  * bits are not zero, so a read of the whole field masks them */
-  uint16_t nvst1[SRA_MAX_BYTES]; /* per offset: byte stores of a non-constant */
-  uint16_t nvst2[SRA_MAX_BYTES]; /* per offset: halfword stores of a non-constant */
+  SraBytes *b;                   /* per-byte tables, NULL until first used (sra_bytes) */
+  int lo, hi;                    /* the object's extent, from tcc_ir_frame_object_at */
+  int refs;                      /* every operand a live instruction names it with */
+  int ok_refs;                   /* those a field VAR can replace */
+  int param_words;               /* words of it a call receives by value (sra_struct_param_words) */
+  int field_refs;                /* accesses of single fields */
   int nloads;                    /* field loads */
   int npart;                     /* partial stores of a non-constant (each a read-modify-write) */
-  uint8_t fstart[SRA_MAX_BYTES]; /* per byte: the start of the field holding it, 0xFF none (sra_index_fields) */
-  uint64_t word_cmp;             /* Word comparisons require an exact, unmasked field. */
-  uint64_t pad;                  /* bytes no member of its type covers (tcc_ir_frame_padding) */
+  uint8_t bad;                   /* two accesses overlap, or one byte offset is read two ways */
+  uint8_t whole_w;               /* a call writes a range of it whole (SraWhole) */
+  uint8_t whole_r;               /* a call reads a range of it whole */
+  uint8_t partial;               /* some access is a part of a wider field */
 } SraUnit;
+
+/* U's per-byte tables, zeroed (no field VARs yet) on first use. */
+static int sra_n(const SraUnit *u)
+{
+  int n = u->hi - u->lo;
+  return n < 0 ? 0 : n > SRA_MAX_BYTES ? SRA_MAX_BYTES : n;
+}
+
+static SraBytes *sra_bytes(const SraUnit *u)
+{
+  SraUnit *m = (SraUnit *)u;
+  if (!m->b)
+  {
+    const int n = sra_n(u);
+    /* var comes with the first field VAR (sra_var): the analysis, where SRA
+     * peaks, never reads it, and most units get none. */
+    SraBytes *t = tcc_mallocz(sizeof(SraBytes) + n * (2 * sizeof(uint16_t) + 10) + 1);
+    uint8_t *p = (uint8_t *)(t + 1);
+    t->nvst1 = (uint16_t *)p, p += n * sizeof(uint16_t);
+    t->nvst2 = (uint16_t *)p, p += n * sizeof(uint16_t);
+    uint8_t **col[] = {&t->width, &t->sign, &t->has64, &t->split, &t->acc,
+                       &t->sgn,   &t->nofit, &t->stvar, &t->pmask, &t->fstart};
+    for (int c = 0; c < 10; c++)
+      *col[c] = p, p += n;
+    t->pad = sra_pad_off() ? 0 : tcc_ir_frame_padding(sra_ir, u->lo, u->hi);
+    m->b = t;
+  }
+  return m->b;
+}
+#define SB(u) sra_bytes(u)
+
+/* U's field VAR per byte offset, -1 for none yet. */
+static int32_t *sra_var(const SraUnit *u)
+{
+  SraBytes *t = sra_bytes(u);
+  if (!t->var)
+  {
+    const int n = sra_n(u);
+    t->var = tcc_malloc(sizeof(int32_t) * (n > 0 ? n : 1));
+    for (int b = 0; b < n; b++)
+      t->var[b] = -1;
+  }
+  return t->var;
+}
+
+static void sra_bytes_free(SraUnit *u)
+{
+  if (u->b)
+    tcc_free(u->b->var);
+  tcc_free(u->b);
+  u->b = NULL;
+}
+
+/* No instruction names U and nothing recorded a use of it: its tables would
+ * be all zero, so every check passes and it gets no field -- the analysis
+ * skips it rather than allocating them. */
+static int sra_untouched(const SraUnit *u)
+{
+  return !u->b && !u->refs && !u->whole_w && !u->whole_r && !u->param_words; /* word_cmp is in b */
+}
 
 /* TCC_SRA_DBG: one line per frame object SRA leaves in memory, with the first
  * reference that kept it there. */
 TCC_DBG_ENV_FLAG(sra_dbg, "TCC_SRA_DBG")
 
 static int sra_dbg_at = -1;
+/* The first reason each unit keeps its memory, its opcode and instruction (or
+ * -1): only under TCC_SRA_DBG, beside the units, so a unit is 16 bytes less
+ * (4K of them in the largest function of a Zig kernel compile). */
+typedef struct
+{
+  const char *why;
+  int op, at;
+} SraWhy;
+static SraWhy *sra_whys;
+static const SraUnit *sra_whys_base;
 static void sra_why(SraUnit *u, const char *why, int op)
 {
-  if (!u->why)
-    u->why = why, u->why_op = op, u->why_at = sra_dbg_at;
+  SraWhy *w = sra_whys ? &sra_whys[u - sra_whys_base] : NULL;
+  if (w && !w->why)
+    w->why = why, w->op = op, w->at = sra_dbg_at;
 }
 
 /* Why operand `o` in slot s of an instruction with opcode `op` is no field. */
@@ -179,7 +264,7 @@ static int sra_type_has_float(CType *t, int depth)
   if ((t->t & VT_ARRAY) && t->ref)
     return sra_type_has_float(&t->ref->type, depth + 1);
   if (bt == VT_STRUCT && t->ref)
-    for (Sym *f = t->ref->next; f; f = f->next)
+    for (Sym *f = sym_first(t->ref); f; f = f->next)
       if (sra_type_has_float(&f->type, depth + 1))
         return 1;
   return 0;
@@ -240,9 +325,9 @@ static void sra_note_field(SraUnit *u, int off, int bytes, int is_unsigned, int 
     sra_why(u, at + bytes > SRA_MAX_BYTES ? "too-big" : "misaligned", 0);
     return;
   }
-  u->acc[at] |= bytes << (is_store ? 3 : 0);
+  SB(u)->acc[at] |= bytes << (is_store ? 3 : 0);
   if (bytes < 4)
-    u->sgn[at] |= (is_unsigned ? 2 : 1) << (bytes == 1 ? 0 : 2);
+    SB(u)->sgn[at] |= (is_unsigned ? 2 : 1) << (bytes == 1 ? 0 : 2);
   if (!is_store)
     u->nloads++;
 }
@@ -278,7 +363,7 @@ static int sra_padded_widths(const SraUnit *u, int at, int w, int b)
   {
     int ok = b + sw <= at + 4;
     for (int x = at; ok && x < at + 4; x++)
-      if ((x < b || x >= b + sw) && !((u->pad >> x) & 1))
+      if ((x < b || x >= b + sw) && !((SB(u)->pad >> x) & 1))
         ok = 0;
     if (ok)
       ws |= sw;
@@ -289,9 +374,10 @@ static int sra_padded_widths(const SraUnit *u, int at, int w, int b)
 static void sra_resolve_fields(SraUnit *u, int whole)
 {
   uint8_t inner[SRA_MAX_BYTES] = {0}; /* bytes inside a field, accessed in part */
-  for (int at = 0; at < SRA_MAX_BYTES && !u->bad; at++)
+  const int n = sra_n(u);
+  for (int at = 0; at < n && !u->bad; at++)
   {
-    int ld = u->acc[at] & 7, st = u->acc[at] >> 3, all = ld | st;
+    int ld = SB(u)->acc[at] & 7, st = SB(u)->acc[at] >> 3, all = ld | st;
     if (!all || inner[at])
       continue;
     int W = all & 4 ? 4 : all & 2 ? 2 : 1;
@@ -308,8 +394,8 @@ static void sra_resolve_fields(SraUnit *u, int whole)
         ok = !(ld & (st - 1)) && !whole;
         for (int b = at + 1; ok && b < at + top; b++)
         {
-          int fb = u->acc[b] >> 3;
-          ok = !u->has64[b] && (!u->acc[b] || (fb && !(fb & (fb - 1)) && !(u->acc[b] & 7 & ~fb) &&
+          int fb = SB(u)->acc[b] >> 3;
+          ok = !SB(u)->has64[b] && (!SB(u)->acc[b] || (fb && !(fb & (fb - 1)) && !(SB(u)->acc[b] & 7 & ~fb) &&
                                                b + fb <= at + top && !sra_combine_off()));
         }
         combine = ok;
@@ -323,10 +409,10 @@ static void sra_resolve_fields(SraUnit *u, int whole)
       }
     }
     if (!combine)
-      for (int b = at + 1; b < at + w && b < SRA_MAX_BYTES; b++)
+      for (int b = at + 1; b < at + w && b < n; b++)
       {
-        int a = u->acc[b], mw = a & 0x24 ? 4 : a & 0x12 ? 2 : a ? 1 : 0;
-        if (u->has64[b] || b + mw > at + w)
+        int a = SB(u)->acc[b], mw = a & 0x24 ? 4 : a & 0x12 ? 2 : a ? 1 : 0;
+        if (SB(u)->has64[b] || b + mw > at + w)
         {
           u->bad = 1;
           sra_why(u, "overlap", 0);
@@ -341,14 +427,14 @@ static void sra_resolve_fields(SraUnit *u, int whole)
       if (w < 4)
       {
         int pst = st & (w - 1);
-        for (int b = at + 1; b < at + w && b < SRA_MAX_BYTES; b++)
-          pst |= u->acc[b] >> 3;
-        u->pmask[at] = pst != 0;
+        for (int b = at + 1; b < at + w && b < n; b++)
+          pst |= SB(u)->acc[b] >> 3;
+        SB(u)->pmask[at] = pst != 0;
       }
-      for (int b = at; b < at + w && b < SRA_MAX_BYTES; b++)
+      for (int b = at; b < at + w && b < n; b++)
       {
         const int pw = sra_pad_off() ? 0 : sra_padded_widths(u, at, w, b);
-        u->npart += ((b == at && w == 1) || (pw & 1) ? 0 : u->nvst1[b]) + ((b == at && w == 2) || (pw & 2) ? 0 : u->nvst2[b]);
+        u->npart += ((b == at && w == 1) || (pw & 1) ? 0 : SB(u)->nvst1[b]) + ((b == at && w == 2) || (pw & 2) ? 0 : SB(u)->nvst2[b]);
       }
       /* Worth it when a call copies the object whole (the copy's loads and
        * stores go), or when the partial stores are constants (they fold into
@@ -356,8 +442,8 @@ static void sra_resolve_fields(SraUnit *u, int whole)
        * narrow store cost the same, and its object's reads were already one
        * instruction each. */
       int stores_var = 0;
-      for (int b = at; b < at + w && b < SRA_MAX_BYTES; b++)
-        stores_var |= u->stvar[b] & (b == at ? (uint8_t)~w : 0xFF) &
+      for (int b = at; b < at + w && b < n; b++)
+        stores_var |= SB(u)->stvar[b] & (b == at ? (uint8_t)~w : 0xFF) &
                       (uint8_t)~(sra_pad_off() ? 0 : sra_padded_widths(u, at, w, b));
       if (sra_partial_off() || !sra_partial_only(u->lo) || (sra_partial_gate() == 1 && !whole) ||
           (sra_partial_gate() == 2 && !whole && stores_var))
@@ -367,20 +453,20 @@ static void sra_resolve_fields(SraUnit *u, int whole)
         return;
       }
     }
-    u->width[at] = w;
+    SB(u)->width[at] = w;
     if (w < 4)
     {
-      int sg = (u->sgn[at] >> (w == 1 ? 0 : 2)) & 3;
+      int sg = (SB(u)->sgn[at] >> (w == 1 ? 0 : 2)) & 3;
       if (sg == 3)
       {
         u->bad = 1;
         sra_why(u, "narrow-sign-mix", 0);
         return;
       }
-      u->sign[at] = sg;
+      SB(u)->sign[at] = sg;
       /* A narrow field's own-width store is its definition and must fit
        * (sra_store_as_def); a partial one is masked. */
-      if (u->nofit[at] & w)
+      if (SB(u)->nofit[at] & w)
       {
         u->bad = 1;
         sra_why(u, "narrow-store", 0);
@@ -408,10 +494,11 @@ static void sra_partial_cost(SraUnit *u, int whole)
 /* fstart: for every byte a field covers, the field's start. */
 static void sra_index_fields(SraUnit *u)
 {
-  memset(u->fstart, 0xFF, sizeof u->fstart);
-  for (int at = 0; at < SRA_MAX_BYTES; at++)
-    for (int b = at; u->width[at] && b < at + u->width[at] && b < SRA_MAX_BYTES; b++)
-      u->fstart[b] = (uint8_t)at;
+  const int n = sra_n(u);
+  memset(SB(u)->fstart, 0xFF, n);
+  for (int at = 0; at < n; at++)
+    for (int b = at; SB(u)->width[at] && b < at + SB(u)->width[at] && b < n; b++)
+      SB(u)->fstart[b] = (uint8_t)at;
 }
 
 /* A 64-bit access at `off`: an 8-byte aligned doubleword of the unit.  Whether
@@ -427,7 +514,7 @@ static void sra_note_wide(SraUnit *u, int off)
     sra_why(u, at + 8 > SRA_MAX_BYTES ? "too-big" : "misaligned", 0);
     return;
   }
-  u->has64[at] = 1;
+  SB(u)->has64[at] = 1;
 }
 
 /* Lay out the doublewords.  One touched only 64 bits at a time is a 64-bit
@@ -438,18 +525,18 @@ static void sra_note_wide(SraUnit *u, int off)
  * access inside a doubleword keeps the object in memory. */
 static void sra_resolve_wide(SraUnit *u)
 {
-  for (int at = 0; at + 8 <= SRA_MAX_BYTES; at += 8)
+  for (int at = 0, n = sra_n(u); at + 8 <= n; at += 8)
   {
-    if (!u->has64[at])
+    if (!SB(u)->has64[at])
       continue;
     for (int b = 1; b < 8; b++)
-      if (b != 4 && u->width[at + b])
+      if (b != 4 && SB(u)->width[at + b])
       {
         u->bad = 1;
         sra_why(u, "wide-overlap", 0);
         return;
       }
-    int w0 = u->width[at], w1 = u->width[at + 4];
+    int w0 = SB(u)->width[at], w1 = SB(u)->width[at + 4];
     if ((w0 && w0 != 4) || (w1 && w1 != 4))
     {
       u->bad = 1;
@@ -457,11 +544,11 @@ static void sra_resolve_wide(SraUnit *u)
       return;
     }
     if (!w0 && !w1)
-      u->width[at] = 8;
+      SB(u)->width[at] = 8;
     else
     {
-      u->width[at] = u->width[at + 4] = 4;
-      u->split[at] = 1;
+      SB(u)->width[at] = SB(u)->width[at + 4] = 4;
+      SB(u)->split[at] = 1;
     }
   }
 }
@@ -491,8 +578,8 @@ static void sra_resolve_wide(SraUnit *u)
  * register copy does not do, so those keep their memory too. */
 static int sra_narrow_fields_unsigned(const SraUnit *u)
 {
-  for (int at = 0; at < SRA_MAX_BYTES; at++)
-    if (u->width[at] && u->width[at] < 4 && u->sign[at] != 2)
+  for (int at = 0, n = sra_n(u); at < n; at++)
+    if (SB(u)->width[at] && SB(u)->width[at] < 4 && SB(u)->sign[at] != 2)
       return 0;
   return 1;
 }
@@ -592,13 +679,13 @@ static void sra_store_as_def(TCCIRState *ir, int i, IROperand rep, int mask_byte
 static int sra_fields_disjoint(const SraUnit *u)
 {
   int end = 0;
-  for (int at = 0; at < SRA_MAX_BYTES; at++)
+  for (int at = 0, n = sra_n(u); at < n; at++)
   {
-    if (!u->width[at])
+    if (!SB(u)->width[at])
       continue;
     if (at < end)
       return 0;
-    end = at + u->width[at];
+    end = at + SB(u)->width[at];
   }
   return 1;
 }
@@ -843,7 +930,7 @@ static void sra_partial_load(TCCIRState *ir, SraInsList *ins, int i, SraUnit *u,
 {
   IROperand v = sra_field_op(ir, u, fs, IROP_BTYPE_INT32, 1);
   IRQuadCompact *q = &ir->compact_instructions[i];
-  const int W = u->width[fs];
+  const int W = SB(u)->width[fs];
   if (is_unsigned)
   {
     if (d == 0)
@@ -878,10 +965,10 @@ static void sra_partial_load(TCCIRState *ir, SraInsList *ins, int i, SraUnit *u,
  * only: a narrow field's VAR is read zero-extended (sra_combine). */
 static int sra_partial_store_padded(TCCIRState *ir, int i, SraUnit *u, int fs, int d, int bytes, IROperand val)
 {
-  if (u->width[fs] != 4 || fs + 4 > 64)
+  if (SB(u)->width[fs] != 4 || fs + 4 > 64)
     return 0;
   for (int b = fs; b < fs + 4; b++)
-    if ((b < fs + d || b >= fs + d + bytes) && !((u->pad >> b) & 1))
+    if ((b < fs + d || b >= fs + d + bytes) && !((SB(u)->pad >> b) & 1))
       return 0;
   IROperand def = sra_field_op(ir, u, fs, IROP_BTYPE_INT32, 1);
   def.is_lval = 0;
@@ -1037,10 +1124,10 @@ static void sra_ins_apply(TCCIRState *ir, SraInsList *l)
 /* The field VAR at byte `at` of unit u, as an operand of type `bt`. */
 static IROperand sra_field_op(TCCIRState *ir, SraUnit *u, int at, int bt, int is_unsigned)
 {
-  if (u->var[at] < 0)
-    u->var[at] = tcc_ir_vreg_alloc_var(ir);
-  IRLiveInterval *iv = tcc_ir_get_live_interval(ir, u->var[at]);
-  IROperand rep = irop_make_stackoff(u->var[at], iv ? iv->original_offset : 0, 1, 0, bt);
+  if (sra_var(u)[at] < 0)
+    sra_var(u)[at] = tcc_ir_vreg_alloc_var(ir);
+  IRLiveInterval *iv = tcc_ir_get_live_interval(ir, sra_var(u)[at]);
+  IROperand rep = irop_make_stackoff(sra_var(u)[at], iv ? iv->original_offset : 0, 1, 0, bt);
   rep.is_unsigned = is_unsigned;
   rep.aux = IROP_AUX_NONVOLATILE;
   return rep;
@@ -1062,7 +1149,7 @@ static IROperand sra_field_op(TCCIRState *ir, SraUnit *u, int at, int bt, int is
 static void sra_rewrite_wide(TCCIRState *ir, SraInsList *ins, int i, int s, IROperand o, SraUnit *u, int at)
 {
   IRQuadCompact *q = &ir->compact_instructions[i];
-  if (u->width[at] == 8)
+  if (SB(u)->width[at] == 8)
   {
     IROperand rep = sra_field_op(ir, u, at, IROP_BTYPE_INT64, o.is_unsigned);
     if (s == 0)
@@ -1377,8 +1464,9 @@ static int sra_whole_use(TCCIRState *ir, int i, const int32_t *call_at, const in
 static void sra_fill_gaps(SraUnit *u, int at0, int n)
 {
   uint8_t cov[SRA_MAX_BYTES] = {0};
-  for (int at = 0; at < SRA_MAX_BYTES; at++)
-    for (int b = at; b < at + u->width[at] && b < SRA_MAX_BYTES; b++)
+  const int nb = sra_n(u);
+  for (int at = 0; at < nb; at++)
+    for (int b = at; b < at + SB(u)->width[at] && b < nb; b++)
       cov[b] = 1;
   for (int b = at0; b < at0 + n;)
   {
@@ -1392,9 +1480,9 @@ static void sra_fill_gaps(SraUnit *u, int at0, int n)
       w = 4;
     else if (!(b & 1) && b + 2 <= at0 + n && !cov[b + 1])
       w = 2;
-    u->width[b] = w;
+    SB(u)->width[b] = w;
     if (w < 4)
-      u->sign[b] = 2;
+      SB(u)->sign[b] = 2;
     for (int k = b; k < b + w; k++)
       cov[k] = 1;
     b += w;
@@ -1404,10 +1492,10 @@ static void sra_fill_gaps(SraUnit *u, int at0, int n)
 /* No field of u crosses an end of [at0, at0 + n). */
 static int sra_range_clean(const SraUnit *u, int at0, int n)
 {
-  for (int at = 0; at < SRA_MAX_BYTES; at++)
+  for (int at = 0, nb = sra_n(u); at < nb; at++)
   {
-    int end = at + u->width[at];
-    if (u->width[at] && ((at < at0 && end > at0) || (at < at0 + n && end > at0 + n)))
+    int end = at + SB(u)->width[at];
+    if (SB(u)->width[at] && ((at < at0 && end > at0) || (at < at0 + n && end > at0 + n)))
       return 0;
   }
   return 1;
@@ -1446,21 +1534,21 @@ static IROperand sra_combine(TCCIRState *ir, SraInsList *ins, int i, SraUnit *u,
                              int is_unsigned)
 {
   IROperand v = sra_field_op(ir, u, at, IROP_BTYPE_INT32, 1);
-  if (u->pmask[at])
+  if (SB(u)->pmask[at])
   {
     IROperand m = sra_new_temp(ir, IROP_BTYPE_INT32);
-    sra_ins_add(ir, ins, i, 0, TCCIR_OP_AND, m, v, irop_make_imm32(-1, sra_field_mask(u->width[at]), IROP_BTYPE_INT32));
+    sra_ins_add(ir, ins, i, 0, TCCIR_OP_AND, m, v, irop_make_imm32(-1, sra_field_mask(SB(u)->width[at]), IROP_BTYPE_INT32));
     v = m;
   }
-  for (int b = at + 1; b < at + bytes && b < SRA_MAX_BYTES; b++)
+  for (int b = at + 1; b < at + bytes && b < sra_n(u); b++)
   {
-    if (!u->width[b])
+    if (!SB(u)->width[b])
       continue;
     IROperand f = sra_field_op(ir, u, b, IROP_BTYPE_INT32, 1);
-    if (u->pmask[b])
+    if (SB(u)->pmask[b])
     {
       IROperand m = sra_new_temp(ir, IROP_BTYPE_INT32);
-      sra_ins_add(ir, ins, i, 0, TCCIR_OP_AND, m, f, irop_make_imm32(-1, sra_field_mask(u->width[b]), IROP_BTYPE_INT32));
+      sra_ins_add(ir, ins, i, 0, TCCIR_OP_AND, m, f, irop_make_imm32(-1, sra_field_mask(SB(u)->width[b]), IROP_BTYPE_INT32));
       f = m;
     }
     IROperand t = sra_new_temp(ir, IROP_BTYPE_INT32), o = sra_new_temp(ir, IROP_BTYPE_INT32);
@@ -1483,8 +1571,8 @@ static IROperand sra_combine(TCCIRState *ir, SraInsList *ins, int i, SraUnit *u,
 /* Does a `bytes`-wide read at `at` of u cover a field past the one there? */
 static int sra_covers_more(const SraUnit *u, int at, int bytes)
 {
-  for (int b = at + 1; b < at + bytes && b < SRA_MAX_BYTES; b++)
-    if (u->width[b])
+  for (int b = at + 1; b < at + bytes && b < sra_n(u); b++)
+    if (SB(u)->width[b])
       return 1;
   return 0;
 }
@@ -1498,13 +1586,13 @@ static void sra_expand_pair(TCCIRState *ir, SraInsList *ins, SraUnit *dst, int d
 {
   for (int d = 0; d < n; d++)
   {
-    const int w = dst->width[d0 + d];
+    const int w = SB(dst)->width[d0 + d];
     if (!w)
       continue;
     const int bt = w == 8 ? IROP_BTYPE_INT64 : IROP_BTYPE_INT32;
     IROperand x = sra_new_temp(ir, bt);
     sra_ins_add(ir, ins, anchor, 0, TCCIR_OP_LOAD, x, sra_field_op(ir, src, s0 + d, bt, 1), IROP_NONE);
-    if (w < 4 && src->pmask[s0 + d])
+    if (w < 4 && SB(src)->pmask[s0 + d])
     {
       IROperand m = sra_new_temp(ir, bt);
       sra_ins_add(ir, ins, anchor, 0, TCCIR_OP_AND, m, x, irop_make_imm32(-1, sra_field_mask(w), IROP_BTYPE_INT32));
@@ -1526,7 +1614,7 @@ static void sra_expand_whole(TCCIRState *ir, SraInsList *ins, SraUnit *u, const 
   const int a0 = e->off - u->lo, anchor = e->call, after = e->sret;
   for (int at = a0; at < a0 + e->n; at++)
   {
-    const int w = u->width[at];
+    const int w = SB(u)->width[at];
     if (!w)
       continue;
     const int d = at - a0;
@@ -1808,6 +1896,29 @@ static int sra_forward_const_vars(TCCIRState *ir, int first_sra_var)
   return changes;
 }
 
+/* A VAR definition holding a frame address (sra_objects). */
+typedef struct
+{
+  int32_t i, addr, root;
+} SraVdef;
+
+/* The one at instruction I in the sorted V[0..N), or NULL. */
+static const SraVdef *sra_vdef(const SraVdef *v, int n, int i)
+{
+  int lo = 0, hi = n - 1;
+  while (lo <= hi)
+  {
+    const int mid = (lo + hi) >> 1;
+    if (v[mid].i < i)
+      lo = mid + 1;
+    else if (v[mid].i > i)
+      hi = mid - 1;
+    else
+      return &v[mid];
+  }
+  return NULL;
+}
+
 static int sra_objects(TCCIRState *ir)
 {
   if (ir->frame_relaid || ir->frame_obj_count == 0)
@@ -1820,13 +1931,14 @@ static int sra_objects(TCCIRState *ir)
   if (nu <= 0)
     return 0;
   SraUnit *u = tcc_mallocz(sizeof(SraUnit) * nu);
+  sra_ir = ir;
+  tcc_free(sra_whys);
+  sra_whys = sra_dbg() ? tcc_mallocz(sizeof(SraWhy) * nu) : NULL;
+  sra_whys_base = u;
   for (int k = 0; k < nu; k++)
   {
     u[k].lo = ir->frame_index[2 * k];
     u[k].hi = ir->frame_index[2 * k + 1];
-    u[k].pad = sra_pad_off() ? 0 : tcc_ir_frame_padding(ir, u[k].lo, u[k].hi);
-    for (int b = 0; b < SRA_MAX_BYTES; b++)
-      u[k].var[b] = -1;
   }
   const int n = ir->next_instruction_index;
   /* A split doubleword's rewrite adds instructions; a computed goto's targets
@@ -1857,8 +1969,9 @@ static int sra_objects(TCCIRState *ir)
   int32_t *tfrom = ntemp > 0 ? tcc_malloc(sizeof(int32_t) * ntemp) : NULL; /* TEMP it was derived from, or -1 */
   int32_t *troot = ntemp > 0 ? tcc_malloc(sizeof(int32_t) * ntemp) : NULL; /* unit of the root Addr */
   uint8_t *tbad = ntemp > 0 ? tcc_mallocz(ntemp) : NULL;
-  int16_t *tbad_op = ntemp > 0 ? tcc_mallocz(sizeof(int16_t) * ntemp) : NULL;
-  int32_t *tbad_at = ntemp > 0 ? tcc_mallocz(sizeof(int32_t) * ntemp) : NULL;
+  /* TCC_SRA_DBG only: what first made each TEMP bad, and where. */
+  int16_t *tbad_op = ntemp > 0 && sra_dbg() ? tcc_mallocz(sizeof(int16_t) * ntemp) : NULL;
+  int32_t *tbad_at = ntemp > 0 && sra_dbg() ? tcc_mallocz(sizeof(int32_t) * ntemp) : NULL;
   for (int t = 0; t < ntemp; t++)
     toff[t] = SRA_NO_ADDR, tfrom[t] = -1, troot[t] = -1;
   for (int i = 0; i < n && ntemp > 0; i++)
@@ -1941,19 +2054,20 @@ static int sra_objects(TCCIRState *ir)
   uint8_t *vmay = nvar ? tcc_mallocz(nvar) : NULL; /* can hold a frame address at all */
   /* 1 read with no known value, 2 an address read other than as one, 3 address-taken or volatile */
   uint8_t *vbad = nvar ? tcc_mallocz(nvar) : NULL;
-  int16_t *vbad_op = nvar ? tcc_mallocz(sizeof(int16_t) * nvar) : NULL;
-  int32_t *vbad_at = nvar ? tcc_mallocz(sizeof(int32_t) * nvar) : NULL; /* TCC_SRA_DBG: that read's instruction */
+  int16_t *vbad_op = nvar && sra_dbg() ? tcc_mallocz(sizeof(int16_t) * nvar) : NULL; /* TCC_SRA_DBG: that read's */
+  int32_t *vbad_at = nvar && sra_dbg() ? tcc_mallocz(sizeof(int32_t) * nvar) : NULL; /* opcode and instruction */
   int32_t *vcur = nvar ? tcc_malloc(sizeof(int32_t) * nvar) : NULL;
   int32_t *vcurroot = nvar ? tcc_malloc(sizeof(int32_t) * nvar) : NULL;
   int *vcurgen = nvar ? tcc_mallocz(sizeof(int) * nvar) : NULL;
-  int32_t *vdef = nvar && n ? tcc_malloc(sizeof(int32_t) * n) : NULL; /* per instruction: the address a VAR def holds */
-  int32_t *vdefroot = nvar && n ? tcc_malloc(sizeof(int32_t) * n) : NULL;
+  /* The VAR definitions that hold an address: their instruction, the address
+   * and its unit, in instruction order (sra_vdef finds one) -- a few among a
+   * function's instructions, which an array apiece had room for. */
+  SraVdef *vdefs = NULL;
+  int nvdef = 0;
   if (nvar)
   {
     for (int v = 0; v < nvar; v++)
       vglob[v] = SRA_NO_ADDR;
-    for (int i = 0; i < n; i++)
-      vdef[i] = SRA_NO_ADDR, vdefroot[i] = -1;
     /* vmay: a definition from a frame address, or a copy (or offset) of a
      * VAR or TEMP that can hold one.  TEMPs take part: `T <- V0; V3 <- T + 4`
      * passes V0's address to V3 through a TEMP whose own address is only
@@ -2211,15 +2325,19 @@ static int sra_objects(TCCIRState *ir)
         if (!vbad[v])
         {
           vbad[v] = st == SRA_UNKNOWN ? 1 : 2;
-          vbad_op[v] = (int16_t)q->op;
-          vbad_at[v] = i;
+          if (vbad_op)
+            vbad_op[v] = (int16_t)q->op, vbad_at[v] = i;
         }
       }
       if (vd >= 0)
       {
         vcur[vd] = val, vcurroot[vd] = root, vcurgen[vd] = gen;
         if (val >= SRA_FIRST_ADDR)
-          vdef[i] = val, vdefroot[i] = root;
+        {
+          if (!(nvdef & (nvdef - 1)))
+            vdefs = tcc_realloc(vdefs, sizeof(*vdefs) * (nvdef ? 2 * nvdef : 1));
+          vdefs[nvdef++] = (SraVdef){i, val, root};
+        }
       }
       else if (td >= 0 && toff[td] == SRA_NO_ADDR && val >= SRA_FIRST_ADDR)
         toff[td] = val, troot[td] = root, tfrom[td] = -1;
@@ -2233,13 +2351,14 @@ static int sra_objects(TCCIRState *ir)
     /* A VAR pinned: every object it held keeps its memory. */
     for (int i = 0; i < n; i++)
     {
-      int v = vdef[i] != SRA_NO_ADDR ? sra_var_def(ir, &ir->compact_instructions[i], nvar) : -1;
-      if (v >= 0 && vbad[v] && vdefroot[i] >= 0)
+      const SraVdef *vd = sra_vdef(vdefs, nvdef, i);
+      int v = vd ? sra_var_def(ir, &ir->compact_instructions[i], nvar) : -1;
+      if (v >= 0 && vbad[v] && vd->root >= 0)
       {
-        u[vdefroot[i]].bad = 1;
-        sra_dbg_at = vbad[v] == 3 ? -1 : vbad_at[v];
-        sra_why(&u[vdefroot[i]], vbad[v] == 1 ? "ptrvar-unknown" : vbad[v] == 2 ? "ptrvar-use" : "ptrvar-addrtaken",
-                vbad_op[v]);
+        u[vd->root].bad = 1;
+        sra_dbg_at = vbad[v] == 3 || !vbad_at ? -1 : vbad_at[v];
+        sra_why(&u[vd->root], vbad[v] == 1 ? "ptrvar-unknown" : vbad[v] == 2 ? "ptrvar-use" : "ptrvar-addrtaken",
+                vbad_op ? vbad_op[v] : 0);
         sra_dbg_at = -1;
       }
     }
@@ -2302,7 +2421,7 @@ static int sra_objects(TCCIRState *ir)
         continue;
       if (s == 1 && dt >= 0 && tfrom[dt] == t)
         continue;
-      if (s == 1 && vdef && vdef[i] != SRA_NO_ADDR)
+      if (s == 1 && sra_vdef(vdefs, nvdef, i))
         continue; /* derives a pointer VAR's address */
       /* `(*T) + x` reading the field at T's address, when the sum feeds
        * nothing but memory accesses: the offset-0 load of such a chain. */
@@ -2410,7 +2529,7 @@ static int sra_objects(TCCIRState *ir)
       if (!sra_concrete(o, &off) || (k = sra_find_unit(u, nu, off)) < 0)
         continue;
       u[k].refs++;
-      if (s == 1 && vdef && vdef[i] != SRA_NO_ADDR)
+      if (s == 1 && sra_vdef(vdefs, nvdef, i))
       {
         u[k].ok_refs++; /* a pointer VAR's root; sra's walk pinned it if it escapes */
         continue;
@@ -2476,23 +2595,23 @@ static int sra_objects(TCCIRState *ir)
       }
       if (bytes && (irop_get_btype(o) != IROP_BTYPE_STRUCT || off == u[k].lo))
       {
-        if (bytes < 4 && s == 0 && q->op == TCCIR_OP_STORE && off - u[k].lo >= 0 && off - u[k].lo < SRA_MAX_BYTES)
+        if (bytes < 4 && s == 0 && q->op == TCCIR_OP_STORE && off - u[k].lo >= 0 && off - u[k].lo < sra_n(&u[k]))
         {
           if (sra_narrow_store_fits(ir, q, bytes, def_idx, ntemp))
             ;
           else if (sra_narrow_store_typed(ir, q, bytes))
             smask[i] = (uint8_t)bytes;
           else
-            u[k].nofit[off - u[k].lo] |= (uint8_t)bytes;
+            SB(&u[k])->nofit[off - u[k].lo] |= (uint8_t)bytes;
           if (!irop_is_plain_imm(tcc_ir_op_get_src1(ir, q)))
           {
-            u[k].stvar[off - u[k].lo] |= (uint8_t)bytes;
-            (bytes == 1 ? u[k].nvst1 : u[k].nvst2)[off - u[k].lo]++;
+            SB(&u[k])->stvar[off - u[k].lo] |= (uint8_t)bytes;
+            (bytes == 1 ? SB(&u[k])->nvst1 : SB(&u[k])->nvst2)[off - u[k].lo]++;
           }
         }
         sra_note_field(&u[k], off, bytes, o.is_unsigned, s == 0);
         if (q->op == TCCIR_OP_CMP && !u[k].bad)
-          u[k].word_cmp |= (uint64_t)1 << (off - u[k].lo);
+          SB(&u[k])->word_cmp |= (uint64_t)1 << (off - u[k].lo);
         u[k].ok_refs++;
       }
       else
@@ -2544,18 +2663,18 @@ static int sra_objects(TCCIRState *ir)
           sra_why(&u[k], "narrow-store", q->op);
         }
         else if (abytes < 4 && (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) && off - u[k].lo >= 0 &&
-                 off - u[k].lo < SRA_MAX_BYTES)
+                 off - u[k].lo < sra_n(&u[k]))
         {
           if (sra_narrow_store_fits(ir, q, abytes, def_idx, ntemp))
             ;
           else if (sra_narrow_store_typed(ir, q, abytes))
             smask[i] = (uint8_t)abytes;
           else
-            u[k].nofit[off - u[k].lo] |= (uint8_t)abytes;
+            SB(&u[k])->nofit[off - u[k].lo] |= (uint8_t)abytes;
           if (!irop_is_plain_imm(tcc_ir_op_get_src1(ir, q)))
           {
-            u[k].stvar[off - u[k].lo] |= (uint8_t)abytes;
-            (abytes == 1 ? u[k].nvst1 : u[k].nvst2)[off - u[k].lo]++;
+            SB(&u[k])->stvar[off - u[k].lo] |= (uint8_t)abytes;
+            (abytes == 1 ? SB(&u[k])->nvst1 : SB(&u[k])->nvst2)[off - u[k].lo]++;
           }
         }
         sra_note_field(&u[k], off, abytes, acc.is_unsigned,
@@ -2568,7 +2687,7 @@ static int sra_objects(TCCIRState *ir)
     for (int x = 0; x < nwhole; x++)
       has_whole[whole[x].unit] = 1;
     for (int k = 0; k < nu; k++)
-      if (!u[k].bad)
+      if (!u[k].bad && !sra_untouched(&u[k]))
       {
         sra_resolve_fields(&u[k], has_whole[k]);
         sra_partial_cost(&u[k], has_whole[k]);
@@ -2576,11 +2695,11 @@ static int sra_objects(TCCIRState *ir)
     tcc_free(has_whole);
   }
   for (int k = 0; k < nu; k++)
-    if (!u[k].bad)
+    if (!u[k].bad && !sra_untouched(&u[k]))
       sra_resolve_wide(&u[k]);
   for (int k = 0; k < nu; k++)
-    for (int at = 0; !u[k].bad && at < SRA_MAX_BYTES; at++)
-      if (((u[k].word_cmp >> at) & 1) && (u[k].width[at] != 4 || u[k].pmask[at]))
+    for (int at = 0, n = sra_n(&u[k]); !u[k].bad && at < n; at++)
+      if (u[k].b && ((u[k].b->word_cmp >> at) & 1) && (SB(&u[k])->width[at] != 4 || SB(&u[k])->pmask[at]))
       {
         u[k].bad = 1;
         sra_why(&u[k], "cmp-field", TCCIR_OP_CMP);
@@ -2630,7 +2749,7 @@ static int sra_objects(TCCIRState *ir)
         continue;
       int a0 = whole[x].off - uk->lo, fields = 0;
       for (int at = a0; at < a0 + whole[x].n; at++)
-        fields += uk->width[at] == 8 ? 2 : uk->width[at] ? 1 : 0;
+        fields += SB(uk)->width[at] == 8 ? 2 : SB(uk)->width[at] ? 1 : 0;
       wcost[whole[x].unit] += fields - (whole[x].sret ? 0 : 2 + 2 * ((whole[x].n + 15) / 16));
     }
     for (int k = 0; k < nu; k++)
@@ -2643,6 +2762,8 @@ static int sra_objects(TCCIRState *ir)
   }
   for (int k = 0; k < nu; k++)
   {
+    if (sra_untouched(&u[k]))
+      continue;
     if (!sra_fields_disjoint(&u[k]))
       sra_why(&u[k], "overlap", 0);
     else if (!sra_narrow_fields_unsigned(&u[k]))
@@ -2658,9 +2779,9 @@ static int sra_objects(TCCIRState *ir)
       int fields = 0;
       for (int b = 4 * w; b < 4 * w + 4; b++)
       {
-        if (u[k].has64[b] || u[k].split[b] || u[k].width[b] > 4)
+        if (SB(&u[k])->has64[b] || SB(&u[k])->split[b] || SB(&u[k])->width[b] > 4)
           fields += 2;
-        else if (u[k].width[b])
+        else if (SB(&u[k])->width[b])
           fields += b == 4 * w ? 1 : 2;
       }
       if (fields > 1)
@@ -2683,7 +2804,7 @@ static int sra_objects(TCCIRState *ir)
       int alike = !sra_pair_off() && a2 >= 0 && a2 + n2 <= u[k2].hi - u[k2].lo && a2 + n2 <= SRA_MAX_BYTES &&
                   sra_range_clean(&u[k2], a2, n2);
       for (int d = 0; alike && d < n2; d++)
-        alike = u[k].width[a1 + d] == u[k2].width[a2 + d];
+        alike = SB(&u[k])->width[a1 + d] == SB(&u[k2])->width[a2 + d];
       if (alike)
       {
         whole[x].pair = k2;
@@ -2698,8 +2819,8 @@ static int sra_objects(TCCIRState *ir)
   {
     int nvars = 0;
     for (int k = 0; k < nu; k++)
-      for (int at = 0; !u[k].bad && at < SRA_MAX_BYTES; at++)
-        nvars += u[k].width[at] ? 1 : 0;
+      for (int at = 0, n = sra_n(&u[k]); !u[k].bad && !sra_untouched(&u[k]) && at < n; at++)
+        nvars += SB(&u[k])->width[at] ? 1 : 0;
     if (nvars > sra_var_budget())
     {
       for (int k = 0; k < nu; k++)
@@ -2723,7 +2844,8 @@ static int sra_objects(TCCIRState *ir)
     {
       const char *callee = "-";
       int pidx = -1;
-      int at = u[k].bad && u[k].why ? u[k].why_at : -1;
+      const SraWhy *w = &sra_whys[k];
+      int at = u[k].bad && w->why ? w->at : -1;
       if (at >= 0 && at < n && ir->compact_instructions[at].op == TCCIR_OP_FUNCPARAMVAL)
       {
         uint32_t e = (uint32_t)tcc_ir_op_src2_imm(ir, &ir->compact_instructions[at]);
@@ -2742,18 +2864,30 @@ static int sra_objects(TCCIRState *ir)
         }
       }
       fprintf(stderr, "[SRA] %s size=%d refs=%d %s op=%d callee=%s param=%d lo=%d acc=", funcname, u[k].hi - u[k].lo,
-              u[k].refs, !u[k].bad ? "PROMOTED" : u[k].why ? u[k].why : "bad", u[k].why_op, callee, pidx, u[k].lo);
-      for (int at = 0; at < SRA_MAX_BYTES; at++)
-        if (u[k].acc[at] || u[k].has64[at])
-          fprintf(stderr, "%d:L%d/S%d%s,", at, u[k].acc[at] & 7, u[k].acc[at] >> 3, u[k].has64[at] ? "/W" : "");
+              u[k].refs, !u[k].bad ? "PROMOTED" : w->why ? w->why : "bad", w->op, callee, pidx, u[k].lo);
+      for (int at = 0, n = sra_n(&u[k]); at < n; at++)
+        if (SB(&u[k])->acc[at] || SB(&u[k])->has64[at])
+          fprintf(stderr, "%d:L%d/S%d%s,", at, SB(&u[k])->acc[at] & 7, SB(&u[k])->acc[at] >> 3, SB(&u[k])->has64[at] ? "/W" : "");
       fprintf(stderr, " whole=%d%d pw=%d pad=%llx\n", u[k].whole_w, u[k].whole_r, u[k].param_words,
-              (unsigned long long)u[k].pad);
+              (unsigned long long)SB(&u[k])->pad);
     }
   }
 
   for (int k = 0; k < nu; k++)
-    if (!u[k].bad)
+    if (!u[k].bad && !sra_untouched(&u[k]))
       sra_index_fields(&u[k]);
+  /* The per-byte tables of the units that keep their memory are not read from
+   * here on, and the rewrite below makes the field VARs: SRA's peak, the peak
+   * of a Zig kernel compile. */
+  for (int k = 0; k < nu; k++)
+    if (u[k].bad && u[k].b)
+      sra_bytes_free(&u[k]);
+  /* Nor are these analysis arrays (the final frees below see NULL). */
+#define SRA_DROP(a) (tcc_free(a), (a) = NULL)
+  SRA_DROP(defs), SRA_DROP(def_idx), SRA_DROP(tbad_op), SRA_DROP(tbad_at);
+  SRA_DROP(vglob), SRA_DROP(vmay), SRA_DROP(vbad), SRA_DROP(vbad_op), SRA_DROP(vbad_at);
+  SRA_DROP(vcur), SRA_DROP(vcurroot), SRA_DROP(vcurgen);
+#undef SRA_DROP
 
   int changes = 0;
   SraInsList ins = {0};
@@ -2837,7 +2971,8 @@ static int sra_objects(TCCIRState *ir)
     if (q->op == TCCIR_OP_NOP)
       continue;
     /* Address arithmetic of a replaced object: nothing reads it any more. */
-    if (vdef && vdef[i] != SRA_NO_ADDR && vdefroot[i] >= 0 && !u[vdefroot[i]].bad)
+    const SraVdef *avd = sra_vdef(vdefs, nvdef, i);
+    if (avd && avd->root >= 0 && !u[avd->root].bad)
     {
       q->op = TCCIR_OP_NOP;
       changes++;
@@ -2870,9 +3005,9 @@ static int sra_objects(TCCIRState *ir)
       int k = troot[t], at = toff[t] + disp - u[k].lo;
       int is_store = q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED;
       const int abytes = sra_btype_bytes(irop_get_btype(acc));
-      const int fs = u[k].fstart[at];
-      if (fs != 0xFF && (fs != at || (is_store && abytes < u[k].width[fs]) ||
-                         (!is_store && abytes == u[k].width[fs] && u[k].pmask[fs])))
+      const int fs = SB(&u[k])->fstart[at];
+      if (fs != 0xFF && (fs != at || (is_store && abytes < SB(&u[k])->width[fs]) ||
+                         (!is_store && abytes == SB(&u[k])->width[fs] && SB(&u[k])->pmask[fs])))
       {
         /* Part of a wider field (sra_resolve_fields). */
         if (is_store && sra_partial_store_padded(ir, i, &u[k], fs, at - fs, abytes, tcc_ir_op_get_src1(ir, q)))
@@ -2881,19 +3016,19 @@ static int sra_objects(TCCIRState *ir)
           sra_partial_store_bfi(ir, i, &u[k], fs, at - fs, abytes, tcc_ir_op_get_src1(ir, q));
         else if (is_store)
           sra_partial_store(ir, &ins, i, &u[k], fs, at - fs, abytes, tcc_ir_op_get_src1(ir, q),
-                            !(u[k].nofit[at] & abytes) && !smask[i]);
+                            !(SB(&u[k])->nofit[at] & abytes) && !smask[i]);
         else
           sra_partial_load(ir, &ins, i, &u[k], fs, at - fs, abytes, acc.is_unsigned, tcc_ir_op_get_dest(ir, q));
         changes++;
         continue;
       }
-      if (u[k].var[at] < 0)
-        u[k].var[at] = tcc_ir_vreg_alloc_var(ir);
-      IRLiveInterval *iv = tcc_ir_get_live_interval(ir, u[k].var[at]);
-      const int narrow = u[k].width[at] && u[k].width[at] < 4;
-      const int extract = !is_store && abytes && abytes < u[k].width[at] && u[k].width[at] <= 4;
+      if (sra_var(&u[k])[at] < 0)
+        sra_var(&u[k])[at] = tcc_ir_vreg_alloc_var(ir);
+      IRLiveInterval *iv = tcc_ir_get_live_interval(ir, sra_var(&u[k])[at]);
+      const int narrow = SB(&u[k])->width[at] && SB(&u[k])->width[at] < 4;
+      const int extract = !is_store && abytes && abytes < SB(&u[k])->width[at] && SB(&u[k])->width[at] <= 4;
       const int rbt = narrow || extract ? IROP_BTYPE_INT32 : irop_get_btype(acc);
-      IROperand rep = irop_make_stackoff(u[k].var[at], iv ? iv->original_offset : 0, 1, 0, rbt);
+      IROperand rep = irop_make_stackoff(sra_var(&u[k])[at], iv ? iv->original_offset : 0, 1, 0, rbt);
       rep.is_unsigned = narrow || extract ? 1 : acc.is_unsigned;
       rep.aux = IROP_AUX_NONVOLATILE;
       if (extract)
@@ -2937,7 +3072,7 @@ static int sra_objects(TCCIRState *ir)
             (tkeep && tkeep[t2]))
           continue;
         int k2 = troot[t2], at2 = toff[t2] - u[k2].lo;
-        if (at2 < 0 || at2 >= SRA_MAX_BYTES || !u[k2].width[at2])
+        if (at2 < 0 || at2 >= sra_n(&u[k2]) || !SB(&u[k2])->width[at2])
           continue;
         IROperand rep = sra_field_op(ir, &u[k2], at2, IROP_BTYPE_INT32, 1);
         if (s2 == 1)
@@ -2986,12 +3121,12 @@ static int sra_objects(TCCIRState *ir)
           for (int w = 0; w < pw; w++)
           {
             IROperand wv;
-            if (u[k].width[4 * w])
+            if (4 * w < sra_n(&u[k]) && SB(&u[k])->width[4 * w])
             {
-              if (u[k].var[4 * w] < 0)
-                u[k].var[4 * w] = tcc_ir_vreg_alloc_var(ir);
-              IRLiveInterval *iv = tcc_ir_get_live_interval(ir, u[k].var[4 * w]);
-              wv = irop_make_stackoff(u[k].var[4 * w], iv ? iv->original_offset : 0, 1, 0, IROP_BTYPE_INT32);
+              if (sra_var(&u[k])[4 * w] < 0)
+                sra_var(&u[k])[4 * w] = tcc_ir_vreg_alloc_var(ir);
+              IRLiveInterval *iv = tcc_ir_get_live_interval(ir, sra_var(&u[k])[4 * w]);
+              wv = irop_make_stackoff(sra_var(&u[k])[4 * w], iv ? iv->original_offset : 0, 1, 0, IROP_BTYPE_INT32);
               wv.is_unsigned = 1;
               wv.aux = IROP_AUX_NONVOLATILE;
             }
@@ -3027,17 +3162,17 @@ static int sra_objects(TCCIRState *ir)
       if (!o.is_lval)
         continue; /* a result buffer's address, or a kept TEMP's root */
       int at = off - u[k].lo;
-      if (irop_get_btype(o) == IROP_BTYPE_INT64 && (u[k].width[at] == 8 || u[k].split[at]))
+      if (irop_get_btype(o) == IROP_BTYPE_INT64 && (SB(&u[k])->width[at] == 8 || SB(&u[k])->split[at]))
       {
         sra_rewrite_wide(ir, &ins, i, s, o, &u[k], at);
         changes++;
         continue;
       }
       const int obytes = sra_btype_bytes(irop_get_btype(o));
-      const int fs = u[k].fstart[at];
-      if (fs != 0xFF && (fs != at || (s == 0 && q->op == TCCIR_OP_STORE && obytes && obytes < u[k].width[fs]) ||
+      const int fs = SB(&u[k])->fstart[at];
+      if (fs != 0xFF && (fs != at || (s == 0 && q->op == TCCIR_OP_STORE && obytes && obytes < SB(&u[k])->width[fs]) ||
                          (s == 1 && (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_ASSIGN) && obytes &&
-                          obytes == u[k].width[fs] && u[k].pmask[fs])))
+                          obytes == SB(&u[k])->width[fs] && SB(&u[k])->pmask[fs])))
       {
         /* Part of a wider field (sra_resolve_fields). */
         if (s == 0 && q->op == TCCIR_OP_STORE &&
@@ -3047,19 +3182,19 @@ static int sra_objects(TCCIRState *ir)
           sra_partial_store_bfi(ir, i, &u[k], fs, at - fs, obytes, tcc_ir_op_get_src1(ir, q));
         else if (s == 0)
           sra_partial_store(ir, &ins, i, &u[k], fs, at - fs, obytes, tcc_ir_op_get_src1(ir, q),
-                            !(u[k].nofit[at] & obytes) && !smask[i]);
+                            !(SB(&u[k])->nofit[at] & obytes) && !smask[i]);
         else
           sra_partial_load(ir, &ins, i, &u[k], fs, at - fs, obytes ? obytes : 4, obytes ? o.is_unsigned : 1,
                            tcc_ir_op_get_dest(ir, q));
         changes++;
         break; /* the instruction is rewritten whole */
       }
-      if (u[k].var[at] < 0)
-        u[k].var[at] = tcc_ir_vreg_alloc_var(ir);
-      int32_t v = u[k].var[at];
-      const int narrow = u[k].width[at] && u[k].width[at] < 4;
+      if (sra_var(&u[k])[at] < 0)
+        sra_var(&u[k])[at] = tcc_ir_vreg_alloc_var(ir);
+      int32_t v = sra_var(&u[k])[at];
+      const int narrow = SB(&u[k])->width[at] && SB(&u[k])->width[at] < 4;
       const int extract = s == 1 && (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_ASSIGN) && obytes &&
-                          obytes < u[k].width[at] && u[k].width[at] <= 4;
+                          obytes < SB(&u[k])->width[at] && SB(&u[k])->width[at] <= 4;
       int bt = narrow || extract || irop_get_btype(o) == IROP_BTYPE_STRUCT ? IROP_BTYPE_INT32 : irop_get_btype(o);
       IRLiveInterval *iv = tcc_ir_get_live_interval(ir, v);
       IROperand rep = irop_make_stackoff(v, iv ? iv->original_offset : 0, 1, 0, bt);
@@ -3116,8 +3251,7 @@ static int sra_objects(TCCIRState *ir)
   tcc_free(vcur);
   tcc_free(vcurroot);
   tcc_free(vcurgen);
-  tcc_free(vdef);
-  tcc_free(vdefroot);
+  tcc_free(vdefs);
   tcc_free(def_idx);
   tcc_free(smask);
   tcc_free(tbad);
@@ -3128,7 +3262,11 @@ static int sra_objects(TCCIRState *ir)
   tcc_free(toff);
   tcc_free(aok);
   tcc_free(defs);
+  for (int k = 0; k < nu; k++)
+    sra_bytes_free(&u[k]);
   tcc_free(u);
+  tcc_free(sra_whys);
+  sra_whys = NULL;
   return changes;
 }
 

@@ -29,7 +29,9 @@
 #include "../opt/flat/memory/small_memset_to_store.c"
 #undef USING_GLOBALS
 #include "../opt/flat/memory/sra.c"
+#undef SB
 #undef SRA_DF_MAX
+#undef SRA_DROP
 #undef SRA_FIRST_ADDR
 #undef SRA_MAX_BYTES
 #undef SRA_NOT_ADDR

@@ -19,6 +19,17 @@ else ifneq ($(filter-out $(NO_CONFIG_GOALS),$(MAKECMDGOALS)),)
  include $(TOP)/config.mak
 endif
 
+# Compiles what runs during the build (c2str, the table generators), so it has
+# to make programs for the machine doing the building.  configure sets it.
+HOSTCC ?= gcc
+
+# On YasOS the target is built by this make, not by the second one the %-tcc
+# rule below starts: both stayed resident through the link, and on the board
+# that link ran out of memory where one started on its own did not.
+ifeq ($(BUILDOS),YasOS)
+ CROSS_TARGET ?= armv8m
+endif
+
 ifeq (-$(GCC_MAJOR)-$(findstring $(GCC_MINOR),56789)-,-4--)
  CFLAGS += -D_FORTIFY_SOURCE=0
 endif
@@ -102,6 +113,11 @@ else
  endif
  ifneq ($(CONFIG_pthread),no)
   LIBS+=-lpthread
+ endif
+ # Built on YasOS: tcc's own runtime is in the rootfs, and nothing else in the
+ # link names it.
+ ifeq ($(BUILDOS),YasOS)
+  LIBS = /usr/lib/armv8m-libtcc1.a -lc -lm
  endif
  # make libtcc as static or dynamic library?
  ifeq ($(CONFIG_static),no)
@@ -391,8 +407,7 @@ lib-objs = $(eval UNITY_SRC_$1 := $2)$(eval UNITY_LIB_NAMES := $(sort $(UNITY_LI
 	$(if $(filter yes,$(UNITY)),$(call lib-objs-unity,$1,$2),$(patsubst %.c,$(X)%.o,$2))
 lib-objs-unity = $(if $(filter-out $2,$(call unity-members,$1)),$\
 	$(error source/unity/unity.mk lists $(filter-out $2,$(call unity-members,$1)) under '$1', which no longer builds it; run scripts/gen_unity.py))$\
-	$(foreach g,$(UNITY_GROUPS_$1),$(X)source/unity/$g.o) $\
-	$(patsubst %.c,$(X)%.o,$(filter-out $(call unity-members,$1),$2))
+	$(foreach g,$(UNITY_GROUPS_$1),$(X)source/unity/$g.o) $(patsubst %.c,$(X)%.o,$(filter-out $(call unity-members,$1),$2))
 
 # Archive a module's objects into its library.  Shared by every module Makefile
 # below so they all agree on how a lib is produced.
@@ -486,7 +501,7 @@ $(X)source/frontend/tccpp.o : $(TCCDEFS_H) tccdefs_table_.h tcckw_index_.h
 # flags, so it is regenerated on every build and replaced only when it changed
 # (tccpp.c's _Static_assert catches a stale table, it cannot repair one).
 tcckw_index_.h : gen_kw_index.c FORCE
-	$Sgcc -o gen_kw_index-$T$(EXESUF) gen_kw_index.c \
+	$S$(HOSTCC) -o gen_kw_index-$T$(EXESUF) gen_kw_index.c \
 	  $(DEFINES) $(filter -D%,$(CFLAGS)) \
 	  && ./gen_kw_index-$T$(EXESUF) $@.tmp && rm -f gen_kw_index-$T$(EXESUF) \
 	  && if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
@@ -512,9 +527,9 @@ tcckw_index_.h : gen_kw_index.c FORCE
 # in the per-target sub-make.  The helper is named per target for the same
 # parallel-make reason c2str is (see above).
 #
-# gcc, not $(CC), for the same reason the c2str rule hardcodes it: this is a
-# HOST tool, and in the native/self-host stage $(CC) is armv8m-tcc, which would
-# build it for the target (and fail on the yasos libc's missing strtok_r).
+# $(HOSTCC), not $(CC), for the same reason as the c2str rule: this is a HOST
+# tool, and in the native/self-host stage $(CC) is armv8m-tcc, which would build
+# it for the target.  On YasOS the two are the same machine and HOSTCC is tcc.
 #
 # Regenerated on every build and replaced only when it changed, like
 # tcckw_index_.h: which predefines exist depends on the -D flags, and a table
@@ -523,7 +538,7 @@ tcckw_index_.h : gen_kw_index.c FORCE
 # __GNUC__ 4 (pico-sdk: "Unsupported toolchain") -- a timestamp rule, even
 # one on config.mak, cannot see every flags change.
 tccdefs_table_.h : tccdefs_.h gen_predef_table.c FORCE
-	$Sgcc -o gen_predef_table-$T$(EXESUF) gen_predef_table.c \
+	$S$(HOSTCC) -o gen_predef_table-$T$(EXESUF) gen_predef_table.c \
 	  $(addsuffix ,$(DEFINES) $(filter -D%,$(CFLAGS))) \
 	  && ./gen_predef_table-$T$(EXESUF) $@.tmp && rm -f gen_predef_table-$T$(EXESUF) \
 	  && if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
@@ -536,7 +551,8 @@ DEFINES += -I$(TOP) $(CORE_INC) $(DRIVER_INC) $(FRONTEND_INC) $(IR_INC) \
 	$(OPT_DSL_INC) $(SSA_OPT_INC) $(FLAT_OPT_INC) $(MEMORY_INC) $(UTILS_INC) \
 	$(GEN_INC) -I$(TOP)/source/backend/arch/arm -I$(TOP)/source/backend/arch/arm/thumb
 
-GITHASH:=$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo no)
+# No git on YasOS, where a build has no repository to ask either.
+GITHASH:=$(if $(filter YasOS,$(BUILDOS)),no,$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo no))
 ifneq ($(GITHASH),no)
 GITHASH:=$(shell git log -1 --date=short --pretty='format:%cd $(GITHASH)@%h')
 GITMODF:=$(shell git diff --quiet || echo '*')
@@ -558,8 +574,7 @@ endif
 # the same hazard through $(TCCDEFS_H); that guard was never extended to cover a
 # second stem.
 %_.h : include/%.h conftest.c
-	# todo: how to pass host CC there?
-	gcc -DC2STR $(filter %.c,$^) -o c2str-$*.exe && ./c2str-$*.exe $< $@ && rm -f c2str-$*.exe
+	$(HOSTCC) -DC2STR $(filter %.c,$^) -o c2str-$*.exe && ./c2str-$*.exe $< $@ && rm -f c2str-$*.exe
 
 # target specific object rules
 # (depend on config.mak so toggling build flags — e.g. ASan via

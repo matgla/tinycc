@@ -46,6 +46,28 @@ extern Sym  *all_cleanups;
 extern int   nocode_wanted;
 extern int   ind;
 extern const char *funcname;
+
+/* funcname for SYM.  A name in the spill file (tok_names_spill) is copied for
+ * the function's compile, not read back for good: freed once the outermost
+ * gen_function ends, as nested and inlined bodies save and restore funcname
+ * in between. */
+static char **funcname_copies;
+static int nb_funcname_copies;
+
+static const char *funcname_of(Sym *sym)
+{
+  const int v = sym->v;
+  if (v < TOK_IDENT || v >= tok_ident || !table_ident[v - TOK_IDENT] || !((uintptr_t)table_ident[v - TOK_IDENT]->str & 1))
+    return get_tok_str(v, NULL);
+  char *copy = tcc_strdup(tok_name_tmp(v));
+  dynarray_add(&funcname_copies, &nb_funcname_copies, copy);
+  return copy;
+}
+
+ST_FUNC void funcname_copies_free(void)
+{
+  dynarray_reset(&funcname_copies, &nb_funcname_copies);
+}
 extern int func_ind;
 extern CType func_vt;
 extern int func_var;
@@ -621,13 +643,13 @@ static KnrConv *knr_params_arrive(Sym *sym, int *pn)
   KnrConv *conv = NULL;
   int n = 0, nb_params = 0;
   *pn = 0;
-  if (ref->f.func_type != FUNC_OLD || !ref->next)
+  if (ref->f.func_type != FUNC_OLD || !sym_first(ref))
     return NULL;
   const SymLocalFacts *facts = sym_facts_peek(sym);
   Sym *pp = facts && facts->knr_proto ? facts->knr_proto->next : NULL;
-  for (Sym *p = ref->next; p; p = p->next)
+  for (Sym *p = sym_first(ref); p; p = p->next)
     nb_params++;
-  for (Sym *p = ref->next; p; p = p->next, pp = pp ? pp->next : NULL)
+  for (Sym *p = sym_first(ref); p; p = p->next, pp = pp ? pp->next : NULL)
   {
     CType arrival;
     if (!knr_arrival_type(&p->type, pp, &arrival))
@@ -674,12 +696,24 @@ static void knr_params_receive(KnrConv *conv, int n)
   tcc_free(conv);
 }
 
+static void gen_function_body(Sym *sym);
+
+/* The tracing cross marks each function's compile in its allocation trace
+ * (scripts/alloc_trace: which blocks die before their function is done). */
 void gen_function(Sym *sym)
+{
+  tcc_alloc_trace_mark(1);
+  gen_function_body(sym);
+  tcc_alloc_trace_mark(2);
+}
+
+static void gen_function_body(Sym *sym)
 {
   struct scope f = {0};
   TCCIRState *ir;
   Sym *global_label_stack_start; /* save global label stack at function start */
   unsigned phase_start = 0;
+  const int outlived_mark = sym_outlived_locals_mark();
   cur_scope = root_scope = &f;
   nocode_wanted = 0;
 
@@ -699,10 +733,21 @@ void gen_function(Sym *sym)
     size_t newoff = section_add(cur_text_section, 0, 1 << (sym->a.aligned - 1));
     gen_fill_nops(newoff - ind);
   }
+  /* What earlier functions left in .text, out of memory while this compiles */
+  text_window_spill(tcc_state);
+  /* Its own section once the object is written (split_text_by_function): it
+   * starts on a word, as it would have at the start of that section. */
+  if (tcc_state->text_split_pending && cur_text_section == text_section && (ind & 3))
+  {
+    split_pad_note(tcc_state, ind);
+    size_t newoff = section_add(cur_text_section, 0, 4);
+    gen_fill_nops(newoff - ind);
+  }
 
   func_align_pad = 0;
-  funcname = get_tok_str(sym->v, NULL);
+  funcname = funcname_of(sym);
   func_ind = ind;
+  tcc_state->split_func_start = ind;
 #ifdef CONFIG_TCC_DEBUG
   /* TCC_DUMP_FUNC=<name>: -dump-ir / -dump-ir-passes print this function only,
    * so a whole-TU compile (whose inlining and summaries a cut-down TU does not
@@ -722,6 +767,7 @@ void gen_function(Sym *sym)
   func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
   func_has_label_addr = 0;
   tcc_state->cur_func_sym = sym;
+  gen_function_depth++; /* see gen_function_depth: no spill, frees deferred to the outlived list */
   if (!tcc_state->current_nested_func)
     nested_names_reset(); /* a file-scope function binds no nested function yet */
   /* Per-caller budget: see CONST_LOOP_INLINE_BUDGET in gen/builtin/call.c. */
@@ -965,11 +1011,18 @@ void gen_function(Sym *sym)
    * two phases are synchronized here so the opt unit stays free of any
    * codegen/backend logic. */
   int nonstatic_global_copier = 0;
+  /* Parsed: the replayed body's tokens need not stay in memory through the
+   * backend (the post-backend next() reads only its final TOK_EOF). */
+  tok_str_release_parsed();
   /* Before anything else reads the IR: struct-return buffers a callee could
    * reach some other way become fresh temporaries (sret_nrvo.c). */
   if (tcc_ir_sret_dealias(ir))
     tcc_ir_dump_after_pass(ir, "sret_dealias");
   tcc_ir_settle(ir);
+  /* The temps the frontend made that nothing names (a quarter of the Zig
+   * kernel's largest function) go before the passes size tables by them. */
+  if (TCC_OPT(tcc_state, optimize) > 0)
+    tcc_ir_compact_temps(ir);
   tcc_ir_opt_run_function_pipeline(ir, sym, func_var, &nonstatic_global_copier);
 
   tcc_ir_backend_fold_pure_forward(ir, sym);
@@ -1451,6 +1504,14 @@ void gen_function(Sym *sym)
   }
   sym_pop(&all_cleanups, NULL, 0);
 
+  /* This function's own section (-ffunction-sections) is complete. */
+  if (cur_text_section->per_function)
+  {
+    section_fit(cur_text_section);
+    if (cur_text_section->reloc)
+      section_fit(cur_text_section->reloc);
+  }
+
   /* It's better to crash than to generate wrong code */
   cur_text_section = NULL;
 #ifdef CONFIG_TCC_DEBUG
@@ -1462,7 +1523,10 @@ void gen_function(Sym *sym)
   func_var = 0;        /* for safety */
   ind = 0;             /* for safety */
   func_ind = -1;
+  tcc_state->split_func_start = -1;
   tcc_state->cur_func_sym = NULL;
+  if (!--gen_function_depth)
+    funcname_copies_free();
   nocode_wanted = DATA_ONLY_WANTED;
   check_vstack();
 
@@ -1470,6 +1534,7 @@ void gen_function(Sym *sym)
   next();
   tcc_ir_free(ir);
   tcc_state->ir = NULL;
+  sym_free_outlived_locals(outlived_mark);
 
   /* Publish the fact that this function's body has been compiled in this
    * TU.  Read by gen_function's late_reopt trigger on later-compiled
@@ -1493,6 +1558,7 @@ void gen_function_check_only(Sym *sym)
   LabelDiffFixup *fixups_start = tcc_state->label_diff_fixups;
   const int nested_start = tcc_state->nb_nested_funcs;
   Section *saved_text = cur_text_section;
+  const int outlived_mark = sym_outlived_locals_mark();
 
   tcc_state->check_only++;
   nested_names_reset();
@@ -1500,12 +1566,13 @@ void gen_function_check_only(Sym *sym)
   nocode_wanted = 0;
   cur_text_section = tcc_state->check_scratch;
   ind = 0;
-  funcname = get_tok_str(sym->v, NULL);
+  funcname = funcname_of(sym);
   func_ind = 0;
   func_vt = sym->type.ref->type;
   func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
   func_has_label_addr = 0;
   tcc_state->cur_func_sym = sym;
+  gen_function_depth++; /* see gen_function_depth: no spill, frees deferred to the outlived list */
   tcc_state->const_loop_inline_used = 0;
 
   sym_push2(&local_stack, SYM_FIELD, 0, 0);
@@ -1546,12 +1613,16 @@ void gen_function_check_only(Sym *sym)
   func_var = 0;
   ind = 0;
   func_ind = -1;
+  tcc_state->split_func_start = -1;
   tcc_state->cur_func_sym = NULL;
+  if (!--gen_function_depth)
+    funcname_copies_free();
   nocode_wanted = DATA_ONLY_WANTED;
   check_vstack();
   next();
   tcc_ir_free(ir);
   tcc_state->ir = NULL;
+  sym_free_outlived_locals(outlived_mark);
   tcc_state->check_only--;
 }
 
@@ -1641,7 +1712,7 @@ static void func_vla_arg(Sym *sym)
 {
   Sym *arg;
 
-  for (arg = sym->type.ref->next; arg; arg = arg->next)
+  for (arg = sym_first(sym->type.ref); arg; arg = arg->next)
   {
     if ((arg->type.t & VT_BTYPE) != VT_PTR)
       continue;

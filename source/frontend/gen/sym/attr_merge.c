@@ -173,11 +173,23 @@ static void patch_type(Sym *sym, CType *type)
       sym->type.t &= ~VT_INLINE | static_proto;
     }
 
+    /* A definition replacing its own prototype's type: the prototype's type
+     * Sym takes the definition's contents and the definition's goes, so no
+     * orphaned type Sym per defined function stays on global_stack (4.8K of
+     * them in the Zig kernel.c compile).  Not K&R: knr_proto keeps old_ref. */
+    if (!local_scope && !local_stack && sym->type.ref == type->ref && old_ref && old_ref != type->ref &&
+        old_ref->a.proto_own && old_ref->f.func_type != FUNC_OLD && type->ref->f.func_type != FUNC_OLD &&
+        sym_functype_adopt(old_ref, type->ref))
+    {
+      sym->type.ref = old_ref;
+      type->ref = old_ref;
+    }
+
     /* An old-style definition met by a prototype, in either order: the
      * symbol keeps the definition's parameters -- its body (and an inline
      * replay of it) binds their names and declared types -- and calls take
      * the prototype (knr_call_type). */
-    if (!local_scope && sym->type.ref->f.func_type == FUNC_OLD && sym->type.ref->next &&
+    if (!local_scope && sym->type.ref->f.func_type == FUNC_OLD && sym_first(sym->type.ref) &&
         old_ref->f.func_type != FUNC_OLD && sym->type.ref != old_ref)
     {
       merge_funcattr(&old_ref->f, &sym->type.ref->f);
@@ -185,7 +197,7 @@ static void patch_type(Sym *sym, CType *type)
     }
     else if (sym->type.ref->f.func_type == FUNC_OLD && type->ref->f.func_type != FUNC_OLD && !local_scope)
     {
-      if (sym->type.ref->next)
+      if (sym_first(sym->type.ref))
       {
         merge_funcattr(&sym->type.ref->f, &type->ref->f);
         merge_funcattr(&type->ref->f, &sym->type.ref->f);
@@ -251,13 +263,19 @@ static Sym *sym_copy(Sym *s0, Sym **ps)
 void sym_copy_ref(Sym *s, Sym **ps)
 {
   int bt = s->type.t & VT_BTYPE;
-  if (bt == VT_FUNC || bt == VT_PTR || (bt == VT_STRUCT && s->sym_scope))
+  /* A struct is copied only when its type is local: a local of a file-scope
+   * struct type left the struct Sym itself in the chain, and the copies of its
+   * members replaced the file-scope struct's own list (a spilled one with the
+   * spill sentinel copied as a member). */
+  if (bt == VT_FUNC || bt == VT_PTR || (bt == VT_STRUCT && s->type.ref && s->type.ref->sym_scope))
   {
     /* For VLA array types, the SYM_FIELD's next/vla_array_str union may
        contain a token stream pointer (set in post_type for TYPE_NEST),
        not a valid Sym* chain.  Don't follow next in that case. */
     int is_vla = s->type.t & VT_VLA;
     Sym **sp = &s->type.ref;
+    if (bt == VT_FUNC && *sp)
+      sym_first(*sp); /* copied whole below: never with a spilled list */
     for (s = *sp, *sp = NULL; s; s = s->next)
     {
       /* For struct types without local scope, don't copy - preserve type identity.

@@ -27,6 +27,7 @@ Sym *find_field(CType *type, int v, int *cumofs)
 {
   Sym *s = type->ref;
   int v1 = v | SYM_FIELD;
+  sym_first(s); /* the loop steps from the struct Sym to its members */
   if (!(v & SYM_FIELD))
   { /* top-level call */
     if ((type->t & VT_BTYPE) != VT_STRUCT)
@@ -62,6 +63,7 @@ Sym *find_field(CType *type, int v, int *cumofs)
 static void check_fields(CType *type, int check)
 {
   Sym *s = type->ref;
+  sym_first(s); /* the loop steps from the struct Sym to its members */
 
   while ((s = s->next) != NULL)
   {
@@ -186,7 +188,7 @@ void struct_layout(CType *type, AttributeDef *ad)
 
   // #define BF_DEBUG
 
-  for (f = type->ref->next; f; f = f->next)
+  for (f = sym_first(type->ref); f; f = f->next)
   {
     /* VLA fields in structs: data is stored inline, so the field has
        zero bytes in the fixed (compile-time) size component.  Its runtime
@@ -390,11 +392,11 @@ void struct_layout(CType *type, AttributeDef *ad)
     type->ref->a.sso_be = 1;
     /* every member is marked: member access swaps the scalar ones (and
        arrays of them), sso_flush_group below lays out the bitfields */
-    for (f = type->ref->next; f; f = f->next)
+    for (f = sym_first(type->ref); f; f = f->next)
       f->a.sso_be = 1;
     /* end of the member data: a packed struct has no padding beyond it */
     int content_end = 0;
-    for (f = type->ref->next; f; f = f->next)
+    for (f = sym_first(type->ref); f; f = f->next)
     {
       int fend;
       if (f->type.t & VT_BITFIELD)
@@ -413,7 +415,7 @@ void struct_layout(CType *type, AttributeDef *ad)
     int group_unit_bits = 0;
     int group_base_type = VT_BYTE;
 
-    for (f = type->ref->next; f; f = f->next)
+    for (f = sym_first(type->ref); f; f = f->next)
     {
       if (!(f->type.t & VT_BITFIELD) || BIT_SIZE(f->type.t) == 0)
       {
@@ -464,7 +466,7 @@ void struct_layout(CType *type, AttributeDef *ad)
   }
 
   /* check whether we can access bitfields by their type */
-  for (f = type->ref->next; f; f = f->next)
+  for (f = sym_first(type->ref); f; f = f->next)
   {
     int s, cx, c0;
     int64_t px; /* bit position: c * 8 overflows int past 256 MB */
@@ -625,6 +627,7 @@ do_decl:
     /* cannot be empty */
     /* non empty enums are not allowed */
     ps = &s->next;
+    Sym *const members_after = global_stack; /* the members are pushed above it */
     if (u == VT_ENUM)
     {
       long long ll = 0, pl = 0, nl = 0;
@@ -828,6 +831,8 @@ do_decl:
       struct_layout(type, &ad);
       if (debug_modes)
         tcc_debug_fix_anon(tcc_state, type);
+      else
+        sym_params_track(s, members_after); /* a file-scope struct's members spill like parameters */
     }
   }
 }

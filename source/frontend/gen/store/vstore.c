@@ -53,7 +53,7 @@ static int type_has_volatile(CType *t, int depth)
   const int bt = t->t & VT_BTYPE;
   if (bt == VT_STRUCT && t->ref)
   {
-    for (Sym *f = t->ref->next; f; f = f->next)
+    for (Sym *f = sym_first(t->ref); f; f = f->next)
       if (type_has_volatile(&f->type, depth + 1))
         return 1;
     return 0;

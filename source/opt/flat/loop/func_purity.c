@@ -223,7 +223,7 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
   if (func_sym->a.weak)
     return TCC_FUNC_PURITY_IMPURE;
 
-  const char *func_name = get_tok_str(func_sym->v, NULL);
+  /* Its name only in the log: a spilled name is not read back for it. */
 
   int is_const = 1;
 
@@ -233,7 +233,7 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
 
     if (ir_q_hazards(ir, q, IR_HZ_VOLATILE))
     {
-      LOG_LICM("PURITY: Function '%s' is IMPURE: volatile access", func_name);
+      LOG_LICM("PURITY: Function '%s' is IMPURE: volatile access", get_tok_str(func_sym->v, NULL));
       return TCC_FUNC_PURITY_IMPURE;
     }
     /* A read folded into a non-LOAD operand (CMP/ADD ... DEREF) still depends on memory. */
@@ -250,7 +250,7 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
         IROperand dest = tcc_ir_op_get_dest(ir, q);
         if (!is_stack_or_param_addr(ir, dest))
         {
-          LOG_LICM("PURITY: Function '%s' is IMPURE: stores to non-stack memory", func_name);
+          LOG_LICM("PURITY: Function '%s' is IMPURE: stores to non-stack memory", get_tok_str(func_sym->v, NULL));
           return TCC_FUNC_PURITY_IMPURE;
         }
       }
@@ -279,7 +279,7 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
            * never a recursive inference) */
           int callee_purity = TCC_FUNC_PURITY_UNKNOWN;
 
-          const char *callee_name = get_tok_str(callee->v, NULL);
+          const char *callee_name = tok_name_tmp(callee->v); /* looked up at once */
           callee_purity = pure_table_lookup(callee_name);
 
           /* soft-float / 64-bit AEABI helpers compute from their arguments
@@ -317,7 +317,7 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
 
           if (callee_purity == TCC_FUNC_PURITY_IMPURE || callee_purity == TCC_FUNC_PURITY_UNKNOWN)
           {
-            LOG_LICM("PURITY: Function '%s' is IMPURE: calls impure function '%s'", func_name, callee_name);
+            LOG_LICM("PURITY: Function '%s' is IMPURE: calls impure function '%s'", get_tok_str(func_sym->v, NULL), callee_name);
             return TCC_FUNC_PURITY_IMPURE;
           }
           if (callee_purity == TCC_FUNC_PURITY_PURE)
@@ -325,7 +325,7 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
         }
         else
         {
-          LOG_LICM("PURITY: Function '%s' is IMPURE: indirect call", func_name);
+          LOG_LICM("PURITY: Function '%s' is IMPURE: indirect call", get_tok_str(func_sym->v, NULL));
           return TCC_FUNC_PURITY_IMPURE;
         }
       }
@@ -347,16 +347,16 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
     case TCCIR_OP_VLA_SP_RESTORE:
     case TCCIR_OP_TRAP:
     case TCCIR_OP_IJUMP:
-      LOG_LICM("PURITY: Function '%s' is IMPURE: opaque side-effecting op %d", func_name, q->op);
+      LOG_LICM("PURITY: Function '%s' is IMPURE: opaque side-effecting op %d", get_tok_str(func_sym->v, NULL), q->op);
       return TCC_FUNC_PURITY_IMPURE;
 
     case TCCIR_OP_VLA_ALLOC:
-      LOG_LICM("PURITY: Function '%s' is IMPURE: VLA allocation", func_name);
+      LOG_LICM("PURITY: Function '%s' is IMPURE: VLA allocation", get_tok_str(func_sym->v, NULL));
       return TCC_FUNC_PURITY_IMPURE;
 
     case TCCIR_OP_RETURN_ADDRESS:
       /* Same arguments, different call site, different result. */
-      LOG_LICM("PURITY: Function '%s' is IMPURE: reads its return address", func_name);
+      LOG_LICM("PURITY: Function '%s' is IMPURE: reads its return address", get_tok_str(func_sym->v, NULL));
       return TCC_FUNC_PURITY_IMPURE;
 
     default:
@@ -365,7 +365,7 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
   }
 
   TCCFuncPurity result = is_const ? TCC_FUNC_PURITY_CONST : TCC_FUNC_PURITY_PURE;
-  LOG_LICM("PURITY: Function '%s' inferred as %s", func_name, result == TCC_FUNC_PURITY_CONST ? "CONST" : "PURE");
+  LOG_LICM("PURITY: Function '%s' inferred as %s", get_tok_str(func_sym->v, NULL), result == TCC_FUNC_PURITY_CONST ? "CONST" : "PURE");
   return result;
 }
 
@@ -378,7 +378,7 @@ int tcc_ir_get_func_purity(TCCIRState *ir, Sym *sym)
   if ((sym->type.t & VT_BTYPE) != VT_FUNC)
     return TCC_FUNC_PURITY_IMPURE;
 
-  const char *func_name = get_tok_str(sym->v, NULL);
+  const char *func_name = tok_name_tmp(sym->v); /* no other name is read below */
   if (!func_name)
     return TCC_FUNC_PURITY_UNKNOWN;
 

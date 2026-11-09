@@ -626,7 +626,7 @@ void compile_nested_functions(Sym *parent_sym)
 
     /* Replay saved token stream (same as inline function expansion) */
     tccpp_setfile(nf->filename);
-    begin_macro(nf->func_str, 1);
+    begin_macro_kept(nf->func_str);
     next(); /* prime the first token - should be '{' */
 
     /* Set up text section for nested function (same as regular functions) */
@@ -758,7 +758,7 @@ void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, NestedFunc *
     Sym *ref = nf->sym ? nf->sym->type.ref : NULL;
     if (ref)
     {
-      for (Sym *param = ref->next; param; param = param->next)
+      for (Sym *param = sym_first(ref); param; param = param->next)
       {
         int pv = param->v & ~SYM_FIELD;
         if (pv >= TOK_IDENT && nb_shadowed < MAX_CAPTURED_VARS)
@@ -1090,7 +1090,7 @@ void prescan_vla_param_captured_vars(NestedFunc *nf, Sym *parent_local_stack)
   Sym *func_type = nf->sym->type.ref;
   if (!func_type)
     return;
-  for (Sym *arg = func_type->next; arg; arg = arg->next)
+  for (Sym *arg = sym_first(func_type); arg; arg = arg->next)
   {
     if ((arg->type.t & VT_BTYPE) != VT_PTR)
       continue;

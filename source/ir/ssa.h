@@ -40,6 +40,7 @@ typedef struct IRSSAState
 
 IRSSAState *tcc_ir_ssa_construct(struct TCCIRState *ir, IRCFG *cfg);
 void tcc_ir_ssa_rename(struct TCCIRState *ir, IRSSAState *ssa);
+void tcc_ir_compact_temps(struct TCCIRState *ir);
 void tcc_ir_ssa_free(IRSSAState *ssa);
 
 #endif

@@ -116,7 +116,7 @@ ST_FUNC void put_extern_sym2(Sym *sym, int sh_num, addr_t value, unsigned long s
       /* sym->v looks like a garbage pointer - skip */
       return;
     }
-    name = get_tok_str(sym->v, NULL);
+    name = tok_name_tmp(sym->v); /* put_elf_sym copies it */
     /* Detect garbage symbol names early */
     if (name && (name[0] == 'L' && name[1] == '.'))
     {
@@ -169,7 +169,7 @@ ST_FUNC void put_extern_sym2(Sym *sym, int sh_num, addr_t value, unsigned long s
 
     if (sym->asm_label)
     {
-      name = get_tok_str(sym->asm_label, NULL);
+      name = tok_name_tmp(sym->asm_label);
       can_add_underscore = 0;
     }
 
@@ -181,7 +181,15 @@ ST_FUNC void put_extern_sym2(Sym *sym, int sh_num, addr_t value, unsigned long s
     }
 
     info = ELFW(ST_INFO)(sym_bind, sym_type);
-    sym->c = put_elf_sym(symtab_section, value, size, info, other, sh_num, name);
+    if (sym_bind == STB_LOCAL && !sym->asm_label && !(tcc_state->leading_underscore && can_add_underscore) &&
+        !debug_modes && sym->v >= TOK_IDENT && sym->v < tok_ident && name && name[0])
+    {
+      /* The name is the token's: strtab gets it at the end of the TU. */
+      sym->c = put_elf_sym(symtab_section, value, size, info, other, sh_num, NULL);
+      ((ElfSym *)symtab_section->data)[sym->c].st_name = ELF_NAME_DEFERRED | (unsigned)sym->v;
+    }
+    else
+      sym->c = put_elf_sym(symtab_section, value, size, info, other, sh_num, name);
 
     if (debug_modes)
       tcc_debug_extern_sym(tcc_state, sym, sh_num, sym_bind, sym_type);
@@ -426,10 +434,13 @@ ST_FUNC void gfunc_regpair_note_asm_names(TokenString *body)
 ST_FUNC int gfunc_regpair_asm_named(Sym *fn)
 {
   TCCState *s1 = tcc_state;
-  const char *name = get_tok_str(fn->v, NULL), *label = fn->asm_label ? get_tok_str(fn->asm_label, NULL) : NULL;
   for (int k = 0; k < s1->nb_regpair_asm_names; k++)
-    if (!strcmp(s1->regpair_asm_names[k], name) || (label && !strcmp(s1->regpair_asm_names[k], label)))
+  {
+    const char *a = s1->regpair_asm_names[k];
+    const int len = (int)strlen(a);
+    if (tok_is_ident(fn->v, a, len) || (fn->asm_label && tok_is_ident(fn->asm_label, a, len)))
       return 1;
+  }
   return 0;
 }
 
@@ -441,4 +452,41 @@ ST_FUNC void gfunc_regpair_reset(TCCState *s1)
   s1->regpair_fns = s1->regpair_adapters = NULL;
   s1->nb_regpair_fns = s1->nb_regpair_adapters = 0;
   s1->regpair_direct_call = NULL;
+}
+
+/* The names of the symbols put_extern_sym2 deferred (ELF_NAME_DEFERRED) go
+ * into strtab: at the end of the TU, before anything writes or links it.
+ * This file's part of strtab is laid out again in symbol order, as it was
+ * when every name went in with its symbol -- tccelf_end_file rewrites it in
+ * place in that order, reading each name ahead of where it writes. */
+ST_FUNC void elf_names_materialize(TCCState *s1)
+{
+  Section *s = symtab_section, *str;
+  if (!s || !(str = s->link))
+    return;
+  const int first = s->sh_offset / sizeof(ElfSym), n = s->data_offset / sizeof(ElfSym);
+  int i, any = 0;
+  for (i = first; i < n && !any; i++)
+    any = (((ElfSym *)s->data)[i].st_name & ELF_NAME_DEFERRED) != 0;
+  if (!any)
+    return;
+  const unsigned long base = str->sh_offset, len = str->data_offset - base;
+  char *old = len ? tcc_malloc(len) : NULL;
+  if (len)
+    memcpy(old, str->data + base, len);
+  str->data_offset = base;
+  for (i = first; i < n; i++)
+  {
+    ElfSym *e = &((ElfSym *)s->data)[i];
+    const char *name;
+    if (e->st_name & ELF_NAME_DEFERRED)
+      name = tok_name_tmp((int)(e->st_name & ~ELF_NAME_DEFERRED));
+    else if (e->st_name >= base && e->st_name < base + len)
+      name = old + (e->st_name - base);
+    else
+      continue; /* the empty name, or an earlier file's */
+    const int off = put_elf_str(str, name); /* moves strtab, never symtab */
+    ((ElfSym *)s->data)[i].st_name = off;
+  }
+  tcc_free(old);
 }

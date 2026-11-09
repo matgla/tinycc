@@ -137,8 +137,12 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
   uint8_t var_written[(UB_ELIDE_MAX_VAR_POS + 7) / 8] = {0};
   uint8_t var_addr_taken[(UB_ELIDE_MAX_VAR_POS + 7) / 8] = {0};
   uint8_t temp_tainted[(UB_ELIDE_MAX_TEMPS + 7) / 8] = {0};
-  /* Stack slots directly written or address-taken; reads of slots not here are uninit. */
-  int32_t stack_blocked_offs[UB_ELIDE_MAX_STACK_OFFS];
+  /* Byte ranges [lo, hi) of the frame directly written or reachable through a
+   * taken address; a read overlapping none of them is uninit.  `overflow`
+   * (too many ranges, or a range that cannot be bounded) turns the stack-slot
+   * classification off: no read is then proven uninit. */
+  int32_t stack_blocked_lo[UB_ELIDE_MAX_STACK_OFFS];
+  int32_t stack_blocked_hi[UB_ELIDE_MAX_STACK_OFFS];
   int stack_blocked_count = 0;
   int stack_blocked_overflow = 0;
 
@@ -156,27 +160,31 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
       /* Bare STACKOFF operand touched other than by a pure read: treat slot as initialised. */
       if (!stack_blocked_overflow && irop_get_tag(op) == IROP_TAG_STACKOFF && irop_is_local(op) && irop_get_vreg(op) == -1)
       {
-        int block = 0;
+        int32_t off = irop_get_stack_offset(op);
+        int lo = off, hi = off;
         if (!op.is_lval)
-          block = 1; /* Addr[StackLoc[X]] — pointer could be used to write */
-        else if (k == 0)
-          block = 1; /* dest with is_lval=1 — direct write to slot */
-        if (block)
         {
-          int32_t off = irop_get_stack_offset(op);
-          int found = 0;
-          for (int s = 0; s < stack_blocked_count; s++)
-            if (stack_blocked_offs[s] == off)
-            {
-              found = 1;
-              break;
-            }
-          if (!found)
+          /* Addr[StackLoc[X]]: the pointer reaches its whole object (a 16-byte
+           * array filled through `&tmp[i]` and copied out word by word). */
+          if (!tcc_ir_frame_object_at(ir, off, &lo, &hi))
+            stack_blocked_overflow = 1;
+        }
+        else if (k == 0)
+        {
+          /* Direct write: the bytes it covers, not just its first word. */
+          int w = ir_opt_store_btype_size_bytes(irop_get_btype(op));
+          if (w <= 0)
+            stack_blocked_overflow = 1;
+          hi = off + w;
+        }
+        if (hi > lo && !stack_blocked_overflow)
+        {
+          if (stack_blocked_count >= UB_ELIDE_MAX_STACK_OFFS)
+            stack_blocked_overflow = 1;
+          else
           {
-            if (stack_blocked_count >= UB_ELIDE_MAX_STACK_OFFS)
-              stack_blocked_overflow = 1;
-            else
-              stack_blocked_offs[stack_blocked_count++] = off;
+            stack_blocked_lo[stack_blocked_count] = lo;
+            stack_blocked_hi[stack_blocked_count++] = hi;
           }
         }
       }
@@ -234,9 +242,10 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
         irop_is_local((sop)) && (sop).is_lval && !(sop).is_param && irop_get_vreg(sop) == -1)                                \
     {                                                                                                                  \
       int32_t _off = irop_get_stack_offset(sop);                                                                       \
-      int _blocked = 0;                                                                                                \
-      for (int _s = 0; _s < stack_blocked_count; _s++)                                                                 \
-        if (stack_blocked_offs[_s] == _off)                                                                            \
+      int _w = ir_opt_store_btype_size_bytes(irop_get_btype(sop));                                                     \
+      int _blocked = _w <= 0; /* a read of unknown width is never proven uninit */                                     \
+      for (int _s = 0; _s < stack_blocked_count && !_blocked; _s++)                                                    \
+        if (_off < stack_blocked_hi[_s] && _off + _w > stack_blocked_lo[_s])                                           \
         {                                                                                                              \
           _blocked = 1;                                                                                                \
           break;                                                                                                       \

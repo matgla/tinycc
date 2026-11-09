@@ -202,6 +202,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
 {
   funcname = "";
   func_ind = -1;
+  s1->split_func_start = -1;
   anon_sym = SYM_FIRST_ANOM;
   pending_aliases = NULL;
   nb_pending_aliases = 0;
@@ -213,6 +214,8 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   unary_addr_operand = 0;
   indir_keep_lvalue = 0;
   debug_modes = (s1->do_debug ? 1 : 0) | s1->test_coverage << 1;
+  /* Function sections made when the object is written (function_text_section) */
+  s1->text_split_pending = s1->function_sections && s1->output_type == TCC_OUTPUT_OBJ && !s1->do_debug;
 
   tcc_debug_start(s1);
   tcc_tcov_start(s1);
@@ -247,10 +250,14 @@ ST_FUNC int tccgen_compile(TCCState *s1)
    * deferred body addresses them. */
   finalize_tentative_definitions(s1);
   s1->tu_parsed = 1;
+  /* The bodies replay token numbers: the names can go to the spill file. */
+  tok_names_spill();
   /* Bodies saved for -finline-functions-called-once: generate them now that
    * every call site in the TU is known. */
   gen_deferred_function_bodies(s1);
   gen_owed_inline_functions(s1);
+  /* .text back in memory for good: the passes below reshape it */
+  text_window_unspill_all(s1);
   /* End-of-TU analysis: compute call-graph reachability and the set of
    * static globals with no reachable readers.  Must run before
    * gen_late_reopt_functions so newly-flagged writer functions get picked
@@ -433,6 +440,8 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   /* Before the pop: nothing may materialise a prototype onto a dying stack. */
   tccgen_predef_protos_disarm();
   nested_names_reset(); /* an error may leave a nested function's name bound */
+  sym_params_spill_close(); /* the parameter lists still in memory, while their types live */
+  funcname_copies_free(); /* an error out of a body skips its gen_function end */
   sym_pop(&global_stack, NULL, 0);
   sym_pop(&local_stack, NULL, 0);
   sym_parked_free_all();
@@ -452,6 +461,8 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   free_defines(NULL);
   sym_pointer_nodes_free();
   sym_short_pools_free();
+  /* the spill file of saved bodies */
+  tok_str_spill_close();
   /* free sym_pools */
   dynarray_reset(&sym_pools, &nb_sym_pools);
   sym_heads_free();

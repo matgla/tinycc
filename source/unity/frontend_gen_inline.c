@@ -10,4 +10,5 @@
 #include "../frontend/gen/inline/emit.c"
 #undef CALLED_ONCE_LARGE_BODY
 #undef CALLED_ONCE_LARGE_FRAME_ARRAY
+#undef DEFERRED_STACK_ROOM
 #undef GC_MARK

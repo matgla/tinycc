@@ -276,7 +276,7 @@ ST_FUNC void tccgen_predef_protos_disarm(void)
 
 ST_FUNC void tccgen_predef_proto_interned(TokenSym *ts)
 {
-  int i = tccgen_predef_proto_index(ts->str, ts->len);
+  int i = tccgen_predef_proto_index(tok_name(ts), ts->len);
   if (i >= 0)
     tccgen_predef_proto_queue(i);
 }

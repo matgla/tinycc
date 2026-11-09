@@ -316,7 +316,7 @@ void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, i
       no_oblock = 0;
     }
     s = type->ref;
-    f = s->next;
+    f = sym_first(s);
     n = s->c;
     size1 = 1;
     goto do_init_list;
@@ -407,7 +407,7 @@ static int type_contains_pointer(CType *type)
   if (bt == VT_STRUCT)
   {
     Sym *f;
-    for (f = tp->ref->next; f; f = f->next)
+    for (f = sym_first(tp->ref); f; f = f->next)
     {
       if (type_contains_pointer(&f->type))
       {
@@ -517,7 +517,7 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
   }
   else if (has_init && (type->t & VT_BTYPE) == VT_STRUCT)
   {
-    Sym *field = type->ref->next;
+    Sym *field = sym_first(type->ref);
     if (field)
     {
       while (field->next)
@@ -538,11 +538,11 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
     if (!flexible_array && IS_UNION(type->ref->type.t))
     {
       Sym *member;
-      for (member = type->ref->next; member; member = member->next)
+      for (member = sym_first(type->ref); member; member = member->next)
       {
         if ((member->type.t & VT_BTYPE) == VT_STRUCT)
         {
-          Sym *mf = member->type.ref->next;
+          Sym *mf = sym_first(member->type.ref);
           if (mf)
           {
             while (mf->next)

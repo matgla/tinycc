@@ -1378,6 +1378,15 @@ static int ra_o0_in_memory(const SSAInterval *iv, const int *seg, int n)
   return (s == 0 ? 0 : seg[s]) != seg[e];
 }
 
+/* The fp_free / survivor_fp bit of a VFP register as an interval holds it
+ * (LS_VFP_REG_BASE + n).  Shifting by the encoded number went past 63: x86
+ * masks the count and freed s<n> by accident, the YasOS-native compiler (ARM)
+ * freed nothing and so chose other registers than the cross. */
+static inline uint64_t ra_fp_bit(int r)
+{
+  return LS_IS_VFP_REG(r) ? 1ull << LS_VFP_REG_NUM(r) : 0;
+}
+
 void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
                            const RegAllocTarget *target, int spill_base,
                            uint64_t *out_dirty_int, uint64_t *out_dirty_fp,
@@ -1583,8 +1592,8 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
       SSAInterval *a = active[j];
       if (a->end >= cur->start && a->r0 >= 0 && a->stack_location == 0) {
         if (a->reg_type == LS_REG_TYPE_FLOAT || a->reg_type == LS_REG_TYPE_DOUBLE) {
-          survivor_fp |= (1ull << a->r0);
-          if (a->r1 >= 0) survivor_fp |= (1ull << a->r1);
+          survivor_fp |= ra_fp_bit(a->r0);
+          if (a->r1 >= 0) survivor_fp |= ra_fp_bit(a->r1);
         } else {
           survivor_int |= (1ull << a->r0);
           if (a->r1 >= 0) survivor_int |= (1ull << a->r1);
@@ -1602,8 +1611,8 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
          * surviving active interval still holds (coalesced sharing). */
         if (a->r0 >= 0 && a->stack_location == 0 && !a->reg_shared) {
           if (a->reg_type == LS_REG_TYPE_FLOAT || a->reg_type == LS_REG_TYPE_DOUBLE) {
-            if (!(survivor_fp & (1ull << a->r0))) fp_free |= (1ull << a->r0);
-            if (a->r1 >= 0 && !(survivor_fp & (1ull << a->r1))) fp_free |= (1ull << a->r1);
+            if (!(survivor_fp & ra_fp_bit(a->r0))) fp_free |= ra_fp_bit(a->r0);
+            if (a->r1 >= 0 && !(survivor_fp & ra_fp_bit(a->r1))) fp_free |= ra_fp_bit(a->r1);
           } else {
             if (!(survivor_int & (1ull << a->r0))) int_free |= (1ull << a->r0);
             if (a->r1 >= 0 && !(survivor_int & (1ull << a->r1))) int_free |= (1ull << a->r1);

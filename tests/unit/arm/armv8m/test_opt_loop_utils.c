@@ -73,7 +73,6 @@ static void utb_init_temp_intervals(TCCIRState *ir, int reserved)
     ir->temporary_variables_live_intervals[i].start = INTERVAL_NOT_STARTED;
     ir->temporary_variables_live_intervals[i].incoming_reg0 = -1;
     ir->temporary_variables_live_intervals[i].incoming_reg1 = -1;
-    ir->temporary_variables_live_intervals[i].stack_slot_index = -1;
     ir->temporary_variables_live_intervals[i].allocation.r0 = PREG_NONE;
     ir->temporary_variables_live_intervals[i].allocation.r1 = PREG_NONE;
   }

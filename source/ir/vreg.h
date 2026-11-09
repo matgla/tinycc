@@ -24,6 +24,8 @@ int tcc_ir_vreg_alloc_temp(struct TCCIRState *ir);
 /* Size the temp and var live interval arrays once SSA renaming has numbered
  * `temp_count` temps: grows or trims them (see vreg.c) */
 void tcc_ir_vreg_fit_intervals(struct TCCIRState *ir, int temp_count);
+void tcc_ir_vreg_compact_temps(struct TCCIRState *ir, const int *map, int old_n, int new_n);
+void tcc_ir_vreg_compact_vars(struct TCCIRState *ir, const int *map, int old_n, int new_n);
 
 /* Allocate a variable virtual register */
 int tcc_ir_vreg_alloc_var(struct TCCIRState *ir);
@@ -111,12 +113,6 @@ struct IRLiveInterval *tcc_ir_vreg_live_interval(struct TCCIRState *ir, int vreg
 /* ============================================================================
  * Stack Slot Access
  * ============================================================================ */
-
-/* Get stack slot index for vreg (or -1 if not assigned) */
-int tcc_ir_vreg_stack_slot_get(struct TCCIRState *ir, int vreg);
-
-/* Set stack slot index for vreg */
-void tcc_ir_vreg_stack_slot_set(struct TCCIRState *ir, int vreg, int slot_idx);
 
 /* Get frame offset for vreg */
 int tcc_ir_vreg_frame_offset_get(struct TCCIRState *ir, int vreg);

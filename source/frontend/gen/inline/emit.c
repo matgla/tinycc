@@ -59,8 +59,12 @@ static void erase_section_range(TCCState *s, Section *sec, addr_t start, addr_t 
     return;
 
   /* What identical code folding recorded about this section describes
-   * addresses that are about to move. */
+   * addresses that are about to move; so do the pads a split will leave out. */
   tcc_icf_section_changed(sec);
+  if (sec == text_section && s->text_split_pending)
+    split_pads_erased(s, (unsigned)start, (unsigned)size, (unsigned)shift);
+  if (sec == text_section && start < sec->data_bias)
+    text_window_unspill_all(s);
 
   /* Shift the section's tail data down (by `shift`, not `size`). */
   size_t tail_offset = (size_t)(start + size);
@@ -108,7 +112,8 @@ static void erase_section_range(TCCState *s, Section *sec, addr_t start, addr_t 
          *   relocations reference by index.
          * - Any other local here: leave as-is; setting st_shndx to
          *   SHN_UNDEF would break the link. */
-        if (ELFW(ST_BIND)(syms[i].st_info) == STB_LOCAL && symtab->link && symtab->link->data)
+        if (ELFW(ST_BIND)(syms[i].st_info) == STB_LOCAL && symtab->link && symtab->link->data &&
+            !(syms[i].st_name & ELF_NAME_DEFERRED)) /* a token's name is no mapping marker */
         {
           const char *nm = (const char *)symtab->link->data + syms[i].st_name;
           if (nm[0] == '$' && (nm[1] == 't' || nm[1] == 'd') && nm[2] == 0)
@@ -340,12 +345,14 @@ void gen_late_reopt_functions(TCCState *s)
     int saved_budget = called_once_budget_begin(body_len);
     tccpp_setfile(fn->filename);
     pp_pack_enter(s, fn->pack, saved_pack);
-    begin_macro(compile_ts, 1);
+    begin_macro_kept(compile_ts);
     next();
     gen_function(sym);
     end_macro();
     pp_pack_leave(s, saved_pack);
     called_once_budget_end(saved_budget);
+    tok_str_release_spilled();
+    sym_params_release();
     if (nalias)
     {
       ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
@@ -394,12 +401,19 @@ Section *function_text_section(TCCState *s1, Sym *sym)
   Section *sec;
   if (!s1->function_sections)
     return text_section;
+  /* An object without debug info gets its function sections when it is
+   * written: two Sections and a block of code per function (the name twice
+   * over, and Zig's names are long) were 0.6 MB of a Zig kernel compile.  An
+   * executable keeps them for gc_sections, debug info for its ranges. */
+  if (s1->text_split_pending)
+    return text_section;
   snprintf(buf, sizeof(buf), ".text.%s", get_tok_str(sym->v & ~SYM_FIELD, NULL));
   sec = find_section(s1, buf);
   /* find_section creates plain SHF_ALLOC PROGBITS; code needs EXECINSTR,
    * and thumb literal pools are PC-aligned-down-to-4 loads, so the section
    * must keep 4-byte alignment. */
   sec->sh_flags = text_section->sh_flags;
+  sec->per_function = 1;
   if (sec->sh_addralign < 4)
     sec->sh_addralign = 4;
   return sec;
@@ -471,11 +485,13 @@ static void emit_inline_functions(TCCState *s, int owed_only)
         int saved_budget = called_once_budget_begin(fn->func_str->len);
         tccpp_setfile(fn->filename);
         pp_pack_enter(s, fn->pack, saved_pack);
-        begin_macro(fn->func_str, 1);
+        begin_macro_kept(fn->func_str);
         next();
         cur_text_section = function_text_section(s, sym);
         gen_function(sym);
         end_macro(); /* frees the tokens: the next body's ICF scan must not read them */
+        tok_str_release_spilled();
+        sym_params_release();
         fn->func_str = NULL;
         pp_pack_leave(s, saved_pack);
         called_once_budget_end(saved_budget);
@@ -516,15 +532,14 @@ void free_inline_functions(TCCState *s)
     if (fn->sym)
       tok_str_free(fn->func_str);
     tcc_free(fn->pack);
-    tcc_free(fn->def_binds);
-    tcc_free(fn->spliced);
+    inline_func_free_rare(fn);
   }
   dynarray_reset(&s->inline_fns, &s->nb_inline_fns);
   for (i = 0; i < s->nb_guard_heads; ++i)
   {
     tok_str_free(s->guard_heads[i]->func_str);
     tcc_free(s->guard_heads[i]->pack);
-    tcc_free(s->guard_heads[i]->guard_free);
+    inline_func_free_rare(s->guard_heads[i]);
   }
   dynarray_reset(&s->guard_heads, &s->nb_guard_heads);
   tcc_free(s->guard_head_by_tok);
@@ -569,9 +584,10 @@ InlineFunc *inline_fn_lookup(TCCState *s, Sym *sym)
     int k = (fn->sym->v & ~SYM_FIELD) - TOK_IDENT;
     if (k < 0)
       continue;
-    if ((s->inline_fn_by_tok_count + 1) * 2 > s->inline_fn_by_tok_size)
+    if ((s->inline_fn_by_tok_count + 1) * 4 > s->inline_fn_by_tok_size * 3)
     {
-      /* at most half full, so a probe ends quickly at an empty slot */
+      /* at most three quarters full: a probe still ends within a few slots, and
+       * the table of a Zig kernel compile's 4.9k functions is 64 KB, not 128 */
       int n = s->inline_fn_by_tok_size ? s->inline_fn_by_tok_size * 2 : 64;
       InlineFnSlot *grown = tcc_mallocz(sizeof(InlineFnSlot) * n);
       for (int i = 0; i < s->inline_fn_by_tok_size; i++)
@@ -651,6 +667,24 @@ static void guard_head_index(TCCState *s, InlineFunc *g)
   }
 }
 
+ST_FUNC InlineFuncRare *inline_func_rare(InlineFunc *fn)
+{
+  if (!fn->rare)
+    fn->rare = tcc_mallocz(sizeof *fn->rare);
+  return fn->rare;
+}
+
+ST_FUNC void inline_func_free_rare(InlineFunc *fn)
+{
+  if (!fn->rare)
+    return;
+  tcc_free(fn->rare->guard_free);
+  tcc_free(fn->rare->spliced);
+  tcc_free(fn->rare->def_binds);
+  tcc_free(fn->rare);
+  fn->rare = NULL;
+}
+
 /* A recompiled body replaces its earlier guard head; one that has none
  * (head == NULL) deactivates it. */
 void guard_head_register(TCCState *s, Sym *sym, TokenString *head, const int *pack, int *free_names)
@@ -672,11 +706,13 @@ void guard_head_register(TCCState *s, Sym *sym, TokenString *head, const int *pa
   {
     tok_str_free(g->func_str);
     tcc_free(g->pack);
-    tcc_free(g->guard_free);
+    if (g->rare)
+      tcc_free(g->rare->guard_free), g->rare->guard_free = NULL;
     g->pack = NULL;
   }
   g->func_str = head;
-  g->guard_free = free_names;
+  if (free_names || g->rare)
+    inline_func_rare(g)->guard_free = free_names;
   if (pack)
   {
     size_t size = sizeof(int) * (pack[0] + 2);
@@ -738,7 +774,7 @@ static int called_once_body_ok(Sym *sym, TokenString *body)
   if (!ref || ref->f.func_noinline || ref->f.func_ctor || ref->f.func_dtor || sym->a.weak ||
       (ref->type.t & (VT_COMPLEX | VT_VECTOR)))
     return 0;
-  for (Sym *p = ref->next; p; p = p->next)
+  for (Sym *p = sym_first(ref); p; p = p->next)
     if (p->type.t & (VT_COMPLEX | VT_VECTOR | VT_VLA))
       return 0;
   int addr_of_label = 0, inline_asm = 0;
@@ -827,6 +863,8 @@ void free_deferred_functions(TCCState *s)
 {
   for (int i = 0; i < s->nb_deferred_fns; i++)
   {
+    if (!s->deferred_fns[i]) /* generated: freed then */
+      continue;
     if (s->deferred_fns[i]->body)
       tok_str_free(s->deferred_fns[i]->body);
     tcc_free(s->deferred_fns[i]->pack);
@@ -1001,6 +1039,7 @@ void prune_unused_statics(TCCState *s)
     TokenString *str = node_toks[work[--nw]];
     if (!str)
       continue;
+    const int reload = str->allocated_len < 0; /* spilled: see tok_str_release */
     const int *p = tok_str_buf(str), *end = p + str->len;
     int prev = 0;
     while (p < end)
@@ -1015,6 +1054,8 @@ void prune_unused_statics(TCCState *s)
       if (t != TOK_LINENUM)
         prev = t;
     }
+    if (reload)
+      tok_str_release(str);
   }
 
   /* A symbol reached under any of its nodes is live under all of them. */
@@ -1295,7 +1336,9 @@ void gc_unreferenced_statics(TCCState *s)
       addr_t v = e->st_value & ~(addr_t)1;
       if (v < nodes[i].start || v >= nodes[i].end)
         continue;
-      const char *nm = symtab_section->link ? (const char *)symtab_section->link->data + e->st_name : "";
+      const char *nm = symtab_section->link && !(e->st_name & ELF_NAME_DEFERRED)
+                           ? (const char *)symtab_section->link->data + e->st_name
+                           : "";
       if (nm[0] == '$' && (nm[1] == 't' || nm[1] == 'd') && nm[2] == 0)
         continue; /* mapping markers: erase_section_range retargets them */
       e->st_shndx = SHN_ABS;
@@ -1418,9 +1461,16 @@ void gen_deferred_function_bodies(TCCState *s)
   int *caller = deferred_alloc(sizeof(int) * n), *self_calls = deferred_alloc(sizeof(int) * n);
   int *edge_start = deferred_alloc(sizeof(int) * (n + 1)), nedges = 0, edge_cap = 0;
   int *edges = NULL;
+  /* One edge per callee, not per call: the post-order below only follows a
+   * callee's first edge (later ones find it visited), and the edges live
+   * through the generation of every body. */
+  int *last_from = deferred_alloc(sizeof(int) * n);
+  for (int j = 0; j < n; j++)
+    last_from[j] = -1;
   for (int i = 0; i < n; i++)
   {
     edge_start[i] = nedges;
+    const int reload = s->deferred_fns[i]->body->allocated_len < 0; /* spilled: see tok_str_release */
     const int *p = tok_str_buf(s->deferred_fns[i]->body);
     int t;
     CValue cv;
@@ -1438,6 +1488,12 @@ void gen_deferred_function_bodies(TCCState *s)
           calls[j]++;
           self_calls[j] += i == j;
           caller[j] = i;
+          if (last_from[j] == i)
+          {
+            t = next_t;
+            continue;
+          }
+          last_from[j] = i;
           if (nedges == edge_cap)
           {
             /* Grown by copying into a fresh tracked array: a realloc'd block
@@ -1457,8 +1513,18 @@ void gen_deferred_function_bodies(TCCState *s)
       }
       t = next_t;
     }
+    if (reload)
+      tok_str_release(s->deferred_fns[i]->body);
   }
   edge_start[n] = nedges;
+  deferred_release(last_from);
+  if (edges && nedges < edge_cap)
+  {
+    int *fit = deferred_alloc(sizeof(int) * (nedges ? nedges : 1));
+    memcpy(fit, edges, sizeof(int) * nedges);
+    deferred_release(edges);
+    edges = fit;
+  }
 
   uint8_t *once = deferred_alloc(n);
   for (int j = 0; j < n; j++)
@@ -1471,9 +1537,14 @@ void gen_deferred_function_bodies(TCCState *s)
     if ((sym->type.t & VT_STATIC) && calls[j] >= 2 && !mentions[j] && !self_calls[j] && !sym->c &&
         !sym->a.addrtaken && d->body && !is_pending_alias_target(sym) && called_once_body_ok(sym, d->body))
       d->call_sites = calls[j];
-    if (!TCC_OPT(s, opt_inline_called_once) || !(sym->type.t & VT_STATIC) || calls[j] != 1 || mentions[j] ||
-        caller[j] == j || sym->c || sym->a.addrtaken || !d->body || is_pending_alias_target(sym) ||
-        !called_once_body_ok(sym, d->body))
+    int once_ok = TCC_OPT(s, opt_inline_called_once) && (sym->type.t & VT_STATIC) && calls[j] == 1 && !mentions[j] &&
+                  caller[j] != j && !sym->c && !sym->a.addrtaken && d->body && !is_pending_alias_target(sym) &&
+                  called_once_body_ok(sym, d->body);
+    /* called_once_body_ok read the parameter list back: give it up before
+     * the next one, or this scan holds every deferred function's at once (a
+     * high-water mark the Sym pools keep for the rest of the TU). */
+    sym_params_release();
+    if (!once_ok)
     {
       /* TCC_CALLED_ONCE_DBG: why a function with one call stays a call. */
       static int dbg = -1;
@@ -1490,13 +1561,16 @@ void gen_deferred_function_bodies(TCCState *s)
                 : !d->body                 ? "no-body"
                                            : "body-rules",
                 caller[j] >= 0 && caller[j] < n ? get_tok_str(s->deferred_fns[caller[j]]->sym->v, NULL) : "?");
+      if (d->body)
+        tok_str_release(d->body);
       continue;
     }
+    tok_str_release(d->body);
     once[j] = 1;
     /* A deferred inline body: the call site replays it, gen_inline_functions
      * emits it only if a reference survives. */
-    InlineFunc *fn = tcc_mallocz(sizeof *fn + strlen(d->filename));
-    strcpy(fn->filename, d->filename);
+    InlineFunc *fn = tcc_mallocz(sizeof *fn);
+    fn->filename = d->filename;
     fn->sym = sym;
     fn->func_str = d->body;
     fn->pack = d->pack;
@@ -1518,12 +1592,30 @@ void gen_deferred_function_bodies(TCCState *s)
   /* Generate the others callees first (post-order over the call edges,
    * iteratively: call chains in generated C run deep). */
   uint8_t *state = deferred_alloc(n); /* 0 new, 1 on the stack, 2 done */
-  int *stack = deferred_alloc(sizeof(int) * 2 * (n + 1)), sp = 0;
-  tcc_open_bf(s, ":deferred:", 0);
+  /* (function, next edge) pairs, as deep as the call chains go: sized for all
+   * n at once it was 39 KB of a Zig kernel compile's peak, for a depth of a
+   * few hundred. */
+  int stack_cap = 256, *stack = deferred_alloc(sizeof(int) * stack_cap), sp = 0;
+#define DEFERRED_STACK_ROOM()                                       \
+  do                                                                \
+  {                                                                 \
+    if (sp + 2 > stack_cap)                                         \
+    {                                                               \
+      int *grown = deferred_alloc(sizeof(int) * stack_cap * 2);     \
+      memcpy(grown, stack, sizeof(int) * sp);                       \
+      deferred_release(stack);                                      \
+      stack = grown;                                                \
+      stack_cap *= 2;                                               \
+    }                                                               \
+  } while (0)
+  /* The order first, then the graph goes: generating does not change it, and
+   * the edges were 70 KB under every deferred function's compile. */
+  int *order = deferred_alloc(sizeof(int) * (n ? n : 1)), norder = 0;
   for (int root = 0; root < n; root++)
   {
     if (state[root])
       continue;
+    DEFERRED_STACK_ROOM();
     stack[sp++] = root;
     stack[sp++] = edge_start[root];
     state[root] = 1;
@@ -1537,6 +1629,7 @@ void gen_deferred_function_bodies(TCCState *s)
         if (!state[j])
         {
           state[j] = 1;
+          DEFERRED_STACK_ROOM();
           stack[sp++] = j;
           stack[sp++] = edge_start[j];
         }
@@ -1544,6 +1637,20 @@ void gen_deferred_function_bodies(TCCState *s)
       }
       sp -= 2;
       state[i] = 2;
+      order[norder++] = i;
+    }
+  }
+#undef DEFERRED_STACK_ROOM
+  deferred_release(stack);
+  deferred_release(state);
+  deferred_release(edges);
+  deferred_release(edge_start);
+
+  tcc_open_bf(s, ":deferred:", 0);
+  for (int oi = 0; oi < norder; oi++)
+  {
+    {
+      const int i = order[oi];
       if (!once[i] && s->deferred_fns[i]->body)
       {
         if (check_every_static())
@@ -1552,6 +1659,12 @@ void gen_deferred_function_bodies(TCCState *s)
           check_dropped_function(s->deferred_fns[i], tok_str_clone(s->deferred_fns[i]->body));
         }
         define_deferred_function(s->deferred_fns[i]);
+        /* Nothing reads the record again: 4.8K of them in a Zig kernel compile. */
+        tcc_free(s->deferred_fns[i]->pack);
+        tcc_free(s->deferred_fns[i]);
+        s->deferred_fns[i] = NULL;
+        tok_str_release_spilled();
+        sym_params_release();
       }
     }
   }

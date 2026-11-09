@@ -39,16 +39,18 @@
 #include "opt_dsl.h"
 #include "opt/flat/known_bits.h"
 
+/* One per temp (11.4K in the largest function of a Zig kernel compile):
+ * the constant first and the flags as bits, 40 -> 32 bytes. */
 typedef struct
 {
+  uint64_t const_val;
   int gen;        /* matches current_gen when entry is valid */
   uint32_t kz;    /* known-zero mask */
   uint32_t ko;    /* known-one mask */
   int32_t stack_off; /* if >= INT32_MIN+1, temp holds Addr[StackLoc[off]] */
-  int has_stack_off;
-  uint64_t const_val;
-  int has_const;
-  uint8_t is_low32; /* kz/ko track only the low 32 bits of a 64-bit value */
+  unsigned has_stack_off : 1;
+  unsigned has_const : 1;
+  unsigned is_low32 : 1; /* kz/ko track only the low 32 bits of a 64-bit value */
 } TmpKB;
 
 typedef struct
@@ -794,7 +796,7 @@ typedef struct KBState
   TmpKB *tmp_kb;
   VregAddrKB *var_addr;
   int *block_start_seen;
-  int *backedge_target;
+  uint8_t *backedge_target; /* a flag per instruction */
   StackKB stack_slots[KB_MAX_STACK_SLOTS];
   int n_stack_slots;
   int block_gen;
@@ -839,7 +841,7 @@ static void *kb_begin(IROptCtx *ctx)
   st->tmp_kb = tcc_mallocz(sizeof(TmpKB) * (max_tmp_pos + 1));
   st->var_addr = tcc_mallocz(sizeof(VregAddrKB) * (max_var_pos + 1));
   st->block_start_seen = tcc_mallocz(sizeof(int) * n);
-  st->backedge_target = tcc_mallocz(sizeof(int) * n);
+  st->backedge_target = tcc_mallocz(n);
 
   ir_opt_mark_block_starts(ir, st->block_start_seen, st->block_gen, n);
   for (int i = 0; i < n; i++)

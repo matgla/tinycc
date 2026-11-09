@@ -168,10 +168,11 @@ int tcc_ir_opt_global_init_prop(TCCIRState *ir)
             if (r_sym_idx > 0 && symtab_section && symtab_section->link)
             {
               ElfW(Sym) *tgt_esym = &((ElfW(Sym) *)symtab_section->data)[r_sym_idx];
-              const char *tname = (const char *)symtab_section->link->data + tgt_esym->st_name;
-              if (tname && *tname)
+              const int deferred = (tgt_esym->st_name & ELF_NAME_DEFERRED) != 0;
+              const char *tname = deferred ? "" : (const char *)symtab_section->link->data + tgt_esym->st_name;
+              if (deferred || (tname && *tname))
               {
-                int tok = tok_alloc_const(tname);
+                int tok = deferred ? (int)(tgt_esym->st_name & ~ELF_NAME_DEFERRED) : tok_alloc_const(tname);
                 Sym *tsym = sym_find(tok);
                 if (tsym)
                 {

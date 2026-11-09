@@ -253,6 +253,19 @@ Set the ELF visibility of every definition that does not name one with
 own. With @option{-fvisibility=hidden}, a shared library exports only what it
 marks @code{visibility("default")}.
 
+@item -fno-internal-spill
+Keep everything in memory.  By default the function bodies saved for later
+(deferred, inline candidates, late re-optimisation) and the parameter lists
+of file-scope prototypes go to a temporary file beside the output,
+@file{@var{output}.@var{pid}.spill} (@file{a.out.@var{pid}.spill}, or
+@file{@var{name}.o.@var{pid}.spill} for @option{-c} without @option{-o}; the
+process id keeps two compilations of one output apart), and are read back
+when used.  Writes
+are buffered, so a small compilation never creates the file.  The output is
+the same; peak memory is lower on large translation units (Zig's 12.7 MB
+kernel C: 33 to 14 MB on YasOS), and on a board the file lands on the storage
+the output goes to.  It is removed when the compilation ends.
+
 @end table
 
 Warning options:

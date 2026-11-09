@@ -2665,7 +2665,7 @@ static int tcc_get_dwarf_info(TCCState *s1, Sym *s)
       if (retval == debug_type)
         retval = i;
       dwarf_data1(dwarf_info_section,
-                  t->type.ref->next ? DWARF_ABBREV_SUBROUTINE_TYPE : DWARF_ABBREV_SUBROUTINE_EMPTY_TYPE);
+                  sym_first(t->type.ref) ? DWARF_ABBREV_SUBROUTINE_TYPE : DWARF_ABBREV_SUBROUTINE_EMPTY_TYPE);
       if (last_pos != -1)
       {
         tcc_debug_check_anon(s1, e, last_pos);
@@ -2674,12 +2674,13 @@ static int tcc_get_dwarf_info(TCCState *s1, Sym *s)
       last_pos = dwarf_info_section->data_offset;
       e = t->type.ref;
       dwarf_data4(dwarf_info_section, 0);
-      if (t->type.ref->next)
+      if (sym_first(t->type.ref))
       {
         sib_pos = dwarf_info_section->data_offset;
         dwarf_data4(dwarf_info_section, 0);
       }
       f = t->type.ref;
+      sym_first(f); /* the loop steps from the type Sym to its parameters */
       i = 0;
       while (f->next)
       {
@@ -2688,6 +2689,7 @@ static int tcc_get_dwarf_info(TCCState *s1, Sym *s)
       }
       pos_type = (int *)tcc_malloc(i * sizeof(int));
       f = t->type.ref;
+      sym_first(f); /* the loop steps from the type Sym to its parameters */
       i = 0;
       while (f->next)
       {
@@ -2696,12 +2698,13 @@ static int tcc_get_dwarf_info(TCCState *s1, Sym *s)
         pos_type[i++] = dwarf_info_section->data_offset;
         dwarf_data4(dwarf_info_section, 0);
       }
-      if (t->type.ref->next)
+      if (sym_first(t->type.ref))
       {
         dwarf_data1(dwarf_info_section, 0);
         write32le(dwarf_info_section->data + sib_pos, dwarf_info_section->data_offset - dwarf_info.start);
       }
       f = t->type.ref;
+      sym_first(f); /* the loop steps from the type Sym to its parameters */
       i = 0;
       while (f->next)
       {

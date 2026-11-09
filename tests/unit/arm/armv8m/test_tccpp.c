@@ -484,12 +484,13 @@ extern Sym *define_stack;
 UT_TEST(test_define_undef_clears_sym_define)
 {
   TokenSym *ts = tok_alloc("undefme", 7);
-  Sym *s = tcc_mallocz(sizeof(Sym));
-  s->v = ts->tok;
-  ts->sym_define = s;
+  Sym *boundary = define_stack;
+  define_push(ts->tok, MACRO_OBJ, NULL, NULL);
+  Sym *s = define_find(ts->tok);
+  UT_ASSERT(s != NULL && ts->has_define);
   define_undef(s);
-  UT_ASSERT(ts->sym_define == NULL);
-  tcc_free(s);
+  UT_ASSERT(define_find(ts->tok) == NULL && !ts->has_define);
+  free_defines(boundary);
   return 0;
 }
 
@@ -497,15 +498,12 @@ UT_TEST(test_free_defines_pops_to_boundary)
 {
   TokenSym *ts = tok_alloc("freeme", 6);
   Sym *boundary = define_stack;
-  Sym *s = tcc_mallocz(sizeof(Sym));
-  s->v = ts->tok;
-  s->prev = define_stack;
-  define_stack = s;
-  ts->sym_define = s;
+  define_push(ts->tok, MACRO_OBJ, NULL, NULL);
+  UT_ASSERT(define_find(ts->tok) != NULL);
 
   free_defines(boundary);
   UT_ASSERT(define_stack == boundary);
-  UT_ASSERT(ts->sym_define == NULL);
+  UT_ASSERT(define_find(ts->tok) == NULL);
   return 0;
 }
 

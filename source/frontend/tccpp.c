@@ -84,8 +84,6 @@ static void parse_number(const char *p);
 static void tcc_predef_try_materialize(TokenSym *ts, const char *str, int len);
 static void parse_string(const char *p, int len);
 
-static struct TinyAlloc *tokstr_alloc;
-
 static TokenString *macro_stack;
 
 static void token_lookup_cache_clear(void)
@@ -100,7 +98,7 @@ static TokenSym *token_lookup_cache_find(unsigned int hash, const char *str, int
 
   if (!ts || entry->hash != hash || entry->len != len)
     return NULL;
-  if (ts->len != len || memcmp(ts->str, str, len))
+  if (ts->len != len || memcmp(tok_name(ts), str, len))
     return NULL;
   return ts;
 }
@@ -151,7 +149,22 @@ ST_FUNC void expect(const char *msg)
 /* ------------------------------------------------------------------------- */
 /* Custom allocator for tiny objects */
 
-#define USE_TAL
+/* Off: its only user was the TokenString headers, and a bump arena reuses a
+ * chunk only once every header in it is freed.  Long-lived headers (saved
+ * bodies, initializers) kept chunks full of dead ones, so it grew by doubling
+ * chunks and gave nothing back -- 4.2 MB on Zig's 12.7 MB kernel.c, where the
+ * headers live at its peak fit in a few KB.  malloc per header measured the
+ * same compile time.  Define USE_TAL to bring it back. */
+/* #define USE_TAL */
+
+#ifdef CONFIG_TCC_LOW_MEM
+#define TOKSYM_CHUNK_SIZE (4 * 1024)
+#else
+/* Equal steps: one malloc per 8 KB costs nothing measurable, and the old
+ * 48 KB first arena was a third empty after a hello world. */
+#define TOKSYM_CHUNK_SIZE (8 * 1024)
+#endif
+#define TOKSYM_BIG 256 /* a longer TokenSym gets a block of its own */
 
 #ifndef USE_TAL
 #define tal_free(al, p) tcc_free(p)
@@ -177,15 +190,10 @@ ST_FUNC void expect(const char *msg)
  * doubling would overshoot by up to half of what is in use. */
 #define TOKSTR_TAL_SIZE (2 * 1024)
 #define TAL_NEXT_SIZE(size) (size)
-#define TOKSYM_CHUNK_SIZE (4 * 1024)
 #else
 #define TOKSTR_TAL_SIZE (8 * 1024)  /* allocator for TokenString structs only (not buffers) */
 #define TAL_NEXT_SIZE(size) ((size) * 2)
-/* Equal steps here too: one malloc per 8 KB costs nothing measurable, and the
- * old 48 KB first arena was a third empty after a hello world. */
-#define TOKSYM_CHUNK_SIZE (8 * 1024)
 #endif
-#define TOKSYM_BIG 256              /* a longer TokenSym gets a block of its own */
 #define TOKSTR_TAL_LIMIT 128        /* structs are ~48-64 bytes */
 
 typedef struct TinyAlloc
@@ -398,68 +406,204 @@ tail_call:
   return ret;
 }
 
+static struct TinyAlloc *tokstr_alloc;
 #endif /* USE_TAL */
 
 /* ------------------------------------------------------------------------- */
 /* TokenSym storage.  A TokenSym lives until tccpp_delete and is never freed or
- * resized on its own, so a bump arena does: no per-entry allocator header (TAL
- * kept one, 4 bytes on ARM), and an entry takes offsetof(str) + len + 1 rather
- * than sizeof(TokenSym) + len, which counted str[1] and its padding again.
- * Chunks are chained through their first word and freed together. */
+ * resized on its own, so bump arenas do: no per-entry allocator header (TAL
+ * kept one, 4 bytes on ARM).  The headers take one arena and the names
+ * another, so that the names can leave memory once the TU is parsed
+ * (tok_names_spill): the code generated after that reads few of them.  A
+ * name takes len + 1 bytes rounded to 2 -- a spilled one's offset is told
+ * from a pointer by its low bit.  Chunks are chained through their first
+ * word and freed together. */
 typedef struct TokSymChunk
 {
   struct TokSymChunk *prev;
+  unsigned size; /* bytes after the header */
 } TokSymChunk;
 
-static TokSymChunk *toksym_chunks;
-static uint8_t *toksym_p, *toksym_end;
-
-static TokenSym *toksym_new(int len)
+typedef struct TokSymArena
 {
-  unsigned size = (offsetof(TokenSym, str) + len + 1 + sizeof(void *) - 1) & ~(sizeof(void *) - 1);
+  TokSymChunk *chunks;
+  uint8_t *p, *end;
+} TokSymArena;
+
+static TokSymArena toksym_heads, toksym_names;
+
+/* Names tok_name_tmp read back, by token: one slot per hash, so a function's
+ * callees and its symbols are not read again at every reference. */
+#define NAME_TMP_SLOTS 64
+static struct
+{
+  int tok;
+  int size;
+  char *name;
+} name_tmp[NAME_TMP_SLOTS];
+
+
+static void *toksym_bump(TokSymArena *a, unsigned size)
+{
   TokSymChunk *c;
   uint8_t *ret;
 
-  if (size > (unsigned)(toksym_end - toksym_p))
+  if (size > (unsigned)(a->end - a->p))
   {
     if (size > TOKSYM_BIG)
     {
       /* Link it behind the current chunk, which keeps its free tail. */
       c = tcc_malloc(sizeof *c + size);
-      if (toksym_chunks)
+      c->size = size;
+      if (a->chunks)
       {
-        c->prev = toksym_chunks->prev;
-        toksym_chunks->prev = c;
+        c->prev = a->chunks->prev;
+        a->chunks->prev = c;
       }
       else
       {
         c->prev = NULL;
-        toksym_chunks = c;
+        a->chunks = c;
       }
-      return (TokenSym *)(c + 1);
+      return c + 1;
     }
     c = tcc_malloc(sizeof *c + TOKSYM_CHUNK_SIZE);
-    c->prev = toksym_chunks;
-    toksym_chunks = c;
-    toksym_p = (uint8_t *)(c + 1);
-    toksym_end = toksym_p + TOKSYM_CHUNK_SIZE;
+    c->size = TOKSYM_CHUNK_SIZE;
+    c->prev = a->chunks;
+    a->chunks = c;
+    a->p = (uint8_t *)(c + 1);
+    a->end = a->p + TOKSYM_CHUNK_SIZE;
   }
-  ret = toksym_p;
-  toksym_p += size;
-  return (TokenSym *)ret;
+  ret = a->p;
+  a->p += size;
+  return ret;
 }
 
-static void toksym_free_all(void)
+static void toksym_arena_free(TokSymArena *a)
 {
   TokSymChunk *c, *prev;
-  for (c = toksym_chunks; c; c = prev)
+  for (c = a->chunks; c; c = prev)
   {
     prev = c->prev;
     tcc_free(c);
   }
-  toksym_chunks = NULL;
-  toksym_p = toksym_end = NULL;
+  a->chunks = NULL;
+  a->p = a->end = NULL;
 }
+
+/* A copy of the LEN bytes at STR, NUL-terminated, in the name arena. */
+static char *toksym_name_copy(const char *str, int len)
+{
+  char *name = toksym_bump(&toksym_names, (len + 2) & ~1u);
+  memcpy(name, str, len);
+  name[len] = '\0';
+  return name;
+}
+
+static TokenSym *toksym_new(const char *str, int len)
+{
+  TokenSym *ts = toksym_bump(&toksym_heads, (sizeof(TokenSym) + sizeof(void *) - 1) & ~(sizeof(void *) - 1));
+  ts->len = len;
+  ts->str = toksym_name_copy(str, len);
+  return ts;
+}
+
+static void toksym_free_all(void)
+{
+  toksym_arena_free(&toksym_heads);
+  toksym_arena_free(&toksym_names);
+  for (int k = 0; k < NAME_TMP_SLOTS; k++)
+  {
+    tcc_free(name_tmp[k].name);
+    name_tmp[k].name = NULL;
+    name_tmp[k].size = 0;
+  }
+}
+
+static int toksym_chunk_cmp(const void *a, const void *b)
+{
+  uintptr_t x = (uintptr_t)*(TokSymChunk *const *)a, y = (uintptr_t)*(TokSymChunk *const *)b;
+  return x < y ? -1 : x > y;
+}
+
+/* The TU is parsed: write every name to the spill file and free the name
+ * chunks.  What reads a name from now on (an ELF symbol, a callee screened by
+ * its name, a diagnostic) reads it back, into the arena again, for good. */
+ST_FUNC void tok_names_spill(void)
+{
+  TokSymChunk *c, **v;
+  long *off;
+  int n = 0, i;
+
+  if (!tcc_spill_active() || !toksym_names.chunks)
+    return;
+  for (c = toksym_names.chunks; c; c = c->prev)
+    n++;
+  v = tcc_malloc(n * (sizeof *v + sizeof *off));
+  off = (long *)(v + n);
+  for (n = 0, c = toksym_names.chunks; c; c = c->prev)
+    v[n++] = c;
+  tcc_qsort(v, n, sizeof *v, toksym_chunk_cmp);
+  for (i = 0; i < n; i++)
+  {
+    unsigned used = v[i] == toksym_names.chunks ? (unsigned)(toksym_names.p - (uint8_t *)(v[i] + 1)) : v[i]->size;
+    off[i] = tcc_spill_append(v[i] + 1, used);
+    if (off[i] < 0 || off[i] + (long)used >= 0x7fffffffL)
+    {
+      tcc_free(v); /* nothing changed yet: the names stay */
+      return;
+    }
+  }
+  for (i = 0; i < tok_ident - TOK_IDENT; i++)
+  {
+    TokenSym *ts = table_ident[i];
+    int lo = 0, hi = n - 1;
+    if (!ts || ((uintptr_t)ts->str & 1))
+      continue;
+    while (lo < hi) /* the last chunk at or below the name */
+    {
+      int mid = (lo + hi + 1) / 2;
+      if ((uintptr_t)v[mid] <= (uintptr_t)ts->str)
+        lo = mid;
+      else
+        hi = mid - 1;
+    }
+    ts->str = (const char *)(((uintptr_t)(off[lo] + (ts->str - (const char *)(v[lo] + 1))) << 1) | 1);
+  }
+  tcc_free(v);
+  toksym_arena_free(&toksym_names);
+}
+
+/* Token V's name for a caller that is done with it before the next call: a
+ * spilled name is read into a slot it shares with other tokens, and stays in
+ * the spill file. */
+ST_FUNC const char *tok_name_tmp(int v)
+{
+  TokenSym *ts;
+  if (v < TOK_IDENT || v >= tok_ident || !(ts = table_ident[v - TOK_IDENT]) || !((uintptr_t)ts->str & 1))
+    return get_tok_str(v, NULL);
+  int k = v & (NAME_TMP_SLOTS - 1);
+  if (name_tmp[k].tok != v || !name_tmp[k].name)
+  {
+    if (name_tmp[k].size < ts->len + 1)
+    {
+      name_tmp[k].size = (ts->len + 16) & ~15;
+      name_tmp[k].name = tcc_realloc(name_tmp[k].name, name_tmp[k].size);
+    }
+    tcc_spill_read((long)((uintptr_t)ts->str >> 1), name_tmp[k].name, ts->len + 1);
+    name_tmp[k].tok = v;
+  }
+  return name_tmp[k].name;
+}
+
+ST_FUNC const char *tok_name_load(TokenSym *ts)
+{
+  char *name = toksym_bump(&toksym_names, (ts->len + 2) & ~1u);
+  tcc_spill_read((long)((uintptr_t)ts->str >> 1), name, ts->len + 1);
+  ts->str = name;
+  return name;
+}
+
 /* String token statistics - enable for analysis
 static unsigned long str_total_added = 0;
 static unsigned long str_bytes_copied = 0;
@@ -640,23 +784,21 @@ static TokenSym *tok_alloc_new(TokenSym **pts, const char *str, int len)
          table_ident, so moving it is safe. */
       new_alloc += 256;
 #else
-      new_alloc <<= 1;
+      new_alloc = (int)(tcc_grow_size(new_alloc * sizeof(TokenSym *), (i + 1) * sizeof(TokenSym *)) /
+                        sizeof(TokenSym *));
 #endif
     ptable = tcc_realloc(table_ident, new_alloc * sizeof(TokenSym *));
     table_ident = ptable;
     table_ident_alloc = new_alloc;
   }
 
-  ts = toksym_new(len);
+  ts = toksym_new(str, len);
 
   table_ident[i] = ts;
   ts->tok = tok_ident++;
-  ts->sym_define = NULL;
+  ts->has_define = 0;
   ts->sym_identifier = NULL;
-  ts->len = len;
   ts->hash_next = NULL;
-  memcpy(ts->str, str, len);
-  ts->str[len] = '\0';
   *pts = ts;
   /* Last, and only once the entry is linked into table_ident: materialising a
      predefine re-enters tok_alloc for the identifiers in its own body, and a
@@ -698,13 +840,10 @@ static TokenSym *tok_materialize_builtin(int tok)
     return ts;
   str = tcc_keywords + kw_off[i];
   len = kw_len[i];
-  ts = toksym_new(len);
+  ts = toksym_new(str, len);
   ts->tok = tok;
-  ts->sym_define = NULL;
+  ts->has_define = 0;
   ts->sym_identifier = NULL;
-  ts->len = len;
-  memcpy(ts->str, str, len);
-  ts->str[len] = '\0';
   h = TOK_HASH_INIT;
   for (k = 0; k < len; k++)
     h = TOK_HASH_FUNC(h, ((unsigned char *)str)[k]);
@@ -759,7 +898,7 @@ ST_FUNC TokenSym *tok_find(const char *str, int len)
   for (i = 0; i < len; i++)
     h = TOK_HASH_FUNC(h, ((unsigned char *)str)[i]);
   for (ts = hash_ident[h & (TOK_HASH_SIZE - 1)]; ts; ts = ts->hash_next)
-    if (ts->len == len && !memcmp(ts->str, str, len))
+    if (ts->len == len && !memcmp(tok_name(ts), str, len))
       return ts;
   return NULL;
 }
@@ -791,7 +930,7 @@ ST_FUNC TokenSym *tok_alloc(const char *str, int len)
     ts = *pts;
     if (!ts)
       break;
-    if (ts->len == len && !memcmp(ts->str, str, len))
+    if (ts->len == len && !memcmp(tok_name(ts), str, len))
     {
       token_lookup_cache_store(full_hash, len, ts);
       return ts;
@@ -975,7 +1114,7 @@ ST_FUNC const char *get_tok_str(int v, CValue *cv)
     {
       TokenSym *ts = table_ident[v - TOK_IDENT];
       if (ts)
-        return ts->str;
+        return tok_name(ts);
       /* Lazy builtin not materialized: its string lives in the blob -- but
          ONLY for the reserved builtin range.  A NULL slot outside it means a
          bogus token id, and indexing kw_off[] with it reads past the array
@@ -1460,6 +1599,8 @@ ST_INLN void tok_str_new(TokenString *s)
   s->len = s->need_spc = 0;
   s->allocated_len = 0; /* 0 means using inline buffer (small_buf) */
   s->last_line_num = 0; /* 0 means no line recorded yet */
+  s->spill_pos = 0;
+  s->owner = NULL;
 }
 
 ST_FUNC TokenString *tok_str_alloc(void)
@@ -1475,8 +1616,11 @@ ST_FUNC void tok_str_free_str(int *str)
   tcc_free(str);
 }
 
+static void tok_str_spill_forget(TokenString *s);
+
 ST_FUNC void tok_str_free(TokenString *str)
 {
+  tok_str_spill_forget(str);
   if (str->allocated_len > 0)
     tok_str_free_str(str->data.str);
   tal_free(tokstr_alloc, str);
@@ -1523,7 +1667,12 @@ ST_FUNC int *tok_str_realloc(TokenString *s, int new_size)
     return str;
   }
 
-  /* Already using heap buffer - grow if needed */
+  /* Already using heap buffer - grow if needed.  Doubling, not
+   * tcc_grow_size: a kept string is trimmed to its length (tok_str_fit), so
+   * its slack does not last, and the holes its outgrown buffers leave are the
+   * sizes the next string asks for.  In tcc_grow_size's steps they were not:
+   * a Zig kernel compile without the internal spill (8 MB of saved bodies)
+   * peaked 0.7 MB higher, in free 4-8 KB holes. */
   size = s->allocated_len;
   while (size < new_size)
     size <<= 1;
@@ -1571,10 +1720,335 @@ ST_FUNC void tok_str_fit(TokenString *s)
    tok_str_free still takes it: tal_free hands foreign pointers to tcc_free. */
 ST_FUNC TokenString *tok_str_keep(TokenString *s)
 {
+#ifdef USE_TAL
   TokenString *k = tcc_malloc(sizeof *k);
   *k = *s;
   tal_free(tokstr_alloc, s);
   return k;
+#else
+  /* Saved bodies run to thousands; their 96-byte headers were 64 bytes of
+   * small_buf they never use.  The tokens go to the heap if they were inline
+   * (a kept string is never appended to again), and the header shrinks to
+   * end at data.str. */
+  if (s->allocated_len == 0)
+  {
+    int n = s->len > 0 ? s->len : 1;
+    int *buf = tcc_malloc(n * sizeof(int));
+    memcpy(buf, s->data.small_buf, s->len * sizeof(int));
+    s->data.str = buf;
+    s->allocated_len = n;
+  }
+  return tcc_realloc(s, TOKSTR_KEPT_SIZE);
+#endif
+}
+
+/* Internal spill (-f[no-]internal-spill, on by default): kept function bodies
+ * (saved for deferral, inlining or late re-optimisation) are written to a file
+ * and their buffers freed; a body is read back when something accesses it
+ * (tok_str_buf) and freed again at the next point where no token string is
+ * being replayed.  Tokens hold no pointers -- values are inline, identifiers
+ * are token numbers -- so a buffer is the same after the round trip.  The
+ * prototype parameter lists of symtab.c (sym_params_release) share the file.
+ * On Zig's 12.7 MB kernel.c the saved bodies were the largest block of the
+ * heap.  The file is <output>.<pid>.spill, beside the output: on a board that
+ * is the storage the object goes to, not a RAM /tmp. */
+/* A spilled string keeps its copy's place in its header (spill_pos).  The
+ * copies read back are listed, with the buffer each was read into, until they
+ * are dropped (tok_str_release, tok_str_release_spilled) or their string is
+ * freed (tok_str_spill_forget). */
+typedef struct TokSpillLoaded
+{
+  TokenString *s;
+  int *buf;
+} TokSpillLoaded;
+
+static TokSpillLoaded *tok_spill_loaded;
+static int nb_tok_spill_loaded, cap_tok_spill_loaded;
+static int tok_spill_fd = -1;
+static int tok_spill_off; /* the file could not be made or written: spill no more this TU */
+static char *tok_spill_path;
+
+/* Writes collect here and reach the file only when it fills, so a small
+ * compilation -- all its records in the buffer -- never creates the file, and
+ * a large one writes in big pieces.  A record is either wholly in the file or
+ * wholly in the buffer (at file offset spill_flushed + its position). */
+#define SPILL_WBUF 8192
+static unsigned char *spill_wbuf;
+static size_t spill_wlen;
+static long spill_flushed; /* bytes in the file */
+
+/* A spilled body saves its buffer and that buffer's malloc header, so all
+ * but the tiniest go: 64 ints kept 1441 bodies of a Zig kernel compile in
+ * memory (0.16 MB), for no measurable time saved. */
+#define TOK_SPILL_MIN_INTS 8
+
+/* <output>.<pid>.spill: the -o file, else what the driver will name the
+ * output (also for an output in /dev, -o /dev/null).  The pid keeps it this
+ * compile's own: two compiles of one output at once (a build naming an
+ * object twice, two tests on one fixture) each truncated and removed the
+ * other's file, and one failed reading it back. */
+static char *spill_path_for(TCCState *s1)
+{
+  char buf[1024];
+  int pid = (int)getpid();
+  if (s1->outfile && strcmp(s1->outfile, "-") && strncmp(s1->outfile, "/dev/", 5))
+    snprintf(buf, sizeof buf, "%s.%d.spill", s1->outfile, pid);
+  else if (s1->output_type == TCC_OUTPUT_OBJ && s1->current_filename && strcmp(s1->current_filename, "-"))
+  {
+    snprintf(buf, sizeof buf, "%s", tcc_basename(s1->current_filename));
+    char *ext = tcc_fileextension(buf);
+    snprintf(ext, sizeof buf - (size_t)(ext - buf), ".o.%d.spill", pid);
+  }
+  else
+    snprintf(buf, sizeof buf, "a.out.%d.spill", pid);
+  return tcc_strdup(buf);
+}
+
+static int tok_spill_open(void)
+{
+  if (tok_spill_fd >= 0)
+    return 0;
+  tok_spill_path = spill_path_for(tcc_state);
+  tok_spill_fd = open(tok_spill_path, O_RDWR | O_CREAT | O_TRUNC | O_BINARY, 0600);
+  if (tok_spill_fd < 0)
+  {
+    /* No warning: the output is the same either way, and a build with
+     * -Werror or a read-only directory must not fail over it. */
+    tok_spill_off = 1;
+    return -1;
+  }
+  spill_flushed = 0;
+  return 0;
+}
+
+/* Write the buffer out.  On failure it stays: what it holds is still read
+ * from it, and nothing more is spilled. */
+static int spill_flush(void)
+{
+  if (!spill_wlen)
+    return 0;
+  if (tok_spill_open() < 0)
+    return -1;
+  if (lseek(tok_spill_fd, spill_flushed, SEEK_SET) < 0 ||
+      write(tok_spill_fd, spill_wbuf, spill_wlen) != (ssize_t)spill_wlen)
+  {
+    tok_spill_off = 1;
+    return -1;
+  }
+  spill_flushed += (long)spill_wlen;
+  spill_wlen = 0;
+  return 0;
+}
+
+/* Spilling is on and has not failed. */
+ST_FUNC int tcc_spill_active(void)
+{
+  return !tok_spill_off && tcc_state->internal_spill && tcc_state->output_type != TCC_OUTPUT_PREPROCESS;
+}
+
+/* Append N bytes: their offset, or -1 (not spilled; the caller keeps them). */
+ST_FUNC long tcc_spill_append(const void *p, size_t n)
+{
+  long off;
+  if (!tcc_spill_active())
+    return -1;
+  if (!spill_wbuf)
+    spill_wbuf = tcc_malloc(SPILL_WBUF);
+  if (spill_wlen + n > SPILL_WBUF && spill_flush() < 0)
+    return -1;
+  if (n > SPILL_WBUF)
+  {
+    /* the buffer is empty now: straight to the file */
+    if (tok_spill_open() < 0)
+      return -1;
+    if (lseek(tok_spill_fd, spill_flushed, SEEK_SET) < 0 || write(tok_spill_fd, p, n) != (ssize_t)n)
+    {
+        tok_spill_off = 1;
+      return -1;
+    }
+    off = spill_flushed;
+    spill_flushed += (long)n;
+    return off;
+  }
+  off = spill_flushed + (long)spill_wlen;
+  memcpy(spill_wbuf + spill_wlen, p, n);
+  spill_wlen += n;
+  return off;
+}
+
+/* Read back N bytes appended at OFF. */
+ST_FUNC void tcc_spill_read(long off, void *p, size_t n)
+{
+  size_t done = 0;
+  if (off >= spill_flushed)
+  {
+    memcpy(p, spill_wbuf + (off - spill_flushed), n);
+    return;
+  }
+  if (tok_spill_fd < 0 || lseek(tok_spill_fd, off, SEEK_SET) < 0)
+    tcc_error("internal spill: cannot seek in '%s'", tok_spill_path);
+  while (done < n)
+  {
+    ssize_t r = read(tok_spill_fd, (char *)p + done, n - done);
+    if (r <= 0)
+      tcc_error("internal spill: cannot read back '%s'", tok_spill_path);
+    done += (size_t)r;
+  }
+}
+
+/* Write S's buffer to the spill file and free it.  S must be a kept,
+ * finished token string: it is never appended to again. */
+ST_FUNC void tok_str_spill(TokenString *s)
+{
+  if (!tcc_spill_active() || s->allocated_len <= 0 || s->len < TOK_SPILL_MIN_INTS || s->spill_pos)
+    return;
+  size_t bytes = (size_t)s->len * sizeof(int);
+  long off = tcc_spill_append(s->data.str, bytes);
+  if (off < 0 || off >= 0x7fffffffL)
+    return;
+  tcc_free(s->data.str);
+  s->data.str = NULL;
+  s->allocated_len = -1;
+  s->spill_pos = (int)off + 1;
+}
+
+int *tok_str_unspill(TokenString *s)
+{
+  if (!s->spill_pos)
+    tcc_error("internal error: spilled token string without a copy");
+  size_t bytes = (size_t)s->len * sizeof(int);
+  int *buf = tcc_malloc(bytes);
+  tcc_spill_read(s->spill_pos - 1L, buf, bytes);
+  s->data.str = buf;
+  s->allocated_len = s->len;
+  if (nb_tok_spill_loaded == cap_tok_spill_loaded)
+  {
+    cap_tok_spill_loaded = cap_tok_spill_loaded ? cap_tok_spill_loaded * 2 : 64;
+    tok_spill_loaded = tcc_realloc(tok_spill_loaded, cap_tok_spill_loaded * sizeof *tok_spill_loaded);
+  }
+  tok_spill_loaded[nb_tok_spill_loaded].s = s;
+  tok_spill_loaded[nb_tok_spill_loaded].buf = buf;
+  nb_tok_spill_loaded++;
+  return buf;
+}
+
+/* Drop the copy read back into BUF for S, if S still holds exactly it; a
+ * string that swapped its buffer since keeps the new one and leaves the
+ * spill file. */
+static void tok_spill_drop_loaded(TokenString *s, int *buf)
+{
+  if (s->data.str == buf && s->allocated_len == s->len)
+  {
+    tcc_free(buf);
+    s->data.str = NULL;
+    s->allocated_len = -1;
+  }
+  else
+    s->spill_pos = 0;
+}
+
+/* S's read-back copy is no longer referenced: free it until the next access.
+ * Only for a copy the caller itself caused to be read (S was spilled,
+ * allocated_len < 0, before its access) or where nothing replays S: a replay
+ * reads the buffer in place. */
+ST_FUNC void tok_str_release(TokenString *s)
+{
+  if (!s->spill_pos)
+    return;
+  for (int i = nb_tok_spill_loaded; i-- > 0;)
+    if (tok_spill_loaded[i].s == s)
+    {
+      TokSpillLoaded e = tok_spill_loaded[i];
+      tok_spill_loaded[i] = tok_spill_loaded[--nb_tok_spill_loaded];
+      tok_spill_drop_loaded(e.s, e.buf);
+      return;
+    }
+}
+
+/* S's read-back copy, which the macro stack replays: once every level reading
+ * it sits on its final TOK_EOF (a function body past its closing brace), each
+ * points at a static end instead and the copy goes until the next access.
+ * Nothing changes while some level is still inside S. */
+static void tok_str_release_replayed(TokenString *s)
+{
+  static const int at_end[1] = {TOK_EOF};
+  if (!s || !s->spill_pos || s->allocated_len <= 0 || s->len <= 0)
+    return;
+  const uintptr_t b = (uintptr_t)s->data.str, last = b + (uintptr_t)(s->len - 1) * sizeof(int);
+  if (s->data.str[s->len - 1] != TOK_EOF)
+    return;
+#define TOKSTR_INSIDE(p) ((uintptr_t)(p) >= b && (uintptr_t)(p) <= last + sizeof(int))
+  if (TOKSTR_INSIDE(macro_ptr) && (uintptr_t)macro_ptr != last)
+    return;
+  for (TokenString *m = macro_stack; m; m = m->prev)
+    if (TOKSTR_INSIDE(m->prev_ptr) && (uintptr_t)m->prev_ptr != last)
+      return;
+#undef TOKSTR_INSIDE
+  if ((uintptr_t)macro_ptr == last)
+    macro_ptr = at_end;
+  for (TokenString *m = macro_stack; m; m = m->prev)
+    if ((uintptr_t)m->prev_ptr == last)
+      m->prev_ptr = at_end;
+  tok_str_release(s);
+}
+
+/* The function being generated is parsed: the read-back copies its replay
+ * holds -- the deferred body, and the body a compile replays (a borrowed
+ * level's owner) -- are not read again before the backend is done. */
+ST_FUNC void tok_str_release_parsed(void)
+{
+  tok_str_release_replayed(tcc_state->deferred_body);
+  for (TokenString *m = macro_stack; m; m = m->prev)
+    if (m->alloc == 2 && m->owner)
+      tok_str_release_replayed(m->owner);
+}
+
+/* Free every read-back copy -- only where no token string is replayed, since
+ * a replay (and the views inline expansion builds) reads the buffer itself. */
+ST_FUNC void tok_str_release_spilled(void)
+{
+  if (macro_stack || !nb_tok_spill_loaded)
+    return;
+  for (int i = 0; i < nb_tok_spill_loaded; i++)
+    tok_spill_drop_loaded(tok_spill_loaded[i].s, tok_spill_loaded[i].buf);
+  nb_tok_spill_loaded = 0;
+}
+
+/* S is being freed: it leaves the list of copies read back. */
+static void tok_str_spill_forget(TokenString *s)
+{
+  if (!s->spill_pos)
+    return;
+  for (int i = nb_tok_spill_loaded; i-- > 0;)
+    if (tok_spill_loaded[i].s == s)
+      tok_spill_loaded[i] = tok_spill_loaded[--nb_tok_spill_loaded];
+  if (s->allocated_len < 0)
+  {
+    s->allocated_len = 0; /* nothing to free: the bytes are in the file */
+    s->data.str = NULL;
+  }
+  s->spill_pos = 0;
+}
+
+/* End of the compilation: remove the spill file. */
+ST_FUNC void tok_str_spill_close(void)
+{
+  if (tok_spill_fd >= 0)
+  {
+    close(tok_spill_fd);
+    unlink(tok_spill_path);
+  }
+  tok_spill_fd = -1;
+  tok_spill_off = 0;
+  tcc_free(tok_spill_path);
+  tok_spill_path = NULL;
+  tcc_free(spill_wbuf);
+  spill_wbuf = NULL;
+  spill_wlen = 0;
+  spill_flushed = 0;
+  tcc_free(tok_spill_loaded);
+  tok_spill_loaded = NULL;
+  nb_tok_spill_loaded = cap_tok_spill_loaded = 0;
 }
 
 static int tok_str_word_count(const int *p)
@@ -1667,6 +2141,30 @@ ST_FUNC void tok_str_add(TokenString *s, int t)
   s->len = len;
 }
 
+/* A header replaying STR's first LEN tokens without copying them: begin_macro(.., 2)
+ * frees the header and leaves the tokens to STR.  Compiling a saved body used to
+ * copy it first (the largest body of a Zig kernel compile is 67 KB, held at its
+ * peak as well as the original).  STR's buffer is read back now if it was
+ * spilled, and stays until the next tok_str_release_spilled -- never inside a
+ * function's compile. */
+/* Is the innermost replay the compile of a function from its own saved tokens? */
+ST_FUNC int tok_reading_compile_replay(void)
+{
+  return macro_stack && macro_stack == tcc_state->compile_replay;
+}
+
+ST_FUNC TokenString *tok_str_borrow(TokenString *str, int len)
+{
+  TokenString *b = tok_str_alloc();
+  if (len > 0)
+  {
+    b->data.str = (int *)tok_str_buf(str);
+    b->allocated_len = len;
+    b->len = len;
+  }
+  return b;
+}
+
 ST_FUNC void begin_macro(TokenString *str, int alloc)
 {
   str->alloc = alloc;
@@ -1675,6 +2173,15 @@ ST_FUNC void begin_macro(TokenString *str, int alloc)
   str->save_line_num = file->line_num;
   macro_ptr = tok_str_buf(str);
   macro_stack = str;
+}
+
+/* Replay STR, which may be a kept string (too short a header for the macro
+ * stack's fields), and free it when the replay ends. */
+ST_FUNC void begin_macro_kept(TokenString *str)
+{
+  TokenString *b = tok_str_borrow(str, str->len);
+  b->owner = str;
+  begin_macro(b, 3);
 }
 
 ST_FUNC void end_macro(void)
@@ -1690,9 +2197,12 @@ ST_FUNC void end_macro(void)
   }
   else
   {
-    if (str->alloc == 2)
+    TokenString *owner = str->alloc == 3 ? str->owner : NULL;
+    if (str->alloc >= 2)
       str->data.str = NULL; /* don't free */
     tok_str_free(str);
+    if (owner)
+      tok_str_free(owner);
   }
 }
 
@@ -2109,6 +2619,62 @@ static int macro_is_equal(const int *a, const int *b)
 }
 
 /* defines handling */
+/* The macro of each name that has one (TokenSym.has_define): open-addressed,
+ * at most half full; an undefined name keeps its slot with a NULL macro. */
+typedef struct DefineSlot
+{
+  int tok; /* 0 = empty */
+  Sym *s;
+} DefineSlot;
+static DefineSlot *define_map;
+static int define_map_nb, define_map_mask;
+
+static Sym **define_slot(int tok, int create)
+{
+  unsigned h;
+  if (!define_map)
+  {
+    if (!create)
+      return NULL;
+    define_map_mask = 63;
+    define_map = tcc_mallocz((define_map_mask + 1) * sizeof *define_map);
+  }
+  for (h = (unsigned)tok * 2654435761u;; h++)
+  {
+    DefineSlot *e = &define_map[h & define_map_mask];
+    if (e->tok == tok)
+      return &e->s;
+    if (e->tok)
+      continue;
+    if (!create)
+      return NULL;
+    if (2 * (define_map_nb + 1) > define_map_mask + 1)
+    {
+      DefineSlot *old = define_map;
+      int n = define_map_mask + 1;
+      define_map_mask = 2 * n - 1;
+      define_map = tcc_mallocz(2 * n * sizeof *define_map);
+      define_map_nb = 0;
+      for (int i = 0; i < n; i++)
+        if (old[i].tok)
+          *define_slot(old[i].tok, 1) = old[i].s;
+      tcc_free(old);
+      return define_slot(tok, 1);
+    }
+    define_map_nb++;
+    e->tok = tok;
+    return &e->s;
+  }
+}
+
+static void define_set(TokenSym *ts, Sym *s)
+{
+  Sym **slot = define_slot(ts->tok, s != NULL);
+  if (slot)
+    *slot = s;
+  ts->has_define = s != NULL;
+}
+
 ST_INLN void define_push(int v, int macro_type, int *str, Sym *first_arg)
 {
   Sym *s, *o;
@@ -2119,7 +2685,7 @@ ST_INLN void define_push(int v, int macro_type, int *str, Sym *first_arg)
   s->next = first_arg;
   /* v may be an as-yet-unmaterialized builtin (e.g. the startup defines for
      __LINE__ etc., or a #define of a builtin name) — ensure its slot. */
-  tok_ensure(v)->sym_define = s;
+  define_set(tok_ensure(v), s);
 
   if (o && !macro_is_equal(o->d, s->d))
     tcc_warning("%s redefined", get_tok_str(v, NULL));
@@ -2133,7 +2699,7 @@ ST_FUNC void define_undef(Sym *s)
   {
     TokenSym *ts = table_ident[v - TOK_IDENT];
     if (ts) /* lazy builtin never materialized => was never a macro */
-      ts->sym_define = NULL;
+      define_set(ts, NULL);
   }
 }
 
@@ -2146,7 +2712,9 @@ ST_INLN Sym *define_find(int v)
     return NULL;
   }
   ts = table_ident[v];
-  return ts ? ts->sym_define : NULL; /* NULL slot = lazy builtin, not a macro */
+  if (!ts || !ts->has_define) /* NULL slot = lazy builtin, not a macro */
+    return NULL;
+  return *define_slot(ts->tok, 0);
 }
 
 static uint8_t *skip_logical_line(uint8_t *p)
@@ -2463,8 +3031,8 @@ static int pp_assertion_value(int kind_tok, int value_tok)
   if (kind_tok < TOK_IDENT || value_tok < TOK_IDENT)
     return 0;
 
-  kind = table_ident[kind_tok - TOK_IDENT]->str;
-  value = table_ident[value_tok - TOK_IDENT]->str;
+  kind = tok_name(table_ident[kind_tok - TOK_IDENT]);
+  value = tok_name(table_ident[value_tok - TOK_IDENT]);
 
   if (!strcmp(kind, "cpu") || !strcmp(kind, "machine") || !strcmp(kind, "system"))
     return pp_assertion_macro_defined(value);
@@ -2830,7 +3398,7 @@ static int pragma_parse(TCCState *s1)
     }
     if (s)
     {
-      table_ident[v - TOK_IDENT]->sym_define = s->d ? s : NULL;
+      define_set(table_ident[v - TOK_IDENT], s->d ? s : NULL);
     }
     else
     {
@@ -4290,7 +4858,7 @@ redo_no_start:
           ts = *pts;
           if (!ts)
             break;
-          if (ts->len == len && !memcmp(ts->str, p1, len)) {
+          if (ts->len == len && !memcmp(tok_name(ts), p1, len)) {
             token_lookup_cache_store(h_full, len, ts);
             goto token_found;
           }
@@ -6077,6 +6645,9 @@ ST_FUNC void tccpp_delete(TCCState *s)
   if (n > total_idents)
     total_idents = n;
   toksym_free_all();
+  tcc_free(define_map); /* the macros' map goes with the names */
+  define_map = NULL;
+  define_map_nb = define_map_mask = 0;
   tcc_free(table_ident);
   table_ident = NULL;
   table_ident_alloc = 0;
@@ -6104,8 +6675,10 @@ ST_FUNC void tccpp_delete(TCCState *s)
   */
 
   /* free allocators */
+#ifdef USE_TAL
   tal_delete(tokstr_alloc);
   tokstr_alloc = NULL;
+#endif
 }
 
 

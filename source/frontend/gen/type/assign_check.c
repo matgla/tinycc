@@ -64,7 +64,7 @@ int mark_value_bytes(CType *type, int base, unsigned char *map, int map_size)
     Sym *sref = type->ref;
     if (!sref)
       return -1;
-    for (Sym *f = sref->next; f; f = f->next)
+    for (Sym *f = sym_first(sref); f; f = f->next)
     {
       int rc = mark_value_bytes(&f->type, base + f->c, map, map_size);
       if (rc < 0)

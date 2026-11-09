@@ -18,11 +18,26 @@
 #include "opt_utils.h"
 #include "memory/small_sequence.h"
 
+/* The value in two words: with an int64_t member the entry was 16 bytes, one
+ * per temp of the function at the compile's memory peak (RA-time SSA). */
 typedef struct
 {
   int gen;
-  int64_t value;
+  uint32_t lo;
+  int32_t hi;
 } TmpConstInfo;
+
+static inline int64_t tci_value(const TmpConstInfo *e)
+{
+  return (int64_t)(((uint64_t)(uint32_t)e->hi << 32) | e->lo);
+}
+
+static inline void tci_set(TmpConstInfo *e, int gen, int64_t v)
+{
+  e->gen = gen;
+  e->lo = (uint32_t)v;
+  e->hi = (int32_t)((uint64_t)v >> 32);
+}
 
 /* Inline-first scratch (caps match the old hand-rolled stack-then-heap split). */
 TCC_SMALL_SEQUENCE_DEFINE(TmpInfoSeq, TmpConstInfo, 64)
@@ -106,7 +121,7 @@ static int cpt_operand_const(CPTCtx *c, IROperand op, int64_t *out)
     int pos = TCCIR_DECODE_VREG_POSITION(vr);
     if (pos <= c->max_tmp_pos && c->tmp_info[pos].gen == c->current_gen)
     {
-      *out = c->tmp_info[pos].value;
+      *out = tci_value(&c->tmp_info[pos]);
       return 1;
     }
     return 0;
@@ -116,7 +131,7 @@ static int cpt_operand_const(CPTCtx *c, IROperand op, int64_t *out)
     int pos = TCCIR_DECODE_VREG_POSITION(vr);
     if (pos <= c->max_var_pos && c->var_info[pos].gen == c->current_gen)
     {
-      *out = c->var_info[pos].value;
+      *out = tci_value(&c->var_info[pos]);
       return 1;
     }
   }
@@ -190,7 +205,7 @@ static int cpt_try_switch_table_fold(CPTCtx *c, int i)
   int pos = TCCIR_DECODE_VREG_POSITION(src1_vr);
   if (pos > c->max_tmp_pos || c->tmp_info[pos].gen != c->current_gen)
     return 0;
-  int64_t index_val = c->tmp_info[pos].value;
+  int64_t index_val = tci_value(&c->tmp_info[pos]);
   int table_id = (int)tcc_ir_op_src2_imm(ir, q);
   if (table_id < 0 || table_id >= ir->num_switch_tables)
     return 0;
@@ -457,8 +472,7 @@ static int cpt_try_softfp_cmp_fold(CPTCtx *c, int i, int *out_continue)
     int dp = TCCIR_DECODE_VREG_POSITION(dv);
     if (dp <= c->max_tmp_pos)
     {
-      c->tmp_info[dp].gen = c->current_gen;
-      c->tmp_info[dp].value = result;
+      tci_set(&c->tmp_info[dp], c->current_gen, result);
     }
   }
   return 1;
@@ -483,8 +497,7 @@ static void cpt_track_tmp_def(CPTCtx *c, int i)
   if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_CVT_FTOF) && irop_is_immediate(cur_src1) &&
       cpt_const_survives_operand(irop_get_imm64_ex(ir, cur_src1), dest))
   {
-    c->tmp_info[pos].gen = c->current_gen;
-    c->tmp_info[pos].value = ir_opt_fit_const_to_operand(irop_get_imm64_ex(ir, cur_src1), dest);
+    tci_set(&c->tmp_info[pos], c->current_gen, ir_opt_fit_const_to_operand(irop_get_imm64_ex(ir, cur_src1), dest));
   }
   else
     c->tmp_info[pos].gen = 0;
@@ -510,8 +523,7 @@ static void cpt_track_var_def(CPTCtx *c, int i)
     if (irop_is_immediate(cur_src1) && !irop_is_sym(cur_src1) &&
         cpt_const_survives_operand(irop_get_imm64_ex(ir, cur_src1), dest))
     {
-      c->var_info[pos].gen = c->current_gen;
-      c->var_info[pos].value = ir_opt_fit_const_to_operand(irop_get_imm64_ex(ir, cur_src1), dest);
+      tci_set(&c->var_info[pos], c->current_gen, ir_opt_fit_const_to_operand(irop_get_imm64_ex(ir, cur_src1), dest));
     }
     else
       c->var_info[pos].gen = 0;

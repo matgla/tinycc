@@ -9,7 +9,7 @@
  *  path. Neither drives tcc_ir_stack_build() itself (the largest function in
  *  the file, ~100 lines: the offset hash table, slot-kind/size derivation
  *  from LSLiveInterval, slot sharing across intervals at the same offset,
- *  and the IRLiveInterval::stack_slot_index back-link) nor the
+ *  and the stack-slot back-link (TCCStackLayout.vreg_slots)) nor the
  *  tcc_ir_stack_spill_cache_* IR-state wrappers (untested anywhere).
  *
  *  This file builds ir->ls.intervals[] directly via the real
@@ -18,7 +18,7 @@
  *  test_opt_promote_extra.c's utb_ls_reg()/utb_ls_spill() helpers, then
  *  calls tcc_ir_stack_build() and inspects the resulting TCCStackLayout with
  *  oracle asserts (exact slot count/offset/size/alignment/kind/vreg, and the
- *  IRLiveInterval::stack_slot_index back-link).
+ *  stack-slot back-link (TCCStackLayout.vreg_slots)).
  */
 
 #define USING_GLOBALS
@@ -241,7 +241,7 @@ UT_TEST(test_build_multiple_distinct_offsets_creates_multiple_slots)
 
   UT_ASSERT_EQ(tcc_ir_stack_slot_count(ir), 3);
 
-  /* Each vreg's IRLiveInterval::stack_slot_index must point at the slot
+  /* Each vreg's stack-slot back-link must point at the slot
    * with the matching offset (the back-link tcc_ir_stack_slot_by_vreg
    * relies on). */
   const TCCStackSlot *s0 = tcc_ir_stack_slot_by_vreg(ir, v0);
@@ -266,9 +266,7 @@ UT_TEST(test_build_stack_slot_index_backlink_set)
 
   tcc_ir_stack_build(ir);
 
-  IRLiveInterval *li = tcc_ir_get_live_interval(ir, v0);
-  UT_ASSERT(li != NULL);
-  UT_ASSERT_EQ(li->stack_slot_index, 0);
+  UT_ASSERT(tcc_ir_stack_slot_by_vreg(ir, v0) == &ir->stack_layout.slots[0]);
 
   tcc_ir_free(ir);
   return 0;
@@ -282,7 +280,7 @@ UT_TEST(test_build_two_intervals_same_offset_share_one_slot)
 {
   /* Two distinct vregs stack_location'd at the same offset (regalloc slot
    * sharing / coalescing) must produce exactly ONE TCCStackSlot, and both
-   * vregs' stack_slot_index must resolve back to it. */
+   * vregs' back-links must resolve back to it. */
   TCCIRState *ir = tcc_ir_alloc();
   int v0 = tcc_ir_vreg_alloc_var(ir);
   int v1 = tcc_ir_vreg_alloc_var(ir);
@@ -396,7 +394,7 @@ UT_TEST(test_slot_by_offset_finds_built_slot)
 UT_TEST(test_slot_by_vreg_no_stack_slot_returns_null)
 {
   /* A valid vreg with a live interval that was never stack-built (no
-   * tcc_ir_stack_build call) has stack_slot_index == -1 (its tcc_mallocz'd
+   * tcc_ir_stack_build call) has no back-link (its tcc_mallocz'd
    * default via ir_vreg_intervals_init). */
   TCCIRState *ir = tcc_ir_alloc();
   int v0 = tcc_ir_vreg_alloc_var(ir);

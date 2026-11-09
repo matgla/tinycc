@@ -1695,7 +1695,7 @@ static void nrvo_type_cover(CType *t, int at, uint8_t *cov, int lim, int depth)
   const int bt = t->t & VT_BTYPE;
   if (depth < 8 && bt == VT_STRUCT && t->ref && !(t->t & VT_BITFIELD))
   {
-    for (Sym *f = t->ref->next; f; f = f->next)
+    for (Sym *f = sym_first(t->ref); f; f = f->next)
     {
       if (f->type.t & VT_BITFIELD)
       {

@@ -253,6 +253,12 @@ static void ra_mark_rematerializable(TCCIRState *ir)
     return;
   for (int t = 0; t < nt; t++)
     ir->temporary_variables_live_intervals[t].remat_kind = 0;
+  /* (position, constant) pairs of the remat temps, by position: a word per
+   * temp of the function was alive through code generation, the peak. */
+  int remat_cap = 0;
+  tcc_free(ir->remat_imm);
+  ir->remat_imm = NULL;
+  ir->remat_imm_size = 0;
 
   int n = ir->next_instruction_index;
   int *def_count = tcc_mallocz(nt * sizeof(int));
@@ -315,7 +321,14 @@ static void ra_mark_rematerializable(TCCIRState *ir)
     if (iv->no_remat)
       continue;
     iv->remat_kind = 1;
-    iv->remat_imm = irop_get_imm32(s);
+    if (ir->remat_imm_size == remat_cap)
+    {
+      remat_cap = remat_cap ? 2 * remat_cap : 16;
+      ir->remat_imm = tcc_realloc(ir->remat_imm, sizeof(int32_t) * 2 * remat_cap);
+    }
+    ir->remat_imm[2 * ir->remat_imm_size] = t;
+    ir->remat_imm[2 * ir->remat_imm_size + 1] = irop_get_imm32(s);
+    ir->remat_imm_size++;
 
     /* Do NOT drop the def: rematerialization only happens for the one
      * machine_op operand shape (spilled + need_lval value read, see
@@ -2191,9 +2204,17 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
    * here with NOPs in the stream. */
   tcc_ir_opt_compact_nops(ir);
 
+  /* The temps no operand names any more go before SRA and the interval
+   * arrays size anything else (tcc_ir_compact_temps). */
+  if (tcc_state && TCC_OPT(tcc_state, optimize) > 0)
+    tcc_ir_compact_temps(ir);
+
   /* Small frame objects touched only a word at a time become VARs, which the
    * SSA construction below renames like any other scalar. */
   ir->sra_var_lo = ir->sra_var_hi = -1;
+  /* The flat passes' frame-pointer map: nothing below asks for it before SSA
+   * construction frees it, and SRA's own tables peak meanwhile. */
+  ir_opt_frame_ptr_free(ir);
   if (tcc_state && TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("sra"))
   {
     tcc_ir_opt_sra(ir);

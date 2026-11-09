@@ -27,23 +27,27 @@ IRSSAVregInfo *ssa_opt_vinfo(IRSSAOptCtx *ctx, int32_t vreg)
  * empty. */
 #define SSA_USE_FIRST_CAP 2
 
+/* Room for one more use.  The capacity is not stored (a word per vreg): a
+ * list only ever grows to the power of two at or above its count, at least
+ * SSA_USE_FIRST_CAP, and a removal leaves the buffer as it is, so it always
+ * has that much -- full exactly when the count is such a power of two. */
+static void ssa_opt_use_room(IRSSAVregInfo *vi)
+{
+  const int n = vi->use_count;
+  if (vi->uses && (n < SSA_USE_FIRST_CAP || (n & (n - 1))))
+    return;
+  vi->uses = tcc_realloc(vi->uses, (n < SSA_USE_FIRST_CAP ? SSA_USE_FIRST_CAP : 2 * n) * sizeof(IRSSAUse));
+}
+
 void ssa_opt_add_use_instr(IRSSAVregInfo *vi, int instr_idx)
 {
-  if (vi->use_count >= vi->use_cap) {
-    int nc = vi->use_cap ? vi->use_cap * 2 : SSA_USE_FIRST_CAP;
-    vi->uses = tcc_realloc(vi->uses, nc * sizeof(IRSSAUse));
-    vi->use_cap = nc;
-  }
+  ssa_opt_use_room(vi);
   vi->uses[vi->use_count++] = (IRSSAUse){ .idx = instr_idx, .kind = SSA_USE_INSTR };
 }
 
 void ssa_opt_add_use_phi(IRSSAVregInfo *vi, int block, int slot)
 {
-  if (vi->use_count >= vi->use_cap) {
-    int nc = vi->use_cap ? vi->use_cap * 2 : SSA_USE_FIRST_CAP;
-    vi->uses = tcc_realloc(vi->uses, nc * sizeof(IRSSAUse));
-    vi->use_cap = nc;
-  }
+  ssa_opt_use_room(vi);
   vi->uses[vi->use_count++] = (IRSSAUse){ .idx = block, .slot = slot, .kind = SSA_USE_PHI };
 }
 
@@ -200,7 +204,6 @@ void tcc_ir_ssa_opt_rebuild(IRSSAOptCtx *ctx)
     tcc_free(ctx->vinfo[i].uses);
     ctx->vinfo[i].uses = NULL;
     ctx->vinfo[i].use_count = 0;
-    ctx->vinfo[i].use_cap = 0;
   }
 
   ssa_opt_vinfo_grow(ctx, ctx->ir->next_temporary_variable);

@@ -6,6 +6,9 @@ so it spends more time waiting for instructions than executing them.
 
 `-Wl,--hot-text=FILE` names functions the loader runs from a copy in SRAM. `FILE` has
 one function name per line; `#` starts a comment; a name that does not exist is ignored.
+A name also matches the functions it names once Zig's numbers are dropped (`fn__1234`,
+`fn__func_12__345` -> `fn`): the C backend renumbers them on every change of the source,
+so the device zig's list (`apps/zig/hot_functions.txt` in yasos) names them without.
 A function moves only if it has a section of its own (`-ffunction-sections`).
 
 ## Link

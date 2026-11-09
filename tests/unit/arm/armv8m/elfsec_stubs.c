@@ -196,4 +196,9 @@ const char *get_tok_str(int v, CValue *cv)
   const char *name = utb_tok_name_lookup(v);
   return name ? name : "";
 }
+
+const char *tok_name_tmp(int v)
+{
+  return get_tok_str(v, NULL);
+}
 #endif /* UT_SSA_OPT_REAL */

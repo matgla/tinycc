@@ -1298,6 +1298,17 @@ static void th_widened_record(int pos)
  * relocation on it, rewrite it to its 32-bit form instead: same bytes, same
  * alignment, one instruction fewer.  Real pass only; the dry passes lay out
  * the pad, which has the same size. */
+/* How far back the IT scans before a widening may look: the section's start,
+ * or -- in an object whose .text is split by function when written
+ * (split_text_by_function) -- this function's, as the bytes before it are
+ * another function's, in a section of its own then. */
+static int th_scan_floor(void)
+{
+  return tcc_state->text_split_pending && cur_text_section == text_section && tcc_state->split_func_start > 0
+             ? tcc_state->split_func_start
+             : 0;
+}
+
 static int th_widen_last_insn(int widen_from)
 {
   if (widen_from == TCC_ALIGN_WIDEN_FROM_PROLOG)
@@ -1320,7 +1331,7 @@ static int th_widen_last_insn(int widen_from)
    * ot()'s IT tracking, and inside IT the 16-bit forms set no flags.  Refuse
    * when any halfword an IT block could reach back from (4 x 32-bit) looks like
    * an IT; a false match only keeps the NOP. */
-  for (int back = pos - 2; back >= pos - 16 && back >= 0; back -= 2)
+  for (int back = pos - 2; back >= pos - 16 && back >= th_scan_floor(); back -= 2)
   {
     const uint16_t prev = *(uint16_t *)(cur_text_section->data + back);
     if ((prev & 0xff00) == 0xbf00 && (prev & 0xf))
@@ -1408,7 +1419,7 @@ void th_widen_armed_apply(thumb_opcode *op)
     return;
   /* An IT written with raw o() is invisible to ot()'s tracking, as in
    * th_widen_last_insn. */
-  for (int back = ind - 2; back >= ind - 16 && back >= 0; back -= 2)
+  for (int back = ind - 2; back >= ind - 16 && back >= th_scan_floor(); back -= 2)
   {
     const uint16_t prev = *(uint16_t *)(cur_text_section->data + back);
     if ((prev & 0xff00) == 0xbf00 && (prev & 0xf))

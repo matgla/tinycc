@@ -126,6 +126,183 @@ ST_FUNC char *tcc_load_text(int fd)
 #undef free
 #undef realloc
 
+#if defined(TCC_ALLOC_PROFILE) && defined(TCC_IS_NATIVE) && defined(TARGETOS_YasOS)
+static void alloc_trace(void *in, unsigned long size, void *out);
+#elif defined(TCC_ALLOC_BACKTRACE) && !defined(TCC_IS_NATIVE)
+/* TCC_ALLOC_BACKTRACE (host cross only, scripts/alloc_trace/alloc_trace.py):
+ * TCC_ALLOCTRACE=FILE writes every malloc/realloc/free made through
+ * default_reallocator as {in, size, out, stack} 32-bit words (in 0 = malloc,
+ * size 0 = free, stack 0 for a free), and FILE.stacks each call stack the
+ * first time it is seen, as {id, depth, pc[depth]}.  Built -m32 -malign-double
+ * -mlong-double-64, the cross's structures have the device compiler's sizes,
+ * so scripts/alloc_trace replays the trace against the device's malloc and names
+ * whatever holds the memory at the peak by its callers, past the helpers
+ * (dynarray_add, sym pools, section_realloc) that a file:line site stops at. */
+#include <execinfo.h>
+#include <fcntl.h>
+#include <unistd.h>
+#define BT_DEPTH 24
+static int bt_fd = -1, bt_stack_fd = -1, bt_tried;
+static unsigned bt_buf[4 * 4096], bt_n;
+static unsigned *bt_tab_hash, *bt_tab_id, bt_tab_cap, bt_tab_n;
+static void **bt_pcs; /* bt_pcs[id * BT_DEPTH ...], id from 1 */
+static unsigned char *bt_depth;
+
+static void bt_flush(void)
+{
+  if (bt_fd >= 0 && bt_n)
+    write(bt_fd, bt_buf, bt_n * sizeof(unsigned));
+  bt_n = 0;
+}
+
+static void bt_close(void)
+{
+  bt_flush();
+  if (bt_fd >= 0)
+    close(bt_fd);
+  if (bt_stack_fd >= 0)
+    close(bt_stack_fd);
+  bt_fd = bt_stack_fd = -1;
+}
+
+static unsigned bt_hash(void **pc, int n)
+{
+  unsigned h = 2166136261u;
+  for (int i = 0; i < n; i++)
+    h = (h ^ (unsigned)(unsigned long)pc[i]) * 16777619u;
+  return h | 1;
+}
+
+static void bt_tab_put(unsigned h, unsigned id)
+{
+  unsigned m = bt_tab_cap - 1, s = h & m;
+  while (bt_tab_hash[s])
+    s = (s + 1) & m;
+  bt_tab_hash[s] = h;
+  bt_tab_id[s] = id;
+}
+
+/* The id of this call stack, written to FILE.stacks the first time. */
+static unsigned bt_stack_id(void)
+{
+  void *pc[BT_DEPTH + 3];
+  int n = backtrace(pc, BT_DEPTH + 3) - 3; /* drop bt_stack_id, alloc_trace, default_reallocator */
+  if (n <= 0)
+    return 0;
+  void **p = pc + 3;
+  unsigned h = bt_hash(p, n);
+  if (2 * (bt_tab_n + 1) > bt_tab_cap)
+  {
+    unsigned *oh = bt_tab_hash, *oi = bt_tab_id, oc = bt_tab_cap;
+    bt_tab_cap = oc ? oc * 2 : 1u << 16;
+    bt_tab_hash = calloc(bt_tab_cap, sizeof(unsigned));
+    bt_tab_id = calloc(bt_tab_cap, sizeof(unsigned));
+    bt_pcs = realloc(bt_pcs, sizeof(void *) * BT_DEPTH * (bt_tab_cap / 2 + 1));
+    bt_depth = realloc(bt_depth, bt_tab_cap / 2 + 1);
+    for (unsigned i = 0; i < oc; i++)
+      if (oh[i])
+        bt_tab_put(oh[i], oi[i]);
+    free(oh);
+    free(oi);
+  }
+  unsigned m = bt_tab_cap - 1;
+  for (unsigned s = h & m; bt_tab_hash[s]; s = (s + 1) & m)
+  {
+    unsigned id = bt_tab_id[s];
+    if (bt_tab_hash[s] == h && bt_depth[id] == n && !memcmp(bt_pcs + id * BT_DEPTH, p, sizeof(void *) * n))
+      return id;
+  }
+  unsigned id = ++bt_tab_n;
+  memcpy(bt_pcs + id * BT_DEPTH, p, sizeof(void *) * n);
+  bt_depth[id] = (unsigned char)n;
+  bt_tab_put(h, id);
+  unsigned rec[2 + BT_DEPTH];
+  rec[0] = id;
+  rec[1] = (unsigned)n;
+  for (int i = 0; i < n; i++)
+    rec[2 + i] = (unsigned)(unsigned long)p[i];
+  write(bt_stack_fd, rec, sizeof(unsigned) * (2 + n));
+  return id;
+}
+
+static void alloc_trace(void *in, unsigned long size, void *out)
+{
+  if (!bt_tried)
+  {
+    bt_tried = 1;
+    const char *path = getenv("TCC_ALLOCTRACE");
+    if (!path)
+      return;
+    char sp[1024];
+    snprintf(sp, sizeof sp, "%s.stacks", path);
+    void *warm[2];
+    backtrace(warm, 2); /* loads the unwinder before the first record */
+    bt_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    bt_stack_fd = open(sp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (bt_fd < 0 || bt_stack_fd < 0)
+      bt_close();
+    else
+      atexit(bt_close);
+  }
+  if (bt_fd < 0)
+    return;
+  bt_buf[bt_n++] = (unsigned)(unsigned long)in;
+  bt_buf[bt_n++] = (unsigned)size;
+  bt_buf[bt_n++] = (unsigned)(unsigned long)out;
+  bt_buf[bt_n++] = size ? bt_stack_id() : 0;
+  if (bt_n == sizeof bt_buf / sizeof bt_buf[0])
+    bt_flush();
+}
+
+/* Pass marks {0xffffffff, 5 begin / 6 end, id, 0}; TRACE.passes names each id
+ * once, as "id name". */
+PUB_FUNC void tcc_alloc_trace_pass(const char *name, int begin)
+{
+  static const char **names;
+  static int nb_names;
+  static FILE *names_file;
+  if (bt_fd < 0 || !name)
+    return;
+  int id = 0;
+  while (id < nb_names && names[id] != name && strcmp(names[id], name))
+    id++;
+  if (id == nb_names)
+  {
+    if (!names_file)
+    {
+      char p[1024];
+      snprintf(p, sizeof p, "%s.passes", getenv("TCC_ALLOCTRACE"));
+      names_file = fopen(p, "w");
+    }
+    names = realloc(names, sizeof(*names) * (nb_names + 1));
+    names[nb_names++] = name;
+    if (names_file)
+      fprintf(names_file, "%d %s\n", id, name), fflush(names_file);
+  }
+  bt_buf[bt_n++] = 0xffffffffu;
+  bt_buf[bt_n++] = begin ? 5 : 6;
+  bt_buf[bt_n++] = (unsigned)id;
+  bt_buf[bt_n++] = 0;
+  if (bt_n == sizeof bt_buf / sizeof bt_buf[0])
+    bt_flush();
+}
+
+/* A record {0xffffffff, what, 0, 0}: alloc_peak and the replays skip it. */
+PUB_FUNC void tcc_alloc_trace_mark(int what)
+{
+  if (bt_fd < 0)
+    return;
+  bt_buf[bt_n++] = 0xffffffffu;
+  bt_buf[bt_n++] = (unsigned)what;
+  bt_buf[bt_n++] = 0;
+  bt_buf[bt_n++] = 0;
+  if (bt_n == sizeof bt_buf / sizeof bt_buf[0])
+    bt_flush();
+}
+#else
+#define alloc_trace(in, size, out) ((void)0)
+#endif
+
 static void *default_reallocator(void *ptr, unsigned long size)
 {
   void *ptr1;
@@ -143,6 +320,7 @@ static void *default_reallocator(void *ptr, unsigned long size)
       exit(1);
     }
   }
+  alloc_trace(ptr, size, ptr1);
   return ptr1;
 }
 
@@ -185,11 +363,20 @@ LIBTCCAPI void tcc_set_realloc(TCCReallocFunc *realloc)
  * take the knobs TCC_TIER (0 first come, 1 arena, 2 arena + slow heap, the default,
  * 3 all slow), TCC_ARENA_KB, TCC_ALLOCPROF and TCC_POOLMAP.
  * -------------------------------------------------------------------------- */
-#if defined(TCC_IS_NATIVE) && defined(TARGETOS_YasOS)
-#include <sys/mman.h>
+#if TCC_HOT_ARENA
 #include "memory/hot_arena.h"
-
+#ifdef TCC_ALLOC_BACKTRACE
+/* The tracing cross (TCC_ALLOC_BACKTRACE) keeps the device's hot arena, so
+ * the hot arrays leave the traced heap as they do on the board; the arena
+ * itself is one traced block, as the board's MAP_FAST mapping is one run. */
+#define HOT_ARENA_MAP(len) tcc_malloc(len)
+#define HOT_ARENA_UNMAP(p, len) tcc_free(p)
+#else
+#include <sys/mman.h>
 extern int __malloc_map_flags;
+#define HOT_ARENA_MAP(len) mmap(NULL, (len), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FAST, -1, 0)
+#define HOT_ARENA_UNMAP(p, len) munmap((p), (len))
+#endif
 
 #define HOT_ARENA_MAX_BYTES (320u * 1024u)
 #define HOT_ARENA_MIN_BYTES (16u * 1024u)
@@ -226,11 +413,183 @@ static int prof_site(const char *file, int line)
   return (int)h;
 }
 
+/* TCC_LIVEPROF=1: what each allocation site holds at the compile's peak, on
+ * the device itself (no board model needed, any image size).  A table keyed
+ * by pointer (libc malloc, outside the counts) gives each block's site and
+ * size back at its free; whenever the total live grows 32 KB past the last
+ * snapshot, every site's live bytes are copied, so the snapshot taken last is
+ * the peak to within 32 KB.  Printed at exit as LIVE lines. */
+static int live_on;
+typedef struct LiveEnt
+{
+  void *p;
+  unsigned size;
+  unsigned site;
+} LiveEnt;
+static LiveEnt *live_tab;
+static unsigned live_cap, live_n;
+static unsigned long live_site[PROF_SITES], live_snap[PROF_SITES];
+static unsigned live_site_blocks[PROF_SITES], live_snap_blocks[PROF_SITES];
+static unsigned long live_total, live_peak, live_snap_total;
+/* live bytes and blocks by allocator class: <2 KB, <32 KB (pooled once the
+ * class widened), >= 32 KB (a mapping of its own) */
+static unsigned long live_cls[3], live_cls_n[3], live_cls_snap[3], live_cls_n_snap[3];
+static int live_class(unsigned long size)
+{
+  return size < 2048 ? 0 : size < 32768 ? 1 : 2;
+}
+/* /proc/poolmap as it was at the last snapshot: whose mappings, and of what
+ * kind, the process held at its peak (allocator overhead = mapped - live). */
+static char live_poolmap[96 * 1024];
+static long live_poolmap_len;
+
+static char live_meminfo[2048];
+static long live_meminfo_len;
+
+static long live_read_file(const char *path, char *buf, long cap)
+{
+  int fd = open(path, O_RDONLY);
+  long n = 0, r;
+  if (fd < 0)
+    return 0;
+  while (n < cap - 1 && (r = read(fd, buf + n, cap - 1 - n)) > 0)
+    n += r;
+  close(fd);
+  return n;
+}
+
+/* TCC_ALLOCTRACE=FILE: every malloc/realloc/free this process makes through
+ * default_reallocator, as {in, size, out} 32-bit words (in 0 = malloc, size 0
+ * = free), for replaying against libc's malloc.c on the host
+ * (libs/libc/tests/malloc_replay.c). */
+static int trace_fd = -1, trace_tried;
+static unsigned trace_buf[3 * 4096], trace_n;
+static unsigned long trace_events;
+
+static void trace_flush(void)
+{
+  if (trace_fd >= 0 && trace_n)
+    write(trace_fd, trace_buf, trace_n * sizeof(unsigned));
+  trace_n = 0;
+}
+
+static void alloc_trace(void *in, unsigned long size, void *out)
+{
+  if (!trace_tried)
+  {
+    trace_tried = 1;
+    const char *path = getenv("TCC_ALLOCTRACE");
+    if (path)
+      trace_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  }
+  if (trace_fd < 0)
+    return;
+  trace_buf[trace_n++] = (unsigned)(unsigned long)in;
+  trace_buf[trace_n++] = (unsigned)size;
+  trace_buf[trace_n++] = (unsigned)(unsigned long)out;
+  trace_events++;
+  if (trace_n == sizeof trace_buf / sizeof trace_buf[0])
+    trace_flush();
+}
+
+void __malloc_stats(long *out, int n);
+static long live_mstats[19];
+
+static void live_poolmap_capture(void)
+{
+  __malloc_stats(live_mstats, 19);
+  /* poolmap stops at the kernel's 4 KB buffer; meminfo's MemProcessUsed is
+   * the whole pool in use at this instant */
+  live_poolmap_len = live_read_file("/proc/poolmap", live_poolmap, sizeof live_poolmap);
+  live_meminfo_len = live_read_file("/proc/meminfo", live_meminfo, sizeof live_meminfo);
+}
+
+static unsigned live_hash(void *p)
+{
+  return (unsigned)(((unsigned long)p >> 3) * 2654435761u);
+}
+
+static void live_insert(LiveEnt e)
+{
+  unsigned m = live_cap - 1, h = live_hash(e.p) & m;
+  while (live_tab[h].p)
+    h = (h + 1) & m;
+  live_tab[h] = e;
+  live_n++;
+}
+
+static void live_grow(void)
+{
+  LiveEnt *old = live_tab;
+  unsigned oc = live_cap;
+  live_cap = oc ? oc * 2 : 1u << 16;
+  live_tab = calloc(live_cap, sizeof *live_tab);
+  live_n = 0;
+  for (unsigned i = 0; i < oc; i++)
+    if (old[i].p)
+      live_insert(old[i]);
+  libc_free(old);
+}
+
+static void live_add(void *p, unsigned long size, int site)
+{
+  if (!p)
+    return;
+  if (2 * (live_n + 1) > live_cap)
+    live_grow();
+  live_insert((LiveEnt){p, (unsigned)size, (unsigned)site});
+  live_site[site] += size;
+  live_site_blocks[site]++;
+  live_cls[live_class(size)] += size;
+  live_cls_n[live_class(size)]++;
+  live_total += size;
+  if (live_total > live_peak)
+    live_peak = live_total;
+  if (live_total > live_snap_total + 32768)
+  {
+    memcpy(live_snap, live_site, sizeof live_snap);
+    memcpy(live_snap_blocks, live_site_blocks, sizeof live_snap_blocks);
+    memcpy(live_cls_snap, live_cls, sizeof live_cls);
+    memcpy(live_cls_n_snap, live_cls_n, sizeof live_cls_n);
+    live_snap_total = live_total;
+    live_poolmap_capture();
+  }
+}
+
+static void live_del(void *p)
+{
+  if (!p || !live_cap)
+    return;
+  unsigned m = live_cap - 1, h = live_hash(p) & m;
+  while (live_tab[h].p && live_tab[h].p != p)
+    h = (h + 1) & m;
+  if (!live_tab[h].p)
+    return; /* allocated before tracking or outside it */
+  LiveEnt e = live_tab[h];
+  live_site[e.site] -= e.size;
+  live_site_blocks[e.site]--;
+  live_cls[live_class(e.size)] -= e.size;
+  live_cls_n[live_class(e.size)]--;
+  live_total -= e.size;
+  live_tab[h].p = NULL;
+  live_n--;
+  /* backward-shift deletion keeps probe chains whole */
+  for (unsigned j = (h + 1) & m; live_tab[j].p; j = (j + 1) & m)
+  {
+    LiveEnt x = live_tab[j];
+    live_tab[j].p = NULL;
+    live_n--;
+    live_insert(x);
+  }
+}
+
 static void prof_alloc(void *p, unsigned long size, const char *file, int line)
 {
   if (!prof_on)
     return;
   int site = prof_site(file, line);
+  if (live_on)
+    live_add(p, size, site);
   prof_port = (1u << 28) | (unsigned)site;
   prof_port = (unsigned)(unsigned long)p;
   prof_port = (unsigned)size;
@@ -240,6 +599,8 @@ static void prof_free(void *p)
 {
   if (!prof_on || !p)
     return;
+  if (live_on)
+    live_del(p);
   prof_port = 2u << 28;
   prof_port = (unsigned)(unsigned long)p;
 }
@@ -270,12 +631,40 @@ static void poolmap_dump(const char *when)
 
 static void prof_exit(void)
 {
+  if (trace_fd >= 0)
+  {
+    trace_flush();
+    close(trace_fd);
+    trace_fd = -1;
+    printf("ALLOCTRACE events=%lu\n", trace_events);
+  }
   if (prof_on)
   {
     prof_on = 0;
-    for (int i = 0; i < PROF_SITES; i++)
-      if (prof_sites[i].file)
-        printf("ALLOCSITE %d %s %d\n", i, prof_sites[i].file, prof_sites[i].line);
+    if (live_on)
+    {
+      printf("LIVEPEAK peak=%lu snap=%lu end=%lu pid=%d\n", live_peak, live_snap_total, live_total, (int)getpid());
+      for (int c = 0; c < 3; c++)
+        printf("LIVECLASS %d bytes=%lu blocks=%lu\n", c, live_cls_snap[c], live_cls_n_snap[c]);
+      printf("MSTATS pools=%ld pool_bytes=%ld free=%ld free_pages=%ld bump=%ld spare=%ld retired=%ld retired_bytes=%ld "
+             "retired_free=%ld retired_free_pages=%ld parked=%ld\n",
+             live_mstats[0], live_mstats[1], live_mstats[2], live_mstats[3], live_mstats[4], live_mstats[5], live_mstats[6],
+             live_mstats[7], live_mstats[8], live_mstats[9], live_mstats[10]);
+      printf("MFREEHIST <64=%ld <256=%ld <1K=%ld <2K=%ld <4K=%ld <8K=%ld <16K=%ld >=16K=%ld\n", live_mstats[11],
+             live_mstats[12], live_mstats[13], live_mstats[14], live_mstats[15], live_mstats[16], live_mstats[17],
+             live_mstats[18]);
+      live_poolmap[live_poolmap_len] = 0;
+      printf("POOLMAP_AT_PEAK_BEGIN\n%sPOOLMAP_AT_PEAK_END\n", live_poolmap);
+      live_meminfo[live_meminfo_len] = 0;
+      printf("MEMINFO_AT_PEAK_BEGIN\n%sMEMINFO_AT_PEAK_END\n", live_meminfo);
+      for (int i = 0; i < PROF_SITES; i++)
+        if (live_snap[i])
+          printf("LIVE %lu %u %s %d\n", live_snap[i], live_snap_blocks[i], prof_sites[i].file, prof_sites[i].line);
+    }
+    else
+      for (int i = 0; i < PROF_SITES; i++)
+        if (prof_sites[i].file)
+          printf("ALLOCSITE %d %s %d\n", i, prof_sites[i].file, prof_sites[i].line);
   }
   if (getenv("TCC_POOLMAP"))
     poolmap_dump("exit");
@@ -304,14 +693,15 @@ PUB_FUNC void tcc_memory_tiers_setup(void)
     __malloc_map_flags = MAP_SLOW;
   if (getenv("TCC_POOLMAP"))
     poolmap_dump("start");
-  if (getenv("TCC_ALLOCPROF"))
+  if (getenv("TCC_ALLOCPROF") || getenv("TCC_LIVEPROF"))
   {
     prof_sites = tcc_mallocz(PROF_SITES * sizeof(*prof_sites));
     prof_port = 0xA110C8EDu;
     prof_on = 1;
+    live_on = getenv("TCC_LIVEPROF") != NULL;
   }
   atexit(prof_exit);
-#else
+#elif !defined(TCC_ALLOC_BACKTRACE)
   __malloc_map_flags = MAP_SLOW;
 #endif
 }
@@ -328,8 +718,8 @@ static void *hot_alloc(unsigned long size)
 #endif
     for (; want >= HOT_ARENA_MIN_BYTES; want -= HOT_ARENA_STEP_BYTES)
     {
-      void *m = mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FAST, -1, 0);
-      if (m != MAP_FAILED)
+      void *m = HOT_ARENA_MAP(want);
+      if (m != NULL && m != (void *)-1)
       {
         hot_arena_init(&hot_arena, m, want);
         hot_arena_mapped = want;
@@ -344,7 +734,7 @@ PUB_FUNC void tcc_hot_release(void)
 {
   if (hot_arena_mapped && !hot_arena.used)
   {
-    munmap(hot_arena.base, hot_arena_mapped);
+    HOT_ARENA_UNMAP(hot_arena.base, hot_arena_mapped);
     hot_arena.base = hot_arena.end = NULL;
     hot_arena_mapped = 0;
   }
@@ -782,6 +1172,20 @@ ST_FUNC void dynarray_add(void *ptab, int *nb_ptr, void *data)
   *nb_ptr = nb;
 }
 
+/* NAME, as one copy shared by every record that names its file: the saved
+ * function bodies and static initializers each carried their own (thousands of
+ * them in Zig's kernel.c, each a full path).  A compile reads a handful of
+ * files, so a list does. */
+ST_FUNC const char *tcc_filename_intern(const char *name)
+{
+  for (int i = 0; i < tcc_state->nb_interned_files; i++)
+    if (!strcmp(tcc_state->interned_files[i], name))
+      return tcc_state->interned_files[i];
+  char *copy = tcc_strdup(name);
+  dynarray_add(&tcc_state->interned_files, &tcc_state->nb_interned_files, copy);
+  return copy;
+}
+
 ST_FUNC void dynarray_reset(void *pp, int *n)
 {
   void **p;
@@ -1206,6 +1610,7 @@ LIBTCCAPI TCCState *tcc_new(void)
   s->warn_discarded_qualifiers = 1;
   s->ms_extensions = 1;
   s->unwind_tables = 1;
+  s->internal_spill = 1;
   /* vreg 0 is a real vreg, so "no vreg bound" has to be -1, not the zeroed
    * default. */
   s->inline_return_vr = -1;
@@ -1261,11 +1666,11 @@ LIBTCCAPI TCCState *tcc_new(void)
   /* Calls to undefined functions that no library in the library paths exports
    * keep R9 (no reload after the call); -fno-module-local-calls restores the
    * reload after every call out of the translation unit. */
-#ifdef CONFIG_TCC_O0_ONLY
+#ifdef CONFIG_TCC_LOW_MEM
   /* The r9-reload elision reads every library's export table into the heap
-   * (tens of KB for libc.so) to decide which callees bind locally; an
-   * O0-only compiler reloads r9 after every external call instead.
-   * -fmodule-local-calls still turns it on. */
+   * (tens of KB for libc.so) to decide which callees bind locally; a low-memory
+   * compiler reloads r9 after every external call instead, which makes code
+   * about 5% bigger.  -fmodule-local-calls still turns it on. */
   s->module_local_calls = 0;
 #else
   s->module_local_calls = 1;
@@ -1296,6 +1701,8 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   tcc_ir_free_switch_func_cache(s1);
   tcc_free(s1->func_purity_cache);
   tcc_free(s1->func_const_result_cache);
+  tcc_free(s1->split_pads);  /* an error before the object is written */
+  tcc_free(s1->text_pieces);
 
   /* free lazy object files (Phase 2 GC) */
   tcc_free_lazy_objfiles(s1);
@@ -1331,6 +1738,7 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   tcc_free(s1->linker_script);
   tcc_free(s1->hot_text_file);
   tcc_free(s1->ram_text_file);
+  dynarray_reset(&s1->interned_files, &s1->nb_interned_files);
   dynarray_reset(&s1->hot_text_flash_names, &s1->nb_hot_text_flash_names);
   dynarray_reset(&s1->ram_text_names, &s1->nb_ram_text_names);
   dynarray_reset(&s1->ram_text_section_names, &s1->nb_ram_text_section_names);
@@ -2004,6 +2412,7 @@ enum
   TCC_OPTION_ba,
   TCC_OPTION_g,
   TCC_OPTION_c,
+  TCC_OPTION_dumpdefaults,
   TCC_OPTION_dumpmachine,
   TCC_OPTION_dumpversion,
   TCC_OPTION_d,
@@ -2091,6 +2500,7 @@ static const TCCOption tcc_options[] = {
     {"bench", TCC_OPTION_bench, 0},
     {"g", TCC_OPTION_g, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"c", TCC_OPTION_c, 0},
+    {"dumpdefaults", TCC_OPTION_dumpdefaults, 0},
     {"dumpmachine", TCC_OPTION_dumpmachine, 0},
     {"dumpversion", TCC_OPTION_dumpversion, 0},
 #ifdef CONFIG_TCC_DEBUG
@@ -2199,6 +2609,7 @@ static const FlagDef options_f[] = {{offsetof(TCCState, char_is_unsigned), 0, "u
                                     {offsetof(TCCState, unwind_tables), 0, "asynchronous-unwind-tables"},
                                     {offsetof(TCCState, function_sections), 0, "function-sections"},
                                     {offsetof(TCCState, data_sections), 0, "data-sections"},
+                                    {offsetof(TCCState, internal_spill), 0, "internal-spill"},
                                     /* IR optimization flags */
                                     {offsetof(TCCState, opt_dce), 0, "dce"},
                                     {offsetof(TCCState, opt_const_prop), 0, "const-prop"},
@@ -2274,6 +2685,19 @@ static int set_flag(TCCState *s, const FlagDef *flags, const char *name)
   }
   return ret;
 }
+
+#define TCC_STR_(x) #x
+#define TCC_STR(x) TCC_STR_(x)
+/* The flags that give a rebuilt compiler this one's defaults: configure asks
+ * for them on YasOS, where they depend on the board the rootfs was built for. */
+static const char dumpdefaults_str[] = ""
+#ifdef CONFIG_TCC_DEFAULT_FPU
+    "-DCONFIG_TCC_DEFAULT_FPU=" TCC_STR(CONFIG_TCC_DEFAULT_FPU) " "
+#endif
+#ifdef CONFIG_TCC_DEFAULT_FP_LIB
+    "-DCONFIG_TCC_DEFAULT_FP_LIB=" TCC_STR(CONFIG_TCC_DEFAULT_FP_LIB) " "
+#endif
+    ;
 
 static const char dumpmachine_str[] =
 /* this is a best guess, please refine as necessary */
@@ -2801,6 +3225,9 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
     case TCC_OPTION_MP:
       s->gen_phony_deps = 1;
       break;
+    case TCC_OPTION_dumpdefaults:
+      printf("%s\n", dumpdefaults_str);
+      exit(0);
     case TCC_OPTION_dumpmachine:
       printf("%s\n", dumpmachine_str);
       exit(0);
@@ -2843,6 +3270,11 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->optimize = atoi(optarg);
         s->optimize_size = 0;
       }
+#ifdef CONFIG_TCC_O0_ONLY
+      /* A note, not a warning: a Makefile's -O2 -Werror still has to build. */
+      if (s->optimize)
+        fprintf(stderr, "tcc: note: built with --disable-optimizer, -O%s has no effect\n", optarg);
+#endif
       /* -O1: scalar cleanup, cheap ARM addressing-mode fusion, constant/range
        * folding, loop rotation, and light inlining of explicitly-inline / tiny
        * functions — the same class of work GCC does at -O1.  The heavy tier

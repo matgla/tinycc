@@ -112,7 +112,7 @@ static int ir_opt_param_vreg_is_volatile(int param_pos)
   if (!tcc_state || !tcc_state->cur_func_sym || !tcc_state->cur_func_sym->type.ref)
     return 1;
 
-  Sym *param = tcc_state->cur_func_sym->type.ref->next;
+  Sym *param = sym_first(tcc_state->cur_func_sym->type.ref);
   for (int i = 0; param && i < param_pos; i++)
     param = param->next;
 

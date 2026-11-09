@@ -36,7 +36,7 @@ static int objsize_ptr_slot_at(CType *t, int off)
   if ((t->t & VT_BTYPE) == VT_STRUCT)
   {
     Sym *f;
-    for (f = t->ref->next; f; f = f->next)
+    for (f = sym_first(t->ref); f; f = f->next)
     {
       int align, fsz;
       if (f->type.t & VT_BITFIELD)

@@ -1524,6 +1524,11 @@ static void tcc_yaff_write_section_image(Section *s, FILE *f)
   addr_t have = s->data_offset < s->sh_size ? s->data_offset : s->sh_size;
   addr_t i;
 
+  if (s->spill)
+  {
+    section_spill_write(s->s1, s, f, s->sh_size);
+    return;
+  }
   if (have)
     fwrite(s->data, 1, have, f);
   for (i = have; i < s->sh_size; ++i)

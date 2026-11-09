@@ -24,18 +24,17 @@ typedef struct IRQuadCompact IRQuadCompact;
 enum { SSA_USE_INSTR = 0, SSA_USE_PHI = 1 };
 
 typedef struct IRSSAUse {
-  int idx;       /* instruction index (INSTR) or block (PHI) */
-  int slot;      /* phi operand slot (PHI only) */
-  uint8_t kind;
+  int idx;               /* instruction index (INSTR) or block (PHI) */
+  signed int slot : 31;  /* phi operand slot (PHI only) */
+  unsigned int kind : 1; /* SSA_USE_INSTR / SSA_USE_PHI */
 } IRSSAUse;
 
 typedef struct IRSSAVregInfo {
   int def_instr;      /* instruction index, -1 if phi/entry */
   int def_phi_block;  /* block ID if phi, -1 otherwise */
   int def_count;      /* number of INSTRUCTION definitions; see ssa_opt_def_total */
-  IRSSAUse *uses;
+  IRSSAUse *uses;     /* room for ssa_opt_use_room(use_count): not stored */
   int use_count;
-  int use_cap;
 } IRSSAVregInfo;
 
 /* Total number of definitions of a vreg, phi included.

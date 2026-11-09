@@ -80,9 +80,11 @@ static const uint8_t *ir_opt_get_rodata_bytes(TCCIRState *ir, IROperand op, size
  * use that is not a plain address derivation or a memory access through it
  * escapes its whole object: the receiver can reach every byte of it. */
 enum { ESP_NONE = 0, ESP_ONE, ESP_MANY };
+/* One per vreg: 8 bytes.  An offset is a frame offset or an object's base
+ * (esp_operand_addr, esp_object_base), always in int32. */
 typedef struct
 {
-  int64_t off; /* an offset inside the object (state ESP_ONE) */
+  int32_t off; /* an offset inside the object (state ESP_ONE) */
   uint8_t state;
 } EspAddr;
 
@@ -222,7 +224,7 @@ static int esp_build_map(TCCIRState *ir, EspAddrMap *m)
         IROperand src = k == 1 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
         EspAddr a = esp_operand_addr(m, src);
         if (a.state == ESP_ONE && irop_get_vreg(src) < 0)
-          a.off = esp_object_base(ir, a.off);
+          a.off = (int32_t)esp_object_base(ir, a.off);
         changed |= esp_merge(ds, a);
       }
     }
@@ -675,16 +677,16 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
 
   typedef struct
   {
-    int64_t offset;
-    int valid;
+    int32_t offset; /* LEA_SET: an offset outside int32 leaves the entry not valid */
+    unsigned valid : 1;
     /* The binding is only a MAY-alias: some vreg on the chain that produced it
        has more than one definition, so at a given use the pointer need not hold
        this address at all (`s = cond ? param : &local;`, or a `p++` that already
        moved it).  Such an entry is still good enough to *invalidate* an entry
        store (Phases 2.5/2.6 want may-alias), but forwarding a stored value into
        a load through it (Phases 3/3b/3c) would be unsound. */
-    int maybe;
-  } SimpleLeaEntry;
+    unsigned maybe : 1;
+  } SimpleLeaEntry; /* one per vreg: 16 -> 8 bytes */
 
   /* Definition counts, used only to set `maybe` above.  A write *through* a
      pointer (`T***DEREF*** <-- v`) is not a definition of the pointer; a VAR
@@ -724,8 +726,9 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
 #define LEA_SET(map, defs, p, off, src_maybe)                  \
   do {                                                         \
     int _p = (p);                                              \
-    (map)[_p].offset = (off);                                  \
-    (map)[_p].valid = 1;                                       \
+    const int64_t _off = (off);                                \
+    (map)[_p].offset = (int32_t)_off;                          \
+    (map)[_p].valid = _off == (int32_t)_off;                   \
     (map)[_p].maybe = ((src_maybe) || (defs)[_p] > 1) ? 1 : 0; \
   } while (0)
 

@@ -238,7 +238,7 @@ void tcc_ir_backend_fold_pure_forward(TCCIRState *ir, Sym *sym)
   Sym *cref = callee->type.ref;
   if (cref->f.func_type != FUNC_NEW || cref->f.func_call != fref->f.func_call || !pf_abi_same(&fref->type, &cref->type))
     return;
-  Sym *pa = fref->next, *pb = cref->next;
+  Sym *pa = sym_first(fref), *pb = sym_first(cref);
   for (; pa && pb; pa = pa->next, pb = pb->next)
     if (!pf_abi_same(&pa->type, &pb->type))
       return;
@@ -732,9 +732,14 @@ static void run_register_coalescing(TCCIRState *ir)
      * written. */
     tcc_ir_stack_reg_assign(ir, hint_li->vreg, hint_li->stack_location, hint_li->r0, hint_li->r1);
     tcc_ir_stack_reg_assign(ir, blocker->vreg, blocker->stack_location, blocker->r0, blocker->r1);
-    ir->ls.dirty_registers |= (1ull << wanted_reg) | (1ull << have_reg);
+    /* Core-register masks: a VFP pair (LS_VFP_REG_BASE + n) has no bit there,
+     * and its two registers were dirty already.  Shifted by the encoded
+     * number, x86 set core bit n and the YasOS-native compiler (ARM) nothing. */
+    const int core_swap = wanted_reg < 32 && have_reg < 32;
+    if (core_swap)
+      ir->ls.dirty_registers |= (1ull << wanted_reg) | (1ull << have_reg);
 
-    if (ir->ls.live_regs_by_instruction)
+    if (core_swap && ir->ls.live_regs_by_instruction)
     {
       int lim = ir->ls.live_regs_by_instruction_size;
       uint32_t have_mask = (1u << have_reg);
@@ -909,8 +914,11 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
       int p = TCCIR_DECODE_VREG_POSITION(ir->ls.intervals[i].vreg);
       if (p > max_vreg_pos) max_vreg_pos = p;
     }
+    /* One bit per (position, type): a var and a temp share positions, and a
+     * dead spilled var must not stay alive because a temp has its number. */
+#define RA_LIVE_BIT(vr) (TCCIR_DECODE_VREG_POSITION(vr) * 4 + (TCCIR_DECODE_VREG_TYPE(vr) & 3))
     small_sequence(RaLiveVregBitset) live_vregs_owner = {0};
-    RaLiveVregBitset_init(&live_vregs_owner, (size_t)((max_vreg_pos + 8) / 8));
+    RaLiveVregBitset_init(&live_vregs_owner, (size_t)((max_vreg_pos + 2) * 4 / 8));
     uint8_t *live_vregs = RaLiveVregBitset_data(&live_vregs_owner);
     for (int j = 0; j < ir->next_instruction_index; j++) {
       const IRQuadCompact *q = &ir->compact_instructions[j];
@@ -930,7 +938,7 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
           continue;
         int p = TCCIR_DECODE_VREG_POSITION(vrs[k]);
         if (p <= max_vreg_pos)
-          live_vregs[p / 8] |= (1 << (p % 8));
+          live_vregs[RA_LIVE_BIT(vrs[k]) / 8] |= (1 << (RA_LIVE_BIT(vrs[k]) % 8));
       }
       if (tcc_ir_op_is_mac(q->op) || q->op == TCCIR_OP_LOAD_INDEXED ||
           q->op == TCCIR_OP_STORE_INDEXED) {
@@ -938,7 +946,7 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
         if (av >= 0 && TCCIR_DECODE_VREG_TYPE(av) != 0) {
           int p = TCCIR_DECODE_VREG_POSITION(av);
           if (p <= max_vreg_pos)
-            live_vregs[p / 8] |= (1 << (p % 8));
+            live_vregs[RA_LIVE_BIT(av) / 8] |= (1 << (RA_LIVE_BIT(av) % 8));
         }
       }
     }
@@ -950,14 +958,15 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
       if (sl >= min_stack_loc)
         continue;
       if (ir->ls.intervals[i].r0 < 0 && !has_nested_chain) {
-        if (!(live_vregs[TCCIR_DECODE_VREG_POSITION(ir->ls.intervals[i].vreg) / 8] &
-              (1 << (TCCIR_DECODE_VREG_POSITION(ir->ls.intervals[i].vreg) % 8)))) {
+        const int bit = RA_LIVE_BIT(ir->ls.intervals[i].vreg);
+        if (!(live_vregs[bit / 8] & (1 << (bit % 8)))) {
           ir->ls.intervals[i].stack_location = 0;
           continue;
         }
       }
       min_stack_loc = sl;
     }
+#undef RA_LIVE_BIT
 
     /* min_op_offset scan (pre-move-coalescing) */
     int min_op_offset = 0;

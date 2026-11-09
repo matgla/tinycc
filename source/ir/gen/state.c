@@ -42,7 +42,6 @@ static void tcc_ir_init_interval_starts(IRLiveInterval *intervals, int count)
     intervals[i].start = INTERVAL_NOT_STARTED;
     intervals[i].incoming_reg0 = -1;
     intervals[i].incoming_reg1 = -1;
-    intervals[i].stack_slot_index = -1;
     intervals[i].allocation.r0 = PREG_NONE;
     intervals[i].allocation.r1 = PREG_NONE;
     intervals[i].allocation.offset = 0;
@@ -65,6 +64,9 @@ static void tcc_ir_clear_live_intervals(TCCIRState *ir)
   {
     tcc_free(ir->temporary_variables_live_intervals);
   }
+  tcc_free(ir->remat_imm);
+  ir->remat_imm = NULL;
+  ir->remat_imm_size = 0;
   ir->temporary_variables_live_intervals =
       (IRLiveInterval *)tcc_mallocz(sizeof(IRLiveInterval) * IR_TEMP_INTERVAL_INIT_SIZE);
   tcc_ir_init_interval_starts(ir->temporary_variables_live_intervals, IR_TEMP_INTERVAL_INIT_SIZE);
@@ -135,6 +137,8 @@ TCCIRState *tcc_ir_alloc(void)
   block->stack_layout.offset_hash_keys = NULL;
   block->stack_layout.offset_hash_values = NULL;
   block->stack_layout.offset_hash_size = 0;
+  block->stack_layout.vreg_slots = NULL;
+  block->stack_layout.vreg_slot_count = 0;
 
 #ifdef CONFIG_TCC_ASM
   block->inline_asms = NULL;
@@ -253,6 +257,9 @@ void tcc_ir_free(TCCIRState *ir)
   {
     tcc_free(ir->temporary_variables_live_intervals);
   }
+  tcc_free(ir->remat_imm);
+  ir->remat_imm = NULL;
+  ir->remat_imm_size = 0;
   if (ir->parameters_live_intervals != NULL)
   {
     tcc_free(ir->parameters_live_intervals);
@@ -324,6 +331,9 @@ void tcc_ir_free(TCCIRState *ir)
     ir->stack_layout.offset_hash_values = NULL;
   }
   ir->stack_layout.offset_hash_size = 0;
+  tcc_free(ir->stack_layout.vreg_slots);
+  ir->stack_layout.vreg_slots = NULL;
+  ir->stack_layout.vreg_slot_count = 0;
 
   tcc_ls_deinitialize(&ir->ls);
 

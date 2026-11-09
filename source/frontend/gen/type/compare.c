@@ -133,7 +133,7 @@ void type_to_str(char *buf, int buf_size, CType *type, const char *varstr)
         pstrcat(buf1, sizeof(buf1), ")");
       }
       pstrcat(buf1, buf_size, "(");
-      sa = s->next;
+      sa = sym_first(s);
       while (sa != NULL)
       {
         char buf2[256];
@@ -219,6 +219,8 @@ static int is_compatible_func(CType *type1, CType *type2)
 
   s1 = type1->ref;
   s2 = type2->ref;
+  sym_first(s1); /* the walk below steps from the type Syms to their parameters */
+  sym_first(s2);
   if (s1->f.func_call != s2->f.func_call)
     return 0;
   if (s1->f.func_type != s2->f.func_type && s1->f.func_type != FUNC_OLD && s2->f.func_type != FUNC_OLD)
@@ -256,7 +258,7 @@ static CType *find_transparent_union_compatible_member(CType *type, CType *other
   if (!is_transparent_union_type(type))
     return NULL;
 
-  for (field = type->ref->next; field; field = field->next)
+  for (field = sym_first(type->ref); field; field = field->next)
   {
     if ((unqualified && compare_types(&field->type, other, 1)) ||
         (!unqualified && is_compatible_types(&field->type, other)))
@@ -317,7 +319,7 @@ CType *find_assignable_transparent_union_member(CType *type)
   if (!is_transparent_union_type(type))
     return NULL;
 
-  for (field = type->ref->next; field; field = field->next)
+  for (field = sym_first(type->ref); field; field = field->next)
   {
     int fbt = field->type.t & VT_BTYPE;
 
@@ -369,7 +371,7 @@ int compare_types_structural(CType *type1, CType *type2)
       return 1;
     if (s1->c != s2->c)
       return 0;
-    for (f1 = s1->next, f2 = s2->next; f1 && f2; f1 = f1->next, f2 = f2->next)
+    for (f1 = sym_first(s1), f2 = sym_first(s2); f1 && f2; f1 = f1->next, f2 = f2->next)
     {
       if (f1->c != f2->c)
         return 0;

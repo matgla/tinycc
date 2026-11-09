@@ -341,7 +341,7 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
     if (interval->remat_kind == 1 && !use_llocal && !spilled_param)
     {
       m.kind = MACH_OP_IMM;
-      m.u.imm.val = (int64_t)interval->remat_imm;
+      m.u.imm.val = (int64_t)tcc_ir_remat_imm(ir, vreg);
       return m;
     }
 

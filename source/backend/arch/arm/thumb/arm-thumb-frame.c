@@ -694,8 +694,8 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
        * parallel move, whose sources are all still live. */
       if (is_64bit && is_vfp_reg(incoming_r0))
       {
-        /* IRVregReplacement.r0/r1 are uint16_t: "no register" (dead parameter)
-         * is 0xFFFF, not a negative int.  Nothing to unpack into then. */
+        /* IRVregReplacement.r0/r1 are uint8_t: "no register" (dead parameter)
+         * is 0xFF, not a negative int.  Nothing to unpack into then. */
         if (alloc_r0 > R12 || alloc_r1 > R12)
           continue;
         /* Deferred: the unpack writes GPRs that may still hold incoming GPR

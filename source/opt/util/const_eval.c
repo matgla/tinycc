@@ -40,7 +40,7 @@ int ir_opt_const_binop(TccIrOp op, int is_64, int64_t v1, int64_t v2, int64_t *o
   case TCCIR_OP_ROR:
   {
     uint32_t v = (uint32_t)v1, sh = (uint32_t)v2 & 31;
-    res = (int64_t)(int32_t)((v >> sh) | (v << (32 - sh)));
+    res = (int64_t)(int32_t)(sh ? (v >> sh) | (v << (32 - sh)) : v); /* v << 32 is undefined */
     break;
   }
   case TCCIR_OP_UMULL: res = (int64_t)((uint64_t)(uint32_t)v1 * (uint64_t)(uint32_t)v2); break;

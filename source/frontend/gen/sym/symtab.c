@@ -25,6 +25,7 @@
 
 /* ------------------------------------------------------------------------- */
 /* symbol allocator */
+#ifndef SYM_DEBUG /* SYM_DEBUG: every Sym its own block */
 static Sym *__sym_malloc(void)
 {
   Sym *sym_pool, *sym, *last_sym;
@@ -44,6 +45,7 @@ static Sym *__sym_malloc(void)
   sym_free_first = last_sym;
   return last_sym;
 }
+#endif
 
 Sym *sym_malloc(void)
 {
@@ -254,6 +256,287 @@ ST_FUNC void sym_short_pools_free(void)
 {
   dynarray_reset(&sym_short_pools, &nb_sym_short_pools);
   sym_short_free_first = NULL;
+}
+
+/* Local variables sym_pop kept for the backend: freed by
+ * sym_free_outlived_locals once their function has been generated. */
+static void **outlived_locals;
+static int nb_outlived_locals;
+
+/* Where the current function's outlived locals begin (gen_function nests). */
+ST_FUNC int sym_outlived_locals_mark(void)
+{
+  return nb_outlived_locals;
+}
+
+/* The function that took MARK is generated: nothing reads the Syms of the
+ * locals popped since.  A nested function frees only its own; its parent's
+ * block locals, popped before it, wait for the parent. */
+ST_FUNC void sym_free_outlived_locals(int mark)
+{
+  for (int i = mark; i < nb_outlived_locals; i++)
+    sym_free(outlived_locals[i]);
+  nb_outlived_locals = mark;
+  if (!mark)
+  {
+    tcc_free(outlived_locals);
+    outlived_locals = NULL;
+  }
+}
+
+/* Spilled parameter lists (internal spill; see sym_first in tcc.h).  A
+ * file-scope prototype's parameter Syms are read only when the function is
+ * called, defined or its type compared, yet the Zig compiler's kernel.c keeps
+ * 14860 of them (713 KB on the device) for 5828 functions, a third on the
+ * lists of forward declarations their definitions replaced.  While
+ * spilling is on, post_type takes such a list off global_stack
+ * (sym_params_track): the function type Sym owns it through next.  Where no
+ * function is being generated (sym_params_release) each list is written to
+ * the spill file as raw Syms, links cleared -- their types point at tags,
+ * pointer nodes and other function types, which live to the end of the TU --
+ * and freed; the type Sym's next becomes sym_params_spilled and its c (always
+ * 0 for a function type) the record's offset + 1.  sym_first reads a list
+ * back; the next release frees it again, or writes it anew if it changed.
+ * The type Sym never moves, so a CType copied from it (&f, __typeof__, a
+ * declaration since replaced) finds its list as well.  A file-scope struct's
+ * or union's members go the same way (struct_decl), their record's offset in
+ * the struct Sym's vreg: 6.7K member Syms (0.3 MB) in a Zig kernel compile. */
+Sym sym_params_spilled = {.v = SYM_FIELD, .type = {.t = VT_VOID}}; /* void: a walk that misses sym_first fails loudly */
+int gen_function_depth; /* gen_function nesting: no parameter list is spilled inside
+                         * one, and sym_pop defers its frees to the outlived list */
+
+typedef struct ParamsResident
+{
+  Sym *ref;      /* a function type Sym whose list is in memory */
+  long rec;      /* the record it was read from, or -1 */
+  uint64_t hash; /* of that record */
+} ParamsResident;
+
+/* Where a spilled list's record is: a function type's c (always 0 for one),
+ * a struct's vreg (-1 otherwise; its c is the struct's size). */
+static long params_rec(const Sym *ref)
+{
+  return (ref->v & SYM_STRUCT) ? (long)ref->vreg - 1 : (long)ref->c - 1;
+}
+
+static void params_set_rec(Sym *ref, long off)
+{
+  if (ref->v & SYM_STRUCT)
+    ref->vreg = (int)off + 1;
+  else
+    ref->c = (int)off + 1;
+}
+
+static void params_clear_rec(Sym *ref)
+{
+  if (ref->v & SYM_STRUCT)
+    ref->vreg = -1;
+  else
+    ref->c = 0;
+}
+
+static ParamsResident *params_res;
+static int nb_params_res, cap_params_res;
+
+#define PARAMS_HDR 8 /* record header: the parameter count, padded for the Syms */
+#define PARAMS_SELF_REF ((Sym *)1) /* in a record's prev: type.ref is the Sym itself */
+
+static void params_res_add(Sym *ref, long rec, uint64_t hash)
+{
+  if (nb_params_res == cap_params_res)
+  {
+    cap_params_res = cap_params_res ? cap_params_res * 2 : 64;
+    params_res = tcc_realloc(params_res, cap_params_res * sizeof *params_res);
+  }
+  params_res[nb_params_res++] = (ParamsResident){ref, rec, hash};
+}
+
+static int params_res_find(Sym *ref)
+{
+  for (int i = nb_params_res; i-- > 0;)
+    if (params_res[i].ref == ref)
+      return i;
+  return -1;
+}
+
+static uint64_t params_hash(const unsigned char *p, size_t n)
+{
+  uint64_t h = 1469598103934665603ull;
+  while (n--)
+    h = (h ^ *p++) * 1099511628211ull;
+  return h;
+}
+
+/* REF's parameters, taken off global_stack, are its own: tracked for
+ * spilling.  They lie on the stack between its top and STACK_BEFORE, in their
+ * order from the bottom up, among the Syms their types made. */
+ST_FUNC void sym_params_track(Sym *ref, Sym *stack_before)
+{
+  Sym *p, **pp, **par, *small[16];
+  int n = 0, k;
+  if (local_stack || !ref->next || !tcc_spill_active())
+    return;
+  for (p = ref->next; p; p = p->next)
+    n++;
+  par = n <= 16 ? small : tcc_malloc(n * sizeof *par);
+  k = 0;
+  for (p = ref->next; p; p = p->next)
+    par[k++] = p;
+  /* all of them there, in order, before anything changes */
+  for (k = n, p = global_stack; p && p != stack_before && k > 0; p = p->prev)
+    if (p == par[k - 1])
+      k--;
+  if (!k)
+  {
+    k = n;
+    for (pp = &global_stack; *pp && *pp != stack_before && k > 0;)
+      if (*pp == par[k - 1])
+        *pp = (*pp)->prev, k--;
+      else
+        pp = &(*pp)->prev;
+    params_res_add(ref, -1, 0);
+  }
+  if (par != small)
+    tcc_free(par);
+}
+
+ST_FUNC Sym *sym_params_load(Sym *ref)
+{
+  long off = params_rec(ref);
+  uint32_t hdr[PARAMS_HDR / 4];
+  Sym *first = NULL, **pl = &first;
+  tcc_spill_read(off, hdr, sizeof hdr);
+  size_t bytes = (size_t)hdr[0] * sizeof(Sym);
+  unsigned char *buf = tcc_malloc(bytes);
+  tcc_spill_read(off + PARAMS_HDR, buf, bytes);
+  for (uint32_t i = 0; i < hdr[0]; i++)
+  {
+    Sym *s = sym_malloc();
+    memcpy(s, buf + i * sizeof(Sym), sizeof(Sym));
+    if (s->prev == PARAMS_SELF_REF)
+      s->type.ref = s;
+    s->prev = NULL;
+    *pl = s;
+    pl = &s->next;
+  }
+  *pl = NULL;
+  params_res_add(ref, off, params_hash(buf, bytes));
+  tcc_free(buf);
+  ref->next = first;
+  params_clear_rec(ref);
+  return first;
+}
+
+/* OLD_REF, a prototype's function type that only its function holds
+ * (proto_own), takes the contents of NEW_REF, the definition's, which
+ * post_type has just pushed: NEW_REF's parameter list moves over, OLD_REF's
+ * own goes, and NEW_REF is freed.  The caller then points the function and
+ * the declaration at OLD_REF.  0 when NEW_REF is not near global_stack's top
+ * (nothing changed then). */
+ST_FUNC int sym_functype_adopt(Sym *old_ref, Sym *new_ref)
+{
+  Sym **pp = &global_stack, keep;
+  int k, i;
+  for (k = 0; *pp && *pp != new_ref && k < 16; k++)
+    pp = &(*pp)->prev;
+  if (*pp != new_ref || old_ref->v != SYM_FIELD || new_ref->v != SYM_FIELD)
+    return 0;
+  *pp = new_ref->prev;
+  /* OLD_REF's list: a record is left in the spill file; one taken off the
+   * stack (tracked) is freed; one still on the stack stays there. */
+  if (old_ref->next != &sym_params_spilled && (i = params_res_find(old_ref)) >= 0)
+  {
+    Sym *p, *next;
+    for (p = old_ref->next; p; p = next)
+    {
+      next = p->next;
+      sym_free(p);
+    }
+    memmove(&params_res[i], &params_res[i + 1], (nb_params_res - i - 1) * sizeof *params_res);
+    nb_params_res--;
+  }
+  if ((i = params_res_find(new_ref)) >= 0)
+    params_res[i].ref = old_ref;
+  keep = *old_ref;
+  *old_ref = *new_ref;
+  old_ref->v = keep.v;
+  old_ref->prev = keep.prev;
+  old_ref->prev_tok = keep.prev_tok;
+  old_ref->a.proto_own = 1;
+  sym_free(new_ref);
+  return 1;
+}
+
+/* Spill every list in memory -- only where nothing holds a parameter Sym:
+ * between declarations, outside gen_function. */
+ST_FUNC void sym_params_release(void)
+{
+  int keep = 0;
+  if (!nb_params_res || gen_function_depth || local_stack || !tcc_spill_active())
+    return;
+  for (int i = 0; i < nb_params_res; i++)
+  {
+    ParamsResident e = params_res[i];
+    Sym *ref = e.ref, *p, *next;
+    int n = 0;
+    if (ref->next == &sym_params_spilled)
+      continue; /* listed twice */
+    for (p = ref->next; p; p = p->next)
+      n++;
+    if (!n)
+      continue;
+    size_t bytes = PARAMS_HDR + (size_t)n * sizeof(Sym);
+    unsigned char *buf = tcc_mallocz(bytes), *o = buf + PARAMS_HDR;
+    ((uint32_t *)buf)[0] = n;
+    for (p = ref->next; p; p = p->next, o += sizeof(Sym))
+    {
+      Sym *q = (Sym *)o;
+      memcpy(q, p, sizeof(Sym));
+      q->next = NULL;
+      q->prev = NULL;
+      q->prev_tok = NULL;
+      if (p->type.ref == p) /* a bitfield member is its own type.ref: it gets the new address back */
+        q->type.ref = NULL, q->prev = PARAMS_SELF_REF;
+    }
+    long off = e.rec;
+    if (off < 0 || params_hash(buf + PARAMS_HDR, bytes - PARAMS_HDR) != e.hash)
+      off = tcc_spill_append(buf, bytes);
+    tcc_free(buf);
+    if (off < 0 || off >= 0x7fffffffL)
+    {
+      params_res[keep++] = e; /* not written: it stays */
+      continue;
+    }
+    for (p = ref->next; p; p = next)
+    {
+      next = p->next;
+      sym_free(p);
+    }
+    ref->next = &sym_params_spilled;
+    params_set_rec(ref, off);
+  }
+  nb_params_res = keep;
+}
+
+/* End of the TU, before global_stack goes: free the lists in memory. */
+ST_FUNC void sym_params_spill_close(void)
+{
+  for (int i = 0; i < nb_params_res; i++)
+  {
+    Sym *ref = params_res[i].ref, *p, *next;
+    if (ref->next == &sym_params_spilled)
+      continue;
+    for (p = ref->next; p; p = next)
+    {
+      next = p->next;
+      sym_free(p);
+    }
+    ref->next = NULL;
+  }
+  tcc_free(params_res);
+  params_res = NULL;
+  nb_params_res = cap_params_res = 0;
+  gen_function_depth = 0;
 }
 
 /* push, without hashing */
@@ -569,13 +852,18 @@ ST_FUNC void sym_park_proto(Sym *s, Sym *stack_before)
         p->vreg != -1 || !park_attr_zero(p->a, 1) || !park_type_ok(&p->type))
       return;
 
-  /* s, f and every parameter must lie on global_stack above stack_before.
-   * A short prototype just walks the segment for each; past that, they are
-   * n + 2 distinct Syms and the segment holds each Sym once, so it holds iff
-   * the segment holds s and n + 1 members of the set {f, params}. */
-  if (n < 8)
+  /* s, f and every parameter must lie on global_stack above stack_before --
+   * the parameters only if sym_params_track has not already taken them off
+   * (then f owns them).  A short prototype just walks the segment for each;
+   * past that, they are n + 2 distinct Syms and the segment holds each Sym
+   * once, so it holds iff the segment holds s and n + 1 members of the set
+   * {f, params}. */
+  int tracked = params_res_find(f);
+  if (tracked >= 0 && params_res[tracked].rec >= 0)
+    return; /* read back from the spill file: not this declaration's own */
+  if (n < 8 || tracked >= 0)
   {
-    for (p = f; p; p = p->next)
+    for (p = f; p; p = tracked >= 0 ? NULL : p->next)
       if (!park_in(p, global_stack, stack_before))
         return;
     if (!park_in(s, global_stack, stack_before))
@@ -641,6 +929,8 @@ ST_FUNC void sym_park_proto(Sym *s, Sym *stack_before)
   }
   if (set && set != small)
     tcc_free(set);
+  if (tracked >= 0)
+    params_res[tracked] = params_res[--nb_params_res];
   for (p = f->next; p; p = next)
   {
     next = p->next;
@@ -1002,12 +1292,33 @@ ST_FUNC void sym_pop(Sym **ptop, Sym *b, int keep)
      * after the scope ends; freeing them here can lead to missing relocations
      * and loads/stores from address 0 at runtime.
      */
-    if (!keep && s->c == 0 && !(tcc_state->ir && (s->r & VT_SYM)))
+    if (!keep && s->c == 0 && !(tcc_state->ir && (s->r & VT_SYM)) && !gen_function_depth)
       sym_free(s);
+    else if (!keep && s->c == 0 && !(tcc_state->ir && (s->r & VT_SYM)))
+    {
+      /* Inside gen_function the backend runs after the body's scopes close
+       * and still reads their Syms through the IR -- inline asm's saved
+       * operands (svalue_to_iroperand reads sym->type), operand types naming
+       * a block-scope struct or function type.  Freed here, a later scope of
+       * the same function got the Sym back with another type (ASan with
+       * SYM_DEBUG: 41 IR tests).  It goes with the function's outlived
+       * locals instead. */
+      sym_free_facts(s);
+      dynarray_add(&outlived_locals, &nb_outlived_locals, s);
+    }
     else if (!keep)
+    {
       /* The Sym outlives its scope (a local's c is its frame offset); its
        * facts do not, and nothing frees them later. */
       sym_free_facts(s);
+      /* A local variable is still read by the backend, which generates the
+       * function after its scopes close -- but by nothing once the function
+       * is done.  Kept until then, they were 125k of the 136k Syms alive at
+       * the end of Zig's 12.7 MB kernel.c (9 MB of a 38 MB peak). */
+      int vr = s->r & VT_VALMASK;
+      if (!(v & (SYM_FIELD | SYM_STRUCT)) && !(s->r & VT_SYM) && (vr == VT_LOCAL || vr == VT_LLOCAL))
+        dynarray_add(&outlived_locals, &nb_outlived_locals, s);
+    }
     s = ss;
   }
   if (!keep)

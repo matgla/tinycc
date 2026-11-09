@@ -170,10 +170,10 @@ struct IRSSAVregInfo *ssa_opt_vinfo(IRSSAOptCtx *ctx, int32_t vreg)
 
 void ssa_opt_add_use_instr(struct IRSSAVregInfo *vi, int instr_idx)
 {
-  if (vi->use_count >= vi->use_cap) {
-    int nc = vi->use_cap ? vi->use_cap * 2 : 4;
-    vi->uses = tcc_realloc(vi->uses, nc * sizeof(*vi->uses));
-    vi->use_cap = nc;
+  {
+    int n = vi->use_count; /* capacity: the power of two at or above the count, at least 2 */
+    if (!vi->uses || (n >= 2 && !(n & (n - 1))))
+      vi->uses = tcc_realloc(vi->uses, (n < 2 ? 2 : 2 * n) * sizeof(*vi->uses));
   }
   vi->uses[vi->use_count].idx = instr_idx;
   vi->uses[vi->use_count].slot = 0;
@@ -183,10 +183,10 @@ void ssa_opt_add_use_instr(struct IRSSAVregInfo *vi, int instr_idx)
 
 void ssa_opt_add_use_phi(struct IRSSAVregInfo *vi, int block, int slot)
 {
-  if (vi->use_count >= vi->use_cap) {
-    int nc = vi->use_cap ? vi->use_cap * 2 : 4;
-    vi->uses = tcc_realloc(vi->uses, nc * sizeof(*vi->uses));
-    vi->use_cap = nc;
+  {
+    int n = vi->use_count; /* capacity: the power of two at or above the count, at least 2 */
+    if (!vi->uses || (n >= 2 && !(n & (n - 1))))
+      vi->uses = tcc_realloc(vi->uses, (n < 2 ? 2 : 2 * n) * sizeof(*vi->uses));
   }
   vi->uses[vi->use_count].idx = block;
   vi->uses[vi->use_count].slot = slot;

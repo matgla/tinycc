@@ -218,7 +218,7 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
 
   /* Count and verify parameters */
   param_count = 0;
-  for (param = func_type_ref->next; param; param = param->next)
+  for (param = sym_first(func_type_ref); param; param = param->next)
     param_count++;
   if (param_count != nb_args)
   {
@@ -237,7 +237,7 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
    * integer. */
   {
     int pi = 0;
-    for (param = func_type_ref->next; param; param = param->next, pi++)
+    for (param = sym_first(func_type_ref); param; param = param->next, pi++)
     {
       int pbt;
       if ((param->v & ~SYM_FIELD) < TOK_IDENT)
@@ -323,7 +323,7 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
    * (up to 8 entries); remaining params are resolved via sym_push below. */
   {
     int oi = 0;
-    Sym *p2 = func_type_ref->next;
+    Sym *p2 = sym_first(func_type_ref);
     for (; oi < nb_args && p2 && oi < 8; oi++, p2 = p2->next)
     {
       tcc_state->inline_eval_overlay_tok[oi] = p2->v & ~SYM_FIELD;
@@ -342,7 +342,7 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
    * mechanism: VT_ENUM_VAL on the param type makes identifier lookup pull
    * the full 64-bit value from sym_enum_val() (see tccgen.c identifier
    * resolution path for IS_ENUM_VAL). */
-  param = func_type_ref->next;
+  param = sym_first(func_type_ref);
   for (i = 0; i < nb_args; i++, param = param->next)
   {
     SValue param_arg = args[i];

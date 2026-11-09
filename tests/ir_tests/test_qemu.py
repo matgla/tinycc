@@ -163,6 +163,7 @@ TEST_FILES = [
     ("bug_nested_loop_body_not_reemitted.c", 0),  # a nested fn whose auto-inline was revoked is not emitted again at TU end
     ("bug_dce_overwrite_mac_accum_read.c", 0),  # ssa:dce overwrite-store scan sees an MLA accumulator read
     ("bug_patch_type_shared_typedef_array.c", 0),  # patch_type must not complete the shared typedef array Sym
+    ("functype_adopt_shared.c", 0),  # a definition adopts its prototype's type Sym only when nothing shares it
     ("bug_partition.c", 0),
     ("bug_llong_const.c", 0),
     ("bug_init_putv_const_init_capture.c", 0),
@@ -240,6 +241,7 @@ TEST_FILES = [
     # AEABI soft-float regressions (bit-level tests; avoids printf %f).
     ("test_aeabi_dmul_bits.c", 0),
     ("test_f2d_bits.c", 0),
+    ("bug_rp2350_f2d_subnormal.c", 0),
     ("test_aeabi_double_all.c", 0),
 
     ("test_llong_add_signed.c", 0),
@@ -2095,6 +2097,7 @@ TEST_FILES = [
     (["bug_func_write_summary_deref_param.c", "bug_func_write_summary_deref_param+.c"], 0),
     ("bug_func_purity_folded_read.c", 0),
     ("bug_pack64_tautology_redef.c", 0),
+    ("bug_pack64_stack_stores_at_join.c", 0),
     ("bug_pragma_pack_push_in_body.c", 0),
     ("bug_post_ra_diamond_switch_target.c", 0),
     ("bug_if_convert_select_goto_switch.c", 0),

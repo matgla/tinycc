@@ -36,7 +36,9 @@ typedef enum TCCIR_VREG_TYPE
 #define TCCIR_VREG_TYPE_NEG 7 /* no vreg: IROP_NEG_VREG_SENTINEL, or IROP_NONE */
 #define TCCIR_DECODE_VREG_POSITION(vr) ((vr) & TCCIR_VREG_POSITION_MASK)
 #define TCCIR_DECODE_VREG_TYPE(vr) ((vr) >> TCCIR_VREG_TYPE_SHIFT)
-#define TCCIR_ENCODE_VREG(type, position) (((type) << TCCIR_VREG_TYPE_SHIFT) | ((position) & TCCIR_VREG_POSITION_MASK))
+/* Shifted unsigned: type 4..7 reaches the sign bit, an undefined signed shift. */
+#define TCCIR_ENCODE_VREG(type, position)                                                                              \
+  ((int32_t)(((uint32_t)(type) << TCCIR_VREG_TYPE_SHIFT) | (uint32_t)((position) & TCCIR_VREG_POSITION_MASK)))
 
 /* ============================================================================
  * IROperand: Compact 8-byte operand representation (vs ~56 byte SValue)

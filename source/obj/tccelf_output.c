@@ -141,7 +141,14 @@ static int tcc_output_elf(TCCState *s1, FILE *f, int phnum, ElfW(Phdr) * phdr)
       size = s->sh_size;
       if (size)
       {
-        if (s->lazy && !s->materialized)
+        if (s->spill)
+        {
+          const unsigned long to_write = size < s->data_offset ? size : s->data_offset;
+          if (section_spill_write(s1, s, f, to_write) < 0)
+            return -1;
+          offset += to_write;
+        }
+        else if (s->lazy && !s->materialized)
         {
           /* Stream directly from source files without loading into memory */
           section_write_streaming(s1, s, f);
@@ -177,7 +184,12 @@ static int tcc_output_binary(TCCState *s1, FILE *f)
         offset++;
       }
       size = s->sh_size;
-      if (s->lazy && !s->materialized)
+      if (s->spill)
+      {
+        if (section_spill_write(s1, s, f, size) < 0)
+          return -1;
+      }
+      else if (s->lazy && !s->materialized)
       {
         /* Stream directly from source files without loading into memory */
         section_write_streaming(s1, s, f);
@@ -579,6 +591,27 @@ void gc_sections(TCCState *s1)
           }
         }
       }
+      if (s->lazy_rels)
+      {
+        int n, k;
+        ElfW_Rel *rels = lazy_rels_read(s1, s, &n);
+        for (k = 0; rels && k < n; k++)
+        {
+          int shndx;
+          sym_index = ELFW(R_SYM)(rels[k].r_info);
+          if (sym_index == 0 || sym_index >= nb_syms)
+            continue;
+          shndx = symtab[sym_index].st_shndx;
+          if (shndx == SHN_UNDEF || shndx >= SHN_LORESERVE || shndx >= nb)
+            continue;
+          if (!sec_used[shndx])
+          {
+            sec_used[shndx] = 1;
+            work[top++] = shndx;
+          }
+        }
+        tcc_free(rels);
+      }
     }
     tcc_free(rel_head);
     tcc_free(rel_next);
@@ -631,6 +664,7 @@ void gc_sections(TCCState *s1)
           section_release(s->reloc);
           s->reloc->sh_size = 0;
         }
+        lazy_rels_free(s);
         /* Free deferred chunks for lazy sections to save memory */
         if (s->lazy && s->has_deferred_chunks)
         {
@@ -672,6 +706,18 @@ void gc_sections(TCCState *s1)
       for (i = 1; i < s1->nb_sections; i++)
       {
         sr = s1->sections[i];
+        if (sr && sr->lazy_rels)
+        {
+          int n, k;
+          ElfW_Rel *rels = lazy_rels_read(s1, sr, &n);
+          for (k = 0; rels && k < n; k++)
+          {
+            sym_index = ELFW(R_SYM)(rels[k].r_info);
+            if (sym_index > 0 && sym_index < nb_syms)
+              referenced[sym_index] = 1;
+          }
+          tcc_free(rels);
+        }
         if (!sr || sr->sh_type != SHT_RELX || !sr->data_offset)
           continue;
         for_each_elem(sr, 0, rel, ElfW_Rel)
@@ -767,7 +813,7 @@ static int hot_text_listed(const Section *s, char **names, int count)
 {
   if (!count || strncmp(s->name, ".text.", 6) || s->name[6] == '.' || !(s->sh_flags & SHF_EXECINSTR))
     return 0;
-  return tcc_name_list_has(names, count, s->name + 6, strlen(s->name + 6));
+  return tcc_name_list_has_unnumbered(names, count, s->name + 6);
 }
 
 static int coalesce_split_sections(TCCState *s1)
@@ -800,6 +846,8 @@ static int coalesce_split_sections(TCCState *s1)
   int nb_sections = s1->nb_sections;
   int pass, nb_hot_names = 0;
   char **hot_names = NULL;
+  SectionSpill *sp = NULL;
+  unsigned long text_tail = 0;
 
   for (i = 1; i < nb_sections && !have_split; i++)
   {
@@ -832,12 +880,14 @@ static int coalesce_split_sections(TCCState *s1)
       grow[nb_grow++].rels = 0;
     }
     grow[g].bytes += s->data_offset + (s->sh_addralign > 4 ? s->sh_addralign : 4);
-    if (s->reloc && s->reloc->data_offset)
+    if ((s->reloc && s->reloc->data_offset) || s->lazy_rels)
     {
       /* Created here, in the order the merge below first needs them. */
       if (!grow[g].rels)
         grow[g].rels = section_reloc(symtab_section, t)->data_offset;
-      grow[g].rels += s->reloc->data_offset;
+      if (s->reloc)
+        grow[g].rels += s->reloc->data_offset;
+      grow[g].rels += lazy_rels_count(s) * sizeof(ElfW_Rel);
     }
   }
   for (i = 0; i < nb_grow; i++)
@@ -919,6 +969,18 @@ static int coalesce_split_sections(TCCState *s1)
       free_section(sr);
       if (!link_arena_owns(s1, sr))
         tcc_free(sr);
+    }
+    if (s->lazy_rels)
+    {
+      int nb, r;
+      ElfW_Rel *rel = lazy_rels_read(s1, s, &nb);
+      if (!rel)
+        ret = -1;
+      for (r = 0; rel && r < nb; r++)
+        put_elf_reloc(symtab_section, t, rel[r].r_offset + base_of[i], ELFW(R_TYPE)(rel[r].r_info),
+                      ELFW(R_SYM)(rel[r].r_info));
+      tcc_free(rel);
+      lazy_rels_free(s);
     }
 
     in->target = t;
@@ -1010,17 +1072,61 @@ static int coalesce_split_sections(TCCState *s1)
   }
 
   dynarray_reset(&hot_names, &nb_hot_names);
+  /* Every relocation left on disk has been read for the last time. */
+  dynarray_reset(&s1->reloc_remaps, &s1->nb_reloc_remaps);
 #ifdef TCC_TARGET_ARM
+  text_tail = arm_hot_text_veneer_bytes(s1) + 8; /* +8: the block's alignment */
   for (i = 0; i < nb_grow; i++)
     if (grow[i].target == text_section)
-      grow[i].bytes += arm_hot_text_veneer_bytes(s1) + 8; /* +8: the block's alignment */
+      grow[i].bytes += text_tail;
 #endif
+  /* .text in a file (see "Spilled sections" in tccelf.c): what it had before
+   * is its first piece, and only what is added after the last one, the veneers,
+   * is in memory. */
+  if (s1->spill_path && text_section->sh_type != SHT_NOBITS && !text_section->spill)
+  {
+    for (g = 0; g < nb_grow && grow[g].target != text_section; g++)
+      ;
+    if (g < nb_grow)
+    {
+      sp = tcc_mallocz(sizeof *sp);
+      sp->fd = sp->src_fd = -1;
+      sp->cur = -1;
+      sp->path = tcc_strdup(s1->spill_path);
+      sp->alloc_pieces = nb_inputs + 1;
+      sp->pieces = tcc_malloc(sizeof *sp->pieces * sp->alloc_pieces);
+      if (text_section->data_offset)
+      {
+        SpillPiece *p = &sp->pieces[sp->nb_pieces++];
+        p->base = 0;
+        p->size = text_section->data_offset;
+        p->data = text_section->data;
+        p->chunks = NULL;
+      }
+      text_section->data = NULL;
+      text_section->data_allocated = 0;
+    }
+  }
   for (i = 0; i < nb_grow; i++)
-    if (grow[i].target->sh_type != SHT_NOBITS)
+    if (grow[i].target->sh_type != SHT_NOBITS && !(sp && grow[i].target == text_section))
       section_reserve_exact(grow[i].target, grow[i].bytes);
   for (in = inputs; in < inputs + nb_inputs; in++)
   {
     Section *t = in->target;
+    if (sp && t == text_section)
+    {
+      if (in->size)
+      {
+        SpillPiece *p = &sp->pieces[sp->nb_pieces++];
+        p->base = in->base;
+        p->size = in->size;
+        p->data = in->data;
+        p->chunks = in->chunks;
+      }
+      else
+        tcc_free(in->data);
+      continue;
+    }
     t->data_offset = in->base;
     if (in->size && t->sh_type == SHT_NOBITS)
       t->data_offset += in->size;
@@ -1042,6 +1148,15 @@ static int coalesce_split_sections(TCCState *s1)
   }
   for (i = 0; ret == 0 && i < nb_grow; i++)
     grow[i].target->data_offset = grow[i].end;
+  if (sp)
+  {
+    for (g = 0; grow[g].target != text_section; g++)
+      ;
+    sp->written = tcc_mallocz(sp->nb_pieces + 1);
+    text_section->spill = sp;
+    text_section->data_base = text_section->data_offset = grow[g].end;
+    section_reserve_exact(text_section, grow[g].end + text_tail);
+  }
   if (fd >= 0)
     close(fd);
   tcc_free(inputs);
@@ -1137,6 +1252,14 @@ static int elf_output_file(TCCState *s1, const char *filename)
    * --gc-sections) must be folded back into their canonical sections before
    * build_got/layout -- see the comment on coalesce_split_sections.  Runs
    * unconditionally: it is a no-op when no split input exists. */
+  /* A .text is written to a file beside the output while it is relocated, not
+   * held in memory: see "Spilled sections" in tccelf.c. */
+  if (file_type != TCC_OUTPUT_MEMORY)
+  {
+    s1->spill_path = tcc_malloc(strlen(filename) + 10);
+    strcpy(s1->spill_path, filename);
+    strcat(s1->spill_path, ".text.tmp");
+  }
   if (coalesce_split_sections(s1) < 0)
     goto the_end;
 
@@ -1388,6 +1511,9 @@ static int elf_output_file(TCCState *s1, const char *filename)
       s1->bench_output_write_us += tcc_getclock_us() - t;
   }
 the_end:
+  section_spill_free(text_section);
+  tcc_free(s1->spill_path);
+  s1->spill_path = NULL;
   tcc_free(sec_order);
   tcc_free(dyninf.phdr);
   return ret;
@@ -1414,6 +1540,295 @@ static void alloc_sec_names(TCCState *s1, int is_obj)
 }
 
 /* Output an elf .o file */
+/* ---- .text out of memory while it is generated ------------------------
+ *
+ * A function's compile reads none of the code before it: codegen appends at
+ * the end, and only identical code folding compares a new body with an older
+ * one.  So in an object split by function (split_text_by_function), what
+ * earlier functions left in .text goes to the internal spill file whenever a
+ * function starts with more than TEXT_WINDOW_MIN of it in memory, and .text
+ * keeps a window from there on (Section.data_bias).  Once every function is
+ * generated, text_window_unspill_all reads it all back for the passes that
+ * reshape it and for the writer.  A Zig kernel compile's largest function ran
+ * with 0.22 MB of earlier code in memory. */
+typedef struct TextPiece
+{
+  unsigned long off, size;
+  long file_off;
+} TextPiece;
+
+#ifndef TEXT_WINDOW_MIN
+#define TEXT_WINDOW_MIN (16 * 1024)
+#endif
+
+ST_FUNC void text_window_spill(TCCState *s1)
+{
+  Section *t = text_section;
+  if (!s1->text_split_pending || s1->text_window_done || !tcc_spill_active() || cur_text_section != t)
+    return;
+  const unsigned long from = t->data_bias, to = t->data_offset;
+  if (to - from < TEXT_WINDOW_MIN)
+    return;
+  long fo = tcc_spill_append(t->data + from, to - from);
+  if (fo < 0)
+    return;
+  if (s1->nb_text_pieces == s1->cap_text_pieces)
+  {
+    s1->cap_text_pieces = s1->cap_text_pieces ? s1->cap_text_pieces * 2 : 32;
+    s1->text_pieces = tcc_realloc(s1->text_pieces, sizeof(TextPiece) * s1->cap_text_pieces);
+  }
+  s1->text_pieces[s1->nb_text_pieces++] = (TextPiece){from, to - from, fo};
+  const unsigned long cap = 4096 - 16;
+  unsigned char *w = tcc_mallocz(cap);
+  tcc_free(t->data + from);
+  t->data = w - to;
+  t->data_bias = to;
+  t->data_allocated = to + cap;
+}
+
+/* SIZE bytes of SEC at OFF, wherever they are: in memory, or read from the
+ * spill file into *TMP (which the caller frees). */
+ST_FUNC const unsigned char *text_window_bytes(TCCState *s1, Section *sec, unsigned long off, unsigned long size,
+                                               unsigned char **tmp)
+{
+  *tmp = NULL;
+  if (sec != text_section || off >= sec->data_bias)
+    return sec->data + off;
+  unsigned char *buf = *tmp = tcc_malloc(size ? size : 1);
+  for (int i = 0; i < s1->nb_text_pieces && size; i++)
+  {
+    TextPiece *p = &s1->text_pieces[i];
+    if (off + size <= p->off || off >= p->off + p->size)
+      continue;
+    unsigned long a = off > p->off ? off : p->off, e = off + size < p->off + p->size ? off + size : p->off + p->size;
+    tcc_spill_read(p->file_off + (long)(a - p->off), buf + (a - off), e - a);
+  }
+  if (off + size > sec->data_bias)
+    memcpy(buf + (sec->data_bias - off), sec->data + sec->data_bias, off + size - sec->data_bias);
+  return buf;
+}
+
+ST_FUNC void text_window_unspill_all(TCCState *s1)
+{
+  Section *t = text_section;
+  s1->text_window_done = 1;
+  if (!t || !t->data_bias)
+    return;
+  const unsigned long b = t->data_bias;
+  unsigned char *full = tcc_malloc(t->data_allocated);
+  for (int i = 0; i < s1->nb_text_pieces; i++)
+  {
+    TextPiece *p = &s1->text_pieces[i];
+    tcc_spill_read(p->file_off, full + p->off, p->size);
+  }
+  memcpy(full + b, t->data + b, t->data_allocated - b);
+  tcc_free(t->data + b);
+  t->data = full;
+  t->data_bias = 0;
+  tcc_free(s1->text_pieces);
+  s1->text_pieces = NULL;
+  s1->nb_text_pieces = s1->cap_text_pieces = 0;
+}
+
+/* A 2-byte pad at OFF in .text (see TCCState.split_pads).  Pads come in
+ * address order but for an erase's filler, which is inserted where it goes. */
+ST_FUNC void split_pad_note(TCCState *s1, unsigned off)
+{
+  if (s1->nb_split_pads == s1->cap_split_pads)
+  {
+    s1->cap_split_pads = s1->cap_split_pads ? s1->cap_split_pads * 2 : 64;
+    s1->split_pads = tcc_realloc(s1->split_pads, sizeof(unsigned) * s1->cap_split_pads);
+  }
+  int i = s1->nb_split_pads++;
+  while (i > 0 && s1->split_pads[i - 1] > off)
+  {
+    s1->split_pads[i] = s1->split_pads[i - 1];
+    i--;
+  }
+  s1->split_pads[i] = off;
+}
+
+/* .text lost [START, START + SIZE), the tail moving down by SHIFT: the pads
+ * follow, those inside go, and filler the erase leaves becomes one. */
+ST_FUNC void split_pads_erased(TCCState *s1, unsigned start, unsigned size, unsigned shift)
+{
+  int k = 0;
+  for (int i = 0; i < s1->nb_split_pads; i++)
+  {
+    unsigned p = s1->split_pads[i];
+    if (p >= start + size)
+      s1->split_pads[k++] = p - shift;
+    else if (p + 2 <= start)
+      s1->split_pads[k++] = p;
+  }
+  s1->nb_split_pads = k;
+  if (size - shift == 2)
+    split_pad_note(s1, start);
+}
+
+static int split_is_pad(TCCState *s1, unsigned off)
+{
+  int lo = 0, hi = s1->nb_split_pads - 1;
+  while (lo <= hi)
+  {
+    int mid = (lo + hi) >> 1;
+    if (s1->split_pads[mid] == off)
+      return 1;
+    if (s1->split_pads[mid] < off)
+      lo = mid + 1;
+    else
+      hi = mid - 1;
+  }
+  return 0;
+}
+
+/* -ffunction-sections into an object (function_text_section): the functions
+ * were generated into .text; give each its own section now.  A function runs
+ * from its symbol to the next function's -- its literal pool and padding go
+ * with it -- and every symbol and relocation in that range moves with it,
+ * relative to the new section.  Without debug info nothing refers to .text
+ * itself (only DWARF uses section symbols), so that is all there is to move.
+ * Anything before the first function stays in .text.  The functions start on
+ * a word, as their literal pools assume; if one did not, the object keeps one
+ * .text. */
+static int split_cmp_addr(const void *a, const void *b)
+{
+  addr_t x = *(const addr_t *)a, y = *(const addr_t *)b;
+  return (x > y) - (x < y);
+}
+
+static void split_pads_free(TCCState *s1)
+{
+  tcc_free(s1->split_pads);
+  s1->split_pads = NULL;
+  s1->nb_split_pads = s1->cap_split_pads = 0;
+}
+
+static void split_text_by_function(TCCState *s1)
+{
+  Section *text = text_section, *rel = text_section->reloc;
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  int nsyms = symtab_section->data_offset / sizeof(ElfW(Sym));
+  addr_t end = text->data_offset;
+  addr_t *starts = tcc_malloc(sizeof(addr_t) * (nsyms + 1));
+  int *first = NULL, n = 0;
+
+  for (int i = 1; i < nsyms; i++)
+    if (syms[i].st_shndx == text->sh_num && ELFW(ST_TYPE)(syms[i].st_info) == STT_FUNC)
+      starts[n++] = syms[i].st_value & ~(addr_t)1;
+  tcc_qsort(starts, n, sizeof(addr_t), split_cmp_addr);
+  int k = 0;
+  for (int i = 0; i < n; i++)
+    if (starts[i] < end && (k == 0 || starts[i] != starts[k - 1]))
+      starts[k++] = starts[i];
+  n = k;
+  for (int i = 0; i < n; i++)
+    if (starts[i] & 3)
+      n = 0; /* not word-aligned: keep one .text */
+  if (n == 0)
+  {
+    tcc_free(starts);
+    split_pads_free(s1);
+    return;
+  }
+  starts[n] = end;
+  /* each range's name: the first function symbol found at its start */
+  first = tcc_mallocz(sizeof(int) * n);
+  for (int i = 1; i < nsyms; i++)
+  {
+    if (syms[i].st_shndx != text->sh_num || ELFW(ST_TYPE)(syms[i].st_info) != STT_FUNC)
+      continue;
+    addr_t a = syms[i].st_value & ~(addr_t)1;
+    int lo = 0, hi = n - 1;
+    while (lo < hi)
+    {
+      int mid = (lo + hi + 1) >> 1;
+      if (starts[mid] <= a)
+        lo = mid;
+      else
+        hi = mid - 1;
+    }
+    if (starts[lo] == a && !first[lo])
+      first[lo] = i;
+  }
+  Section **secs = tcc_malloc(sizeof(Section *) * n);
+  const char *strtab = (const char *)symtab_section->link->data;
+  for (int r = 0; r < n; r++)
+  {
+    char name[300];
+    snprintf(name, sizeof name, ".text.%s", strtab + syms[first[r]].st_name);
+    Section *sec = new_section(s1, name, SHT_PROGBITS, text->sh_flags);
+    sec->sh_addralign = text->sh_addralign > 4 ? text->sh_addralign : 4;
+    unsigned long size = starts[r + 1] - starts[r];
+    /* a pad before the next function (or at the end) is no part of this one */
+    if (size >= 2 && split_is_pad(s1, starts[r + 1] - 2))
+      size -= 2;
+    if (size)
+      memcpy(section_ptr_add(sec, size), text->data + starts[r], size);
+    secs[r] = sec;
+  }
+  /* the range an address in .text falls in, or -1 before the first function */
+  for (int i = 1; i < nsyms; i++)
+  {
+    ElfW(Sym) *e = &syms[i];
+    if (e->st_shndx != text->sh_num)
+      continue;
+    addr_t a = ELFW(ST_TYPE)(e->st_info) == STT_FUNC ? e->st_value & ~(addr_t)1 : e->st_value;
+    if (a < starts[0])
+      continue;
+    int lo = 0, hi = n - 1;
+    while (lo < hi)
+    {
+      int mid = (lo + hi + 1) >> 1;
+      if (starts[mid] <= a)
+        lo = mid;
+      else
+        hi = mid - 1;
+    }
+    e->st_shndx = secs[lo]->sh_num;
+    e->st_value -= starts[lo];
+  }
+  if (rel)
+  {
+    ElfW_Rel *r0 = (ElfW_Rel *)rel->data, *rend = (ElfW_Rel *)(rel->data + rel->data_offset), *keep = r0;
+    int nrel = rend - r0;
+    ElfW_Rel *copy = tcc_malloc(sizeof(ElfW_Rel) * (nrel ? nrel : 1));
+    memcpy(copy, r0, sizeof(ElfW_Rel) * nrel);
+    for (int j = 0; j < nrel; j++)
+    {
+      ElfW_Rel *x = &copy[j];
+      addr_t a = x->r_offset;
+      if (a < starts[0])
+      {
+        *keep++ = *x;
+        continue;
+      }
+      int lo = 0, hi = n - 1;
+      while (lo < hi)
+      {
+        int mid = (lo + hi + 1) >> 1;
+        if (starts[mid] <= a)
+          lo = mid;
+        else
+          hi = mid - 1;
+      }
+#if SHT_RELX == SHT_RELA
+      addr_t addend = x->r_addend;
+#else
+      addr_t addend = 0;
+#endif
+      put_elf_reloca(symtab_section, secs[lo], a - starts[lo], ELFW(R_TYPE)(x->r_info), ELFW(R_SYM)(x->r_info), addend);
+    }
+    rel->data_offset = (unsigned char *)keep - rel->data;
+    tcc_free(copy);
+  }
+  text->data_offset = starts[0];
+  split_pads_free(s1);
+  tcc_free(secs);
+  tcc_free(first);
+  tcc_free(starts);
+}
+
 static int elf_output_obj(TCCState *s1, const char *filename)
 {
   Section *s;
@@ -1426,6 +1841,9 @@ static int elf_output_obj(TCCState *s1, const char *filename)
   if (!have_section(s1, ".ARM.attributes"))
     create_arm_attribute_section(s1);
 #endif
+  text_window_unspill_all(s1);
+  if (s1->text_split_pending)
+    split_text_by_function(s1);
   /* Allocate strings for section names */
   alloc_sec_names(s1, 1);
   file_offset = (sizeof(ElfW(Ehdr)) + 3) & -4;

@@ -331,14 +331,13 @@ typedef struct Sym Sym;
 
 typedef struct IRVregReplacement
 {
-  uint16_t r0; // first physical register
-  uint16_t r1; // second physical register (for long long)
-  int offset;  // stack offset if spilled
+  uint8_t r0; // first physical register (PREG_* bits fit in a byte; LS's -1 is 0xFF)
+  uint8_t r1; // second physical register (for long long)
+  int offset; // stack offset if spilled
 } IRVregReplacement;
 
 typedef struct IRLiveInterval
 {
-  uint8_t start_within_if : 1; // whether the interval starts within an if block
   uint8_t addrtaken : 1;       // whether the variable's address is taken
   uint8_t is_float : 1;        // whether this is a float/double variable
   uint8_t is_double : 1;       // whether this is a double (vs float)
@@ -353,21 +352,22 @@ typedef struct IRLiveInterval
   uint8_t is_struct : 1;      // param of struct type: its vreg names memory, never a value
   uint8_t nested_home : 1;    // param captured by a nested function: it keeps a parent-frame home
   uint8_t no_remat : 1;       // reload when spilled, never rematerialise (-Os shared constant)
-  /* remat_kind and the two incoming regs share the flags' word: as separate
-   * bytes behind the 32-bit fields they padded the struct to 40 bytes; packed
-   * here it is 32, and the per-function interval arrays (one entry per
-   * temp/var/param, alive through register allocation) shrink by a fifth.
-   * Sixteen flag bits fill those two bytes: remat_kind has one kind. */
+  /* The sixteen flags and the two incoming regs fill one word, and the
+   * allocation's byte-wide registers sit in front of its offset: 24 bytes.
+   * The per-function interval arrays (one entry per temp/var/param) are
+   * alive through register allocation, at the compile's memory peak.
+   * remat_kind has one kind; the stack-slot back-link is a list in
+   * TCCStackLayout. */
   uint8_t remat_kind : 1;  // 0=none, 1=imm32: recompute value instead of reloading when spilled
   uint8_t loop_split : 1;  // ra:loop_split entry-copy temp: the split is the point, never coalesce it back with its source
   int8_t incoming_reg0;    // for params: which register arg arrives in (-1 if stack)
   int8_t incoming_reg1;    // for doubles: second register (-1 if not double or stack)
+  IRVregReplacement allocation;
   uint32_t start;           // start instruction index
   uint32_t end;             // end instruction index
-  IRVregReplacement allocation;
   int32_t original_offset; // for params: original offset from function entry point
-  int stack_slot_index;    // index into stack layout (-1 if not stack-backed)
-  int32_t remat_imm;       // the constant when remat_kind==1
+  /* The constant of a remat_kind 1 temp is in TCCIRState.remat_imm: decided
+   * after allocation, it took 4 bytes of every interval through every pass. */
 } IRLiveInterval;
 
 typedef struct IRCallArgument
@@ -430,6 +430,11 @@ typedef struct TCCStackLayout
   int *offset_hash_keys;
   int *offset_hash_values;
   int offset_hash_size; /* 0 if disabled, otherwise power-of-two */
+
+  /* vreg -> slot for the stack-backed vregs, sorted by vreg (built by
+   * tcc_ir_stack_build): kept here, not in every vreg's interval. */
+  struct TCCStackVregSlot *vreg_slots;
+  int vreg_slot_count;
 } TCCStackLayout;
 
 /* Switch table metadata for jump table generation */
@@ -691,6 +696,10 @@ typedef struct TCCIRState
   IRLiveInterval *temporary_variables_live_intervals;
   int temporary_variables_live_intervals_size;
   int next_temporary_variable;
+  /* ra_mark_rematerializable: (position, constant) pairs of the remat_kind 1
+   * temps, sorted by position (tcc_ir_remat_imm); remat_imm_size pairs. */
+  int32_t *remat_imm;
+  int remat_imm_size;
 
   IRLiveInterval *parameters_live_intervals;
   int parameters_live_intervals_size;
@@ -881,6 +890,24 @@ typedef struct TCCIRState
    * tcc_ir_find_defining_instruction without a whole-function scan. */
   struct IRVregIndex *vreg_index;
 } TCCIRState;
+
+/* The constant temp VREG is rematerialized as (remat_kind 1). */
+static inline int32_t tcc_ir_remat_imm(const TCCIRState *ir, int vreg)
+{
+  const int p = TCCIR_DECODE_VREG_POSITION(vreg);
+  int lo = 0, hi = ir->remat_imm_size - 1;
+  while (lo <= hi)
+  {
+    const int mid = (lo + hi) >> 1, q = ir->remat_imm[2 * mid];
+    if (q == p)
+      return ir->remat_imm[2 * mid + 1];
+    if (q < p)
+      lo = mid + 1;
+    else
+      hi = mid - 1;
+  }
+  return 0;
+}
 
 /* Volatility queries for the optimizer, in the two shapes memory ops come in:
  * `op` is the deref (lvalue) operand of a LOAD/STORE, or the BASE operand of a

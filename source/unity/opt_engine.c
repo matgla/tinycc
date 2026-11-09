@@ -9,6 +9,7 @@
 #include "../opt/engine/gen_adapters.c"
 #undef USING_GLOBALS
 #include "../opt/engine/pass_timing.c"
+#undef TCC_MP_MAX
 #undef TCC_PASS_TIMING_MAX
 #undef TCC_PT_STACK_MAX
 #undef USING_GLOBALS

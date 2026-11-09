@@ -410,3 +410,40 @@ def test_computed_goto_keeps_the_result_buffer(char_result_frames):
     # b and the by-value argument: the result's buffer shares their bytes
     # (3032 when the goto made the call reroute).
     assert char_result_frames["char_result_computed_goto"] <= 2100, char_result_frames
+
+
+# ---------------------------------------------------------------------------
+# Dead locals keep no slot (backend/generators/regalloc.c compute_stack_layout).
+# A spilled var nothing uses gives its slot back, but the check looked the var
+# up by position alone, so a live temp with the same number kept the slot:
+# Zig's meta.eql, two u64 locals memset and assigned and never read, kept 16
+# bytes of frame or none depending on how the temps happened to be numbered.
+
+DEAD_LOCALS_SOURCE = r"""
+typedef __SIZE_TYPE__ size_t;
+void *memset(void *, int, size_t); /* no <string.h>: a bare cross has no sysroot */
+typedef unsigned long long u64;
+
+_Bool meta_eql(u64 const a0, u64 const a1)
+{
+  u64 t0;
+  u64 t1;
+  _Bool t2;
+  memset(&t0, 0x00, sizeof(u64));
+  t0 = a0;
+  memset(&t1, 0x00, sizeof(u64));
+  t1 = a1;
+  t2 = a0 == a1;
+  return t2;
+}
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
+def test_dead_locals_keep_no_frame(tmp_path, opt):
+    src = tmp_path / "dead_locals.c"
+    src.write_text(DEAD_LOCALS_SOURCE)
+    obj = tmp_path / "dead_locals.o"
+    subprocess.run([str(TCC), opt, "-fno-pic", "-mno-sb-relative-got", "-I" + str(CURRENT_DIR.parent.parent / "include"),
+                    "-c", str(src), "-o", str(obj)], check=True)
+    assert _frames(obj)["meta_eql"] == 0, _frames(obj)
