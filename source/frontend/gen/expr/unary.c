@@ -39,7 +39,7 @@ static CType union_cast_member_type(CType *union_type)
   else if ((op.t & VT_BTYPE) == VT_FUNC)
     mk_pointer(&op);
 
-  for (f = union_type->ref->next; f; f = f->next)
+  for (f = sym_first(union_type->ref); f; f = f->next)
   {
     if (!(f->type.t & VT_BITFIELD) && compare_types(&f->type, &op, 1))
     {
@@ -485,7 +485,7 @@ postfix:
             struct_type.ref->type.t != VT_UNION)
         {
           Sym *f;
-          for (f = struct_type.ref->next; f && f != s; f = f->next)
+          for (f = sym_first(struct_type.ref); f && f != s; f = f->next)
           {
             if (f->type.t & VT_VLA)
             {
@@ -502,7 +502,7 @@ postfix:
              its runtime or compile-time size. */
           Sym *f;
           vpushi(0); /* running integer offset */
-          for (f = struct_type.ref->next; f; f = f->next)
+          for (f = sym_first(struct_type.ref); f; f = f->next)
           {
             int f_align, f_size;
             if (f->type.t & VT_VLA)

@@ -35,7 +35,7 @@ static int struct_has_pointer_member(const CType *type)
   Sym *f;
   if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
     return 0;
-  for (f = type->ref->next; f; f = f->next)
+  for (f = sym_first(type->ref); f; f = f->next)
   {
     int bt = f->type.t & VT_BTYPE;
     if (bt == VT_PTR)
@@ -97,7 +97,7 @@ int auto_inline_sig_ok(Sym *func_sym)
     return 0;
   }
   int has_llong_param = 0;
-  for (p = ref->next; p; p = p->next)
+  for (p = sym_first(ref); p; p = p->next)
   {
     /* (void) parameter list: single VT_VOID param with no next */
     if ((p->type.t & VT_BTYPE) == VT_VOID && !p->next)
@@ -160,7 +160,7 @@ int auto_inline_nonstatic_struct_body_ok(Sym *func_sym, TokenString *func_str)
     return 1;
   if (!func_sym->type.ref)
     return 1;
-  for (p = func_sym->type.ref->next; p; p = p->next)
+  for (p = sym_first(func_sym->type.ref); p; p = p->next)
     if ((p->type.t & VT_BTYPE) == VT_STRUCT)
     {
       has_struct_param = 1;
@@ -181,7 +181,7 @@ int auto_inline_param_count(Sym *func_sym)
   int count = 0;
   if (!ref)
     return 0;
-  for (p = ref->next; p; p = p->next)
+  for (p = sym_first(ref); p; p = p->next)
   {
     if ((p->type.t & VT_BTYPE) == VT_VOID && !p->next)
       break;
@@ -645,7 +645,7 @@ static int inline_body_scan_names(TokenString *func_str, Sym *callee, const int 
       vector_push_back(&toks, tv);
   }
   if (callee && callee->type.ref)
-    for (Sym *p = callee->type.ref->next; p; p = p->next)
+    for (Sym *p = sym_first(callee->type.ref); p; p = p->next)
     {
       InlineNameState *ns = inline_name_find(names, nnames, p->v & ~SYM_FIELD);
       vector_push_back(&decl_names, p->v & ~SYM_FIELD); /* a parameter is no typedef name */
@@ -894,7 +894,9 @@ void inline_record_def_bindings(InlineFunc *fn, NestedFunc *nf)
     if (tv >= TOK_UIDENT && tv < tok_ident)
       n++;
   }
-  fn->def_binds = tcc_malloc((n ? n : 1) * sizeof(Sym *));
+  InlineFuncRare *r = inline_func_rare(fn);
+  tcc_free(r->def_binds);
+  r->def_binds = tcc_malloc((n ? n : 1) * sizeof(Sym *));
   tp = tok_str_buf(fn->func_str);
   n = 0;
   while (*tp)
@@ -907,24 +909,25 @@ void inline_record_def_bindings(InlineFunc *fn, NestedFunc *nf)
     if (tv >= TOK_UIDENT && tv < tok_ident)
     {
       TokenSym *ts = table_ident[tv - TOK_IDENT];
-      fn->def_binds[n++] = inline_def_binding(ts ? ts->sym_identifier : NULL);
+      r->def_binds[n++] = inline_def_binding(ts ? ts->sym_identifier : NULL);
     }
   }
-  fn->def_func = tcc_state->cur_func_sym;
-  fn->def_nf = tcc_state->current_nested_func;
-  fn->def_scope_top = local_stack;
-  fn->def_has_capture = nested_has_genuine_capture(nf);
+  r->def_func = tcc_state->cur_func_sym;
+  r->def_nf = tcc_state->current_nested_func;
+  r->def_scope_top = local_stack;
+  r->def_has_capture = nested_has_genuine_capture(nf);
 }
 
 /* Is the scope a nested function was defined in still the one being parsed? */
 static int inline_def_scope_live(InlineFunc *fn)
 {
-  if (!fn->def_binds || fn->def_func != tcc_state->cur_func_sym || fn->def_nf != tcc_state->current_nested_func)
+  const InlineFuncRare *r = fn->rare;
+  if (!r || !r->def_binds || r->def_func != tcc_state->cur_func_sym || r->def_nf != tcc_state->current_nested_func)
     return 0;
-  if (!fn->def_scope_top)
+  if (!r->def_scope_top)
     return 1;
   for (Sym *s = local_stack; s; s = s->prev)
-    if (s == fn->def_scope_top)
+    if (s == r->def_scope_top)
       return 1;
   return 0;
 }
@@ -943,12 +946,12 @@ int inline_body_has_unsafe_shadowed_ident(TokenString *func_str, Sym *call_func_
   if (inline_body_shadowed_ident(func_str, tcc_state->in_inline_expansion != 0))
     return 1;
   InlineFunc *fn = call_func_sym ? inline_fn_lookup(tcc_state, call_func_sym) : NULL;
-  const int *spliced = fn && fn->func_str == func_str ? fn->spliced : NULL;
+  const int *spliced = fn && fn->func_str == func_str ? INLINE_RARE(fn, spliced) : NULL;
   if (call_func_sym && call_func_sym->a.nested_func)
   {
     if (fn && inline_def_scope_live(fn))
-      return inline_body_free_names_unsafe(func_str, call_func_sym, fn->def_binds, NULL);
-    if (!fn || !fn->def_binds || fn->def_has_capture)
+      return inline_body_free_names_unsafe(func_str, call_func_sym, fn->rare->def_binds, NULL);
+    if (!fn || !INLINE_RARE(fn, def_binds) || INLINE_RARE(fn, def_has_capture))
       return 1;
   }
   return inline_body_free_names_unsafe(func_str, call_func_sym, NULL, spliced);
@@ -1236,7 +1239,7 @@ int nested_has_genuine_capture(NestedFunc *nf)
     Sym *ref = nf->sym->type.ref;
     if (ref)
     {
-      for (Sym *p = ref->next; p; p = p->next)
+      for (Sym *p = sym_first(ref); p; p = p->next)
       {
         if ((p->v & ~SYM_FIELD) == ctok)
         {
@@ -1317,7 +1320,7 @@ int nested_capture_is_read_only(NestedFunc *nf)
    * function body token stream. */
   Sym *fref = nf->sym->type.ref;
   if (fref) {
-    for (Sym *p = fref->next; p; p = p->next) {
+    for (Sym *p = sym_first(fref); p; p = p->next) {
       if ((p->type.t & VT_VLA) || ((p->type.t & VT_BTYPE) == VT_PTR && p->type.ref &&
                                     (p->type.ref->type.t & VT_VLA)))
         return 0;
@@ -1333,7 +1336,7 @@ int nested_capture_is_read_only(NestedFunc *nf)
     int shadowed = 0;
     Sym *ref = nf->sym->type.ref;
     if (ref) {
-      for (Sym *p = ref->next; p; p = p->next) {
+      for (Sym *p = sym_first(ref); p; p = p->next) {
         if ((p->v & ~SYM_FIELD) == ctok) {
           shadowed = 1;
           break;
@@ -1955,7 +1958,7 @@ static TokenString *guard_head_scan(TokenString *func_str, Sym *sym, GuardTok *t
   Sym *ref = sym->type.ref;
   const int self = sym->v & ~SYM_FIELD;
   int params[16], nparams = 0;
-  for (Sym *p = ref->next; p; p = p->next)
+  for (Sym *p = sym_first(ref); p; p = p->next)
   {
     int bt = p->type.t & VT_BTYPE;
     if (nparams >= 16 || !p->v || (p->v & ~SYM_FIELD) == self || (p->type.t & (VT_VLA | VT_ARRAY | VT_VOLATILE)) ||

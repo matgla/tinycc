@@ -2,5 +2,6 @@
 #include "../frontend/gen/sym/attr_merge.c"
 #include "../frontend/gen/sym/elfsym.c"
 #include "../frontend/gen/sym/symtab.c"
+#undef PARAMS_HDR
 #undef PARK_SCOPED
 #undef PARK_VOLATILE

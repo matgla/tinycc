@@ -165,9 +165,12 @@ static void icf_scan_pending_bodies(TCCState *s1)
     const int n = pass == 0 ? s1->nb_deferred_fns : s1->nb_inline_fns;
     for (int i = 0; i < n; i++)
     {
-      TokenString *ts = pass == 0 ? s1->deferred_fns[i]->body : s1->inline_fns[i]->func_str;
+      TokenString *ts = pass == 0 ? (s1->deferred_fns[i] ? s1->deferred_fns[i]->body : NULL) : s1->inline_fns[i]->func_str;
       if (!ts)
         continue;
+      /* A spilled body read back for this scan goes again after it; one
+       * already loaded may be what a replay up the stack is reading. */
+      const int reload = ts->allocated_len < 0;
       const int *p = tok_str_buf(ts), *end = p + ts->len;
       int prev = 0, prev_is_ident = 0;
       while (p < end)
@@ -192,6 +195,8 @@ static void icf_scan_pending_bodies(TCCState *s1)
         if (idx >= 0 && idx < icf_value_tok_size)
           icf_value_tok[idx] = 1;
       }
+      if (reload)
+        tok_str_release(ts);
     }
   }
 }
@@ -291,15 +296,18 @@ static int icf_same_body(Section *sec, addr_t a_start, addr_t size, const ElfW_R
     if (sa != sb)
       return 0;
   }
-  /* Compare every byte but a branch's displacement. */
+  /* Compare every byte but a branch's displacement.  The other body may be in
+   * the spill file now (text_window_spill). */
+  unsigned char *b_tmp;
+  const unsigned char *b_data = text_window_bytes(tcc_state, b->sec, b->start, size, &b_tmp) - b->start;
   addr_t pos = 0;
   for (int i = 0; i <= a_nrel; i++)
   {
     addr_t next = (i < a_nrel) ? a_rel[i].r_offset - a_start : size;
     if (next > size)
       next = size;
-    if (next > pos && memcmp(sec->data + a_start + pos, b->sec->data + b->start + pos, next - pos) != 0)
-      return 0;
+    if (next > pos && memcmp(sec->data + a_start + pos, b_data + b->start + pos, next - pos) != 0)
+      return tcc_free(b_tmp), 0;
     if (i < a_nrel)
     {
       const int type = ELFW(R_TYPE)(a_rel[i].r_info);
@@ -307,11 +315,12 @@ static int icf_same_body(Section *sec, addr_t a_start, addr_t size, const ElfW_R
       if (end > size)
         end = size;
       if (!icf_reloc_skips_bytes(type) && end > next &&
-          memcmp(sec->data + a_start + next, b->sec->data + b->start + next, end - next) != 0)
-        return 0;
+          memcmp(sec->data + a_start + next, b_data + b->start + next, end - next) != 0)
+        return tcc_free(b_tmp), 0;
       pos = end;
     }
   }
+  tcc_free(b_tmp);
   return 1;
 }
 

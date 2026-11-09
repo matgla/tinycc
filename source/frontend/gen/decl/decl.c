@@ -55,6 +55,17 @@ void do_Static_assert(void)
  * nothing compiles the body here (!COMPILED_NOW), its own pack directives are
  * applied to the live state now too: they sit at this point of the file, and
  * the declarations after the body must see them. */
+/* FN's tokens are no longer wanted.  If they are the deferred body still being
+ * replayed (adopted by save_function_body), define_deferred_function frees them
+ * once its replay ends: the stream reads past the body's end from them. */
+static void inline_fn_drop_tokens(InlineFunc *fn)
+{
+  if (fn->func_str && fn->func_str == tcc_state->deferred_body && tcc_state->deferred_adopted)
+    tcc_state->deferred_adopted = 2; /* adopted, then dropped */
+  else
+    tok_str_free(fn->func_str);
+}
+
 static void save_function_body(TokenString **str, int **pack, int compiled_now)
 {
   int captures = pp_pack_captures;
@@ -67,8 +78,22 @@ static void save_function_body(TokenString **str, int **pack, int compiled_now)
     const int *buf = tok_str_buf(*str);
     pp_apply_pack_replays(tcc_state, buf, buf + (*str)->len);
   }
+  /* A deferred body compiled now (define_deferred_function) records what it
+   * replays: the same tokens, already kept and spilled.  Take that one and
+   * drop the copy -- it would be written to the spill file a second time and
+   * read back beside the first while the function compiles. */
+  TokenString *src = tcc_state->deferred_body;
+  if (compiled_now && src && !tcc_state->deferred_adopted && src->len == (*str)->len &&
+      !memcmp(tok_str_buf(src), tok_str_buf(*str), sizeof(int) * src->len))
+  {
+    tok_str_free(*str);
+    *str = src;
+    tcc_state->deferred_adopted = 1;
+    return;
+  }
   tok_str_fit(*str);
   *str = tok_str_keep(*str);
+  tok_str_spill(*str); /* internal spill: out of the heap until replayed */
 }
 
 /* A file-scope function definition's body, from its opening '{' in the
@@ -84,8 +109,8 @@ static void define_global_function(Sym *sym, Section *ad_section)
   if (sym->type.t & VT_INLINE)
   {
     struct InlineFunc *fn;
-    fn = tcc_mallocz(sizeof *fn + strlen(file->filename));
-    strcpy(fn->filename, file->filename);
+    fn = tcc_mallocz(sizeof *fn);
+    fn->filename = tcc_filename_intern(file->filename);
     fn->sym = sym;
     dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
     save_function_body(&fn->func_str, &fn->pack, 0);
@@ -244,8 +269,8 @@ static void define_global_function(Sym *sym, Section *ad_section)
      *   keep the token stream in inline_fns for call-site inlining within
      *   this TU. VT_INLINE is NOT set so ELF linkage stays global. */
     struct InlineFunc *fn;
-    fn = tcc_mallocz(sizeof *fn + strlen(file->filename));
-    strcpy(fn->filename, file->filename);
+    fn = tcc_mallocz(sizeof *fn);
+    fn->filename = tcc_filename_intern(file->filename);
     fn->sym = sym;
     fn->func_str = NULL;
     save_function_body(&fn->func_str, &fn->pack, 1);
@@ -309,25 +334,21 @@ static void define_global_function(Sym *sym, Section *ad_section)
         sym->type.t |= VT_INLINE;
       dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
 
-      TokenString *compile_ts = tok_str_alloc();
-      if (body_len > 0)
-      {
-        int *buf = tcc_malloc(body_len * sizeof(int));
-        memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
-        compile_ts->data.str = buf;
-        compile_ts->allocated_len = body_len;
-        compile_ts->len = body_len;
-      }
+      TokenString *compile_ts = tok_str_borrow(fn->func_str, body_len);
+      compile_ts->owner = fn->func_str; /* for tok_str_release_parsed */
       int saved_outer_tok = tok;
       CValue saved_outer_tokc = tokc;
       if (TCC_LOG_INLINE_STRUCT)
         fprintf(stderr, "[auto-inline] SMALL: compiling standalone for %s\n",
                 get_tok_str(sym->v & ~SYM_FIELD, NULL));
       tcc_state->had_nested_funcs = 0;
-      begin_macro(compile_ts, 1); /* owning: compile_ts freed on end_macro */
+      TokenString *saved_replay = tcc_state->compile_replay;
+      tcc_state->compile_replay = compile_ts;
+      begin_macro(compile_ts, 2); /* borrowed tokens: only the header is freed */
       next();
       gen_function(sym);
       end_macro();
+      tcc_state->compile_replay = saved_replay;
       tok = saved_outer_tok;
       tokc = saved_outer_tokc;
       /* Revoke auto-inline for functions that contain nested function
@@ -389,7 +410,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
             sym->type.t &= ~VT_INLINE;
           if (fn->func_str)
           {
-            tok_str_free(fn->func_str);
+            inline_fn_drop_tokens(fn);
             fn->func_str = NULL;
           }
           fn->sym = NULL;
@@ -425,19 +446,18 @@ static void define_global_function(Sym *sym, Section *ad_section)
           sym->type.t |= VT_INLINE;
         dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
 
-        TokenString *compile_ts = tok_str_alloc();
-        int *buf = tcc_malloc(body_len * sizeof(int));
-        memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
-        compile_ts->data.str = buf;
-        compile_ts->allocated_len = body_len;
-        compile_ts->len = body_len;
+        TokenString *compile_ts = tok_str_borrow(fn->func_str, body_len);
+        compile_ts->owner = fn->func_str; /* for tok_str_release_parsed */
 
         int saved_outer_tok = tok;
         CValue saved_outer_tokc = tokc;
-        begin_macro(compile_ts, 1);
+        TokenString *saved_replay = tcc_state->compile_replay;
+        tcc_state->compile_replay = compile_ts;
+        begin_macro(compile_ts, 2); /* borrowed tokens: only the header is freed */
         next();
         gen_function(sym);
         end_macro();
+        tcc_state->compile_replay = saved_replay;
         tok = saved_outer_tok;
         tokc = saved_outer_tokc;
         /* Promoted as a small straight-line leaf: inline it at every call
@@ -455,16 +475,15 @@ static void define_global_function(Sym *sym, Section *ad_section)
           /* Preserve token stream for post-optimization re-inlining.
            * Compile from a copy (same pattern as the small-function path). */
           dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
-          TokenString *compile_ts = tok_str_alloc();
-          int *buf = tcc_malloc(body_len * sizeof(int));
-          memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
-          compile_ts->data.str = buf;
-          compile_ts->allocated_len = body_len;
-          compile_ts->len = body_len;
-          begin_macro(compile_ts, 1);
+          TokenString *compile_ts = tok_str_borrow(fn->func_str, body_len);
+          compile_ts->owner = fn->func_str; /* for tok_str_release_parsed */
+          TokenString *saved_replay = tcc_state->compile_replay;
+          tcc_state->compile_replay = compile_ts;
+          begin_macro(compile_ts, 2); /* borrowed tokens: only the header is freed */
           next();
           gen_function(sym);
           end_macro();
+          tcc_state->compile_replay = saved_replay;
           if (sym->type.ref->f.func_small_leaf || sym->type.ref->f.func_inl_few_callers) {
             /* Promoted as a small straight-line leaf (see gen_function):
              * its optimized body is what gets duplicated, not its tokens,
@@ -483,7 +502,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
             /* Keep tokens — TU-wide DSE may flag this for re-compile. */
           } else {
             /* Not promoted: prevent gen_inline_functions re-compilation. */
-            tok_str_free(fn->func_str);
+            inline_fn_drop_tokens(fn);
             fn->func_str = NULL;
             fn->sym = NULL;
           }
@@ -495,17 +514,16 @@ static void define_global_function(Sym *sym, Section *ad_section)
            * re-compilation; preserve them by going through the same
            * inline_fns path used for the smaller-body case. */
           if (TCC_OPT(tcc_state, opt_dead_store)) {
-            TokenString *compile_ts = tok_str_alloc();
-            int *buf = tcc_malloc(body_len * sizeof(int));
-            memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
-            compile_ts->data.str = buf;
-            compile_ts->allocated_len = body_len;
-            compile_ts->len = body_len;
+            TokenString *compile_ts = tok_str_borrow(fn->func_str, body_len);
+            compile_ts->owner = fn->func_str; /* for tok_str_release_parsed */
             dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
-            begin_macro(compile_ts, 1);
+            TokenString *saved_replay = tcc_state->compile_replay;
+            tcc_state->compile_replay = compile_ts;
+            begin_macro(compile_ts, 2); /* borrowed tokens: only the header is freed */
             next();
             gen_function(sym);
             end_macro();
+            tcc_state->compile_replay = saved_replay;
             if (!sym->type.ref->f.tu_static_writer &&
                 !sym->type.ref->f.func_late_reopt &&
                 !sym->type.ref->f.func_keep_tokens_for_noreturn &&
@@ -515,18 +533,19 @@ static void define_global_function(Sym *sym, Section *ad_section)
                  * is 536 tokens and 8 ops once its loop unrolls. */
                 !sym->type.ref->f.func_small_leaf) {
               /* Not a static writer — discard tokens to save memory. */
-              tok_str_free(fn->func_str);
+              inline_fn_drop_tokens(fn);
               fn->func_str = NULL;
               fn->sym = NULL;
             }
           } else {
             TokenString *ts = fn->func_str;
             fn->func_str = NULL;
-            begin_macro(ts, 1);
+            begin_macro_kept(ts);
             next();
             gen_function(sym);
             end_macro();
             tcc_free(fn->pack);
+            inline_func_free_rare(fn);
             tcc_free(fn);
           }
         }
@@ -536,6 +555,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
       else
       {
         tcc_free(fn->pack);
+        inline_func_free_rare(fn);
         tcc_free(fn);
       }
     }
@@ -561,8 +581,8 @@ static void define_global_function(Sym *sym, Section *ad_section)
     const int late_reopt_cap = 512;
     if (TCC_OPT(tcc_state, opt_dead_store))
     {
-      struct InlineFunc *fn = tcc_mallocz(sizeof *fn + strlen(file->filename));
-      strcpy(fn->filename, file->filename);
+      struct InlineFunc *fn = tcc_mallocz(sizeof *fn);
+      fn->filename = tcc_filename_intern(file->filename);
       fn->sym = sym;
       fn->func_str = NULL;
       save_function_body(&fn->func_str, &fn->pack, 1);
@@ -570,19 +590,18 @@ static void define_global_function(Sym *sym, Section *ad_section)
       if (fn->func_str && body_len > 0 && body_len <= late_reopt_cap)
       {
         dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
-        TokenString *compile_ts = tok_str_alloc();
-        int *buf = tcc_malloc(body_len * sizeof(int));
-        memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
-        compile_ts->data.str = buf;
-        compile_ts->allocated_len = body_len;
-        compile_ts->len = body_len;
+        TokenString *compile_ts = tok_str_borrow(fn->func_str, body_len);
+        compile_ts->owner = fn->func_str; /* for tok_str_release_parsed */
         int saved_outer_tok = tok;
         CValue saved_outer_tokc = tokc;
         tcc_state->had_nested_funcs = 0;
-        begin_macro(compile_ts, 1);
+        TokenString *saved_replay = tcc_state->compile_replay;
+        tcc_state->compile_replay = compile_ts;
+        begin_macro(compile_ts, 2); /* borrowed tokens: only the header is freed */
         next();
         gen_function(sym);
         end_macro();
+        tcc_state->compile_replay = saved_replay;
         tok = saved_outer_tok;
         tokc = saved_outer_tokc;
         /* Token-replay cannot reproduce nested function closure
@@ -595,7 +614,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
              !sym->type.ref->f.func_keep_tokens_for_noreturn &&
              !sym->type.ref->f.func_late_reopt))
         {
-          tok_str_free(fn->func_str);
+          inline_fn_drop_tokens(fn);
           fn->func_str = NULL;
           fn->sym = NULL;
         }
@@ -610,7 +629,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
           CValue saved_outer_tokc2 = tokc;
           TokenString *ts = fn->func_str;
           fn->func_str = NULL;
-          begin_macro(ts, 1);
+          begin_macro_kept(ts);
           next();
           gen_function(sym);
           end_macro();
@@ -622,6 +641,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
           gen_function(sym);
         }
         tcc_free(fn->pack);
+        inline_func_free_rare(fn);
         tcc_free(fn);
       }
     }
@@ -696,7 +716,7 @@ static int body_calls_unprototyped(Sym *sym, TokenString *body)
       else if (t >= TOK_BUILTIN_END)
       {
         int local = tok_ends_decl_specifiers(prev);
-        for (Sym *param = sym->type.ref->next; param && !local; param = param->next)
+        for (Sym *param = sym_first(sym->type.ref); param && !local; param = param->next)
           local = (param->v & ~SYM_FIELD) == t;
         for (const int *q = start; q < at && !local;)
         {
@@ -720,12 +740,14 @@ static int defer_function_body(Sym *sym, Section *section)
   if (!(TCC_OPT(tcc_state, opt_inline_called_once) || TCC_OPT(tcc_state, opt_drop_unused_statics)) || tcc_state->nb_vla_param_exprs ||
       (sym->type.t & VT_INLINE) || !sym->type.ref || sym->type.ref->f.func_type != FUNC_NEW || sym->a.nested_func)
     return 0;
-  DeferredFunc *d = tcc_mallocz(sizeof *d + strlen(file->filename));
-  strcpy(d->filename, file->filename);
+  DeferredFunc *d = tcc_mallocz(sizeof *d);
+  d->filename = tcc_filename_intern(file->filename);
   d->sym = sym;
   d->section = section;
   save_function_body(&d->body, &d->pack, 0);
-  if (body_calls_unprototyped(sym, d->body))
+  int unprototyped = body_calls_unprototyped(sym, d->body);
+  tok_str_release(d->body);
+  if (unprototyped)
   {
     /* Generate it now, from the saved tokens, as if never deferred. */
     int saved_tok = tok, saved_line = file->line_num;
@@ -756,10 +778,20 @@ void define_deferred_function(DeferredFunc *d)
   d->body = NULL;
   tccpp_setfile(d->filename);
   pp_pack_enter(tcc_state, d->pack, saved_pack);
-  begin_macro(body, 1);
+  /* Replayed through a borrowed header, so save_function_body can adopt the
+   * body itself; if nothing does, it goes here as before. */
+  TokenString *saved_deferred = tcc_state->deferred_body;
+  int saved_adopted = tcc_state->deferred_adopted;
+  tcc_state->deferred_body = body;
+  tcc_state->deferred_adopted = 0;
+  begin_macro(tok_str_borrow(body, body->len), 2);
   next();
   define_global_function(d->sym, d->section);
   end_macro();
+  if (tcc_state->deferred_adopted != 1)
+    tok_str_free(body); /* not adopted, or adopted and dropped */
+  tcc_state->deferred_body = saved_deferred;
+  tcc_state->deferred_adopted = saved_adopted;
   pp_pack_leave(tcc_state, saved_pack);
   tcc_state->deferred_sym = saved_sym;
   tcc_state->deferred_call_sites = saved_sites;
@@ -821,7 +853,7 @@ static int defer_static_data(CType *type, AttributeDef *ad, int r, int v)
 #endif
   if ((type->t & VT_BTYPE) == VT_STRUCT)
   {
-    Sym *field = type->ref->next;
+    Sym *field = sym_first(type->ref);
     while (field && field->next)
       field = field->next;
     if (field && (field->type.t & VT_ARRAY) && field->type.ref->c < 0)
@@ -853,12 +885,15 @@ static int defer_static_data(CType *type, AttributeDef *ad, int r, int v)
     sym = sym_push(v, &declared, r | VT_SYM, 0);
     patch_storage(sym, ad, NULL);
   }
-  DeferredData *d = tcc_mallocz(sizeof *d + strlen(file->filename));
-  strcpy(d->filename, file->filename);
+  DeferredData *d = tcc_mallocz(sizeof *d);
+  d->filename = tcc_filename_intern(file->filename);
   d->sym = sym;
   d->type = *type;
   d->ad = *ad;
   d->r = r;
+  /* As a saved body is: a 16-byte header, the tokens in the spill file. */
+  init = tok_str_keep(init);
+  tok_str_spill(init);
   d->init = init;
   dynarray_add(&tcc_state->deferred_data, &tcc_state->nb_deferred_data, d);
   return 1;
@@ -871,7 +906,7 @@ void define_deferred_data(DeferredData *d)
   TokenString *init = d->init;
   d->init = NULL;
   tccpp_setfile(d->filename);
-  begin_macro(init, 1);
+  begin_macro_kept(init);
   next();
   decl_initializer_alloc(&d->type, &d->ad, d->r, 1, d->sym->v, 1);
   if (tok != TOK_EOF)
@@ -893,7 +928,7 @@ void check_dropped_deferred_data(DeferredData *d, TokenString *init)
   nocode_wanted = DATA_ONLY_WANTED;
   tcc_state->check_only++;
   tccpp_setfile(d->filename);
-  begin_macro(init, 1);
+  begin_macro_kept(init);
   next();
   decl_initializer(&p, &d->type, addr, DIF_FIRST, -1);
   if (tok != TOK_EOF)
@@ -909,7 +944,7 @@ void check_dropped_function(DeferredFunc *d, TokenString *body)
   int saved_pack[PACK_STACK_SIZE + 1];
   tccpp_setfile(d->filename);
   pp_pack_enter(tcc_state, d->pack, saved_pack);
-  begin_macro(body, 1);
+  begin_macro_kept(body);
   next();
   gen_function_check_only(d->sym);
   end_macro();
@@ -928,6 +963,12 @@ int decl(int l)
 
   while (1)
   {
+    /* Between file-scope declarations no saved body is being replayed. */
+    if (l == VT_CONST)
+      {
+      tok_str_release_spilled();
+      sym_params_release();
+    }
 
     oldint = 0;
     if (!parse_btype(&btype, &adbase, l == VT_LOCAL))
@@ -992,7 +1033,10 @@ int decl(int l)
       Sym *stack_before = global_stack;
       type = btype;
       ad = adbase;
+      declarator_last_functype = NULL;
       type_decl(&type, &ad, &v, TYPE_DIRECT);
+      /* this declarator built the function type itself, not a typedef or typeof */
+      const int own_functype = (type.t & VT_BTYPE) == VT_FUNC && type.ref && type.ref == declarator_last_functype;
       /* #pragma GCC visibility covers every declaration it encloses, extern
        * ones too; an attribute on the declaration wins.  Not typedefs: their
        * attributes merge into every later declaration that uses them. */
@@ -1108,6 +1152,7 @@ int decl(int l)
            New-style (FUNC_NEW/FUNC_ELLIPSIS) unnamed params are valid
            in GNU C and C23. */
         sym = type.ref;
+        sym_first(sym); /* the loop steps from the type Sym to its parameters */
         while ((sym = sym->next) != NULL)
         {
           if (!(sym->v & ~SYM_FIELD) && type.ref->f.func_type == FUNC_OLD)
@@ -1208,8 +1253,8 @@ int decl(int l)
                 !inline_body_has_static_local(nf->func_str) && !inline_body_has_unsafe_loops(nf->func_str))
             {
               nf->sym->type.ref->f.func_auto_inline = 1;
-              struct InlineFunc *fn = tcc_mallocz(sizeof *fn + strlen(file->filename));
-              strcpy(fn->filename, file->filename);
+              struct InlineFunc *fn = tcc_mallocz(sizeof *fn);
+              fn->filename = tcc_filename_intern(file->filename);
               fn->sym = nf->sym;
               /* Copy the token stream — nf->func_str is freed by end_macro()
                * during compile_nested_functions, so InlineFunc needs its own. */
@@ -1298,7 +1343,7 @@ int decl(int l)
               /* Pin the struct tag if its compile-time size is 0 */
               if (ct->ref->c == 0)
                 ct->ref->r |= VT_SYM;
-              for (Sym *f = ct->ref->next; f; f = f->next)
+              for (Sym *f = sym_first(ct->ref); f; f = f->next)
               {
                 if (f->c == 0)
                   f->r |= VT_SYM;
@@ -1313,7 +1358,7 @@ int decl(int l)
             Sym *ss = nf->parent_struct_tag_syms[si];
             if (ss)
             {
-              for (Sym *f = ss->next; f; f = f->next)
+              for (Sym *f = sym_first(ss); f; f = f->next)
               {
                 if (f->c == 0)
                   f->r |= VT_SYM;
@@ -1429,7 +1474,7 @@ int decl(int l)
         if (l == VT_CMP)
         {
           /* find parameter in function parameter list */
-          for (sym = func_vt.ref->next; sym; sym = sym->next)
+          for (sym = sym_first(func_vt.ref); sym; sym = sym->next)
             if ((sym->v & ~SYM_FIELD) == v)
               goto found;
           tcc_error("declaration for parameter '%s' but no such parameter", get_tok_str(v, NULL));
@@ -1514,6 +1559,8 @@ int decl(int l)
                         !sym_find(v);
             type.t |= VT_EXTERN;
             sym = external_sym(v, &type, r, &ad);
+            if (fresh && own_functype && !local_stack && sym->type.ref == type.ref)
+              type.ref->a.proto_own = 1;
             if (l == VT_LOCAL && (type.t & VT_BTYPE) == VT_FUNC)
               nested_note_block_proto(v); /* `auto`: a nested function defined later */
             /* a first prototype: kept compactly until something names it */

@@ -37,7 +37,7 @@ static int vidx_slot(const IRVregIndex *x, int32_t vreg)
   /* a negative sentinel or bits between position and type: the scans compare
    * the whole value */
   if (vreg < 0 || type < TCCIR_VREG_TYPE_VAR || type > TCCIR_VREG_TYPE_PARAM ||
-      (vreg & ~(0xF << 28 | TCCIR_VREG_POSITION_MASK)))
+      ((uint32_t)vreg & ~(0xFu << 28 | TCCIR_VREG_POSITION_MASK)))
     return -1;
   int slot = x->base[type - TCCIR_VREG_TYPE_VAR] + TCCIR_DECODE_VREG_POSITION(vreg);
   return slot < x->base[type - TCCIR_VREG_TYPE_VAR + 1] ? slot : -1;

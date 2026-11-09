@@ -23,6 +23,8 @@
 
 #include "gen_priv.h"
 
+Sym *declarator_last_functype; /* the function type Sym post_type built last (decl's own-ref test) */
+
 /* convert a function parameter type (array to pointer and function to
    function pointer) */
 void convert_parameter_type(CType *pt)
@@ -177,10 +179,14 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
     ad->f.func_type = l;
     s = sym_push(SYM_FIELD, type, 0, 0);
     s->a = ad->a;
+    s->a.proto_own = 0;
+    declarator_last_functype = s;
     s->f = ad->f;
     s->next = first;
     type->t = VT_FUNC;
     type->ref = s;
+    if (first)
+      sym_params_track(s, first->prev);
   }
   else if (tok == '[')
   {

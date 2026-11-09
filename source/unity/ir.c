@@ -21,6 +21,8 @@
 #undef SC_MAX_DIST
 #include "../ir/ssa.c"
 #undef DD_VAR
+#undef SSA_TEMP_POS
+#undef SSA_TEMP_REMAP
 #undef USING_GLOBALS
 #include "../ir/type.c"
 #undef USING_GLOBALS

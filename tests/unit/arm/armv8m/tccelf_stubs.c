@@ -326,3 +326,9 @@ void ld_script_cleanup(void *ld)
 {
   (void)ld;
 }
+
+/* frontend/gen/sym/elfsym.c: nothing defers a name here */
+void elf_names_materialize(struct TCCState *s1)
+{
+  (void)s1;
+}

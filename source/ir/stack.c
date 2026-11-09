@@ -187,11 +187,56 @@ static void tcc_ir_stack_layout_ensure_capacity(TCCStackLayout *layout, int need
   layout->slot_capacity = new_capacity;
 }
 
+typedef struct TCCStackVregSlot
+{
+  int vreg;
+  int slot;
+  int seq; /* build order: a later entry for the same vreg wins */
+} TCCStackVregSlot;
+
+static int stack_vreg_slot_cmp(const void *a, const void *b)
+{
+  const TCCStackVregSlot *x = (const TCCStackVregSlot *)a, *y = (const TCCStackVregSlot *)b;
+  if (x->vreg != y->vreg)
+    return x->vreg < y->vreg ? -1 : 1;
+  return x->seq < y->seq ? -1 : x->seq > y->seq;
+}
+
+/* Record that VREG lives in SLOT (only vregs with an interval, as the
+ * back-link in the interval used to be). */
+static void stack_vreg_slot_note(TCCIRState *ir, int vreg, int slot)
+{
+  TCCStackLayout *layout = &ir->stack_layout;
+  if (!tcc_ir_get_live_interval(ir, vreg))
+    return;
+  TCCStackVregSlot *e = &layout->vreg_slots[layout->vreg_slot_count];
+  e->vreg = vreg;
+  e->slot = slot;
+  e->seq = layout->vreg_slot_count++;
+}
+
+/* Sort the notes by vreg, keeping the last one of each vreg. */
+static void stack_vreg_slots_finish(TCCStackLayout *layout)
+{
+  int n = layout->vreg_slot_count, w = 0;
+  if (n <= 0)
+    return;
+  tcc_qsort(layout->vreg_slots, n, sizeof(TCCStackVregSlot), stack_vreg_slot_cmp);
+  for (int i = 0; i < n; i++)
+  {
+    if (i + 1 < n && layout->vreg_slots[i + 1].vreg == layout->vreg_slots[i].vreg)
+      continue;
+    layout->vreg_slots[w++] = layout->vreg_slots[i];
+  }
+  layout->vreg_slot_count = w;
+}
+
 static void tcc_ir_stack_layout_reset(TCCStackLayout *layout)
 {
   if (!layout)
     return;
   layout->slot_count = 0;
+  layout->vreg_slot_count = 0;
   if (layout->offset_hash_keys && layout->offset_hash_size > 0)
   {
     for (int i = 0; i < layout->offset_hash_size; ++i)
@@ -234,6 +279,8 @@ void tcc_ir_stack_build(TCCIRState *ir)
   TCCStackLayout *layout = &ir->stack_layout;
   tcc_ir_stack_layout_ensure_capacity(layout, estimated_slots);
   tcc_ir_stack_layout_offset_hash_ensure_capacity(layout, estimated_slots + 8);
+  tcc_free(layout->vreg_slots);
+  layout->vreg_slots = (TCCStackVregSlot *)tcc_malloc(sizeof(TCCStackVregSlot) * estimated_slots);
 
   /* Build slots directly from LSLiveInterval data. */
   for (int i = 0; i < n; ++i)
@@ -251,10 +298,7 @@ void tcc_ir_stack_build(TCCIRState *ir)
       TCCStackSlot *slot = &layout->slots[existing_idx];
       if (slot->vreg == -1)
         slot->vreg = (int)ls_it->vreg;
-      /* Update stack_slot_index in corresponding IRLiveInterval. */
-      IRLiveInterval *ir_interval = tcc_ir_get_live_interval(ir, (int)ls_it->vreg);
-      if (ir_interval)
-        ir_interval->stack_slot_index = existing_idx;
+      stack_vreg_slot_note(ir, (int)ls_it->vreg, existing_idx);
       continue;
     }
 
@@ -300,23 +344,31 @@ void tcc_ir_stack_build(TCCIRState *ir)
     /* Insert into hash table for fast lookup. */
     tcc_ir_stack_layout_offset_hash_insert(layout, offset, slot_idx);
 
-    /* Update stack_slot_index in corresponding IRLiveInterval. */
-    IRLiveInterval *ir_interval = tcc_ir_get_live_interval(ir, (int)ls_it->vreg);
-    if (ir_interval)
-      ir_interval->stack_slot_index = slot_idx;
+    stack_vreg_slot_note(ir, (int)ls_it->vreg, slot_idx);
   }
+  stack_vreg_slots_finish(layout);
 }
 
 const TCCStackSlot *tcc_ir_stack_slot_by_vreg(const TCCIRState *ir, int vreg)
 {
   if (!ir || !tcc_ir_vreg_is_valid((TCCIRState *)ir, vreg))
     return NULL;
-  IRLiveInterval *interval = tcc_ir_get_live_interval((TCCIRState *)ir, vreg);
-  if (!interval || interval->stack_slot_index < 0)
+  if (!tcc_ir_get_live_interval((TCCIRState *)ir, vreg))
     return NULL;
-  if (interval->stack_slot_index >= ir->stack_layout.slot_count)
-    return NULL;
-  return &ir->stack_layout.slots[interval->stack_slot_index];
+  const TCCStackLayout *layout = &ir->stack_layout;
+  int lo = 0, hi = layout->vreg_slot_count - 1;
+  while (lo <= hi)
+  {
+    const int mid = (lo + hi) >> 1;
+    const TCCStackVregSlot *e = &layout->vreg_slots[mid];
+    if (e->vreg == vreg)
+      return e->slot < layout->slot_count ? &layout->slots[e->slot] : NULL;
+    if (e->vreg < vreg)
+      lo = mid + 1;
+    else
+      hi = mid - 1;
+  }
+  return NULL;
 }
 
 const TCCStackSlot *tcc_ir_stack_slot_by_offset(const TCCIRState *ir, int frame_offset)

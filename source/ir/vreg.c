@@ -92,22 +92,19 @@ static void ir_vreg_intervals_resize(IRLiveInterval **intervals, int *size, int 
   *size = cap;
 }
 
-/* Grow one interval array to hold at least `need` entries.  The arrays are
- * freed after every function, so the slack left in the largest one is what
- * reaches the peak.  CONFIG_TCC_LOW_MEM grows by 1.5x instead of doubling: a
- * few more reallocs on a large function for about a third less slack.  (The
- * instruction array and operand pool keep doubling: ra_resolve_phis replaces
- * the one and doubles the other itself, so a 1.5x step there only moved which
- * files got lucky -- measured worse over the corpus.) */
+/* Grow one interval array to hold at least `need` entries, by tcc_grow_size's
+ * steps.  The arrays are freed after every function, but until SSA renaming
+ * trims them (tcc_ir_vreg_fit_intervals) their slack is live through the
+ * passes before it, SRA among them: doubling left kernel.c's largest function
+ * with 16384 temp and 8192 var slots for 11372 and 4166 (325 KB idle at the
+ * compile's peak).  (The instruction array and operand pool keep doubling:
+ * ra_resolve_phis replaces the one and doubles the other itself, so a 1.5x
+ * step there only moved which files got lucky -- measured worse over the
+ * corpus.) */
 static void ir_vreg_intervals_grow(IRLiveInterval **intervals, int *size, int need)
 {
-  int cap = *size > 0 ? *size : 1;
-  while (cap < need)
-#ifdef CONFIG_TCC_LOW_MEM
-    cap += cap > 1 ? cap >> 1 : 1;
-#else
-    cap <<= 1;
-#endif
+  const unsigned long esz = sizeof(IRLiveInterval);
+  int cap = (int)(tcc_grow_size((unsigned long)(*size > 0 ? *size : 1) * esz, (unsigned long)need * esz) / esz);
   ir_vreg_intervals_resize(intervals, size, cap);
 }
 
@@ -199,7 +196,6 @@ static void ir_vreg_intervals_init(IRLiveInterval *intervals, int count)
     intervals[i].start = INTERVAL_NOT_STARTED;
     intervals[i].incoming_reg0 = -1;
     intervals[i].incoming_reg1 = -1;
-    intervals[i].stack_slot_index = -1;
     intervals[i].allocation.r0 = PREG_NONE;
     intervals[i].allocation.r1 = PREG_NONE;
     intervals[i].allocation.offset = 0;
@@ -212,6 +208,58 @@ static void ir_vreg_intervals_fit(IRLiveInterval **intervals, int *size, int cou
 {
   if (*size < count || *size > count + headroom)
     ir_vreg_intervals_resize(intervals, size, count + headroom > 0 ? count + headroom : 1);
+}
+
+/* Renumber the temps after SSA renaming (ssa_compact_temps): MAP gives each
+ * old position its new one, -1 for a temp nothing names; it is monotone, so
+ * every interval moves down (or stays) and the move is in place.  A temp past
+ * the array -- renaming numbers its temps before tcc_ir_vreg_fit_intervals
+ * grows it -- had no interval yet, so its new slot gets the default one
+ * growing would have given it, not whatever stayed there: kept, that made a
+ * 32-bit temp an `is_llong` register pair.  The vacated tail is reset;
+ * tcc_ir_vreg_fit_intervals then gives it back. */
+void tcc_ir_vreg_compact_temps(TCCIRState *ir, const int *map, int old_n, int new_n)
+{
+  IRLiveInterval *iv = ir->temporary_variables_live_intervals;
+  const int size = ir->temporary_variables_live_intervals_size;
+  for (int i = 0; i < old_n; i++)
+  {
+    const int d = map[i];
+    if (d < 0 || d >= size)
+      continue; /* dead, or past the array: fit's growth initialises it */
+    if (i >= size)
+    {
+      memset(&iv[d], 0, sizeof(IRLiveInterval));
+      ir_vreg_intervals_init(&iv[d], 1);
+    }
+    else if (d != i)
+      iv[d] = iv[i];
+  }
+  const int n = old_n < size ? old_n : size;
+  if (new_n < n)
+  {
+    memset(&iv[new_n], 0, sizeof(IRLiveInterval) * (n - new_n));
+    ir_vreg_intervals_init(&iv[new_n], n - new_n);
+  }
+}
+
+/* Renumber the vars after SSA renaming (ssa_compact_vars): MAP gives each old
+ * position its new one, -1 for a var nothing names any more; it is monotone,
+ * so every interval moves down (or stays) and the move is in place.  The
+ * vacated tail is reset and next_local_variable becomes NEW_N. */
+void tcc_ir_vreg_compact_vars(TCCIRState *ir, const int *map, int old_n, int new_n)
+{
+  IRLiveInterval *iv = ir->variables_live_intervals;
+  const int n = old_n < ir->variables_live_intervals_size ? old_n : ir->variables_live_intervals_size;
+  for (int i = 0; i < n; i++)
+    if (map[i] >= 0 && map[i] != i)
+      iv[map[i]] = iv[i];
+  if (new_n < n)
+  {
+    memset(&iv[new_n], 0, sizeof(IRLiveInterval) * (n - new_n));
+    ir_vreg_intervals_init(&iv[new_n], n - new_n);
+  }
+  ir->next_local_variable = new_n;
 }
 
 /* Size the temp and var interval arrays once SSA renaming has numbered every
@@ -427,25 +475,6 @@ const char *tcc_ir_vreg_type_string(int vreg)
 /* ============================================================================
  * Stack Slot Access
  * ============================================================================ */
-
-/* Get stack slot index for vreg */
-int tcc_ir_vreg_stack_slot_get(TCCIRState *ir, int vreg)
-{
-  if (!tcc_ir_vreg_is_valid(ir, vreg))
-    return -1;
-  IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, vreg);
-  return interval ? interval->stack_slot_index : -1;
-}
-
-/* Set stack slot index for vreg */
-void tcc_ir_vreg_stack_slot_set(TCCIRState *ir, int vreg, int slot_idx)
-{
-  if (!tcc_ir_vreg_is_valid(ir, vreg))
-    return;
-  IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, vreg);
-  if (interval)
-    interval->stack_slot_index = slot_idx;
-}
 
 /* Get frame offset for vreg */
 int tcc_ir_vreg_frame_offset_get(TCCIRState *ir, int vreg)

@@ -137,6 +137,12 @@ int tcc_ir_opt_pack64_from_stack_stores(TCCIRState *ir)
     if (irop_get_vreg(src) != -1)
       continue;
 
+    /* A LOAD that is itself a join is reached from paths the backward scan
+     * never sees (a u128 shift's three arms meeting on the result read): the
+     * stores above it are only the fall-through arm's. */
+    if (q->is_jump_target)
+      continue;
+
     int64_t addr_lo = irop_get_imm64_ex(ir, src);
     int64_t addr_hi = addr_lo + 4;
 

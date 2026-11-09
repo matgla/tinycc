@@ -11,11 +11,13 @@
 #ifndef TCC_OPT_FLAT_IPA_TU_SUMMARY_H
 #define TCC_OPT_FLAT_IPA_TU_SUMMARY_H
 
+/* The capacity is not kept: it doubles from 4, so it is the count's power of
+ * two (tu_symset_add).  Five sets in each of a Zig kernel compile's 1.4K
+ * summaries. */
 typedef struct TuSymSet
 {
   Sym **items;
   int count;
-  int capacity;
 } TuSymSet;
 
 typedef struct TuFuncSummary

@@ -43,7 +43,7 @@ int compute_aapcs_natural_alignment(const CType *type)
   if (!s)
     return 4;
   int max_align = 1;
-  for (Sym *f = s->next; f; f = f->next)
+  for (Sym *f = sym_first(s); f; f = f->next)
   {
     int member_align;
     if ((f->type.t & VT_BTYPE) == VT_STRUCT)
@@ -193,7 +193,7 @@ void vpush_type_size(CType *type, int *a)
     Sym *f;
     int fixed = type_size(type, a);
     vpushs(fixed);
-    for (f = type->ref->next; f; f = f->next)
+    for (f = sym_first(type->ref); f; f = f->next)
     {
       if (f->type.t & VT_VLA)
       {

@@ -25,4 +25,6 @@
 #include "../opt/flat/memory/sl_forward.c"
 #undef GSLFWD_MAX_ENTRIES
 #undef SL_FWD_MAX_DEAD_STORES
+#undef SL_FWD_MAX_INSNS
+#undef SL_PRED_INC
 #undef USING_GLOBALS

@@ -367,3 +367,38 @@ UT_TEST(test_spill_swap_pair_frees_high_register)
   UT_ASSERT_EQ(ivs[2].stack_location, 0);
   return 0;
 }
+
+/* -------------------------------------------------------------------------- */
+/* VFP registers return to the free pool when their interval expires          */
+/* -------------------------------------------------------------------------- */
+
+/* A float interval's r0 is LS_VFP_REG_BASE + n; the expiry and survivor masks
+ * shifted by that encoded number, past 63: x86 masks the count and freed s<n>
+ * by accident, the YasOS-native tcc (ARM) freed nothing, so the device picked
+ * other VFP registers than the cross (and the unit build, -fsanitize=shift,
+ * traps on it). */
+static SSAInterval float_interval(int pos, int start, int end)
+{
+  SSAInterval iv = spill_swap_interval(pos, end, 1);
+  iv.start = start;
+  iv.reg_type = LS_REG_TYPE_FLOAT;
+  return iv;
+}
+
+UT_TEST(test_vfp_register_reused_after_expiry)
+{
+  SSAInterval ivs[] = {
+    float_interval(0, 0, 0), /* A: dies at 0 */
+    float_interval(1, 1, 2), /* B: takes A's register */
+    float_interval(2, 1, 3), /* C: overlaps B, the next one */
+    float_interval(3, 3, 4), /* D: B ended at 2, takes its register */
+  };
+  scan_spill_swap(ivs, 4, 0, 0);
+  UT_ASSERT(LS_IS_VFP_REG(ivs[0].r0));
+  UT_ASSERT_EQ(ivs[1].r0, ivs[0].r0);
+  UT_ASSERT_EQ(ivs[2].r0, ivs[0].r0 + 1);
+  UT_ASSERT_EQ(ivs[3].r0, ivs[1].r0);
+  for (int i = 0; i < 4; i++)
+    UT_ASSERT_EQ(ivs[i].stack_location, 0);
+  return 0;
+}

@@ -760,7 +760,7 @@ static int hot_text_branch_side(TCCState *s1, const ElfW(Sym) * sym, addr_t src)
   if (!src_hot && s1->nb_hot_text_flash_names)
   {
     const char *name = (char *)symtab_section->link->data + sym->st_name;
-    if (tcc_name_list_has(s1->hot_text_flash_names, s1->nb_hot_text_flash_names, name, strlen(name)))
+    if (tcc_name_list_has_unnumbered(s1->hot_text_flash_names, s1->nb_hot_text_flash_names, name))
       return 0;
   }
   return src_hot ? 1 : 2;

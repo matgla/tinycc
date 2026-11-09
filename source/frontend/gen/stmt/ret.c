@@ -63,7 +63,7 @@ static int regpair_pieces(CType *type, int base, RegpairPiece *out, int n)
   {
     if (IS_UNION(type->t))
       return -1;
-    for (Sym *f = type->ref->next; f && n >= 0; f = f->next)
+    for (Sym *f = sym_first(type->ref); f && n >= 0; f = f->next)
       n = (f->type.t & VT_BITFIELD) ? -1 : regpair_pieces(&f->type, base + f->c, out, n);
     return n;
   }

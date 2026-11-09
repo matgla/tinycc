@@ -24,7 +24,6 @@ static void ut_init_intervals(IRLiveInterval **arr, int *size, int *next)
     (*arr)[i].start = INTERVAL_NOT_STARTED;
     (*arr)[i].incoming_reg0 = -1;
     (*arr)[i].incoming_reg1 = -1;
-    (*arr)[i].stack_slot_index = -1;
     (*arr)[i].allocation.r0 = PREG_NONE;
     (*arr)[i].allocation.r1 = PREG_NONE;
   }

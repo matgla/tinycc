@@ -82,6 +82,43 @@ ST_FUNC int tcc_name_list_has(char **names, int count, const char *name, size_t 
   return 0;
 }
 
+/* `name` is in the sorted list, or is with Zig's numbers dropped: the C backend
+ * numbers functions (fn__1234) and inner functions (fn__func_12__345) afresh on every
+ * change, so a list made from a profile names them without.  A number is "__" and
+ * digits ending the name or followed by '_' ("_28..._29" spells "(...)": not one). */
+ST_FUNC int tcc_name_list_has_unnumbered(char **names, int count, const char *name)
+{
+  char buf[256];
+  size_t i = 0, o = 0, len = strlen(name);
+  if (tcc_name_list_has(names, count, name, len))
+    return 1;
+  if (len >= sizeof(buf))
+    return 0;
+  while (i < len)
+  {
+    size_t j = i;
+    if (name[i] == '_' && name[i + 1] == '_')
+    {
+      j = i + 2;
+      if (!strncmp(name + j, "func_", 5))
+        j += 5;
+      if (name[j] >= '0' && name[j] <= '9')
+      {
+        while (name[j] >= '0' && name[j] <= '9')
+          j++;
+        if (name[j] == 0 || name[j] == '_')
+        {
+          i = j;
+          continue;
+        }
+      }
+      j = i;
+    }
+    buf[o++] = name[i++];
+  }
+  return o != len && tcc_name_list_has(names, count, buf, o);
+}
+
 /* --ram-text: a listed function's section goes where the linker script runs
  * functions from RAM, as if the source had asked for it.  Zig's C backend numbers
  * its functions (name__1234) differently on every change, so the list names them

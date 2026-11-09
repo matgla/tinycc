@@ -104,7 +104,7 @@ static int psd_store_range(IRSSAOptCtx *ctx, const uint8_t *param_redef, int aff
     const int shift = irop_get_imm32(sc);
     if (shift < 0 || shift > 3)
       return 0;
-    base_off = (int)tcc_ir_op_src2_imm(ir, q) << shift;
+    base_off = (int)((uint32_t)tcc_ir_op_src2_imm(ir, q) << shift); /* a negative offset too */
     btype = irop_get_btype(tcc_ir_op_get_src1(ir, q));
   }
   if (!affine && btype != IROP_BTYPE_INT32 && btype != IROP_BTYPE_FLOAT32)

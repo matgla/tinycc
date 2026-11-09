@@ -140,6 +140,7 @@ ST_FUNC Section *new_section(TCCState *s1, const char *name, int sh_type, int sh
 ST_FUNC Section *new_symtab(TCCState *s1, const char *symtab_name, int sh_type, int sh_flags, const char *strtab_name,
                             const char *hash_name, int hash_sh_flags);
 ST_FUNC void section_realloc(Section *sec, unsigned long new_size);
+ST_FUNC void section_fit(Section *sec);
 ST_FUNC size_t section_add(Section *sec, addr_t size, int align);
 ST_FUNC void *section_ptr_add(Section *sec, addr_t size);
 #ifndef ELF_OBJ_ONLY

@@ -29,17 +29,19 @@ int tcc_ir_estimate_hoist_budget(TCCIRState *ir, int loop_start, int loop_end, i
   if (loop_start < 0) loop_start = 0;
   if (loop_end >= n) loop_end = n - 1;
 
-  /* Max distinct vregs in any WINDOW_SIZE-instruction window approximates peak liveness. */
+  /* Max distinct vregs in any WINDOW_SIZE-instruction window approximates peak
+   * liveness.  The window holds at most 3 * WINDOW_SIZE operands, so they are
+   * counted by identity in a set that small.  (A table indexed by position
+   * counted only positions below 512, and a VAR, a TEMP and a PARAM at the same
+   * position as one: in a large function most of its temps went uncounted, and
+   * renumbering the temps changed the estimate.) */
   #define WINDOW_SIZE 8
-  #define BUDGET_MAX_VREGS 512
-  int16_t window_buf[WINDOW_SIZE][3];
+  int32_t window_buf[WINDOW_SIZE][3];
+  int32_t set_vr[3 * WINDOW_SIZE];
+  int set_n[3 * WINDOW_SIZE], nset = 0;
   int window_head = 0;
   int window_fill = 0;
   int max_pressure = 0;
-
-  uint16_t refcount[BUDGET_MAX_VREGS];
-  for (int i = 0; i < BUDGET_MAX_VREGS; i++) refcount[i] = 0;
-  int current_distinct = 0;
 
   for (int i = loop_start; i <= loop_end; i++)
   {
@@ -51,8 +53,20 @@ int tcc_ir_estimate_hoist_budget(TCCIRState *ir, int loop_start, int loop_end, i
     {
       for (int j = 0; j < 3; j++)
       {
-        int16_t pos = window_buf[window_head][j];
-        if (pos >= 0 && --refcount[pos] == 0) current_distinct--;
+        int32_t vr = window_buf[window_head][j];
+        if (vr < 0)
+          continue;
+        for (int k = 0; k < nset; k++)
+          if (set_vr[k] == vr)
+          {
+            if (--set_n[k] == 0)
+            {
+              set_vr[k] = set_vr[nset - 1];
+              set_n[k] = set_n[nset - 1];
+              nset--;
+            }
+            break;
+          }
       }
       window_head = (window_head + 1) % WINDOW_SIZE;
       window_fill--;
@@ -66,29 +80,33 @@ int tcc_ir_estimate_hoist_budget(TCCIRState *ir, int loop_start, int loop_end, i
     const int has[3] = {irop_config[q->op].has_dest, irop_config[q->op].has_src1, irop_config[q->op].has_src2};
     for (int j = 0; j < 3; j++)
     {
-      int16_t pos = -1;
+      int32_t vr = -1;
       if (has[j])
       {
-        int32_t vr = irop_get_vreg(ops[j]);
-        if (tcc_ir_vreg_is_valid(ir, vr))
-        {
-          int p = TCCIR_DECODE_VREG_POSITION(vr);
-          if (p >= 0 && p < BUDGET_MAX_VREGS)
-          {
-            pos = (int16_t)p;
-            if (refcount[p]++ == 0) current_distinct++;
-          }
-        }
+        vr = irop_get_vreg(ops[j]);
+        if (!tcc_ir_vreg_is_valid(ir, vr))
+          vr = -1;
       }
-      window_buf[slot][j] = pos;
+      if (vr >= 0)
+      {
+        int k = 0;
+        while (k < nset && set_vr[k] != vr)
+          k++;
+        if (k == nset)
+        {
+          set_vr[nset] = vr;
+          set_n[nset++] = 0;
+        }
+        set_n[k]++;
+      }
+      window_buf[slot][j] = vr;
     }
     window_fill++;
 
-    if (current_distinct > max_pressure)
-      max_pressure = current_distinct;
+    if (nset > max_pressure)
+      max_pressure = nset;
   }
   #undef WINDOW_SIZE
-  #undef BUDGET_MAX_VREGS
 
   if (max_pressure < 3) max_pressure = 3;
   int budget = total_regs - num_params - max_pressure;

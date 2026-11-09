@@ -499,7 +499,7 @@ static int cjl_same_location(TCCIRState *ir, int32_t va, int32_t vb)
   }
   else if ((a->allocation.r0 & PREG_REG_NONE) == PREG_REG_NONE)
     return 0; /* no location at all */
-  if (a->remat_kind != b->remat_kind || (a->remat_kind && a->remat_imm != b->remat_imm))
+  if (a->remat_kind != b->remat_kind || (a->remat_kind && tcc_ir_remat_imm(ir, va) != tcc_ir_remat_imm(ir, vb)))
     return 0;
   return 1;
 }
@@ -993,6 +993,72 @@ static int rm_call_id(TCCIRState *ir, IRQuadCompact *q)
 #define RM_MULTI (INT64_MIN + 1)
 #define RM_MAX_PARAMS 8
 
+/* A vreg pairing map: key -> partner (and, on side A, the pairing's uses),
+ * valid where stamp == gen.  Open addressing over the keys one comparison
+ * touches, not arrays over every vreg of the function (five of them, 270 KB
+ * for the Zig kernel's largest function, at the compile's peak).  A slot of an
+ * older comparison counts as empty, so a new one starts without clearing. */
+typedef struct RMSlot
+{
+  int key, stamp, map, cnt;
+} RMSlot;
+
+typedef struct RMMap
+{
+  RMSlot *s;
+  int cap;  /* a power of two */
+  int used; /* slots of generation used_gen */
+  int used_gen;
+} RMMap;
+
+static unsigned rm_map_home(const RMMap *m, int key)
+{
+  return ((unsigned)key * 2654435761u) & (unsigned)(m->cap - 1);
+}
+
+static RMSlot *rm_map_find(RMMap *m, int key, int gen)
+{
+  if (!m->cap)
+    return NULL;
+  for (unsigned h = rm_map_home(m, key);; h = (h + 1) & (unsigned)(m->cap - 1))
+  {
+    RMSlot *e = &m->s[h];
+    if (e->stamp != gen)
+      return NULL;
+    if (e->key == key)
+      return e;
+  }
+}
+
+/* KEY, absent in generation GEN, gets a slot. */
+static RMSlot *rm_map_add(RMMap *m, int key, int gen)
+{
+  if (m->used_gen != gen)
+    m->used_gen = gen, m->used = 0;
+  if (2 * (m->used + 1) > m->cap)
+  {
+    RMSlot *old = m->s;
+    int ocap = m->cap;
+    m->cap = ocap ? 2 * ocap : 64;
+    m->s = tcc_mallocz(sizeof(RMSlot) * m->cap);
+    for (int i = 0; i < ocap; i++)
+      if (old[i].stamp == gen)
+      {
+        unsigned h = rm_map_home(m, old[i].key);
+        while (m->s[h].stamp == gen)
+          h = (h + 1) & (unsigned)(m->cap - 1);
+        m->s[h] = old[i];
+      }
+    tcc_free(old);
+  }
+  unsigned h = rm_map_home(m, key);
+  while (m->s[h].stamp == gen)
+    h = (h + 1) & (unsigned)(m->cap - 1);
+  m->used++;
+  m->s[h] = (RMSlot){.key = key, .stamp = gen};
+  return &m->s[h];
+}
+
 typedef struct RMState
 {
   TCCIRState *ir;
@@ -1005,7 +1071,7 @@ typedef struct RMState
   unsigned char *dead;
   int *ia, *ib; /* matched instruction pairs */
   /* pairing maps, valid where stamp == gen */
-  int *vmap_a, *vmap_b, *vcnt, *vstamp_a, *vstamp_b;
+  RMMap vm_a, vm_b;
   int *cmap_a, *cmap_b, *ccnt, *cstamp_a, *cstamp_b;
   int gen;
   /* Case-constant merging (NULL arrays when off). */
@@ -1018,6 +1084,26 @@ typedef struct RMState
   unsigned char *exact_in; /* an exact copy was merged into this entry */
   int nparam, param_at[RM_MAX_PARAMS], param_slot[RM_MAX_PARAMS];
 } RMState;
+
+/* Pair vreg key ka (copy A) with kb (copy B); returns 0 on a conflict. */
+static int rm_vpair(RMState *st, int ka, int kb, int may_start)
+{
+  RMSlot *ea = rm_map_find(&st->vm_a, ka, st->gen), *eb = rm_map_find(&st->vm_b, kb, st->gen);
+  if (ea || eb)
+  {
+    if (!ea || !eb || ea->map != kb || eb->map != ka)
+      return 0;
+    ea->cnt++;
+    return 1;
+  }
+  if (!may_start)
+    return 0;
+  ea = rm_map_add(&st->vm_a, ka, st->gen);
+  ea->map = kb;
+  ea->cnt = 1;
+  rm_map_add(&st->vm_b, kb, st->gen)->map = ka;
+  return 1;
+}
 
 /* Pair key ka (copy A) with kb (copy B); returns 0 on a conflict. */
 static int rm_pair(RMState *st, int *map_a, int *map_b, int *cnt, int *stamp_a, int *stamp_b, int ka, int kb,
@@ -1397,11 +1483,10 @@ static int rm_match(RMState *st, int a, int b)
         continue;
       if (va < 0 || vb < 0)
         return 0;
-      int paired = st->vstamp_a[va] == st->gen || st->vstamp_b[vb] == st->gen;
+      int paired = rm_map_find(&st->vm_a, va, st->gen) || rm_map_find(&st->vm_b, vb, st->gen);
       if (!paired && va == vb)
         continue; /* the same value in both */
-      if (!rm_pair(st, st->vmap_a, st->vmap_b, st->vcnt, st->vstamp_a, st->vstamp_b, va, vb,
-                   cj_defines(qa, s, oa) && cj_defines(qb, s, ob)))
+      if (!rm_vpair(st, va, vb, cj_defines(qa, s, oa) && cj_defines(qb, s, ob)))
         return 0;
     }
   }
@@ -1417,10 +1502,11 @@ static int rm_match(RMState *st, int a, int b)
     for (int s = 0; s < 4; s++)
     {
       int va = cj_vkey(ir, irop_get_vreg(cj_slot(ir, qa, s)));
-      if (va < 0 || st->vstamp_a[va] != st->gen)
+      RMSlot *e = va < 0 ? NULL : rm_map_find(&st->vm_a, va, st->gen);
+      if (!e)
         continue;
-      int vb = st->vmap_a[va];
-      if (st->vcnt[va] != st->occ[va] || st->vcnt[va] != st->occ[vb])
+      int vb = e->map;
+      if (e->cnt != st->occ[va] || e->cnt != st->occ[vb])
         return 0; /* used outside its region */
     }
   }
@@ -1467,11 +1553,6 @@ int tcc_ir_region_merge(TCCIRState *ir)
   st.dead = tcc_mallocz(n);
   st.ia = tcc_malloc(sizeof(int) * RM_MAX_LEN);
   st.ib = tcc_malloc(sizeof(int) * RM_MAX_LEN);
-  st.vmap_a = tcc_malloc(sizeof(int) * nkeys);
-  st.vmap_b = tcc_malloc(sizeof(int) * nkeys);
-  st.vcnt = tcc_malloc(sizeof(int) * nkeys);
-  st.vstamp_a = tcc_mallocz(sizeof(int) * nkeys);
-  st.vstamp_b = tcc_mallocz(sizeof(int) * nkeys);
   st.cmap_a = tcc_malloc(sizeof(int) * ncalls);
   st.cmap_b = tcc_malloc(sizeof(int) * ncalls);
   st.ccnt = tcc_malloc(sizeof(int) * ncalls);
@@ -1641,11 +1722,8 @@ out:
   tcc_free(st.ccnt);
   tcc_free(st.cmap_b);
   tcc_free(st.cmap_a);
-  tcc_free(st.vstamp_b);
-  tcc_free(st.vstamp_a);
-  tcc_free(st.vcnt);
-  tcc_free(st.vmap_b);
-  tcc_free(st.vmap_a);
+  tcc_free(st.vm_b.s);
+  tcc_free(st.vm_a.s);
   tcc_free(st.ib);
   tcc_free(st.ia);
   tcc_free(st.dead);

@@ -563,18 +563,21 @@ static void ssa_scan_var_global(TCCIRState *ir, IRCFG *cfg, SSAVarInfo *info,
  * Over-approximating USE or under-approximating KILL only places extra phis,
  * so both sets err towards the previous behaviour. */
 static void ssa_live_mark_use(uint8_t *ue_b, const uint8_t *kill_b, IROperand op,
-                              int num_vars)
+                              int num_vars, const int *live_idx)
 {
   int pos = ssa_global_var_pos(irop_get_vreg(op), num_vars);
-  if (pos < 0 || raw_bitset_test(kill_b, pos))
+  if (pos < 0 || (pos = live_idx[pos]) < 0 || raw_bitset_test(kill_b, pos))
     return;
   raw_bitset_set(ue_b, pos);
 }
 
 /* Returns an nb x var_bytes block-major bitmap of live-in vars, or NULL when
- * liveness is unavailable (callers then keep semi-pruned placement). */
+ * liveness is unavailable (callers then keep semi-pruned placement).  A var's
+ * bit is LIVE_IDX[var]: only the vars phi placement asks about have one (-1
+ * for the rest), and each var's liveness is its own, so leaving the others out
+ * changes no bit. */
 static uint8_t *ssa_compute_live_in(TCCIRState *ir, IRCFG *cfg,
-                                    const SSAVarInfo *info, int var_bytes)
+                                    const SSAVarInfo *info, int var_bytes, const int *live_idx)
 {
   int nb = cfg->num_blocks;
   int num_vars = info->num_vars;
@@ -583,9 +586,13 @@ static uint8_t *ssa_compute_live_in(TCCIRState *ir, IRCFG *cfg,
     return NULL;
 
   size_t sz = (size_t)nb * var_bytes;
+  /* USE becomes live-in in place: the dataflow below only ever adds to a
+   * block's bits, so live-in starts as USE and never drops one.  A third
+   * bitmap beside the two held this pass's peak (0.21 MB each in the largest
+   * function of a Zig kernel compile). */
   uint8_t *ue = tcc_mallocz(sz);
   uint8_t *kill = tcc_mallocz(sz);
-  uint8_t *live = tcc_mallocz(sz);
+  uint8_t *const live = ue;
 
   int n = ir->next_instruction_index;
   for (int i = 0; i < n; i++) {
@@ -599,11 +606,11 @@ static uint8_t *ssa_compute_live_in(TCCIRState *ir, IRCFG *cfg,
     uint8_t *kill_b = &kill[(size_t)blk * var_bytes];
 
     if (irop_config[q->op].has_src1)
-      ssa_live_mark_use(ue_b, kill_b, tcc_ir_op_get_src1(ir, q), num_vars);
+      ssa_live_mark_use(ue_b, kill_b, tcc_ir_op_get_src1(ir, q), num_vars, live_idx);
     if (irop_config[q->op].has_src2)
-      ssa_live_mark_use(ue_b, kill_b, tcc_ir_op_get_src2(ir, q), num_vars);
+      ssa_live_mark_use(ue_b, kill_b, tcc_ir_op_get_src2(ir, q), num_vars, live_idx);
     if (q->op == TCCIR_OP_MLA)
-      ssa_live_mark_use(ue_b, kill_b, tcc_ir_op_get_accum(ir, q), num_vars);
+      ssa_live_mark_use(ue_b, kill_b, tcc_ir_op_get_accum(ir, q), num_vars, live_idx);
 
     if (!irop_config[q->op].has_dest)
       continue;
@@ -618,16 +625,14 @@ static uint8_t *ssa_compute_live_in(TCCIRState *ir, IRCFG *cfg,
     if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC ||
         (q->op == TCCIR_OP_STORE &&
          ssa_store_slot_def_pos(ir, q, info->store_def_ok, num_vars) < 0)) {
-      ssa_live_mark_use(ue_b, kill_b, d, num_vars);
+      ssa_live_mark_use(ue_b, kill_b, d, num_vars, live_idx);
       continue;
     }
     int pos = ssa_global_var_pos(irop_get_vreg(d), num_vars);
-    if (pos >= 0)
-      raw_bitset_set(kill_b, pos);
+    if (pos >= 0 && live_idx[pos] >= 0)
+      raw_bitset_set(kill_b, live_idx[pos]);
   }
 
-  memcpy(live, ue, sz);
-  tcc_free(ue);
 
   /* Backward dataflow: live_in(b) = ue(b) | (U live_in(succ) & ~kill(b)).
    * Blocks are visited in reverse RPO so a loop settles in ~2 sweeps; when the
@@ -801,7 +806,7 @@ static int ssa_place_phis_for_var(IRSSAState *ssa, TCCIRState *ir, IRCFG *cfg, i
                                   uint8_t *def_bits, SSABitset *has_phi,
                                   SSABitset *in_worklist, int *worklist,
                                   int phi_counter,
-                                  const uint8_t *live_in, int var_bytes)
+                                  const uint8_t *live_in, int var_bytes, int live_bit)
 {
   int nb = cfg->num_blocks;
   int wl_count = 0;
@@ -828,7 +833,7 @@ static int ssa_place_phis_for_var(IRSSAState *ssa, TCCIRState *ir, IRCFG *cfg, i
        * either, so it must not seed further frontier expansion -- every use
        * reachable from it is preceded by a real def whose block is already on
        * the worklist. */
-      if (live_in && !raw_bitset_test(&live_in[(size_t)df * var_bytes], v))
+      if (live_in && !raw_bitset_test(&live_in[(size_t)df * var_bytes], live_bit))
         continue;
       SSABitset_set(has_phi, df);
 
@@ -956,8 +961,13 @@ IRSSAState *tcc_ir_ssa_construct(TCCIRState *ir, IRCFG *cfg)
   }
   int *worklist = vector_data(&worklist_owner);
   int phi_counter = 0;
-  int var_bytes = (num_vars + 7) / 8;
-  uint8_t *live_in = ssa_compute_live_in(ir, cfg, &info, var_bytes);
+  /* Live-in only for the vars that get phis: promoted and live across a
+   * block boundary (the loop below). */
+  int *live_idx = tcc_malloc(sizeof(int) * (num_vars ? num_vars : 1)), nlive = 0;
+  for (int v = 0; v < num_vars; v++)
+    live_idx[v] = raw_bitset_test(is_promotable, v) && SSABitset_test(&global, v) ? nlive++ : -1;
+  int var_bytes = (nlive + 7) / 8;
+  uint8_t *live_in = ssa_compute_live_in(ir, cfg, &info, var_bytes, live_idx);
 
   for (int v = 0; v < num_vars; v++) {
     /* Place phis for every promoted var (is_promotable already excludes
@@ -973,10 +983,11 @@ IRSSAState *tcc_ir_ssa_construct(TCCIRState *ir, IRCFG *cfg)
     uint8_t *def_bits = &info.def_blocks[v * bitset_bytes];
     phi_counter = ssa_place_phis_for_var(ssa, ir, cfg, v, info.var_btype[v], def_bits,
                                          &has_phi, &in_worklist, worklist,
-                                         phi_counter, live_in, var_bytes);
+                                         phi_counter, live_in, var_bytes, live_idx[v]);
   }
 
   tcc_free(live_in);
+  tcc_free(live_idx);
 
   ssa->next_ssa_vreg = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP,
                                           ir->next_temporary_variable + phi_counter);
@@ -1159,6 +1170,185 @@ static void ssa_fill_successor_phis(IRSSAState *ssa, IRCFG *cfg, int b,
   }
 }
 
+/* The position of V if it is a TYPE vreg below N, else -1. */
+static inline int ssa_vreg_pos(int32_t v, int type, int n)
+{
+  return v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == type && TCCIR_DECODE_VREG_POSITION(v) < n
+             ? TCCIR_DECODE_VREG_POSITION(v)
+             : -1;
+}
+
+/* What names a temp or a var besides the intervals: the operand pool (all of
+ * it, NOP'd instructions' operands too, which keeps them consistent), the phis
+ * once SSA is built, the SValues saved with inline asm and the switch value
+ * tables.  Mark the TYPE positions below N that something names. */
+static void ssa_vreg_holders_mark(TCCIRState *ir, IRSSAState *ssa, int type, int n, uint8_t *live)
+{
+  int p;
+  for (int i = 0; i < ir->iroperand_pool_count; i++)
+    if ((p = ssa_vreg_pos(irop_get_vreg(ir->iroperand_pool[i]), type, n)) >= 0)
+      live[p] = 1;
+  for (int b = 0; ssa && b < ssa->cfg->num_blocks; b++)
+    for (IRPhiNode *ph = ssa->block_phis[b]; ph; ph = ph->next)
+    {
+      if ((p = ssa_vreg_pos(ph->dest_vreg, type, n)) >= 0)
+        live[p] = 1;
+      if ((p = ssa_vreg_pos(ph->orig_vreg, type, n)) >= 0)
+        live[p] = 1;
+      for (int k = 0; k < ph->num_operands; k++)
+        if ((p = ssa_vreg_pos(ph->operands[k].vreg, type, n)) >= 0)
+          live[p] = 1;
+    }
+#ifdef CONFIG_TCC_ASM
+  for (int a = 0; ir->inline_asms && a < ir->inline_asm_count; a++)
+    for (int k = 0; k < ir->inline_asms[a].nb_operands; k++)
+      if ((p = ssa_vreg_pos(ir->inline_asms[a].values[k].vr, type, n)) >= 0)
+        live[p] = 1;
+#endif
+  for (int t = 0; t < ir->num_switch_value_tables; t++)
+  {
+    TCCIRSwitchValueTable *vt = &ir->switch_value_tables[t];
+    for (int k = 0; vt->values && k < vt->num_entries; k++)
+      if ((p = ssa_vreg_pos(irop_get_vreg(vt->values[k]), type, n)) >= 0)
+        live[p] = 1;
+    if ((p = ssa_vreg_pos(irop_get_vreg(vt->default_val), type, n)) >= 0)
+      live[p] = 1;
+  }
+}
+
+/* Renumber the TYPE vregs below N through MAP in every holder. */
+static void ssa_vreg_holders_remap(TCCIRState *ir, IRSSAState *ssa, int type, int n, const int *map)
+{
+  int p;
+#define SSA_REMAP(lv)                                                                                                  \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    if ((p = ssa_vreg_pos((lv), type, n)) >= 0)                                                                        \
+      (lv) = TCCIR_ENCODE_VREG(type, map[p]);                                                                          \
+  } while (0)
+  for (int i = 0; i < ir->iroperand_pool_count; i++)
+    if ((p = ssa_vreg_pos(irop_get_vreg(ir->iroperand_pool[i]), type, n)) >= 0)
+      irop_set_vreg(&ir->iroperand_pool[i], TCCIR_ENCODE_VREG(type, map[p]));
+  for (int b = 0; ssa && b < ssa->cfg->num_blocks; b++)
+    for (IRPhiNode *ph = ssa->block_phis[b]; ph; ph = ph->next)
+    {
+      SSA_REMAP(ph->dest_vreg);
+      SSA_REMAP(ph->orig_vreg);
+      for (int k = 0; k < ph->num_operands; k++)
+        SSA_REMAP(ph->operands[k].vreg);
+    }
+#ifdef CONFIG_TCC_ASM
+  for (int a = 0; ir->inline_asms && a < ir->inline_asm_count; a++)
+    for (int k = 0; k < ir->inline_asms[a].nb_operands; k++)
+      SSA_REMAP(ir->inline_asms[a].values[k].vr);
+#endif
+#undef SSA_REMAP
+  for (int t = 0; t < ir->num_switch_value_tables; t++)
+  {
+    TCCIRSwitchValueTable *vt = &ir->switch_value_tables[t];
+    for (int k = 0; vt->values && k < vt->num_entries; k++)
+      if ((p = ssa_vreg_pos(irop_get_vreg(vt->values[k]), type, n)) >= 0)
+        irop_set_vreg(&vt->values[k], TCCIR_ENCODE_VREG(type, map[p]));
+    if ((p = ssa_vreg_pos(irop_get_vreg(vt->default_val), type, n)) >= 0)
+      irop_set_vreg(&vt->default_val, TCCIR_ENCODE_VREG(type, map[p]));
+  }
+}
+
+/* Close the gaps in the temp numbering.  By the end of renaming most temp
+ * positions name nothing: the frontend's temps that the flat passes removed,
+ * those ra_promote_multidef_temps_to_vars turned into vars.  In the Zig
+ * compiler's kernel.c the largest function ends renaming at 20293 temps of
+ * which 9392 appear in any operand -- and every per-temp array from here to
+ * the end of register allocation (the intervals, the SSA use-def table, the
+ * passes' own tables) is sized by the highest position.  The live temps keep
+ * their order, so nothing that compares positions sees a difference.  Also
+ * run before SSA (SSA == NULL, tcc_ir_compact_vregs).
+ *
+ * What names a temp: ssa_vreg_holders_mark.  The intervals move with them
+ * (tcc_ir_vreg_compact_temps); ignored_vregs is never written; the frame
+ * pointer analysis cache keys per-temp data and is dropped, the vreg index
+ * rebuilt.  Returns the new temp count. */
+static int ssa_compact_temps(TCCIRState *ir, IRSSAState *ssa, int n)
+{
+  if (n <= 0)
+    return n;
+  uint8_t *live = tcc_mallocz(n);
+  ssa_vreg_holders_mark(ir, ssa, TCCIR_VREG_TYPE_TEMP, n, live);
+  int *map = tcc_malloc(sizeof(int) * n), m = 0;
+  for (int i = 0; i < n; i++)
+    map[i] = live[i] ? m++ : -1;
+  tcc_free(live);
+  if (m == n)
+  {
+    tcc_free(map);
+    return n;
+  }
+  ssa_vreg_holders_remap(ir, ssa, TCCIR_VREG_TYPE_TEMP, n, map);
+  tcc_ir_vreg_compact_temps(ir, map, n, m);
+  tcc_free(map);
+  if (ssa)
+    ssa->next_ssa_vreg = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, m);
+  tcc_ir_vreg_index_dirty(ir);
+  ir_opt_frame_ptr_free(ir);
+  return m;
+}
+
+/* Close the gaps in the var numbering, as ssa_compact_temps does for temps.
+ * Renaming turns the promoted vars into temps: in the Zig compiler's kernel.c
+ * the largest function ends it with 4166 vars of which 47 appear in any
+ * operand, and the var intervals and every per-var table of the passes after
+ * it (SRA, the frame relayout, region_merge, ...) are sized by the highest
+ * position.  The live vars keep their order.  Also run before SSA.
+ *
+ * Besides ssa_vreg_holders_mark, SRA's range of field vars (ir->sra_var_lo/hi)
+ * names vars.  A local Sym's vreg also does, read after this only by debug
+ * info and by nested functions (captures, the static chain): neither is
+ * compacted. */
+static void ssa_compact_vars(TCCIRState *ir, IRSSAState *ssa)
+{
+  const int n = ir->next_local_variable;
+  if (n <= 0 || (tcc_state && (tcc_state->do_debug || tcc_state->nb_nested_funcs || tcc_state->had_nested_funcs ||
+                               tcc_state->current_nested_func)))
+    return;
+  uint8_t *live = tcc_mallocz(n);
+  ssa_vreg_holders_mark(ir, ssa, TCCIR_VREG_TYPE_VAR, n, live);
+  int *map = tcc_malloc(sizeof(int) * n), m = 0;
+  for (int i = 0; i < n; i++)
+    map[i] = live[i] ? m++ : -1;
+  tcc_free(live);
+  if (m == n)
+  {
+    tcc_free(map);
+    return;
+  }
+  ssa_vreg_holders_remap(ir, ssa, TCCIR_VREG_TYPE_VAR, n, map);
+  /* A range bound becomes the count of live vars below it. */
+  if (ir->sra_var_lo >= 0)
+  {
+    int lo = 0, hi = 0;
+    for (int i = 0; i < n; i++)
+      if (map[i] >= 0)
+        lo += i < ir->sra_var_lo, hi += i < ir->sra_var_hi;
+    ir->sra_var_lo = lo, ir->sra_var_hi = hi;
+  }
+  tcc_ir_vreg_compact_vars(ir, map, n, m);
+  tcc_free(map);
+  tcc_ir_vreg_index_dirty(ir);
+  ir_opt_frame_ptr_free(ir);
+}
+
+/* Before SSA -- the RA-time entry, ahead of SRA: in the Zig kernel's largest
+ * function the IR names 4572 of its 11372 temps there, and SRA's tables and
+ * the interval arrays (at the compile's peak) are sized by the positions.
+ * Not the vars: a var nothing names still counts as promotable, and with none
+ * left SSA construction picks the fallback pass schedule. */
+void tcc_ir_compact_temps(TCCIRState *ir)
+{
+  const int n = ssa_compact_temps(ir, NULL, ir->next_temporary_variable);
+  ir->next_temporary_variable = n;
+  tcc_ir_vreg_fit_intervals(ir, n);
+}
+
 void tcc_ir_ssa_rename(TCCIRState *ir, IRSSAState *ssa)
 {
   if (!ir || !ssa || !ssa->cfg || !ssa->is_promotable)
@@ -1219,6 +1409,8 @@ void tcc_ir_ssa_rename(TCCIRState *ir, IRSSAState *ssa)
     }
   }
 
+  next_temp_pos = ssa_compact_temps(ir, ssa, next_temp_pos);
+  ssa_compact_vars(ir, ssa);
   tcc_ir_vreg_fit_intervals(ir, next_temp_pos);
   ir->next_temporary_variable = next_temp_pos;
 

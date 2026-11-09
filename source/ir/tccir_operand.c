@@ -338,7 +338,7 @@ static int ctype_has_volatile_member(const CType *t, int depth)
     return t->ref ? ctype_has_volatile_member(&t->ref->type, depth + 1) : 0;
   if ((t->t & VT_BTYPE) != VT_STRUCT || !t->ref)
     return 0;
-  for (Sym *f = t->ref->next; f; f = f->next)
+  for (Sym *f = sym_first(t->ref); f; f = f->next)
     if (ctype_has_volatile_member(&f->type, depth + 1))
       return 1;
   return 0;
@@ -1065,7 +1065,7 @@ static int compute_aapcs_member_alignment(CType *ct)
   if (!is_plausible_sym_ptr(s))
     return 4;
   int max_align = 1;
-  for (Sym *f = s->next; f;)
+  for (Sym *f = sym_first(s); f;)
   {
     int member_align;
     Sym *next = NULL;

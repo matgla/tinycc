@@ -554,7 +554,7 @@ static void unary_funcall_body(void)
   const int nrvo_hint = tcc_state->nrvo_target_active;
   tcc_state->nrvo_target_active = 0;
 
-  sa = s->next; /* first parameter */
+  sa = sym_first(s); /* first parameter */
   nb_args = regsize = 0;
   int nb_implicit_args = 0; /* sret pointer counted in nb_args but not saved_arg_count */
   int sret_param_idx = -1;  /* IR index of the sret pointer's FUNCPARAMVAL */
@@ -753,12 +753,17 @@ static void unary_funcall_body(void)
    * and not under plain -fno-builtin.  The __builtin_ spellings always fold. */
   int libcall_by_name_ok = 1;
   const char *func_name = NULL;
+  /* The callee's name, as far as any library name it is screened against
+   * reaches (the longest is 26 bytes): a longer one is cut, which keeps every
+   * comparison's answer, and a spilled name is not read back for good. */
+  char func_name_buf[48];
   int inl_first_obj = 0; /* frame objects of an inline expansion start here (tcc_ir_frame_scope_end) */
 
   /* Check if we have a named function that might be foldable */
   if (call_func_sym && call_func_sym->v >= TOK_IDENT)
   {
-    func_name = get_tok_str(call_func_sym->v, NULL);
+    pstrcpy(func_name_buf, sizeof func_name_buf, tok_name_tmp(call_func_sym->v));
+    func_name = func_name_buf;
     if (func_name && strncmp(func_name, "__builtin_", 10) != 0 &&
         ((call_func_sym->type.t & VT_STATIC) || (tcc_state->no_builtin_funcs & NO_BUILTIN_ALL)))
       libcall_by_name_ok = 0;
@@ -960,7 +965,7 @@ static void unary_funcall_body(void)
       /* Count named params */
       int n_named = 0;
       Sym *param;
-      for (param = call_func_sym->type.ref->next; param; param = param->next)
+      for (param = sym_first(call_func_sym->type.ref); param; param = param->next)
         n_named++;
 
       /* Save all argument tokens (everything until matching ')') */
@@ -1170,7 +1175,7 @@ static void unary_funcall_body(void)
 
       /* Copy named parameters */
       Sym **pparam = &clone_ref->next;
-      for (param = orig_ref->next; param; param = param->next)
+      for (param = sym_first(orig_ref); param; param = param->next)
       {
         Sym *new_param = sym_push2(&global_stack, param->v, param->type.t, param->c);
         new_param->type = param->type;
@@ -1202,15 +1207,15 @@ static void unary_funcall_body(void)
 
       /* Register clone as inline function */
       struct InlineFunc *clone_fn;
-      clone_fn = tcc_mallocz(sizeof *clone_fn + strlen(orig_fn->filename));
-      strcpy(clone_fn->filename, orig_fn->filename);
+      clone_fn = tcc_mallocz(sizeof *clone_fn);
+      clone_fn->filename = orig_fn->filename;
       clone_fn->sym = clone_sym;
       clone_fn->func_str = clone_body;
       /* the caller's arguments bind at the call site: [count, start, end, ...] */
-      clone_fn->spliced = tcc_malloc(sizeof(int) * (spliced.size + 1));
-      clone_fn->spliced[0] = (int)spliced.size / 2;
+      int *sp = inline_func_rare(clone_fn)->spliced = tcc_malloc(sizeof(int) * (spliced.size + 1));
+      sp[0] = (int)spliced.size / 2;
       if (spliced.size)
-        memcpy(clone_fn->spliced + 1, spliced.data, sizeof(int) * spliced.size);
+        memcpy(sp + 1, spliced.data, sizeof(int) * spliced.size);
       /* the clone replays the original's body: same #pragma pack state */
       if (orig_fn->pack)
       {
@@ -1232,7 +1237,7 @@ static void unary_funcall_body(void)
 
       /* Update s (callee type ref) for argument parsing */
       s = clone_ref;
-      sa = s->next;
+      sa = sym_first(s);
       call_func_sym = clone_sym;
 
       /* Replay all the args + ')' via macro so normal call parsing handles
@@ -2213,7 +2218,8 @@ static void unary_funcall_body(void)
        * the same function.  Fall back to a normal call in that case. */
       int *_fsb = tok_str_buf(inline_fn->func_str);
       int _fsl = inline_fn->func_str->len;
-      if ((!macro_ptr || macro_ptr < _fsb || macro_ptr >= _fsb + _fsl) &&
+      if ((!macro_ptr || macro_ptr < _fsb || macro_ptr >= _fsb + _fsl ||
+           tok_reading_compile_replay()) &&
           !inline_body_has_unsafe_shadowed_ident(inline_fn->func_str, call_func_sym) &&
           !inline_body_has_static_local(inline_fn->func_str) &&
           !inline_body_has_apply_args(inline_fn->func_str) &&
@@ -2246,9 +2252,9 @@ static void unary_funcall_body(void)
         }
         if (call_func_sym->type.ref->f.func_inl_sret_loop ||
             !call_func_sym->type.ref->f.func_inl_wrapper || !inline_inside_wrapper())
-          inline_fn->caller_count++;
+          inline_fn->caller_count += inline_fn->caller_count < 3;
         if (call_func_sym->type.ref->f.func_inline_call_heavy)
-          inline_fn->inline_count++;
+          inline_fn->inline_count += inline_fn->inline_count < 15;
         if (call_func_sym->type.ref->f.func_inl_few_callers && !inline_inside_moved_body())
           inline_fn->few_callers_left--;
         if (call_func_sym->type.ref->f.func_called_once)
@@ -2306,7 +2312,7 @@ static void unary_funcall_body(void)
     {
       InlineFunc *guard = guard_head_lookup(tcc_state, call_func_sym);
       if (guard && !inline_body_has_unsafe_shadowed_ident(guard->func_str, call_func_sym) &&
-          !guard_head_captures_local(guard->guard_free))
+          !guard_head_captures_local(INLINE_RARE(guard, guard_free)))
       {
         inline_fn = guard;
         force_always_inline = 1;
@@ -2365,7 +2371,7 @@ static void unary_funcall_body(void)
                              call_func_sym->type.ref->f.func_type == FUNC_OLD
                          ? call_func_sym->type.ref
                          : s;
-      Sym *param_sym = def_ref->next; /* first parameter from function type */
+      Sym *param_sym = sym_first(def_ref); /* first parameter from function type */
       for (int pi = 0; pi < nb_args && param_sym; pi++, param_sym = param_sym->next)
       {
         int psize, palign;

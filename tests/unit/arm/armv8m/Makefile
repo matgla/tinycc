@@ -62,8 +62,13 @@ UT_DEFINES := \
 # us pull the irop_config[] table (ir/gen/config.c) out of the heavy ir/gen/*.c
 # modules without dragging in their frontend functions (sym_push, vtop, ...) —
 # unreferenced sections are GC'd.
+# -fsanitize=shift, trapping (no runtime): an out-of-range shift is undefined,
+# and x86 masks the count where the YasOS-native compiler on ARM does not -- a
+# divergence between the cross and the device compiler (VFP register masks
+# shifted by the encoded register number).
 UT_CFLAGS := -std=c11 -g -O0 -Wall -Werror -Wno-unused-function \
 			 -Wno-declaration-after-statement \
+			 -fsanitize=shift -fsanitize-undefined-trap-on-error \
 			 -ffunction-sections -fdata-sections \
 			 -I$(TOP) -I$(TOP)/source/include -I$(TOP)/source/driver -I$(TOP)/source/frontend -I$(TOP)/source/ir -I$(TOP)/source/machine -I$(TOP)/source/obj -I$(TOP)/source/support -I$(TOP)/source/opt/include -I$(TOP)/source/memory/include -I$(TOP)/source/utils/include -I$(TOP)/source/backend/arch/arm -I$(TOP)/source/backend/arch/arm/thumb -I$(TOP)/source/opt/ssa -I$(TOP)/source/opt/ssa/include -I$(TOP)/source/opt/ssa/string -I$(TOP)/source/opt/ssa/scalar -I$(TOP)/source/opt/ssa/memory -I$(TOP)/source/opt/flat/include -I$(TOP)/source/opt/flat/ipa -I$(TOP)/source/opt/framework -I$(TOP)/source/frontend/gen -I$(UT_ROOT) $(UT_DEFINES) $(UT_COV_CFLAGS)
 UT_DEPFLAGS := -MMD -MP

@@ -27,12 +27,9 @@ void tu_symset_add(TuSymSet *s, Sym *sym)
   for (int i = 0; i < s->count; i++)
     if (s->items[i] == sym)
       return;
-  if (s->count >= s->capacity)
-  {
-    int new_cap = s->capacity ? s->capacity * 2 : 4;
-    s->items = tcc_realloc(s->items, sizeof(Sym *) * new_cap);
-    s->capacity = new_cap;
-  }
+  /* Full at 0 and at every power of two from 4: where doubling from 4 left it. */
+  if (s->count == 0 || (s->count >= 4 && !(s->count & (s->count - 1))))
+    s->items = tcc_realloc(s->items, sizeof(Sym *) * (s->count ? s->count * 2 : 4));
   s->items[s->count++] = sym;
 }
 
@@ -49,7 +46,7 @@ void tu_symset_free(TuSymSet *s)
   if (s->items)
     tcc_free(s->items);
   s->items = NULL;
-  s->count = s->capacity = 0;
+  s->count = 0;
 }
 
 TuFuncSummary *tu_summary_head = NULL;

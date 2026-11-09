@@ -229,25 +229,45 @@ ST_FUNC void section_realloc(Section *sec, unsigned long new_size)
   unsigned long size;
   unsigned char *data;
 
+  if (sec->data_bias)
+  {
+    /* the window of a spilled .text (text_window_spill) */
+    const unsigned long b = sec->data_bias, have = sec->data_allocated - b;
+    size = tcc_grow_size(have, new_size - b);
+    data = tcc_realloc(sec->data + b, size);
+    memset(data + have, 0, size - have);
+    sec->data = data - b;
+    sec->data_allocated = b + size;
+    return;
+  }
+
   new_size -= sec->data_base;
-  size = sec->data_allocated;
-  if (size == 0)
-  {
-    /* First allocation: round up to power of 2 with minimum 256 bytes
-       to reduce future reallocations */
-    size = 256;
-    while (size < new_size)
-      size = size * 2;
-  }
-  else
-  {
-    while (size < new_size)
-      size = size * 2;
-  }
+  /* at least 256 bytes to start with, then the steps tcc_grow_size takes */
+  size = tcc_grow_size(sec->data_allocated ? sec->data_allocated : 256, new_size);
   data = section_grow_data(sec, size);
   memset(data + sec->data_allocated, 0, size - sec->data_allocated);
   sec->data = data;
   sec->data_allocated = size;
+}
+
+/* Give back the capacity past data_offset of a section nothing will add to:
+ * under -ffunction-sections every function has a .text.<name> and its
+ * relocations, which start at 256 bytes and double -- a TU's thousands of
+ * small functions left more of that unused than used.  A later write grows it
+ * again through section_realloc. */
+ST_FUNC void section_fit(Section *sec)
+{
+  unsigned long used = sec->data_offset;
+  if (!sec->data || sec->data_base || used >= sec->data_allocated || link_arena_owns(sec->s1, sec->data))
+    return;
+  if (used)
+    sec->data = tcc_realloc(sec->data, used);
+  else
+  {
+    tcc_free(sec->data);
+    sec->data = NULL;
+  }
+  sec->data_allocated = used;
 }
 
 /* Capacity of exactly `size` bytes, for a section whose size is known: growing

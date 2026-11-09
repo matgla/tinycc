@@ -1874,7 +1874,7 @@ tok_next:
     vtop->vr = s->vreg;
     /* An old-style definition with a prototype in scope is called (and its
      * address typed) as the prototype says. */
-    if ((s->type.t & VT_BTYPE) == VT_FUNC && s->type.ref->f.func_type == FUNC_OLD && s->type.ref->next)
+    if ((s->type.t & VT_BTYPE) == VT_FUNC && s->type.ref->f.func_type == FUNC_OLD && sym_first(s->type.ref))
     {
       const SymLocalFacts *facts = sym_facts_peek(s);
       if (facts && facts->knr_proto)

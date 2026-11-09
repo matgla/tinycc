@@ -16,7 +16,6 @@
 #include "../opt/flat/loop/func_purity.c"
 #undef NUM_PURE_FUNCS
 #include "../opt/flat/loop/loop_detect.c"
-#undef BUDGET_MAX_VREGS
 #undef WINDOW_SIZE
 #include "../opt/flat/loop/loop_eliminate.c"
 #undef USING_GLOBALS

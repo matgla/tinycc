@@ -97,6 +97,20 @@ enum
 #define OP_COPROC (1 << OPT_COPROC)
 #define OP_CREG (1 << OPT_CREG)
 
+/* Is ESYM's distance from here known while assembling?  It is in this section,
+ * and -- in an object whose .text is split by function when written
+ * (split_text_by_function) -- in this function: an earlier one gets a section
+ * of its own, so a branch to it needs its relocation, as between real function
+ * sections. */
+static int asm_sym_here(const ElfSym *esym)
+{
+  if (!esym || esym->st_shndx != cur_text_section->sh_num)
+    return 0;
+  if (tcc_state->text_split_pending && cur_text_section == text_section)
+    return tcc_state->split_func_start >= 0 && (esym->st_value & ~(addr_t)1) >= (addr_t)tcc_state->split_func_start;
+  return 1;
+}
+
 static bool thumb_operand_is_immediate(int type)
 {
   if (type != OP_IM32 && type != OP_IM8 && type != OP_IM8N)
@@ -1819,7 +1833,7 @@ static void thumb_adr_opcode(TCCState *s1, int token)
   if (e.sym)
   {
     esym = elfsym(e.sym);
-    if (esym && esym->st_shndx == cur_text_section->sh_num)
+    if (asm_sym_here(esym))
     {
       int aligned_ind = ind & -4;
       jump_addr = esym->st_value - aligned_ind - 4;
@@ -2158,7 +2172,7 @@ static thumb_opcode thumb_single_memory_transfer_literal_opcode(TCCState *s1, in
   if (e.sym)
   {
     esym = elfsym(e.sym);
-    if (esym && esym->st_shndx == cur_text_section->sh_num)
+    if (asm_sym_here(esym))
     {
       int aligned_ind = ind & -4;
       jump_addr = esym->st_value - aligned_ind - 4;
@@ -2239,7 +2253,7 @@ static thumb_opcode thumb_cache_preload_opcode(TCCState *s1, int token)
     if (e.sym)
     {
       esym = elfsym(e.sym);
-      if (esym && esym->st_shndx == cur_text_section->sh_num)
+      if (asm_sym_here(esym))
       {
         int aligned_ind = ind & -4;
         jump_addr = esym->st_value - aligned_ind - 4;
@@ -3707,7 +3721,7 @@ static void thumb_branch(TCCState *s1, int token)
     if (e.sym)
     {
       esym = elfsym(e.sym);
-      if (esym && esym->st_shndx == cur_text_section->sh_num)
+      if (asm_sym_here(esym))
       {
         /* Strip thumb bit from the fully computed target (GAS does this for B/BL).
            Otherwise we can end up with an odd offset and the short encoding rejects it. */

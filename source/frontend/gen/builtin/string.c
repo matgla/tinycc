@@ -63,6 +63,9 @@ const char *try_get_constant_string(SValue *sv, int *out_len)
 
   if (esym->st_size == 0)
     return NULL;
+  /* A function's bytes are code, and its value carries the Thumb bit. */
+  if (ELFW(ST_TYPE)(esym->st_info) == STT_FUNC)
+    return NULL;
 
   offset_in_sym = (addr_t)sv->c.i;
   if (offset_in_sym >= esym->st_size)
@@ -74,6 +77,9 @@ const char *try_get_constant_string(SValue *sv, int *out_len)
 
   str = (const char *)(sec->data + offset);
   remaining = (size_t)(esym->st_size - offset_in_sym);
+  /* nothing past what the section holds: a fitted section has no slack */
+  if (remaining > sec->data_offset - offset)
+    remaining = (size_t)(sec->data_offset - offset);
   nul = memchr(str, '\0', remaining);
   if (!nul)
     return NULL;
@@ -245,7 +251,7 @@ int builtin_abs_decl_matches(Sym *func_sym, const char *func_name)
   if (func_ref->f.func_type == FUNC_OLD)
     return 1;
 
-  param = func_ref->next;
+  param = sym_first(func_ref);
   if (!param || param->next)
     return 0;
 

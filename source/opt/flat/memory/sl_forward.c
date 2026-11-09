@@ -365,6 +365,23 @@ static int ir_has_stack_arg_variadic_call(TCCIRState *ir)
   return 0;
 }
 
+/* The slot of target T in the sorted targets AT[0..N), or -1. */
+static int sl_snap_slot(const int *at, int n, int t)
+{
+  int lo = 0, hi = n - 1;
+  while (lo <= hi)
+  {
+    const int mid = (lo + hi) >> 1;
+    if (at[mid] < t)
+      lo = mid + 1;
+    else if (at[mid] > t)
+      hi = mid - 1;
+    else
+      return mid;
+  }
+  return -1;
+}
+
 static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir);
 int tcc_ir_opt_sl_forward(TCCIRState *ir)
 {
@@ -375,19 +392,23 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
 }
 static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
 {
+  /* The entries and every jump target's snapshot of them were the peak of a
+   * Zig kernel compile (0.43 MB in its largest function): the flags, the width
+   * and the index share one word, 48 -> 32 bytes on the device. */
   typedef struct StoreEntry
   {
-    int valid;
-    int addr_addrtaken;     /* 1 if address of this local is taken */
-    int addr_via_pointer;   /* 1 if store was resolved through LEA map (pointer) */
     int64_t local_offset;   /* stack offset or symref addend */
     const Sym *local_sym;   /* symbol for VT_LOCAL (NULL for pure stack offsets) */
     IROperand stored_value;
-    int instruction_idx;    /* where the store happened */
     int store_dest_vr;      /* vreg of the store destination (address) */
-    int store_btype;        /* btype of the store address (access width) */
     struct StoreEntry *next;
+    unsigned valid : 1;
+    unsigned addr_addrtaken : 1;   /* 1 if address of this local is taken */
+    unsigned addr_via_pointer : 1; /* 1 if store was resolved through LEA map (pointer) */
+    unsigned store_btype : 3;      /* IROP_BTYPE_* of the store address (access width) */
+    signed instruction_idx : 26;   /* where the store happened: below SL_FWD_MAX_INSNS */
   } StoreEntry;
+#define SL_FWD_MAX_INSNS (1 << 25)
 
   /* Detects a LOAD address vreg written after a matching store (the forward is then stale). */
   typedef struct
@@ -415,15 +436,17 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
   struct SlFwdStore *fwd_stores; /* heap: 6 KiB inline made this a 7 KiB frame */
   int fwd_store_count = 0;
 
-  if (n == 0)
-    return 0;
+  if (n == 0 || n >= SL_FWD_MAX_INSNS)
+    return 0; /* nothing to do, or more instructions than an entry's index holds */
   /* Bail on a variadic body or a stack-arg variadic call (unsound forwarding). */
   if (ir->is_variadic || ir_has_stack_arg_variadic_call(ir))
     return 0;
   fwd_stores = tcc_malloc(sizeof(*fwd_stores) * SL_FWD_MAX_DEAD_STORES);
 
   /* Recompute is_jump_target from actual jumps (stale flags block forwarding) and pred_count[t]. */
-  int *pred_count = tcc_mallocz(sizeof(int) * n);
+  /* Read only as 1, 2 or more: a byte that stops at 255 (n bytes, not n ints). */
+  uint8_t *pred_count = tcc_mallocz(n);
+#define SL_PRED_INC(t) (pred_count[t] += pred_count[t] < 255)
   {
     uint8_t *actual_targets = tcc_mallocz((n + 7) / 8);
     for (i = 0; i < n; i++)
@@ -435,7 +458,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
         if (target >= 0 && target < n)
         {
           actual_targets[target / 8] |= (1 << (target % 8));
-          pred_count[target]++;
+          SL_PRED_INC(target);
         }
       }
       else if (jq->op == TCCIR_OP_INLINE_ASM)
@@ -444,7 +467,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
           if (target < n)
           {
             actual_targets[target / 8] |= (1 << (target % 8));
-            pred_count[target]++;
+            SL_PRED_INC(target);
           }
       }
       /* Switch case/default targets are predecessors too; count them for correct pred_count. */
@@ -460,13 +483,13 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
             if (t >= 0 && t < n)
             {
               actual_targets[t / 8] |= (1 << (t % 8));
-              pred_count[t]++;
+              SL_PRED_INC(t);
             }
           }
           if (table->default_target >= 0 && table->default_target < n)
           {
             actual_targets[table->default_target / 8] |= (1 << (table->default_target % 8));
-            pred_count[table->default_target]++;
+            SL_PRED_INC(table->default_target);
           }
         }
       }
@@ -477,11 +500,11 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
       IRQuadCompact *fq = &ir->compact_instructions[i];
       if (fq->op != TCCIR_OP_JUMP && fq->op != TCCIR_OP_RETURNVALUE && fq->op != TCCIR_OP_RETURNVOID &&
           fq->op != TCCIR_OP_SWITCH_TABLE && fq->op != TCCIR_OP_IJUMP)
-        pred_count[i + 1]++;
+        SL_PRED_INC(i + 1);
     }
     /* Instruction 0 is always a function entry — has an implicit predecessor. */
     if (n > 0)
-      pred_count[0]++;
+      SL_PRED_INC(0);
     for (i = 0; i < n; i++)
     {
       int is_actual = (actual_targets[i / 8] & (1 << (i % 8))) != 0;
@@ -494,7 +517,27 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
   }
 
   memset(hash_table, 0, sizeof(hash_table));
-  entries = tcc_malloc(sizeof(StoreEntry) * n);
+  /* An entry is recorded only by a STORE, STORE_INDEXED or STORE_POSTINC, at
+   * most one each per pass, and a snapshot restores no more than were live:
+   * so the stores bound it, not the instructions (13.8k instructions, 1 MB of
+   * entries, in the largest function of Zig's kernel.c). */
+  /* And entry_count goes back to 0 after every JUMP and every terminator,
+   * while a join keeps a subset of what is live: the most stores between two
+   * of those bounds it (the scan below resets at exactly these). */
+  int nstores = 0;
+  for (int k = 0, run = 0; k < n; k++)
+  {
+    int op = ir->compact_instructions[k].op;
+    if (op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_STORE_POSTINC)
+    {
+      if (++run > nstores)
+        nstores = run;
+    }
+    else if (op == TCCIR_OP_JUMP || op == TCCIR_OP_RETURNVALUE || op == TCCIR_OP_RETURNVOID ||
+             op == TCCIR_OP_SWITCH_TABLE || op == TCCIR_OP_IJUMP)
+      run = 0;
+  }
+  entries = tcc_malloc(sizeof(StoreEntry) * (nstores + 1));
   entry_count = 0;
 
   /* Generation counter avoids clearing write trackers on block boundaries. */
@@ -509,11 +552,20 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
   /* LEA map: TEMPs holding addresses of stack locals, to resolve derefs back to StackLoc refs. */
   typedef struct
   {
-    int64_t offset; /* resolved stack offset */
-    const Sym *sym; /* local symbol (NULL for anonymous) */
-    int valid;      /* 1 if entry is valid */
-    int lea_idx;    /* instruction index of the LEA that created this entry */
-  } LeaMapEntry;
+    int32_t offset;       /* resolved stack offset */
+    const Sym *sym;       /* local symbol (NULL for anonymous) */
+    unsigned valid : 1;   /* 1 if entry is valid */
+    unsigned fits : 1;    /* the offset was in int32 range: an entry is valid only then */
+    signed lea_idx : 30;  /* instruction index of the LEA that created this entry */
+  } LeaMapEntry; /* one per temp (11.4K in the largest function of a Zig kernel compile): 12 bytes on the device */
+  /* An offset past int32 is not tracked: the entry it would go in is not valid. */
+#define LEA_SET_OFFSET(e, v)                                                                                           \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    const int64_t lea_off_ = (v);                                                                                      \
+    (e).offset = (int32_t)lea_off_;                                                                                    \
+    (e).fits = lea_off_ == (int32_t)lea_off_;                                                                          \
+  } while (0)
 
   LeaMapEntry *lea_map = tcc_mallocz(sizeof(LeaMapEntry) * (max_tmp + 1));
 
@@ -611,16 +663,16 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
           }
           if (resolved && dest_is_var)
           {
-            var_lea_map[tmp_pos].offset = loff;
+            LEA_SET_OFFSET(var_lea_map[tmp_pos], loff);
             var_lea_map[tmp_pos].sym = lsym;
-            var_lea_map[tmp_pos].valid = 1;
+            var_lea_map[tmp_pos].valid = var_lea_map[tmp_pos].fits;
             var_lea_map[tmp_pos].lea_idx = i;
           }
           if (resolved && !dest_is_var)
           {
-            lea_map[tmp_pos].offset = loff;
+            LEA_SET_OFFSET(lea_map[tmp_pos], loff);
             lea_map[tmp_pos].sym = lsym;
-            lea_map[tmp_pos].valid = 1;
+            lea_map[tmp_pos].valid = lea_map[tmp_pos].fits;
             lea_map[tmp_pos].lea_idx = i;
           }
           if (resolved)
@@ -672,9 +724,9 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
             int s1_pos = TCCIR_DECODE_VREG_POSITION(s1_vr);
             if (s1_pos <= max_tmp && lea_map[s1_pos].valid)
             {
-              lea_map[dest_pos].offset = lea_map[s1_pos].offset + irop_get_imm64_ex(ir, lsrc2);
+              LEA_SET_OFFSET(lea_map[dest_pos], lea_map[s1_pos].offset + irop_get_imm64_ex(ir, lsrc2));
               lea_map[dest_pos].sym = lea_map[s1_pos].sym;
-              lea_map[dest_pos].valid = 1;
+              lea_map[dest_pos].valid = lea_map[dest_pos].fits;
               lea_map[dest_pos].lea_idx = lea_map[s1_pos].lea_idx;
             }
           }
@@ -685,9 +737,9 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
             int s2_pos = TCCIR_DECODE_VREG_POSITION(s2_vr);
             if (s2_pos <= max_tmp && lea_map[s2_pos].valid)
             {
-              lea_map[dest_pos].offset = lea_map[s2_pos].offset + irop_get_imm64_ex(ir, lsrc1);
+              LEA_SET_OFFSET(lea_map[dest_pos], lea_map[s2_pos].offset + irop_get_imm64_ex(ir, lsrc1));
               lea_map[dest_pos].sym = lea_map[s2_pos].sym;
-              lea_map[dest_pos].valid = 1;
+              lea_map[dest_pos].valid = lea_map[dest_pos].fits;
               lea_map[dest_pos].lea_idx = lea_map[s2_pos].lea_idx;
             }
           }
@@ -696,9 +748,9 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
                    irop_is_immediate(lsrc2) && !irop_is_sym(lsrc2))
           {
             int64_t loff = irop_get_stack_offset(lsrc1) + irop_get_imm64_ex(ir, lsrc2);
-            lea_map[dest_pos].offset = loff;
+            LEA_SET_OFFSET(lea_map[dest_pos], loff);
             lea_map[dest_pos].sym = NULL;
-            lea_map[dest_pos].valid = 1;
+            lea_map[dest_pos].valid = lea_map[dest_pos].fits;
             lea_map[dest_pos].lea_idx = i;
             int already = 0;
             for (int k = 0; k < addrtaken_count; k++)
@@ -729,9 +781,9 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
                    irop_is_immediate(lsrc1) && !irop_is_sym(lsrc1))
           {
             int64_t loff = irop_get_stack_offset(lsrc2) + irop_get_imm64_ex(ir, lsrc1);
-            lea_map[dest_pos].offset = loff;
+            LEA_SET_OFFSET(lea_map[dest_pos], loff);
             lea_map[dest_pos].sym = NULL;
-            lea_map[dest_pos].valid = 1;
+            lea_map[dest_pos].valid = lea_map[dest_pos].fits;
             lea_map[dest_pos].lea_idx = i;
             int already = 0;
             for (int k = 0; k < addrtaken_count; k++)
@@ -774,9 +826,9 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
         int sp = TCCIR_DECODE_VREG_POSITION(s_vr);
         if (vp <= max_var && sp <= max_tmp && lea_map[sp].valid && var_def_count[vp] == 1)
         {
-          var_lea_map[vp].offset = lea_map[sp].offset;
+          LEA_SET_OFFSET(var_lea_map[vp], lea_map[sp].offset);
           var_lea_map[vp].sym = lea_map[sp].sym;
-          var_lea_map[vp].valid = 1;
+          var_lea_map[vp].valid = var_lea_map[vp].fits;
           var_lea_map[vp].lea_idx = lea_map[sp].lea_idx;
         }
       }
@@ -789,9 +841,9 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
         int vp = TCCIR_DECODE_VREG_POSITION(s_vr);
         if (dp <= max_tmp && vp <= max_var && var_lea_map[vp].valid)
         {
-          lea_map[dp].offset = var_lea_map[vp].offset;
+          LEA_SET_OFFSET(lea_map[dp], var_lea_map[vp].offset);
           lea_map[dp].sym = var_lea_map[vp].sym;
-          lea_map[dp].valid = 1;
+          lea_map[dp].valid = lea_map[dp].fits;
           lea_map[dp].lea_idx = var_lea_map[vp].lea_idx;
         }
       }
@@ -804,9 +856,9 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
         if (dp <= max_tmp)
         {
           int64_t loff = irop_get_stack_offset(lsrc1);
-          lea_map[dp].offset = loff;
+          LEA_SET_OFFSET(lea_map[dp], loff);
           lea_map[dp].sym = NULL;
-          lea_map[dp].valid = 1;
+          lea_map[dp].valid = lea_map[dp].fits;
           lea_map[dp].lea_idx = i;
           int already = 0;
           for (int k = 0; k < addrtaken_count; k++)
@@ -965,11 +1017,29 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
   }
   /* Consumers re-check fwd_tmp_defs[t]<2 so a multiply-defined temp is never substituted for a merge. */
 
-  /* Snapshot state at JUMP/JUMPIF to saved_entries[target] for cross-BB forwarding. */
-  StoreEntry **saved_entries = tcc_mallocz(sizeof(StoreEntry *) * n);
-  int *saved_entry_count = tcc_mallocz(sizeof(int) * n);
-  /* Per-target snapshot capacity, grown lazily to avoid O(targets*n) memory. */
-  int *saved_entry_cap = tcc_mallocz(sizeof(int) * n);
+  /* Snapshot state at JUMP/JUMPIF to snaps[target] for cross-BB forwarding.  Only
+   * a target with two predecessors reads one (the diamond join below), so only
+   * those take one; a snapshot carries its own count and capacity, one pointer
+   * per instruction instead of three arrays of them. */
+  typedef struct
+  {
+    int count, cap;
+    StoreEntry e[];
+  } SlFwdSnap;
+  /* The scan below runs once, in order: a snapshot is read at its target and
+   * never again, so it goes after that, and a jump back to a target already
+   * passed takes none.  The targets with two predecessors, sorted, find their
+   * slot -- not a pointer per instruction (15.5K in the largest function of a
+   * Zig kernel compile). */
+  int nsnap = 0;
+  for (int k = 0; k < n; k++)
+    nsnap += pred_count[k] == 2;
+  int *snap_at = tcc_malloc(sizeof(int) * (nsnap + 1));
+  SlFwdSnap **snaps = tcc_mallocz(sizeof(SlFwdSnap *) * (nsnap + 1));
+  nsnap = 0;
+  for (int k = 0; k < n; k++)
+    if (pred_count[k] == 2)
+      snap_at[nsnap++] = k;
 
   LOG_IR_GEN("=== STORE-LOAD FORWARDING START ===");
 
@@ -981,16 +1051,19 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
       int jtarget = (int)tcc_ir_op_dest_u_imm32(ir, q);
-      if (jtarget >= 0 && jtarget < n && entry_count > 0)
+      if (jtarget > i && jtarget < n && entry_count > 0 && pred_count[jtarget] == 2)
       {
         /* Snapshot entries[] for the target, growing the slot to entry_count. */
-        if (saved_entry_cap[jtarget] < entry_count)
+        const int slot = sl_snap_slot(snap_at, nsnap, jtarget);
+        SlFwdSnap *sn = snaps[slot];
+        if (!sn || sn->cap < entry_count)
         {
-          saved_entries[jtarget] = tcc_realloc(saved_entries[jtarget], sizeof(StoreEntry) * entry_count);
-          saved_entry_cap[jtarget] = entry_count;
+          sn = tcc_realloc(sn, sizeof(SlFwdSnap) + sizeof(StoreEntry) * entry_count);
+          sn->cap = entry_count;
+          snaps[slot] = sn;
         }
-        memcpy(saved_entries[jtarget], entries, sizeof(StoreEntry) * entry_count);
-        saved_entry_count[jtarget] = entry_count;
+        memcpy(sn->e, entries, sizeof(StoreEntry) * entry_count);
+        sn->count = entry_count;
       }
       if (q->op == TCCIR_OP_JUMP)
       {
@@ -1017,9 +1090,11 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
       if (pred_count[i] > 1)
       {
         /* pred==2 join: intersect snapshot with fall-through state (diamond pattern). */
-        if (pred_count[i] == 2 && saved_entries[i] && entry_count > 0)
+        const int slot = pred_count[i] == 2 ? sl_snap_slot(snap_at, nsnap, i) : -1;
+        if (slot >= 0 && snaps[slot] && entry_count > 0)
         {
-          int sc = saved_entry_count[i];
+          const StoreEntry *saved = snaps[slot]->e;
+          int sc = snaps[slot]->count;
           int new_count = 0;
           for (int j = 0; j < entry_count; j++)
           {
@@ -1028,11 +1103,11 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
             int found = 0;
             for (int k = 0; k < sc; k++)
             {
-              if (!saved_entries[i][k].valid)
+              if (!saved[k].valid)
                 continue;
-              if (saved_entries[i][k].instruction_idx == entries[j].instruction_idx &&
-                  saved_entries[i][k].local_sym == entries[j].local_sym &&
-                  saved_entries[i][k].local_offset == entries[j].local_offset)
+              if (saved[k].instruction_idx == entries[j].instruction_idx &&
+                  saved[k].local_sym == entries[j].local_sym &&
+                  saved[k].local_offset == entries[j].local_offset)
               {
                 found = 1;
                 break;
@@ -1082,6 +1157,11 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
           memset(hash_table, 0, sizeof(hash_table));
           entry_count = 0;
           write_tracker_gen++;
+        }
+        if (slot >= 0) /* read for the last time */
+        {
+          tcc_free(snaps[slot]);
+          snaps[slot] = NULL;
         }
       }
       else if (pred_count[i] == 1)
@@ -1780,9 +1860,9 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
                     int sv_pos = TCCIR_DECODE_VREG_POSITION(sv_vr);
                     if (sv_pos <= max_tmp && lea_map[sv_pos].valid)
                     {
-                      lea_map[fwd_pos].offset = lea_map[sv_pos].offset;
+                      LEA_SET_OFFSET(lea_map[fwd_pos], lea_map[sv_pos].offset);
                       lea_map[fwd_pos].sym = lea_map[sv_pos].sym;
-                      lea_map[fwd_pos].valid = 1;
+                      lea_map[fwd_pos].valid = lea_map[fwd_pos].fits;
                     }
                   }
                 }
@@ -2084,9 +2164,9 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
                   fwd_tmp_valid[fp] = 1;
                   if (li_tag == IROP_TAG_STACKOFF)
                   {
-                    lea_map[fp].offset = irop_get_stack_offset(lie->stored_value);
+                    LEA_SET_OFFSET(lea_map[fp], irop_get_stack_offset(lie->stored_value));
                     lea_map[fp].sym = lie->local_sym;
-                    lea_map[fp].valid = 1;
+                    lea_map[fp].valid = lea_map[fp].fits;
                   }
                 }
               }
@@ -2439,6 +2519,8 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
               }
             }
 
+            if (entry_count > nstores)
+              tcc_error("internal error: sl_forward: more store entries than stores");
             StoreEntry *sne = &entries[entry_count++];
             sne->valid = 1;
             sne->addr_addrtaken = 0;
@@ -2795,6 +2877,8 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
       }
 
       /* Record the new store */
+      if (entry_count > nstores)
+        tcc_error("internal error: sl_forward: more store entries than stores");
       new_entry = &entries[entry_count++];
       new_entry->valid = 1;
       new_entry->addr_addrtaken = addr_addrtaken;
@@ -2961,9 +3045,9 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
             int s1p = TCCIR_DECODE_VREG_POSITION(s1v);
             if (s1p <= max_tmp && lea_map[s1p].valid)
             {
-              lea_map[adp].offset = lea_map[s1p].offset + irop_get_imm64_ex(ir, as2);
+              LEA_SET_OFFSET(lea_map[adp], lea_map[s1p].offset + irop_get_imm64_ex(ir, as2));
               lea_map[adp].sym = lea_map[s1p].sym;
-              lea_map[adp].valid = 1;
+              lea_map[adp].valid = lea_map[adp].fits;
             }
           }
           else if (s2v >= 0 && !as2.is_lval && TCCIR_DECODE_VREG_TYPE(s2v) == TCCIR_VREG_TYPE_TEMP &&
@@ -2972,9 +3056,9 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
             int s2p = TCCIR_DECODE_VREG_POSITION(s2v);
             if (s2p <= max_tmp && lea_map[s2p].valid)
             {
-              lea_map[adp].offset = lea_map[s2p].offset + irop_get_imm64_ex(ir, as1);
+              LEA_SET_OFFSET(lea_map[adp], lea_map[s2p].offset + irop_get_imm64_ex(ir, as1));
               lea_map[adp].sym = lea_map[s2p].sym;
-              lea_map[adp].valid = 1;
+              lea_map[adp].valid = lea_map[adp].fits;
             }
           }
         }
@@ -3235,6 +3319,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
     }
   }
 #undef SL_FWD_MAX_DEAD_STORES
+#undef SL_FWD_MAX_INSNS
 
   tcc_free(fwd_stores);
   tcc_free(entries);
@@ -3249,12 +3334,12 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
   tcc_free(fwd_tmp_val);
   tcc_free(fwd_tmp_valid);
   tcc_free(fwd_tmp_defs);
-  for (i = 0; i < n; i++)
-    tcc_free(saved_entries[i]);
-  tcc_free(saved_entries);
-  tcc_free(saved_entry_count);
-  tcc_free(saved_entry_cap);
+  for (i = 0; i < nsnap; i++)
+    tcc_free(snaps[i]);
+  tcc_free(snaps);
+  tcc_free(snap_at);
   tcc_free(pred_count);
+#undef SL_PRED_INC
 
   LOG_IR_GEN("=== STORE-LOAD FORWARDING END: %d changes ===", changes);
 

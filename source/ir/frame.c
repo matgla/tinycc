@@ -110,7 +110,7 @@ static void frame_cover(CType *t, int at, uint8_t *cov, int n, int depth)
   /* A vector is a VT_STRUCT with no members: all of it is its elements. */
   if (depth < 8 && bt == VT_STRUCT && t->ref && !(t->t & (VT_BITFIELD | VT_VECTOR)))
   {
-    for (Sym *f = t->ref->next; f; f = f->next)
+    for (Sym *f = sym_first(t->ref); f; f = f->next)
     {
       frame_cover(&f->type, at + f->c, cov, n, depth + 1);
       if (f->type.t & VT_BITFIELD)
@@ -720,8 +720,9 @@ static int frame_function_eligible(TCCIRState *ir)
 /* ---- Step 1 fallback: drop dead segments, pack live runs towards 0 ---- */
 
 /* Consecutive live segments form a run that moves as one block; a run holding
- * a pinned gap stays where it is.  Returns the new bottom. */
-static int frame_pack_runs(FrameSeg *seg, int nseg)
+ * a pinned gap stays where it is.  Returns the new bottom; with !WRITE only
+ * that, leaving the segments' deltas alone. */
+static int frame_pack_runs_ex(FrameSeg *seg, int nseg, int write)
 {
   int top = 0;
   for (int s = nseg - 1; s >= 0;)
@@ -742,12 +743,17 @@ static int frame_pack_runs(FrameSeg *seg, int nseg)
     r_lo++;
     int room = top - seg[r_hi].end;
     int delta = pinned ? 0 : room - room % align;
-    for (int k = r_lo; k <= r_hi; k++)
+    for (int k = r_lo; write && k <= r_hi; k++)
       seg[k].delta = delta;
     top = seg[r_lo].start + delta;
     s = r_lo - 1;
   }
   return top;
+}
+
+static int frame_pack_runs(FrameSeg *seg, int nseg)
+{
+  return frame_pack_runs_ex(seg, nseg, 1);
 }
 
 /* ---- Lifetime colouring ----
@@ -3019,11 +3025,9 @@ static int frame_colour(TCCIRState *ir, FrameSeg *seg, int nseg, int bottom, int
               seg[s].first[0], seg[s].last[0], seg[s].first[1], seg[s].last[1], seg[s].refs, seg[s].unit,
               seg[s].unit >= 0 ? u[seg[s].unit].new_start : 0);
 
-  /* Keep it only if its frame is no bigger than packing live runs in place. */
-  FrameSeg *tmp = tcc_malloc(sizeof(FrameSeg) * (nseg > 0 ? nseg : 1));
-  memcpy(tmp, seg, sizeof(FrameSeg) * nseg);
-  int packed = frame_pack_runs(tmp, nseg);
-  tcc_free(tmp);
+  /* Keep it only if its frame is no bigger than packing live runs in place
+   * (measured, not applied: a copy of the segments was 223 KB in kernel.c). */
+  int packed = frame_pack_runs_ex(seg, nseg, 0);
   int result = 1;
   if (placed >= packed)
   {
@@ -3052,25 +3056,13 @@ static int frame_colour(TCCIRState *ir, FrameSeg *seg, int nseg, int bottom, int
   return result;
 }
 
-int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc)
+/* The frame's objects as disjoint segments tiling [bottom, 0), gaps
+ * included, with what the operands keep live: *PSEG, their count returned.
+ * Built again for the relayout's second attempt rather than copied (a copy of
+ * kernel.c's largest frame was 223 KB, held across the first attempt). */
+static int frame_build_segments(TCCIRState *ir, int bottom, FrameSeg **pseg)
 {
-  int bottom = *ploc;
-  /* Once only: after it, the operands no longer match frame_objs. */
-  if (!ir || ir->frame_relaid || bottom >= 0 || ir->frame_obj_count == 0 || !frame_function_eligible(ir))
-    return 0;
-  ir->frame_relaid = 1;
-
-  /* Objects -> disjoint segments tiling [bottom, 0), gaps included. */
-  int nobj = ir->frame_obj_count;
-  tcc_qsort(ir->frame_objs, nobj, sizeof(int32_t) * FRAME_OBJ_WORDS, frame_obj_cmp);
-  /* `bottom` is the lowest offset an operand still names (compute_min_stack_ref),
-   * so an object whose low words lost their last reference -- a dead store
-   * removed -- starts below it.  Measure the frame from that object instead:
-   * otherwise it is pinned in place at the bottom and nothing above it can
-   * pack (a single 8-byte temporary kept a 43 KB frame from colouring down
-   * to 8.7 KB).  Its unreferenced low bytes simply move with it. */
-  if (ir->frame_objs[0] < bottom)
-    bottom = ir->frame_objs[0];
+  const int nobj = ir->frame_obj_count;
   FrameSeg *seg = tcc_mallocz(sizeof(FrameSeg) * (2 * nobj + 2));
   int nseg = 0, cur = bottom;
   for (int k = 0; k < nobj; k++)
@@ -3119,6 +3111,9 @@ int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc)
   }
   if (cur < 0)
     seg[nseg++] = (FrameSeg){.start = cur, .end = 0, .size = -cur, .live = 1, .pinned = 1};
+  /* Room was for a gap before every object; about one segment per object is
+   * used, and this is live across frame_colour, at a big function's peak. */
+  seg = tcc_realloc(seg, sizeof(FrameSeg) * (nseg > 0 ? nseg : 1));
 
   /* Liveness over the whole operand pool rather than per instruction: every
    * operand slot is covered whatever its position, and an orphaned or NOP'd
@@ -3147,14 +3142,40 @@ int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc)
         seg[s].live = seg[s].pinned = 1;
   }
 
+  *pseg = seg;
+  return nseg;
+}
+
+int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc)
+{
+  int bottom = *ploc;
+  /* Once only: after it, the operands no longer match frame_objs. */
+  if (!ir || ir->frame_relaid || bottom >= 0 || ir->frame_obj_count == 0 || !frame_function_eligible(ir))
+    return 0;
+  ir->frame_relaid = 1;
+
+  /* Objects -> disjoint segments tiling [bottom, 0), gaps included. */
+  int nobj = ir->frame_obj_count;
+  tcc_qsort(ir->frame_objs, nobj, sizeof(int32_t) * FRAME_OBJ_WORDS, frame_obj_cmp);
+  /* `bottom` is the lowest offset an operand still names (compute_min_stack_ref),
+   * so an object whose low words lost their last reference -- a dead store
+   * removed -- starts below it.  Measure the frame from that object instead:
+   * otherwise it is pinned in place at the bottom and nothing above it can
+   * pack (a single 8-byte temporary kept a 43 KB frame from colouring down
+   * to 8.7 KB).  Its unreferenced low bytes simply move with it. */
+  if (ir->frame_objs[0] < bottom)
+    bottom = ir->frame_objs[0];
+  FrameSeg *seg;
+  int nseg = frame_build_segments(ir, bottom, &seg);
+  IROperand *pool = ir->iroperand_pool;
+  const int npool = ir->iroperand_pool_count;
+
   /* Laid out once without regard to the 16-bit offsets, and again with every
    * object a STRUCT operand names pinned in place should one of them have
    * landed below -32768 (the layout only ever shrinks such a frame: a
    * function whose 38 KB of inlined callees' temporaries had 655 struct
    * objects pinned across a 33 KB frame comes down to a few KB, and with it
    * every access from movw + register-indexed to a 16-bit [sp, #imm]). */
-  FrameSeg *seg0 = tcc_malloc(sizeof(FrameSeg) * (nseg > 0 ? nseg : 1));
-  memcpy(seg0, seg, sizeof(FrameSeg) * nseg);
   int new_top = 1;
   int *merged_at = NULL, nmerged = 0;
   for (int attempt = 0; attempt < 2; attempt++)
@@ -3164,7 +3185,9 @@ int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc)
     nmerged = 0;
     if (attempt)
     {
-      memcpy(seg, seg0, sizeof(FrameSeg) * nseg);
+      /* from the segments as built, not as the first attempt left them */
+      tcc_free(seg);
+      nseg = frame_build_segments(ir, bottom, &seg);
       for (int i = 0; i < npool; i++)
       {
         int off, s;
@@ -3191,7 +3214,6 @@ int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc)
       if (!dead)
       {
         tcc_free(merged_at);
-        tcc_free(seg0);
         tcc_free(seg);
         return 0;
       }
@@ -3210,7 +3232,6 @@ int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc)
     if (fits)
       break;
   }
-  tcc_free(seg0);
   /* Only now, with the layout settled, do the kept attempt's merged copies go. */
   for (int k = 0; k < nmerged; k++)
   {

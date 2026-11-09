@@ -62,6 +62,15 @@ void tcc_ir_opt_ctx_invalidate(IROptCtx *ctx)
 {
   ctx->generation++;
   ctx->n = ctx->ir->next_instruction_index;
+  /* What the cached analyses held is stale now and rebuilt on the next ask:
+   * kept until then, it sat under the passes that never ask (SRA held the
+   * peak of a Zig kernel compile over 0.1 MB of a stale frame-pointer map). */
+  if (ctx->du.def)
+  {
+    tcc_free(ctx->du.def);
+    ctx->du.def = NULL;
+  }
+  ir_opt_frame_ptr_free(ctx->ir);
 }
 
 const IROptDU *tcc_ir_opt_ctx_require_du(IROptCtx *ctx)

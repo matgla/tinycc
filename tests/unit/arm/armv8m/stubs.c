@@ -332,6 +332,24 @@ void tok_str_free(struct TokenString *s)
   tcc_free(s);
 }
 
+/* tok_str_buf's reload of a spilled body (tccpp.c); no test spills. */
+int *tok_str_unspill(struct TokenString *s)
+{
+  (void)s;
+  abort();
+}
+
+/* spilled parameter lists (symtab.c): nothing spills here, so no type
+ * Sym is ever the sentinel and sym_first never loads.  struct Sym is
+ * incomplete in this file and the sentinel is only ever compared by address:
+ * any object of that name serves. */
+_Alignas(8) char sym_params_spilled[64];
+struct Sym *sym_params_load(struct Sym *ref)
+{
+  (void)ref;
+  abort();
+}
+
 /* set_elf_sym is declared in tcc.h; thumb.c uses it for symbol table entries.
  * Unit tests don't emit ELF, so return 0 (always succeeds). */
 typedef unsigned long addr_t;
@@ -391,6 +409,11 @@ const char *get_tok_str(int v, void *cv)
   if (v >= 0 && v < UTB_MAX_TOK && utb_tok_names[v])
     return utb_tok_names[v];
   return "?";
+}
+
+const char *tok_name_tmp(int v)
+{
+  return get_tok_str(v, NULL);
 }
 
 /* ───── Frontend / IR link stubs pulled in by core, operand and opt modules ─────
@@ -519,15 +542,16 @@ int tok_alloc_const(const char *str)
   return utb_next_tok++;
 }
 
-/* Mirrors TokenSym (tcc.h): tags and labels are not in it any more. */
+/* Mirrors TokenSym (tcc.h): tags, labels and macros are not in it, and the
+ * name is a pointer (here to the bytes after the header). */
 typedef struct UtbTokenSym
 {
   struct UtbTokenSym *hash_next;
-  void *sym_define;
   void *sym_identifier;
   int tok;
-  int len;
-  char str[1];
+  int len : 31;
+  unsigned has_define : 1;
+  const char *str;
 } UtbTokenSym;
 
 void *tok_alloc(const char *str, int len)
@@ -542,10 +566,11 @@ void *tok_alloc(const char *str, int len)
   memcpy(buf, str, len);
   buf[len] = '\0';
   tok = tok_alloc_const(buf);
-  ts = (UtbTokenSym *)tcc_mallocz(sizeof(*ts) + (unsigned)len);
+  ts = (UtbTokenSym *)tcc_mallocz(sizeof(*ts) + (unsigned)len + 1);
   ts->tok = tok;
   ts->len = len;
-  memcpy(ts->str, buf, (unsigned)len + 1);
+  memcpy((char *)(ts + 1), buf, (unsigned)len + 1);
+  ts->str = (const char *)(ts + 1);
   return ts;
 }
 

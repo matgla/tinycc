@@ -190,10 +190,23 @@ __aeabi_d2uiz:
     bx lr
 .size __rp2350_d2uiz, .-__rp2350_d2uiz
 
-/* dcp_float2double_m r0,r1, r0 */
+/* dcp_float2double_m r0,r1, r0
+ *
+ * NRDD flushes a subnormal float to zero (f2d_subnormal.c): screen the biased
+ * exponent and hand a nonzero mantissa under exponent 0 to software; zero,
+ * normal, Inf and NaN keep the three-instruction DCP path.  Shifts, not
+ * ubfx/cbz: tcc's assembler has neither (see __aeabi_d2f). */
 .global __rp2350_f2d
 .type __rp2350_f2d, %function
 __rp2350_f2d:
+    lsls r2, r0, #1                 /* drop the sign bit */
+    lsrs r2, r2, #24                /* r2 = biased exponent of the float */
+    cmp  r2, #0
+    bne  1f                         /* normal, Inf or NaN */
+    lsls r3, r0, #9                 /* the mantissa alone */
+    beq  1f                         /* +-0 */
+    b    __rp2350_f2d_subnormal     /* tail call; argument stays in r0 */
+1:
     mcrr p4, #1, r0, r0, c2         /* WXYU r0,r0 */
     cdp  p4, #8, c0, c0, c0, #1     /* NRDD */
     mrrc p4, #11, r0, r1, c0        /* RDDG r0,r1 */
@@ -577,6 +590,14 @@ __aeabi_dneg:
 .type __aeabi_f2d_bits, %function
 __aeabi_f2d:
 __aeabi_f2d_bits:
+    lsls r2, r0, #1                 /* drop the sign bit */
+    lsrs r2, r2, #24                /* r2 = biased exponent of the float */
+    cmp  r2, #0
+    bne  1f                         /* normal, Inf or NaN */
+    lsls r3, r0, #9                 /* the mantissa alone */
+    beq  1f                         /* +-0 */
+    b    __rp2350_f2d_subnormal     /* tail call; argument stays in r0 */
+1:
     mcrr p4, #1, r0, r0, c2         /* WXYU r0,r0 */
     cdp  p4, #8, c0, c0, c0, #1     /* NRDD */
     mrrc p4, #11, r0, r1, c0        /* RDDG r0,r1 */

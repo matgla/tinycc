@@ -54,6 +54,11 @@ void tcc_ir_settle(TCCIRState *ir)
 {
   const int n = ir->next_instruction_index;
   int slots = 0;
+  /* In place when every instruction's operands lie whole in the pool, after
+   * the previous instruction's: each copy then moves down, never over operands
+   * not read yet.  A second pool beside the first was the peak of a Zig kernel
+   * compile (0.53 + 0.39 MB, its largest function). */
+  int in_place = 1, prev_end = 0;
   for (int i = 0; i < n; i++)
   {
     const IRQuadCompact *q = &ir->compact_instructions[i];
@@ -61,9 +66,15 @@ void tcc_ir_settle(TCCIRState *ir)
     if (ir_op_has(q->op, IROP_A_SLOT3))
       k = 4;
     slots += k;
+    if (k)
+    {
+      if ((int)q->operand_base < prev_end || (int)q->operand_base + k > ir->iroperand_pool_count)
+        in_place = 0;
+      prev_end = (int)q->operand_base + k;
+    }
   }
   int cap = tcc_ir_pool_capacity_for(slots + slots / 8 + 16, slots);
-  IROperand *np = tcc_malloc(sizeof(IROperand) * cap);
+  IROperand *np = in_place ? ir->iroperand_pool : tcc_malloc(sizeof(IROperand) * cap);
   int wp = 0;
   for (int i = 0; i < n; i++)
   {
@@ -71,7 +82,12 @@ void tcc_ir_settle(TCCIRState *ir)
     int k = ir_op_slot_count(q->op);
     if (ir_op_has(q->op, IROP_A_SLOT3))
       k = 4;
-    if (k && (int)q->operand_base + k <= ir->iroperand_pool_count)
+    if (in_place)
+    {
+      if (k && (int)q->operand_base != wp)
+        memmove(&np[wp], &np[q->operand_base], sizeof(IROperand) * k);
+    }
+    else if (k && (int)q->operand_base + k <= ir->iroperand_pool_count)
       memcpy(&np[wp], &ir->iroperand_pool[q->operand_base], sizeof(IROperand) * k);
     else if (k)
       for (int j = 0; j < k; j++)
@@ -79,7 +95,8 @@ void tcc_ir_settle(TCCIRState *ir)
     q->operand_base = wp;
     wp += k;
   }
-  tcc_hot_free(ir->iroperand_pool);
+  if (!in_place)
+    tcc_hot_free(ir->iroperand_pool);
   ir->iroperand_pool = NULL;
   int qcap = n + n / 8 + 16;
   ir->compact_instructions = tcc_hot_settle(ir->compact_instructions, sizeof(IRQuadCompact) * (unsigned long)n, sizeof(IRQuadCompact) * (unsigned long)qcap);

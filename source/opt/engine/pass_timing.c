@@ -12,6 +12,8 @@
 
 #include "ir.h"
 #include "opt.h"
+#include <fcntl.h>
+#include <unistd.h>
 
 signed char tcc_pass_timing_on = -1;
 
@@ -21,11 +23,88 @@ signed char tcc_pass_timing_on = -1;
  * dump needs the flag, not the variable. */
 TCC_DBG_ENV_FLAG(pass_timing_env_on, "TCC_PASS_TIMING")
 
+#ifdef TCC_ALLOC_BACKTRACE
+/* The tracing cross marks every pass in the allocation trace
+ * (scripts/alloc_trace: what each pass holds); the timing it rides on stays
+ * unprinted unless asked for. */
+static int tcc_pt_trace_only;
+#endif
+
+/* TCC_MEMPEAK=1 on YasOS: which pass the process memory peaks in.  Reading
+ * /proc/mempeak returns the pool's watermark since the last read and clears
+ * it, so a read at every timed pass's start and end gives the peak of the
+ * stretch since the previous one, charged to the innermost pass running over
+ * it ("-" outside them).  Not a debug-build flag: the device compiler is a
+ * release build.  Off where the file does not exist. */
+static int tcc_mp_on;
+static int tcc_mp_only; /* timing rides along for the hooks, unprinted */
+#define TCC_MP_MAX 256
+static struct {
+  const char *name;
+  unsigned long peak;
+} *tcc_mp_tab;
+static int tcc_mp_count;
+static unsigned long tcc_mp_max;
+static char tcc_mp_max_pass[48], tcc_mp_max_func[64];
+
+static void tcc_mp_sample(const char *owner)
+{
+  char buf[160];
+  int fd = open("/proc/mempeak", O_RDONLY), n;
+  if (fd < 0)
+  {
+    tcc_mp_on = 0;
+    return;
+  }
+  n = (int)read(fd, buf, sizeof buf - 1);
+  close(fd);
+  if (n <= 0)
+    return;
+  buf[n] = 0;
+  const char *p = strstr(buf, "process_peak_bytes ");
+  if (!p)
+    return;
+  unsigned long v = strtoul(p + 19, NULL, 10);
+  if (!owner)
+    owner = "-";
+  int i;
+  for (i = 0; i < tcc_mp_count; i++)
+    if (tcc_mp_tab[i].name == owner || !strcmp(tcc_mp_tab[i].name, owner))
+      break;
+  if (i == tcc_mp_count && tcc_mp_count < TCC_MP_MAX)
+  {
+    if (!tcc_mp_tab)
+      tcc_mp_tab = tcc_mallocz(sizeof(*tcc_mp_tab) * TCC_MP_MAX);
+    tcc_mp_tab[tcc_mp_count++].name = owner;
+  }
+  if (i < tcc_mp_count && v > tcc_mp_tab[i].peak)
+    tcc_mp_tab[i].peak = v;
+  if (v > tcc_mp_max)
+  {
+    tcc_mp_max = v;
+    snprintf(tcc_mp_max_pass, sizeof tcc_mp_max_pass, "%s", owner);
+    snprintf(tcc_mp_max_func, sizeof tcc_mp_max_func, "%s",
+             tcc_state && tcc_state->cur_func_sym ? get_tok_str(tcc_state->cur_func_sym->v, NULL) : "-");
+  }
+}
+
 void tcc_pass_timing_init(void)
 {
   if (tcc_pass_timing_on < 0)
+  {
     tcc_pass_timing_on =
         (pass_timing_env_on() || (tcc_state && tcc_state->do_bench)) ? 1 : 0;
+    if (getenv("TCC_MEMPEAK"))
+    {
+      tcc_mp_on = 1;
+      if (!tcc_pass_timing_on)
+        tcc_pass_timing_on = 1, tcc_mp_only = 1;
+    }
+#ifdef TCC_ALLOC_BACKTRACE
+    if (!tcc_pass_timing_on && getenv("TCC_ALLOCTRACE"))
+      tcc_pass_timing_on = 1, tcc_pt_trace_only = 1;
+#endif
+  }
 }
 
 unsigned long tcc_pass_clk_us(void)
@@ -101,10 +180,13 @@ void tcc_pass_timing_begin(TCCPassTimer *t, const char *name)
   for (int i = 0; i < tcc_pt_depth && i < TCC_PT_STACK_MAX; i++)
     if (tcc_pt_stack[i] == name || strcmp(tcc_pt_stack[i], name) == 0)
       return; /* outer frame of the same pass already owns this time */
+  if (tcc_mp_on)
+    tcc_mp_sample(tcc_pt_depth > 0 && tcc_pt_depth <= TCC_PT_STACK_MAX ? tcc_pt_stack[tcc_pt_depth - 1] : NULL);
   if (tcc_pt_depth < TCC_PT_STACK_MAX)
     tcc_pt_stack[tcc_pt_depth] = name;
   tcc_pt_depth++;
   t->active = 1;
+  tcc_alloc_trace_pass(name, 1);
   t->saved_child_us = tcc_pt_child_us;
   tcc_pt_child_us = 0;
   t->start_us = tcc_pass_clk_us();
@@ -115,20 +197,48 @@ void tcc_pass_timing_end(TCCPassTimer *t, int changes)
 {
   if (!t->active)
     return;
+  if (tcc_mp_on)
+    tcc_mp_sample(t->name);
   unsigned long incl = tcc_pass_clk_us() - t->start_us;
   unsigned long self = incl > tcc_pt_child_us ? incl - tcc_pt_child_us : 0;
   tcc_pt_child_us = t->saved_child_us + incl;
   if (tcc_pt_depth > 0)
     tcc_pt_depth--;
   t->active = 0;
+  tcc_alloc_trace_pass(t->name, 0);
   tcc_pass_timing_record(t->name, self, incl, changes);
+}
+
+static void tcc_mp_dump(void)
+{
+  if (!tcc_mp_count)
+    return;
+  tcc_mp_sample(NULL); /* the stretch after the last pass */
+  fprintf(stderr, "MEMPEAK max %lu in %s of %s\n", tcc_mp_max, tcc_mp_max_pass, tcc_mp_max_func);
+  char used[TCC_MP_MAX] = {0};
+  for (int k = 0; k < 15 && k < tcc_mp_count; k++)
+  {
+    int best = -1;
+    for (int i = 0; i < tcc_mp_count; i++)
+      if (!used[i] && (best < 0 || tcc_mp_tab[i].peak > tcc_mp_tab[best].peak))
+        best = i;
+    used[best] = 1;
+    fprintf(stderr, "MEMPEAK %9lu  %s\n", tcc_mp_tab[best].peak, tcc_mp_tab[best].name);
+  }
 }
 
 void tcc_pass_timing_dump(void)
 {
+  tcc_mp_dump();
+  if (tcc_mp_only)
+    return;
   /* tcc_pt_count is non-zero only when timing was enabled: no separate gate needed. */
   if (tcc_pt_count == 0)
     return;
+#ifdef TCC_ALLOC_BACKTRACE
+  if (tcc_pt_trace_only)
+    return;
+#endif
   unsigned long total = 0, total_calls = 0, total_prod = 0;
   for (int i = 0; i < tcc_pt_count; i++) {
     total += tcc_pt_tab[i].self_us;

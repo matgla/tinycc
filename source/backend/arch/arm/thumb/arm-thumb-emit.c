@@ -1369,7 +1369,7 @@ static int hfa_scan(const CType *type, int *base)
   if (btype == VT_STRUCT && type->ref && !IS_UNION(t))
   {
     int count = 0;
-    for (const Sym *f = type->ref->next; f; f = f->next)
+    for (const Sym *f = sym_first(type->ref); f; f = f->next)
     {
       if (f->type.t & VT_BITFIELD)
         return 0;

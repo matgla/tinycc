@@ -310,35 +310,29 @@ int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
       parse_expr_type(&type1);
       /* remove all storage modifiers except typedef */
       type1.t &= ~(VT_STORAGE & ~VT_TYPEDEF);
+      if ((type1.t & VT_BTYPE) == VT_FUNC && type1.ref)
+        type1.ref->a.proto_own = 0; /* another declaration may take this function's type now */
       if (type1.ref)
         sym_to_attr(ad, type1.ref);
       goto basic_type2;
     case TOK_THREAD_LOCAL:
       tcc_error("_Thread_local is not implemented");
     default:
-      if (tok >= TOK_IDENT)
+      if (tok_is_ident(tok, "__thread", 8))
       {
-        const char *tok_str = get_tok_str(tok, NULL);
-        if (tok_str && tok_str[0] == '_' && strcmp(tok_str, "__thread") == 0)
-        {
-          next();
-          break;
-        }
+        next();
+        break;
       }
 
       if (typespec_found)
         goto the_end;
 
-      if (tok >= TOK_IDENT && tcc_state->cversion > 201710)
+      if (tcc_state->cversion > 201710 && tok_is_ident(tok, "bool", 4))
       {
-        const char *tok_str = get_tok_str(tok, NULL);
-        if (tok_str && tok_str[0] == 'b' && strcmp(tok_str, "bool") == 0)
-        {
-          u = VT_BOOL;
-          next();
-          typespec_found = 1;
-          break;
-        }
+        u = VT_BOOL;
+        next();
+        typespec_found = 1;
+        break;
       }
 
       s = sym_find(tok);

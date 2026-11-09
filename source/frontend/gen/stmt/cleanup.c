@@ -83,7 +83,7 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
   }
 
   Sym *s = fs->type.ref;
-  Sym *param_sym = s->next;
+  Sym *param_sym = sym_first(s);
   if (!param_sym || param_sym->next != NULL) {
     TCC_DBG_TRACE(dbg_clinl, (stderr, "[CLINL] %s: bad params\n", clinl_name(fs)));
     return 0;

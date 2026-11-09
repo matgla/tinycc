@@ -9,6 +9,7 @@ written as *characterizations* of the current codegen; as the size-reduction
 levers land, the failing assertions should be flipped to lock in the wins.
 """
 
+import os
 import re
 import hashlib
 import subprocess
@@ -42,7 +43,10 @@ def _compile(name, extra_cflags=(), src_dir=None):
     # tests expected the same lowering; it surfaced the moment one of them
     # started expecting VFP and the other __aeabi_ calls.
     tag = hashlib.sha1(" ".join(extra_cflags).encode()).hexdigest()[:8] if extra_cflags else "base"
-    obj = BUILD_DIR / f"{name}.{tag}.o"
+    # ...and the worker: two tests with the same case and flags (both of
+    # test_zero_high_shift_codegen.py's) still shared one .o across xdist
+    # workers, read by one while the other rewrote it.
+    obj = BUILD_DIR / f"{name}.{tag}.{os.getpid()}.o"
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
 
     cflags = [

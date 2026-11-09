@@ -1914,7 +1914,7 @@ static int try_reassign_scratch_conflict(TCCIRState *ir, int r, int insn_i)
             new_r, blocked, avail);
 
   /* 1. Update the IRLiveInterval (read by machine_op_from_ir). */
-  ir_iv->allocation.r0 = (uint16_t)new_r;
+  ir_iv->allocation.r0 = (uint8_t)new_r;
 
   /* 2. Update the LSLiveInterval (read by tcc_ls_build_live_regs_by_instruction
    *    and tcc_ls_find_free_scratch_reg). */
@@ -2237,7 +2237,7 @@ static int try_demote_scratch_conflict(TCCIRState *ir, int r, int insn_i, const 
     return -1;
   if (ir_iv->allocation.offset != 0)
     return -1;
-  if (ir_iv->allocation.r0 != (uint16_t)r)
+  if (ir_iv->allocation.r0 != (uint8_t)r)
     return -1;
   /* A rematerializable constant is reloaded with a MOV, never from memory —
    * demoting it frees the register without any memory traffic, but it also
@@ -2401,7 +2401,7 @@ static bool ir_reg_conflict(const TCCIRState *ir, int reg, uint32_t start, uint3
        * stack argument of the same call sat in R0:R1 -- the reload into R1
        * overwrote its high word (zig.c -Os, a split reload of a shared
        * constant). */
-      if (other->allocation.r0 != (uint16_t)reg && other->allocation.r1 != (uint16_t)reg)
+      if (other->allocation.r0 != (uint8_t)reg && other->allocation.r1 != (uint8_t)reg)
         continue;
       /* Skip the vreg we're about to reassign */
       if (p == 0 && k == TCCIR_DECODE_VREG_POSITION(skip_vreg) &&
@@ -2510,7 +2510,7 @@ static void ir_codegen_pre_patch_funcparam_allocations(TCCIRState *ir)
       continue;
 
     /* Patch allocation to ABI register */
-    li->allocation.r0 = (uint16_t)target_reg;
+    li->allocation.r0 = (uint8_t)target_reg;
     li->allocation.offset = 0;
   }
 }
@@ -2688,10 +2688,10 @@ static bool ir_codegen_before_ret_peephole(TCCIRState *ir, int i, const IROperan
       return false;
 
     /* Patch the source vreg's allocation to the ASSIGN's destination register */
-    li->allocation.r0 = (uint16_t)target_r0;
+    li->allocation.r0 = (uint8_t)target_r0;
     li->allocation.offset = 0;
     if (needs_pair)
-      li->allocation.r1 = (uint16_t)target_r1;
+      li->allocation.r1 = (uint8_t)target_r1;
 
     *out_mop_dest = (MachineOperand){.kind = MACH_OP_REG,
                                      .btype = irop_get_btype(*dest_ir),
@@ -2772,7 +2772,7 @@ static bool ir_codegen_before_ret_peephole(TCCIRState *ir, int i, const IROperan
       return false;
 
     /* Patch allocation */
-    li->allocation.r0 = (uint16_t)target_reg;
+    li->allocation.r0 = (uint8_t)target_reg;
     li->allocation.offset = 0;
 
     *out_mop_dest = (MachineOperand){.kind = MACH_OP_REG,
@@ -3867,11 +3867,19 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     ir->orig_ir_to_code_mapping_size = 0;
   }
   /* +1 extra slot for a synthetic epilogue mapping.
-   * Use 0xFFFFFFFF sentinel to distinguish "unmapped" from offset 0. */
-  ir->orig_ir_to_code_mapping_size = max_orig_index + 2;
-  ir->orig_ir_to_code_mapping = tcc_malloc(sizeof(uint32_t) * ir->orig_ir_to_code_mapping_size);
-  uint32_t *orig_ir_to_code_mapping = ir->orig_ir_to_code_mapping;
-  memset(orig_ir_to_code_mapping, 0xFF, sizeof(uint32_t) * ir->orig_ir_to_code_mapping_size);
+   * Use 0xFFFFFFFF sentinel to distinguish "unmapped" from offset 0.
+   * Only a label whose address is taken (&&label, asm goto, a nested
+   * function's non-local goto) is placed by its original index after codegen
+   * (label_pop): elsewhere the 4 bytes per original instruction went unread. */
+  uint32_t *orig_ir_to_code_mapping = NULL;
+  if (ir->func_has_label_addr || ir->func_has_asm_goto ||
+      (tcc_state && (tcc_state->nb_nested_funcs || tcc_state->had_nested_funcs || tcc_state->current_nested_func)))
+  {
+    ir->orig_ir_to_code_mapping_size = max_orig_index + 2;
+    ir->orig_ir_to_code_mapping = tcc_malloc(sizeof(uint32_t) * ir->orig_ir_to_code_mapping_size);
+    orig_ir_to_code_mapping = ir->orig_ir_to_code_mapping;
+    memset(orig_ir_to_code_mapping, 0xFF, sizeof(uint32_t) * ir->orig_ir_to_code_mapping_size);
+  }
   /* Track addresses of return jumps for later backpatching to epilogue */
   int *return_jump_addrs = tcc_malloc(sizeof(int) * ir->next_instruction_index);
   ir->codegen_return_jump_addrs = return_jump_addrs;
@@ -7475,12 +7483,13 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   ir->codegen_branch_target_reset = NULL;
 
   ir_to_code_mapping[ir->next_instruction_index] = ind;
-  orig_ir_to_code_mapping[ir->orig_ir_to_code_mapping_size - 1] = ind;
 
   /* Fill gaps for removed original indices: map them to the next reachable
    * emitted code address (or epilogue). This keeps &&label stable even if the
    * instruction at the exact original index was optimized away. */
+  if (orig_ir_to_code_mapping)
   {
+    orig_ir_to_code_mapping[ir->orig_ir_to_code_mapping_size - 1] = ind;
     uint32_t last = orig_ir_to_code_mapping[ir->orig_ir_to_code_mapping_size - 1];
     for (int k = ir->orig_ir_to_code_mapping_size - 2; k >= 0; --k)
     {

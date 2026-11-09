@@ -513,13 +513,19 @@ typedef struct Sym Sym;
 typedef struct TokenSym
 {
   struct TokenSym *hash_next;
-  struct Sym *sym_define;     /* direct pointer to define */
+  /* A macro of this name is in a small map instead (define_find; has_define
+   * says there is one), as struct tags and labels are: a Zig kernel compile
+   * interns 13K names and defines a few hundred. */
   struct Sym *sym_identifier; /* direct pointer to identifier */
   /* Struct tags and labels are bound through two small maps instead
      (sym_tag_head / sym_label_head): few names are ever either. */
   int tok;                    /* token number */
-  int len;
-  char str[1];
+  int len : 31;
+  unsigned has_define : 1;
+  /* The name, NUL-terminated, in a name chunk (tccpp.c).  Once the TU is
+   * parsed, with the internal spill on, the chunks go to the spill file and
+   * this holds the name's offset there, tagged odd: read it with tok_name. */
+  const char *str;
 } TokenSym;
 
 /* One predefined macro in the build-time table (tccdefs_table_.h, produced by
@@ -652,6 +658,11 @@ struct SymAttr
       regpair_ret : 2,            /* REGPAIR_RET_*: an internal function's
                                      8-byte aggregate comes back in r0/r1
                                      (gfunc_regpair_ret), decided once. */
+      proto_own : 1,              /* a function type Sym a file-scope prototype's
+                                     declarator built for that one function: no
+                                     typedef, typeof or other declaration holds
+                                     it, so its definition's type is adopted into
+                                     it (patch_type, sym_functype_adopt). */
       pure_via_sret : 1;          /* inferred: the function's only observable
                                      effect is its aggregate result (*sret_arg
                                      writes, or r0/r1).  In SymAttr, not
@@ -775,6 +786,19 @@ struct Sym
 };
 #define SYM_SHORT_SIZE (offsetof(struct Sym, prev) + sizeof(struct Sym *))
 
+/* Internal spill: the parameter list of a file-scope prototype goes to the spill
+ * file between declarations and comes back when something reads it
+ * (sym_params_release in symtab.c).  A spilled function type Sym's next is
+ * this sentinel, so every walk of a type's member or parameter list starts
+ * with sym_first(ref), never ref->next.  A spilled list is never empty, so
+ * `ref->next != NULL` stays a valid "has parameters" test. */
+extern struct Sym sym_params_spilled;
+struct Sym *sym_params_load(struct Sym *ref);
+static inline struct Sym *sym_first(struct Sym *ref)
+{
+  return ref->next == &sym_params_spilled ? sym_params_load(ref) : ref->next;
+}
+
 /* A function's key in the TU's by-token analysis caches (purity, constant
  * result, switch snapshot): 0, never cached, for a GNU nested function, whose
  * name other functions of the TU (file-scope or nested) may share. */
@@ -897,6 +921,11 @@ typedef struct Section
   unsigned char *data;          /* section data: offsets [data_base, data_base + data_allocated) */
   unsigned long data_allocated; /* used for realloc() handling */
   unsigned long data_base;      /* 0, except in a spilled section: its pieces are below */
+  /* .text while functions are generated into it (text_window_spill): the code
+   * below data_bias is in the internal spill file, and data is biased so that
+   * data + off is still the byte at off for every off from data_bias on;
+   * data_allocated counts from 0 as ever.  0 everywhere else. */
+  unsigned long data_bias;
   struct SectionSpill *spill;   /* NULL, or where the bytes below data_base are */
   LazyRels *lazy_rels;          /* relocations still in the object files, in load order */
   TCCState *s1;
@@ -918,6 +947,7 @@ typedef struct Section
   unsigned char lazy;                /* 1 = section uses lazy loading */
   unsigned char materialized;        /* 1 = data has been loaded (legacy) */
   unsigned char has_deferred_chunks; /* 1 = has chunks not yet materialized */
+  unsigned char per_function;        /* one function's code (function_text_section): fitted once generated */
   DeferredChunk *deferred_head;      /* List of chunks to load */
   DeferredChunk *deferred_tail;      /* For O(1) append */
   struct SectionAux *aux;            /* what few sections need: section_aux() */
@@ -1089,24 +1119,45 @@ typedef struct BufferedFile
 
 typedef struct TokenString
 {
-  char alloc;
-  signed char need_spc;         /* space insertion state: -1, 0, 1, 2, 3 */
-  int last_line_num; /* last recorded line number (0 = none) */
-  int save_line_num; /* saved line number for macro */
-  int allocated_len;            /* 0 = inline, >0 = heap capacity (in ints) */
-  int len;                      /* current length in ints */
-  /* used to chain token-strings with begin/end_macro() */
-  const int *prev_ptr;
+  int allocated_len; /* 0 = inline, >0 = heap capacity (in ints) */
+  int len;           /* current length in ints */
+  int spill_pos;     /* 1 + the offset of its copy in the spill file, while allocated_len == -1 or read back from it */
+  /* A kept string (tok_str_keep), whose tokens are always on the heap, ends
+   * after data.str (TOKSTR_KEPT_SIZE, 16 bytes on ARM): thousands of saved
+   * bodies wait for the end of the TU.  What follows is for a string being
+   * built or replayed; a kept one is replayed through a header of its own
+   * (begin_macro_kept). */
   union
   {
     int *str;                            /* heap buffer pointer */
     int small_buf[TOKSTR_SMALL_BUFSIZE]; /* inline buffer for small strings */
   } data;
+  char alloc;
+  signed char need_spc; /* space insertion state: -1, 0, 1, 2, 3 */
+  int last_line_num;    /* last recorded line number (0 = none) */
+  int save_line_num;    /* saved line number for macro */
+  /* used to chain token-strings with begin/end_macro() */
+  const int *prev_ptr;
   struct TokenString *prev;
+  struct TokenString *owner; /* begin_macro_kept: the string this header replays, freed with it */
 } TokenString;
 
-/* Access TokenString buffer (either inline small_buf or heap str) */
-#define tok_str_buf(s) ((s)->allocated_len > 0 ? (s)->data.str : (s)->data.small_buf)
+/* The header of a kept string: everything up to and including data.str. */
+#define TOKSTR_KEPT_SIZE (offsetof(TokenString, data) + sizeof(int *))
+
+/* A kept body written to the spill file (allocated_len == -1): read back on access. */
+int *tok_str_unspill(TokenString *s);
+
+/* Access TokenString buffer (inline small_buf, heap str, or reloaded from the spill file) */
+static inline int *tok_str_access(TokenString *s)
+{
+  if (s->allocated_len > 0)
+    return s->data.str;
+  if (s->allocated_len == 0)
+    return s->data.small_buf;
+  return tok_str_unspill(s);
+}
+#define tok_str_buf(s) tok_str_access((TokenString *)(s))
 
 /* GNUC attribute definition */
 typedef struct AttributeDef
@@ -1127,23 +1178,40 @@ typedef struct InlineFunc
   TokenString *func_str;
   Sym *sym;
   int *pack;        /* #pragma pack state at the body (pp_pack_snapshot), NULL = default */
-  int inline_count; /* number of auto-inline expansions performed so far (call-heavy budget) */
-  int caller_gen, caller_count; /* expansions into the function being compiled (tcc_state->inline_caller_gen) */
+  int caller_gen;   /* expansions into the function being compiled (tcc_state->inline_caller_gen) */
+  struct InlineFuncRare *rare; /* NULL but for a guard head, a nested function, a va_arg_pack clone */
+  const char *filename; /* tcc_filename_intern */
   /* As a small leaf (not a wrapper): its cost, flat backward jumps and whether
    * it is bounded per caller (func_inl_sret_loop), for a caller wrapping it
-   * (tcc_state->inline_leaf_ops). */
-  int leaf_ops, leaf_backedges, leaf_bounded;
-  int few_callers_left; /* func_inl_few_callers: expansions still allowed in the TU */
-  int *guard_free;      /* guard head: the names it reads but does not bind, [0] = count */
+   * (tcc_state->inline_leaf_ops).  A small leaf's are small. */
+  uint16_t leaf_ops, leaf_backedges;
+  int16_t few_callers_left; /* func_inl_few_callers: expansions still allowed in the TU (2 x <= 97) */
+  /* Read only as >= 8 and >= INLINE_WRAPPER_PER_CALLER (2): they stop counting
+   * past what those can tell apart. */
+  unsigned inline_count : 4; /* auto-inline expansions so far (call-heavy budget) */
+  unsigned caller_count : 2; /* expansions into the function being compiled */
+  unsigned leaf_bounded : 1;
+} InlineFunc; /* 4.9K in a Zig kernel compile: 44 -> 32 bytes */
+
+/* What few InlineFuncs carry, out of the one every function of a TU has
+ * (4.9k at the peak of a Zig kernel compile: 72 -> 44 bytes each). */
+typedef struct InlineFuncRare
+{
+  int *guard_free; /* guard head: the names it reads but does not bind, [0] = count */
+  int *spliced;    /* a __builtin_va_arg_pack clone: the caller's argument names, [0] = ranges, then [start, end) */
   /* A nested function's copy: what each name of its body (in order) bound to at
    * the definition (inline_record_def_bindings), and where that was. */
   struct Sym **def_binds;
   struct Sym *def_func, *def_scope_top;
   struct NestedFunc *def_nf;
   int def_has_capture;
-  int *spliced; /* a __builtin_va_arg_pack clone: the caller's argument names, [0] = ranges, then [start, end) */
-  char filename[1];
-} InlineFunc;
+} InlineFuncRare;
+
+/* FN's rare part, made on first use (emit.c); INLINE_RARE reads a field of it,
+ * 0 if none; inline_func_free_rare frees it and what it holds. */
+ST_FUNC InlineFuncRare *inline_func_rare(InlineFunc *fn);
+ST_FUNC void inline_func_free_rare(InlineFunc *fn);
+#define INLINE_RARE(fn, field) ((fn)->rare ? (fn)->rare->field : 0)
 
 /* A file-scope function definition whose body is generated at the end of the
  * TU (gen_deferred_function_bodies): its tokens from the opening '{', and the
@@ -1157,7 +1225,7 @@ typedef struct DeferredFunc
   /* A static function referenced only by this many direct calls (>= 2), none
    * from itself and none from code emitted before the end of the TU; else 0. */
   int call_sites;
-  char filename[1];
+  const char *filename; /* tcc_filename_intern */
 } DeferredFunc;
 
 /* A file-scope static object whose initializer is parsed at the end of the TU
@@ -1170,7 +1238,7 @@ typedef struct DeferredData
   AttributeDef ad;
   int r;
   TokenString *init;
-  char filename[1];
+  const char *filename; /* tcc_filename_intern */
 } DeferredData;
 
 /* nested functions */
@@ -1364,8 +1432,26 @@ struct TCCState
   unsigned char gc_sections;       /* -Wl,--gc-sections: garbage collect unused sections */
   unsigned char function_sections; /* -ffunction-sections: place each function
                                       in its own section */
+  /* -ffunction-sections into an object, without debug info: the functions go
+   * to .text while compiling and are split into their own sections when the
+   * object is written (split_text_by_function in tccelf_output.c). */
+  unsigned char text_split_pending;
+  /* Where .text holds a 2-byte pad that is no function's (a function start
+   * padded to a word, an erase's filler), sorted: split_text_by_function
+   * leaves them out of the sections, as the linker pads between real ones. */
+  unsigned *split_pads;
+  int nb_split_pads, cap_split_pads;
+  /* func_ind for the backend's split checks (arm-thumb-asm/gen): where the
+   * function being generated starts in .text, -1 outside one. */
+  int split_func_start;
+  /* .text spilled by text_window_spill: {offset, size, file offset} each */
+  struct TextPiece *text_pieces;
+  int nb_text_pieces, cap_text_pieces;
+  unsigned char text_window_done; /* read back for good (text_window_unspill_all) */
   unsigned char data_sections;     /* -fdata-sections: place each data item in its
                                       own section */
+  unsigned char internal_spill;    /* -f[no-]internal-spill (on): saved bodies and prototype
+                                      parameter lists go to <output>.<pid>.spill (tccpp.c) */
   unsigned int cversion;           /* supported C ISO version, 199901 (the default), 201112, ... */
 
   /* C language options */
@@ -1558,6 +1644,8 @@ struct TCCState
   char **hot_text_flash_names;    /* --hot-text's '=name': flash callers call its flash copy */
   int nb_hot_text_flash_names;
   char *ram_text_file;            /* --ram-text=FILE: functions the linker script runs from RAM */
+  char **interned_files;          /* tcc_filename_intern: one copy of each source path */
+  int nb_interned_files;
   char **ram_text_names, **ram_text_section_names;
   int nb_ram_text_names, nb_ram_text_section_names;
   unsigned char ram_text_read;
@@ -1961,6 +2049,15 @@ struct TCCState
      stream at a call site, these track the return value destination. */
   uint8_t in_inline_expansion; /* nonzero while expanding inline body */
   uint8_t inline_expansion_depth; /* nested expansion depth, capped to bound work */
+  /* The header replaying the body of the function being compiled from its own
+   * saved tokens (tok_str_borrow): a call inside it may still inline the
+   * function, as when the body was replayed from a copy. */
+  struct TokenString *compile_replay;
+  /* The saved body define_deferred_function is replaying; deferred_adopted is
+   * 1 once save_function_body made it the function's kept tokens, 2 if those
+   * were then dropped (freed when the replay ends). */
+  struct TokenString *deferred_body;
+  int deferred_adopted;
   /* The functions whose bodies are being expanded, outermost first: a callee
    * already here is recursion, never expanded again. */
   struct Sym *inline_expansion_syms[INLINE_NEST_MAX];
@@ -2423,11 +2520,55 @@ PUB_FUNC char *tcc_strdup(const char *str);
 #define tcc_mallocz(size) tcc_mallocz_at(size, __FILE__, __LINE__)
 #define tcc_realloc(ptr, size) tcc_realloc_at(ptr, size, __FILE__, __LINE__)
 #endif
+/* Growing arrays: tcc_grow_size(have, need) is the capacity in bytes for an
+ * array of `have` bytes that needs `need`; tcc_fit_size rounds a size to what
+ * the device's malloc hands out anyway.  Memory, not reallocs, is what runs
+ * out on the board: doubling leaves a quarter of an array unused on average,
+ * and a power-of-two size past the pools is the worst fit the device's malloc
+ * has -- from 32 KB a block is a mapping of whole 4 KB pages behind a 16-byte
+ * header, so 64 KB takes 68 KB.  So a large array grows by a quarter (an
+ * eighth past 256 KB); a mapping usually grows in place (mremap), so the
+ * smaller steps copy little.  Below 32 KB a block may be a pool block, which
+ * costs its size in 8-byte steps: rounded to whole pages there, it became a
+ * mapping of its own instead (libc pools exactly the sizes whose header would
+ * spill onto a page), and a Zig kernel compile peaked 0.18 MB higher.  Small
+ * arrays still double: they live in pools, where slack is a few bytes. */
+static inline unsigned long tcc_fit_size(unsigned long size)
+{
+  if (size < 32768)
+    return (size + 7) & ~7ul;
+  return ((size + 16 + 4095) & ~4095ul) - 16;
+}
+
+static inline unsigned long tcc_grow_size(unsigned long have, unsigned long need)
+{
+  unsigned long n = have ? have : 16;
+  while (n < need)
+    n += n < 4096 ? n : n < 262144 ? n / 4 : n / 8;
+  return tcc_fit_size(n);
+}
+
+/* A mark in the TCC_ALLOC_BACKTRACE trace (1: a function's compile starts,
+ * 2: it ends); nothing in any other build. */
+#ifdef TCC_ALLOC_BACKTRACE
+PUB_FUNC void tcc_alloc_trace_mark(int what);
+/* A pass starts (begin 1) or ends (0): a mark naming it (TRACE.passes). */
+PUB_FUNC void tcc_alloc_trace_pass(const char *name, int begin);
+#else
+#define tcc_alloc_trace_mark(what) ((void)0)
+#define tcc_alloc_trace_pass(name, begin) ((void)0)
+#endif
 PUB_FUNC void *tcc_malloc_at(unsigned long size, const char *file, int line);
 PUB_FUNC void *tcc_mallocz_at(unsigned long size, const char *file, int line);
 /* The IR arrays every pass walks: on the board, in memory that cannot miss (see
- * libtcc.c).  Everywhere else, the plain heap. */
-#if defined(TCC_IS_NATIVE) && defined(TARGETOS_YasOS)
+ * libtcc.c), and in the tracing cross that stands in for it (TCC_ALLOC_BACKTRACE).
+ * Everywhere else, the plain heap. */
+#if (defined(TCC_IS_NATIVE) && defined(TARGETOS_YasOS)) || defined(TCC_ALLOC_BACKTRACE)
+#define TCC_HOT_ARENA 1
+#else
+#define TCC_HOT_ARENA 0
+#endif
+#if TCC_HOT_ARENA
 PUB_FUNC void *tcc_hot_mallocz_at(unsigned long size, const char *file, int line);
 PUB_FUNC void *tcc_hot_realloc_at(void *ptr, unsigned long size, const char *file, int line);
 PUB_FUNC void tcc_hot_free(void *ptr);
@@ -2591,6 +2732,31 @@ ST_DATA int pp_pack_captures;
 /* display benchmark infos */
 ST_DATA int tok_ident;
 ST_DATA TokenSym **table_ident;
+ST_FUNC const char *tok_name_load(TokenSym *ts);
+ST_FUNC const char *tok_name_tmp(int v);
+/* A local symbol put_extern_sym2 named by its token: st_name holds the token
+ * with this bit, and its name goes into strtab only at the end of the TU
+ * (elf_names_materialize) -- a Zig kernel compile's strtab was 180 KB of its
+ * peak, the names of its thousands of static functions.  tccelf_end_file
+ * fills them in, for a C or an asm file alike. */
+#define ELF_NAME_DEFERRED 0x80000000u
+ST_FUNC void elf_names_materialize(TCCState *s1);
+ST_FUNC void funcname_copies_free(void);
+ST_FUNC void tok_names_spill(void);
+/* TS's name, read back from the spill file if it is there (TokenSym.str). */
+static inline const char *tok_name(TokenSym *ts)
+{
+  return ((uintptr_t)ts->str & 1) ? tok_name_load(ts) : ts->str;
+}
+/* Whether token T is the identifier S of LEN bytes: the length first, so a
+ * spilled name of another length is not read back for it. */
+static inline int tok_is_ident(int t, const char *s, int len)
+{
+  TokenSym *ts;
+  if (t < TOK_IDENT || t >= tok_ident || !(ts = table_ident[t - TOK_IDENT]) || ts->len != len)
+    return 0;
+  return !memcmp(tok_name(ts), s, len);
+}
 ST_DATA int pp_expr;
 
 #define TOK_FLAG_BOL 0x0001   /* beginning of line before */
@@ -2628,7 +2794,16 @@ ST_FUNC TokenSym *tok_ensure(int v); /* table_ident[v], materializing a lazy bui
 ST_FUNC TokenSym *tok_find(const char *str, int len); /* existing token or NULL; interns nothing */
 ST_FUNC int tok_alloc_const(const char *str);
 ST_FUNC const char *get_tok_str(int v, CValue *cv);
+ST_FUNC TokenString *tok_str_borrow(TokenString *str, int len);
+ST_FUNC void split_pad_note(TCCState *s1, unsigned off);
+ST_FUNC void text_window_spill(TCCState *s1);
+ST_FUNC void text_window_unspill_all(TCCState *s1);
+ST_FUNC const unsigned char *text_window_bytes(TCCState *s1, Section *sec, unsigned long off, unsigned long size,
+                                               unsigned char **tmp);
+ST_FUNC void split_pads_erased(TCCState *s1, unsigned start, unsigned size, unsigned shift);
+ST_FUNC int tok_reading_compile_replay(void);
 ST_FUNC void begin_macro(TokenString *str, int alloc);
+ST_FUNC void begin_macro_kept(TokenString *str);
 ST_FUNC void end_macro(void);
 ST_FUNC void end_macro_to(TokenString *target);
 ST_FUNC int set_idnum(int c, int val);
@@ -2639,6 +2814,15 @@ ST_FUNC void tok_str_free_str(int *str);
 ST_FUNC int *tok_str_ensure_heap(TokenString *s);
 ST_FUNC void tok_str_fit(TokenString *s);
 ST_FUNC TokenString *tok_str_keep(TokenString *s);
+ST_FUNC void tok_str_spill(TokenString *s);
+ST_FUNC void tok_str_release(TokenString *s);
+ST_FUNC void tok_str_release_parsed(void);
+ST_FUNC void tok_str_release_spilled(void);
+ST_FUNC void tok_str_spill_close(void);
+ST_FUNC int tcc_spill_active(void);
+ST_FUNC long tcc_spill_append(const void *p, size_t n);
+ST_FUNC void tcc_spill_read(long off, void *p, size_t n);
+ST_FUNC const char *tcc_filename_intern(const char *name);
 ST_FUNC void tok_str_add(TokenString *s, int t);
 ST_FUNC void tok_str_add2(TokenString *s, int t, CValue *cv);
 ST_FUNC void tok_str_add_tok(TokenString *s);
@@ -2763,7 +2947,7 @@ ST_FUNC struct Sym *tccgen_predef_proto_find_unseen(int v);
 #define TCC_PREDEF_PROTO_INTERNED(ts)                                                   \
   do                                                                                    \
   {                                                                                     \
-    if (tcc_predef_protos_armed && (ts)->len > 10 && !memcmp((ts)->str, "__builtin_", 10)) \
+    if (tcc_predef_protos_armed && (ts)->len > 10 && !memcmp(tok_name(ts), "__builtin_", 10)) \
       tccgen_predef_proto_interned(ts);                                                 \
   } while (0)
 #define TCC_PREDEF_PROTOS_FLUSH()       \
@@ -2825,6 +3009,8 @@ ST_FUNC void sym_heads_free(void);
 ST_FUNC Sym *sym_push2_short(Sym **ps, int v, int t, int c);
 ST_FUNC void sym_free_short(Sym *s);
 ST_FUNC void sym_short_pools_free(void);
+ST_FUNC int sym_outlived_locals_mark(void);
+ST_FUNC void sym_free_outlived_locals(int mark);
 ST_FUNC Sym *sym_pointer_node(CType *type);
 ST_FUNC void sym_pointer_nodes_free(void);
 /* A parked prototype (sym_park_proto): its name's sym_identifier holds the
@@ -2832,6 +3018,12 @@ ST_FUNC void sym_pointer_nodes_free(void);
 #define SYM_IS_PARKED(s) ((uintptr_t)(s) & 1)
 ST_FUNC Sym *sym_unpark(TokenSym *ts);
 ST_FUNC void sym_park_proto(Sym *s, Sym *stack_before);
+ST_FUNC void sym_params_track(Sym *ref, Sym *stack_before);
+ST_FUNC void sym_params_release(void);
+ST_FUNC void sym_params_spill_close(void);
+ST_FUNC int sym_functype_adopt(Sym *old_ref, Sym *new_ref);
+extern Sym *declarator_last_functype;
+ST_DATA int gen_function_depth;
 ST_FUNC void sym_parked_free_all(void);
 
 ST_FUNC Sym *global_identifier_push(int v, int t, int c);
@@ -2918,6 +3110,7 @@ ST_FUNC void tccelf_begin_file(TCCState *s1);
 ST_FUNC void tccelf_end_file(TCCState *s1);
 ST_FUNC Section *new_section(TCCState *s1, const char *name, int sh_type, int sh_flags);
 ST_FUNC void section_realloc(Section *sec, unsigned long new_size);
+ST_FUNC void section_fit(Section *sec);
 ST_FUNC void section_materialize(TCCState *s1, Section *sec);
 ST_FUNC int deferred_chunks_read(TCCState *s1, DeferredChunk **chunks, unsigned char *dest, int *fd, const char **fd_path);
 ST_FUNC void section_reserve_exact(Section *sec, unsigned long size);
@@ -2935,6 +3128,7 @@ ST_FUNC void *link_arena_alloc(TCCState *s1, unsigned long size);
 ST_FUNC int link_arena_owns(const TCCState *s1, const void *p);
 ST_FUNC char **tcc_name_list_read(TCCState *s1, const char *path, const char *option, int *count);
 ST_FUNC int tcc_name_list_has(char **names, int count, const char *name, size_t len);
+ST_FUNC int tcc_name_list_has_unnumbered(char **names, int count, const char *name);
 ST_FUNC void tcc_name_list_sort(char **names, int count);
 ST_FUNC Section *new_input_section(TCCState *s1, const char *name, int sh_type, int sh_flags);
 ST_FUNC void tcc_link_arena_prepare(TCCState *s1);

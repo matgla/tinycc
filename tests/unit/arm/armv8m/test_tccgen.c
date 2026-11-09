@@ -291,6 +291,11 @@ const char *get_tok_str(int v, CValue *cv)
   return "?";
 }
 
+const char *tok_name_tmp(int v)
+{
+  return get_tok_str(v, NULL);
+}
+
 void _tcc_warning(const char *fmt, ...)
 {
   (void)fmt;
@@ -319,6 +324,25 @@ int tok_alloc_const(const char *str)
   return 0;
 }
 void gen_vla_sp_restore(int addr) { (void)addr; }
+/* internal spill (tccpp.c): no test spills, so a spilled string never exists. */
+int *tok_str_unspill(TokenString *s)
+{
+  (void)s;
+  abort();
+}
+void tok_str_spill_close(void) {}
+/* symtab.c's parameter-list spill: never active in these tests. */
+int tcc_spill_active(void) { return 0; }
+long tcc_spill_append(const void *p, size_t n)
+{
+  (void)p, (void)n;
+  return -1;
+}
+void tcc_spill_read(long off, void *p, size_t n)
+{
+  (void)off, (void)p, (void)n;
+  abort();
+}
 
 /* ---------------------------------------------------------------------------
  * gen_op / gen_cast link cascade.  gen_opic/gen_opif/gen_cast fold constant
@@ -949,6 +973,29 @@ UT_TEST(test_sym_push_and_sym_find)
   UT_ASSERT_EQ(sym_find(TOK_IDENT + 1), s);
   UT_ASSERT_EQ(s->r, VT_CONST);
   sym_pop(&global_stack, NULL, 0);
+  return 0;
+}
+
+/* Inside gen_function the backend runs after the body's scopes close, and
+ * reads their Syms through the IR (inline asm's saved operands, operand
+ * types): a popped block-scope Sym with no frame offset waits for the
+ * function's outlived list instead of going back to the free list, where a
+ * later scope of the same function would get it with another type. */
+UT_TEST(test_sym_pop_defers_free_inside_gen_function)
+{
+  tcc_state = &ut_dummy_state;
+  ut_dummy_state.ir = NULL;
+  reset_symbol_state();
+  int mark = sym_outlived_locals_mark();
+  gen_function_depth++; /* inside gen_function */
+  Sym *s = sym_push2(&local_stack, TOK_IDENT + 1, VT_INT | VT_VOLATILE, 0);
+  s->r = VT_LOCAL | VT_LVAL;
+  sym_pop(&local_stack, NULL, 0);
+  UT_ASSERT_EQ(s->v, TOK_IDENT + 1);
+  UT_ASSERT_EQ(s->type.t, VT_INT | VT_VOLATILE);
+  gen_function_depth--;
+  sym_free_outlived_locals(mark); /* with the function's other outlived Syms */
+  tcc_state = NULL;
   return 0;
 }
 
@@ -2965,6 +3012,69 @@ UT_TEST(test_try_get_constant_string_guards)
   return 0;
 }
 
+/* A function's bytes are code, not a string: its ELF value carries the Thumb
+ * bit, so a scan from st_value + offset for st_size bytes also ran one byte
+ * past a section fitted to its code (-ffunction-sections, section_fit).  And
+ * no symbol's bytes are read past what its section holds. */
+UT_TEST(test_try_get_constant_string_function_and_bounds)
+{
+  static unsigned char code[8] = {0x01, 0x02, 0x00, 0x04, 0x05, 0x06, 0x07, 0x08};
+  static unsigned char bytes[8] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'};
+  Section text, data, *secs[3] = {NULL, &text, &data};
+  SValue sv;
+  Sym sym;
+  int len = -1;
+
+  tcc_state = &ut_dummy_state;
+  ut_dummy_state.sections = secs;
+  ut_dummy_state.nb_sections = 3;
+  symtab_section = &ut_symtab_section;
+  ut_symtab_section.data = (unsigned char *)ut_symtab_data;
+  memset(&text, 0, sizeof text);
+  text.data = code;
+  text.data_offset = text.data_allocated = sizeof code;
+  text.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+  memset(&data, 0, sizeof data);
+  data.data = bytes;
+  data.data_offset = data.data_allocated = sizeof bytes;
+  data.sh_flags = SHF_ALLOC;
+
+  memset(&sym, 0, sizeof sym);
+  memset(&sv, 0, sizeof sv);
+  sym.c = 1;
+  sv.sym = &sym;
+  sv.r = VT_CONST | VT_SYM;
+  sv.type.t = VT_PTR;
+
+  /* a Thumb function: value 1, 8 bytes of code with a zero byte in them */
+  memset(&ut_symtab_data[1], 0, sizeof ut_symtab_data[1]);
+  ut_symtab_data[1].st_value = 1;
+  ut_symtab_data[1].st_size = sizeof code;
+  ut_symtab_data[1].st_info = ELFW(ST_INFO)(STB_LOCAL, STT_FUNC);
+  ut_symtab_data[1].st_shndx = 1;
+  UT_ASSERT(try_get_constant_string(&sv, &len) == NULL);
+
+  /* an object whose size runs past its section's data: no terminator inside */
+  ut_symtab_data[1].st_value = 0;
+  ut_symtab_data[1].st_size = 16;
+  ut_symtab_data[1].st_info = ELFW(ST_INFO)(STB_LOCAL, STT_OBJECT);
+  ut_symtab_data[1].st_shndx = 2;
+  UT_ASSERT(try_get_constant_string(&sv, &len) == NULL);
+
+  /* still found inside: "ab" at the start of a 3-byte object */
+  bytes[2] = 0;
+  ut_symtab_data[1].st_size = 3;
+  UT_ASSERT(try_get_constant_string(&sv, &len) != NULL);
+  UT_ASSERT_EQ(len, 2);
+  bytes[2] = 'c';
+
+  ut_dummy_state.sections = NULL;
+  ut_dummy_state.nb_sections = 0;
+  symtab_section = NULL;
+  tcc_state = NULL;
+  return 0;
+}
+
 /* Fold a binary op over two int constants and return the result. */
 static long long fold_ii(int a, int b, int op)
 {
@@ -3449,7 +3559,7 @@ UT_TEST(test_struct_is_small_bitfield_word)
 UT_TEST(test_promote_bitfield_expr_type)
 {
   /* build a bitfield btype: base | VT_BITFIELD | (size << (STRUCT_SHIFT+6)) */
-#define BF(base, size) ((base) | VT_BITFIELD | ((size) << (VT_STRUCT_SHIFT + 6)))
+#define BF(base, size) ((base) | VT_BITFIELD | (int)((unsigned)(size) << (VT_STRUCT_SHIFT + 6)))
 
   /* signed int:5 -> int (bitfield bits stripped) */
   UT_ASSERT_EQ(promote_bitfield_expr_type(BF(VT_INT, 5)), VT_INT);

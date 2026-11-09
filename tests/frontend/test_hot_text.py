@@ -208,3 +208,24 @@ def test_a_flash_caller_calls_the_flash_copy_of_a_marked_function(tcc, tmp_path)
     assert re.search(r"bl\s+[0-9a-f]+ <hot_a>", body(dis, "cold_b")), "no veneer from flash"
     assert not re.search(r"bl\s+[0-9a-f]+ <hot_tail>", body(dis, "_start")), "unmarked: still a veneer"
     assert re.search(r"bl\s+[0-9a-f]+ <hot_b>", body(dis, "hot_a"))
+
+
+def test_the_list_names_zig_functions_without_their_numbers(tcc, tmp_path):
+    """Zig's C backend numbers functions (fn__1234) and inner functions (fn__func_12__345)
+    afresh on every change of the compiler: a list made from a profile names them without
+    the numbers, as --ram-text does.  Only __<digits> ending the name or before '_' is a
+    number: _28..._29 is how the backend spells '(...)'."""
+    objs = compile_objects(tcc, tmp_path, {"k": "int fn_a__1234(int a) { return a + 1; }\n"
+                                                "int fn_g__func_7__88(int a) { return a + 2; }\n"
+                                                "int pool_28256_29_bit__9(int a) { return a + 3; }\n"
+                                                "int fn_a__x12(int a) { return a + 4; }\n"
+                                                "int exact__77(int a) { return a + 5; }\n"
+                                                "int cold__5(int a) { return a + 6; }\n"
+                                                "int _start(int a) { return fn_a__1234(a) + fn_g__func_7__88(a) + "
+                                                "pool_28256_29_bit__9(a) + fn_a__x12(a) + exact__77(a) + cold__5(a); }\n"})
+    hot = tmp_path / "hot.txt"
+    hot.write_text("fn_a\nfn_g\npool_28256_29_bit\nexact__77\n")
+    s = symbols(link_objects(tcc, tmp_path, objs, f"-Wl,--hot-text={hot}"))
+    cold = max(s["cold__5"], s["_start"], s["fn_a__x12"])
+    for name in ("fn_a__1234", "fn_g__func_7__88", "pool_28256_29_bit__9", "exact__77"):
+        assert s[name] > cold, name

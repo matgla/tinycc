@@ -30,7 +30,7 @@ int struct_has_vla_member(const CType *type)
   Sym *f;
   if ((type->t & VT_BTYPE) != VT_STRUCT)
     return 0;
-  for (f = type->ref->next; f; f = f->next)
+  for (f = sym_first(type->ref); f; f = f->next)
     if (f->type.t & VT_VLA)
       return 1;
   return 0;
@@ -47,7 +47,7 @@ int struct_has_bitfield_member(const CType *type)
   Sym *f;
   if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
     return 0;
-  for (f = type->ref->next; f; f = f->next)
+  for (f = sym_first(type->ref); f; f = f->next)
     if (f->type.t & VT_BITFIELD)
       return 1;
   return 0;
@@ -59,7 +59,7 @@ int struct_is_single_2byte_scalar_member(const CType *type)
   Sym *f;
   if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
     return 0;
-  f = type->ref->next;
+  f = sym_first(type->ref);
   if (!f || f->next || f->c != 0)
     return 0;
   if (f->type.t & VT_BITFIELD)
@@ -86,7 +86,7 @@ int struct_is_small_bitfield_word(const CType *type)
   sz = type_size(type, &align);
   if (sz != 1 && sz != 2 && sz != 4)
     return 0;
-  for (f = type->ref->next; f; f = f->next)
+  for (f = sym_first(type->ref); f; f = f->next)
   {
     if (!(f->type.t & VT_BITFIELD))
       return 0;
@@ -132,7 +132,7 @@ int struct_member_copy_safe(const CType *type)
   int align, saw_bf = 0;
   if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
     return 0;
-  for (f = type->ref->next; f; f = f->next)
+  for (f = sym_first(type->ref); f; f = f->next)
   {
     if (f->type.t & VT_BITFIELD)
     {
@@ -169,7 +169,7 @@ void ir_emit_struct_unit_copy(const SValue *src, const SValue *dst,
   if (size <= 0 || size > (int)sizeof(cut))
     return; /* caller gates size <= 16; defensive against overflow */
   memset(cut, 0, sizeof(cut));
-  for (f = stype->ref->next; f; f = f->next)
+  for (f = sym_first(stype->ref); f; f = f->next)
   {
     int off = f->c, w, align;
     if (f->type.t & VT_BITFIELD)
@@ -252,7 +252,7 @@ int struct_is_single_1byte_scalar_member(const CType *type)
   Sym *f;
   if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
     return 0;
-  f = type->ref->next;
+  f = sym_first(type->ref);
   if (!f || f->next || f->c != 0)
     return 0;
   if (f->type.t & VT_BITFIELD)
@@ -284,7 +284,7 @@ static int small_copy_cover(const CType *t, int base, int w, int size, unsigned 
   {
     if (!t->ref)
       return 0;
-    for (Sym *f = t->ref->next; f; f = f->next)
+    for (Sym *f = sym_first(t->ref); f; f = f->next)
     {
       if (f->type.t & VT_BITFIELD)
       {

@@ -1293,6 +1293,12 @@ ST_FUNC void free_section(Section *s)
     tcc_free(s->aux->hash_val_cache);
   tcc_free(s->aux);
   s->aux = NULL;
+  if (s->data_bias)
+  {
+    /* a compile stopped with .text spilled (text_window_spill) */
+    s->data += s->data_bias;
+    s->data_bias = 0;
+  }
   if (!link_arena_owns(s->s1, s->data))
     tcc_free(s->data);
   s->data = NULL;
@@ -1378,6 +1384,7 @@ ST_FUNC void tccelf_end_file(TCCState *s1)
   Section *s = s1->symtab;
   int first_sym, nb_syms, *tr, i;
 
+  elf_names_materialize(s1); /* C or asm: the deferred names, before they are read below */
   first_sym = s->sh_offset / sizeof(ElfSym);
   nb_syms = s->data_offset / sizeof(ElfSym) - first_sym;
   s->data_offset = s->sh_offset;

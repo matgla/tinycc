@@ -62,10 +62,11 @@ static int vl_def_pos(TCCIRState *ir, IRQuadCompact *q, int num_vars)
   return p;
 }
 
-/* Set the bit of every VAR `q` reads in `live`, except those already set in
- * `kill` (NULL: none).  With kill = the block's defs-so-far this adds the
- * instruction's upward-exposed uses straight into the block's USE set. */
-static void vl_mark_uses(TCCIRState *ir, IRQuadCompact *q, int num_vars,
+/* Set the bit of every candidate VAR `q` reads in `live` (bits are MAP's
+ * dense numbers), except those already set in `kill` (NULL: none).  With kill
+ * = the block's defs-so-far this adds the instruction's upward-exposed uses
+ * straight into the block's USE set. */
+static void vl_mark_uses(TCCIRState *ir, IRQuadCompact *q, int num_vars, const int *map,
                          uint32_t *live, const uint32_t *kill)
 {
   int p[4], k = 0;
@@ -83,8 +84,11 @@ static void vl_mark_uses(TCCIRState *ir, IRQuadCompact *q, int num_vars,
       (p[k] = vl_var_pos(tcc_ir_op_get_dest(ir, q), num_vars)) >= 0)
     k++;
   while (k-- > 0)
-    if (!kill || !VL_BIT(kill, p[k]))
-      VL_SET(live, p[k]);
+  {
+    int m = map[p[k]];
+    if (m >= 0 && (!kill || !VL_BIT(kill, m)))
+      VL_SET(live, m);
+  }
 }
 
 static int vl_removable(TCCIRState *ir, IRQuadCompact *q)
@@ -146,13 +150,7 @@ int dce_var_liveness(IRSSAOptCtx *ctx)
   }
 
   int nb = cfg->num_blocks;
-  int nw = (num_vars + 31) / 32;
-  size_t bmsz = (size_t)nw * sizeof(uint32_t);
-  uint32_t *excl = tcc_mallocz(bmsz);
-  uint32_t *use = tcc_mallocz((size_t)nb * bmsz);
-  uint32_t *def = tcc_mallocz((size_t)nb * bmsz);
-  uint32_t *lin = tcc_mallocz((size_t)nb * bmsz);
-  uint32_t *live = tcc_mallocz(bmsz);
+  uint32_t *excl = tcc_mallocz((size_t)((num_vars + 31) / 32) * sizeof(uint32_t));
 
   /* sticky iv->addrtaken deliberately NOT consulted: escapes are re-derived below */
   for (int p = 0; p < num_vars; p++) {
@@ -184,6 +182,36 @@ int dce_var_liveness(IRSSAOptCtx *ctx)
     }
   }
 
+  /* Only a VAR with a definition this pass may remove needs its liveness:
+   * the rest are never asked about, and liveness is per VAR.  They get dense
+   * numbers for the bitsets, which were blocks x every VAR slot -- most of them
+   * promoted by SSA long before (kernel.c's largest function: three 204 KB
+   * sets for 4166 slots, at what had become the compile's peak). */
+  int *map = tcc_malloc((size_t)num_vars * sizeof(int));
+  int ncand = 0;
+  for (int p = 0; p < num_vars; p++)
+    map[p] = -1;
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    int dp = vl_def_pos(ir, q, num_vars);
+    if (dp >= 0 && !VL_BIT(excl, dp) && map[dp] < 0)
+      map[dp] = ncand++;
+  }
+  if (!ncand) {
+    tcc_free(map);
+    tcc_free(excl);
+    tcc_ir_cfg_free(cfg);
+    return 0;
+  }
+  int nw = (ncand + 31) / 32;
+  size_t bmsz = (size_t)nw * sizeof(uint32_t);
+  uint32_t *use = tcc_mallocz((size_t)nb * bmsz);
+  uint32_t *def = tcc_mallocz((size_t)nb * bmsz);
+  uint32_t *lin = tcc_mallocz((size_t)nb * bmsz);
+  uint32_t *live = tcc_mallocz(bmsz);
+
   for (int b = 0; b < nb; b++) {
     uint32_t *ub = use + (size_t)b * nw;
     uint32_t *db = def + (size_t)b * nw;
@@ -193,10 +221,10 @@ int dce_var_liveness(IRSSAOptCtx *ctx)
         continue;
       /* Uses go straight into USE: clearing and OR-ing a whole bitset per
        * instruction made this O(instructions x VARs). */
-      vl_mark_uses(ir, q, num_vars, ub, db);
+      vl_mark_uses(ir, q, num_vars, map, ub, db);
       int dp = vl_def_pos(ir, q, num_vars);
       if (dp >= 0 && !VL_BIT(excl, dp))
-        VL_SET(db, dp);
+        VL_SET(db, map[dp]);
     }
   }
 
@@ -237,18 +265,20 @@ int dce_var_liveness(IRSSAOptCtx *ctx)
           continue;
         int dp = vl_def_pos(ir, q, num_vars);
         if (dp >= 0 && !VL_BIT(excl, dp)) {
-          if (!VL_BIT(live, dp) && vl_removable(ir, q)) {
+          int m = map[dp];
+          if (!VL_BIT(live, m) && vl_removable(ir, q)) {
             ssa_opt_nop_instr(ctx, i);
             changes++;
             continue;
           }
-          VL_CLR(live, dp);
+          VL_CLR(live, m);
         }
-        vl_mark_uses(ir, q, num_vars, live, NULL);
+        vl_mark_uses(ir, q, num_vars, map, live, NULL);
       }
     }
   }
 
+  tcc_free(map);
   tcc_free(excl);
   tcc_free(use);
   tcc_free(def);

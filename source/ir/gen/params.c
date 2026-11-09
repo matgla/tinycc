@@ -65,7 +65,7 @@ void tcc_ir_params_add(TCCIRState *ir, CType *func_type)
   }
 
   /* Process function parameters */
-  tcc_ir_params_process_arguments(ir, sym->next, &call_layout);
+  tcc_ir_params_process_arguments(ir, sym_first(sym), &call_layout);
 
   tcc_abi_call_layout_deinit(&call_layout);
 }
@@ -240,7 +240,7 @@ int tcc_ir_params_sret_shift_moves(Sym *func_ref, uint8_t *src, uint8_t *dst, in
   with_sret.hard_float = without.hard_float = (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT);
   with_sret.is_variadic = without.is_variadic = func_ref->f.func_type == FUNC_ELLIPSIS;
   with_sret.next_reg = 1;
-  for (Sym *p = func_ref->next; p && n >= 0; p = p->next, arg_index++)
+  for (Sym *p = sym_first(func_ref); p && n >= 0; p = p->next, arg_index++)
   {
     TCCAbiArgDesc desc;
     tcc_ir_param_abi_desc(&p->type, &desc);

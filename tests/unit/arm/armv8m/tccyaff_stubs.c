@@ -257,3 +257,9 @@ void add32le(unsigned char *p, int32_t x)
 {
   write32le(p, read32le(p) + x);
 }
+
+/* frontend/gen/sym/elfsym.c: nothing defers a name here */
+void elf_names_materialize(struct TCCState *s1)
+{
+  (void)s1;
+}
