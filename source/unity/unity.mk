@@ -2,7 +2,7 @@
 # Unity-build groups: see the "Unity build" block in the Makefile.
 # Membership comes from source/unity/groups.txt.
 # own TU: source/backend/generators/regalloc.c (expands differently inside a group)
-# own TU: source/driver/libtcc.c (redefines header macros WARN_ON _tcc_error free gnu_ext realloc tcc_malloc tcc_mallocz tcc_realloc)
+# own TU: source/driver/libtcc.c (redefines header macros WARN_ON _tcc_error free gnu_ext realloc)
 # own TU: source/frontend/gen/decl/decl.c (redefines header macros gjmp gjmp_addr)
 # own TU: source/frontend/gen/init/initializer.c (redefines header macros DIF_CLEAR DIF_FIRST DIF_HAVE_ELEM DIF_SIZE_ONLY EXPR_ANY EXPR_CONST)
 # own TU: source/frontend/gen/type/compare.c (redefines header macros CMP_OP SHIFT_OP)

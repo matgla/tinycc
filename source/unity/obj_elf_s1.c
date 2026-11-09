@@ -8,6 +8,7 @@
 #include "../obj/tccelf_load.c"
 #undef LINK_ARENA_MIN
 #include "../obj/tccelf_output.c"
+#undef TEXT_WINDOW_MIN
 #include "../obj/tccelf_reloc.c"
 #include "../obj/tccelf_sym.c"
 #undef ELFCLASS_BITS
