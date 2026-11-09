@@ -420,7 +420,8 @@ def test_computed_goto_keeps_the_result_buffer(char_result_frames):
 # bytes of frame or none depending on how the temps happened to be numbered.
 
 DEAD_LOCALS_SOURCE = r"""
-#include <string.h>
+typedef __SIZE_TYPE__ size_t;
+void *memset(void *, int, size_t); /* no <string.h>: a bare cross has no sysroot */
 typedef unsigned long long u64;
 
 _Bool meta_eql(u64 const a0, u64 const a1)
