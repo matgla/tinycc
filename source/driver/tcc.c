@@ -625,19 +625,3 @@ cleanup_early:
     fclose(ppfp);
   return ret;
 }
-
-ST_FUNC int tcc_is_64bit_operand(SValue *sv)
-{
-  int vt = 0;
-  if (sv == NULL)
-  {
-    return 0;
-  }
-
-  vt = sv->type.t & VT_BTYPE;
-  if ((vt == VT_LLONG) || (vt == VT_DOUBLE) || (vt == VT_LDOUBLE))
-  {
-    return 1;
-  }
-  return 0;
-}

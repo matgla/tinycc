@@ -41,6 +41,7 @@ extern int tcc_output_file(TCCState *s, const char *filename);
 /* Rename main() so the test harness keeps its own entry point. */
 #define main tcc_ut_main
 #include "tcc.c"
+#include "tcchelpers.c"
 #undef main
 
 /* ========================================================================

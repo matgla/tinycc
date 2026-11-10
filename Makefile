@@ -646,6 +646,16 @@ $(DRIVER_MAIN_OBJ) : DEFINES += $(DEF_GITHASH)
 $(CROSS_TARGET)-tcc$(EXESUF): $(TCC_FILES)
 	$S$(CC) -o $@ $(DRIVER_MAIN_OBJ) $(LINK_MODULE_LIBS) $(ARCH_LIB) $(LDFLAGS) $(LIBS)
 
+# libtcc as a shared library, for programs that compile through the library
+# rather than running the driver.  The modules must be position independent: on
+# a host, configure with --extra-cflags=-fPIC; the YasOS stages are PIC already.
+# `make armv8m-libtcc.so`
+%-libtcc$(DLLSUF): $(TCCDEFS_H) FORCE
+	@$(MAKE) --no-print-directory $@ CROSS_TARGET=$*
+
+$(CROSS_TARGET)-libtcc$(DLLSUF): $(TCC_LIBS)
+	$S$(CC) -shared -o $@ $(LINK_MODULE_LIBS) $(ARCH_LIB) $(LDFLAGS) $(LIBS)
+
 # Cross libtcc1.a
 %-libtcc1.a : %-tcc$(EXESUF) FORCE
 	@$(MAKE) -C lib CROSS_TARGET=$*

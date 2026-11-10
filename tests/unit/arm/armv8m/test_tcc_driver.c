@@ -31,6 +31,7 @@ char *tcc_driver_fileextension_for_unit_tests(const char *name)
 #define read64le tcc_driver_read64le_for_unit_tests
 #define write64le tcc_driver_write64le_for_unit_tests
 #include "tcc.c"
+#include "tcchelpers.c"
 #undef write64le
 #undef read64le
 #undef add32le

@@ -3566,3 +3566,5 @@ PUB_FUNC void tcc_print_stats(TCCState *s1, unsigned total_time)
   fprintf(stderr, " %d max (bytes)\n", mem_max_size);
 #endif
 }
+
+#include "tcchelpers.c"
