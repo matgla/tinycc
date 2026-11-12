@@ -27,6 +27,19 @@
 /* parse a function defined by symbol 'sym' and generate its code in
    'cur_text_section' */
 
+/* Where a symbol starts in its section.  Code symbols carry the Thumb bit in
+ * st_value; code is halfword-aligned, so in an executable section bit 0 is
+ * only ever that tag.  A data object has no tag and may start at an odd
+ * offset (a packed .rodata string): masking it would put it one byte early. */
+static addr_t sym_section_addr(TCCState *s, const ElfW(Sym) *e)
+{
+  const int shndx = e->st_shndx;
+  const int code = ELFW(ST_TYPE)(e->st_info) == STT_FUNC ||
+                   (shndx > 0 && shndx < s->nb_sections && s->sections[shndx] &&
+                    (s->sections[shndx]->sh_flags & SHF_EXECINSTR));
+  return code ? e->st_value & ~(addr_t)1 : e->st_value;
+}
+
 /* Remove [start, start+size) bytes from `sec`, shifting trailing data
  * down by a multiple of `unit` (a power of two: the alignment the tail must
  * keep).  Updates symbol values and relocation offsets accordingly so
@@ -90,9 +103,7 @@ static void erase_section_range(TCCState *s, Section *sec, addr_t start, addr_t 
     {
       if (syms[i].st_shndx != sec->sh_num)
         continue;
-      /* Thumb function symbols carry a LSB tag (st_value odd), so compare
-       * after masking. */
-      addr_t sv = syms[i].st_value & ~(addr_t)1;
+      addr_t sv = sym_section_addr(s, &syms[i]);
       if (sv >= start + size)
       {
         syms[i].st_value -= shift;
@@ -1204,7 +1215,7 @@ void gc_unreferenced_statics(TCCState *s)
     if (e->st_shndx == SHN_UNDEF || e->st_shndx >= nsec || !s->sections[e->st_shndx] ||
         !(s->sections[e->st_shndx]->sh_flags & SHF_ALLOC))
       continue;
-    addr_t start = e->st_value & ~(addr_t)1; /* Thumb bit */
+    addr_t start = sym_section_addr(s, e);
     nodes[nn].sec = e->st_shndx;
     nodes[nn].start = start;
     nodes[nn].end = start + e->st_size;
@@ -1266,7 +1277,7 @@ void gc_unreferenced_statics(TCCState *s)
         pinned[e->st_shndx] = 1;
         continue;
       }
-      int to = gc_node_at(nodes, sec_first, sec_count, e->st_shndx, e->st_value & ~(addr_t)1);
+      int to = gc_node_at(nodes, sec_first, sec_count, e->st_shndx, sym_section_addr(s, e));
       if (to < 0)
         continue;
       int from = gc_node_at(nodes, sec_first, sec_count, sh, rel->r_offset);
@@ -1306,11 +1317,11 @@ void gc_unreferenced_statics(TCCState *s)
   {
     ElfW(Sym) *e = &syms[i];
     if (ELFW(ST_BIND)(e->st_info) != STB_LOCAL && e->st_shndx != SHN_UNDEF && e->st_shndx < nsec)
-      GC_MARK(gc_node_at(nodes, sec_first, sec_count, e->st_shndx, e->st_value & ~(addr_t)1));
+      GC_MARK(gc_node_at(nodes, sec_first, sec_count, e->st_shndx, sym_section_addr(s, e)));
   }
   for (Sym *g = global_stack; g; g = g->prev)
     if (g->a.used && g->c > 0 && g->c < nsyms && syms[g->c].st_shndx < nsec)
-      GC_MARK(gc_node_at(nodes, sec_first, sec_count, syms[g->c].st_shndx, syms[g->c].st_value & ~(addr_t)1));
+      GC_MARK(gc_node_at(nodes, sec_first, sec_count, syms[g->c].st_shndx, sym_section_addr(s, &syms[g->c])));
   while (nw)
   {
     int n = work[--nw];
@@ -1333,7 +1344,7 @@ void gc_unreferenced_statics(TCCState *s)
       int type = ELFW(ST_TYPE)(e->st_info);
       if (e->st_shndx != nodes[i].sec || type == STT_SECTION || type == STT_FILE)
         continue;
-      addr_t v = e->st_value & ~(addr_t)1;
+      addr_t v = sym_section_addr(s, e);
       if (v < nodes[i].start || v >= nodes[i].end)
         continue;
       const char *nm = symtab_section->link && !(e->st_name & ELF_NAME_DEFERRED)
