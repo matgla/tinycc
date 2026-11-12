@@ -19,6 +19,11 @@
 #undef OUTLINE_MAX_OPS
 #undef OUTLINE_MIN_BYTES
 #undef R_IS_SP_LR_PC
+#undef TAB_BODY
+#undef TAB_KEY
+#undef TAB_PAGE
+#undef TAB_PAGE_BITS
+#undef TAB_VAL
 #undef USING_GLOBALS
 #undef WINDOW_EXTEND
 #undef WINDOW_SIZE

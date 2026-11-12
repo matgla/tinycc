@@ -57,14 +57,14 @@ static int tcc_vector_grow_storage(void *data_owner, size_t *capacity, size_t el
   if (minimum_capacity <= *capacity) {
     return 0;
   }
-  new_capacity = *capacity == 0 ? 4 : *capacity;
-  while (new_capacity < minimum_capacity) {
-    if (new_capacity > SIZE_MAX / 2) {
-      new_capacity = minimum_capacity;
-      break;
-    }
-    new_capacity *= 2;
-  }
+  /* Twice what it had, or exactly what is asked when that is more: pushes grow
+   * geometrically as before, and a resize to a size known up front (a matrix of
+   * words by blocks) is not rounded up to the next power of two -- 34,029 entries
+   * took a 512 KB block for 272 KB of them, on a device where the block is what
+   * runs out first. */
+  new_capacity = *capacity == 0 ? 4 : (*capacity > SIZE_MAX / 2 ? minimum_capacity : *capacity * 2);
+  if (new_capacity < minimum_capacity)
+    new_capacity = minimum_capacity;
   return tcc_vector_reserve_storage(data_owner, capacity, element_size, new_capacity);
 }
 

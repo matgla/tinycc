@@ -105,6 +105,9 @@ $(TOP)/bcheck.o : XFLAGS += $(BFLAGS) -I$(TOP)
 # `ldr Rt,[r9,#imm12]` form (ctags' 13 KB GOT put chk_calls at offset 13040).
 ifeq ($T,armv8m)
 $(X)builtin.o : XFLAGS += -mno-sb-relative-got
+# The user runtime: no exclusives, which never succeed in the RP2350's PSRAM (see
+# armv8m_atomic.S).  The kernel assembles its own copy with them.
+$(X)armv8m_atomic.o : XFLAGS += -DTCC_ATOMICS_PLAIN
 endif
 # includes tccrun.c, $(TOP) for config.h  (tccrun.c prerequisite via $(TCC))
 $(TOP)/bt-exe.o : XFLAGS += -I$(TOP)

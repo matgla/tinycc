@@ -350,12 +350,6 @@ static uint64_t fnv_mix(uint64_t h, uint64_t v)
   return h;
 }
 
-typedef struct
-{
-  uint64_t key;
-  uint32_t count;
-  int32_t body; /* index into bodies[] + 1, 0 while it has none */
-} OutlineEntry;
 
 /* A shared body: its code is the window's halfwords plus BX LR. */
 typedef struct
@@ -367,8 +361,25 @@ typedef struct
   uint16_t nrel;
 } OutlineBody;
 
-static OutlineEntry *tab;
+/* The windows seen so far: open addressing over their 64-bit fingerprints.  Each
+ * has one 32-bit word: how many times it was seen, or -- TAB_BODY set -- the body
+ * it has, after which its count is never read again.  The table is kept in pages
+ * of TAB_PAGE entries, keys and words apart (12 bytes an entry, 48 KB a page):
+ * on a big TU it reaches thousands of entries, and on a device without an MMU
+ * one block of that size (1 MB, plus the old half while it grows) is what the
+ * memory had no room left for. */
+#define TAB_PAGE_BITS 12
+#define TAB_PAGE (1u << TAB_PAGE_BITS)
+#define TAB_BODY 0x80000000u
+typedef struct
+{
+  uint64_t key[TAB_PAGE];
+  uint32_t val[TAB_PAGE];
+} TabPage;
+static TabPage **tab;
 static uint32_t tab_cap, tab_n;
+#define TAB_KEY(t, i) ((t)[(i) >> TAB_PAGE_BITS]->key[(i) & (TAB_PAGE - 1)])
+#define TAB_VAL(t, i) ((t)[(i) >> TAB_PAGE_BITS]->val[(i) & (TAB_PAGE - 1)])
 static OutlineBody *bodies;
 static int nbodies, bodies_cap;
 static uint16_t *body_hw;
@@ -380,38 +391,54 @@ static Section *outline_sec;
 static int64_t st_saved;
 static uint64_t st_bodies, st_calls, st_fallbacks;
 
-static OutlineEntry *tab_find(uint64_t key, int insert)
+static TabPage **tab_alloc(uint32_t cap)
+{
+  uint32_t npages = cap / TAB_PAGE;
+  TabPage **t = tcc_malloc(sizeof(TabPage *) * npages);
+  for (uint32_t p = 0; p < npages; p++)
+    t[p] = tcc_mallocz(sizeof(TabPage));
+  return t;
+}
+
+static void tab_release(TabPage **t, uint32_t cap)
+{
+  for (uint32_t p = 0; p < cap / TAB_PAGE; p++)
+    tcc_free(t[p]);
+  tcc_free(t);
+}
+
+/* The word of window `key`, entered (as 0) when `insert` and it is new; NULL when
+ * it is not there. */
+static uint32_t *tab_find(uint64_t key, int insert)
 {
   if (!key)
     key = 1;
   if (insert && (tab_n + 1) * 4 >= tab_cap * 3)
   {
     uint32_t oc = tab_cap;
-    OutlineEntry *ot_ = tab;
-    tab_cap = tab_cap ? tab_cap * 2 : (1u << 12);
-    tab = tcc_mallocz(sizeof(OutlineEntry) * tab_cap);
+    TabPage **ot_ = tab;
+    tab_cap = tab_cap ? tab_cap * 2 : TAB_PAGE;
+    tab = tab_alloc(tab_cap);
     tab_n = 0;
     for (uint32_t i = 0; i < oc; i++)
-      if (ot_[i].key)
-      {
-        OutlineEntry *e = tab_find(ot_[i].key, 1);
-        *e = ot_[i];
-      }
-    tcc_free(ot_);
+      if (TAB_KEY(ot_, i))
+        *tab_find(TAB_KEY(ot_, i), 1) = TAB_VAL(ot_, i);
+    if (ot_)
+      tab_release(ot_, oc);
   }
   if (!tab_cap)
     return NULL;
   uint32_t m = tab_cap - 1, i = (uint32_t)(key ^ (key >> 29)) & m;
-  while (tab[i].key && tab[i].key != key)
+  while (TAB_KEY(tab, i) && TAB_KEY(tab, i) != key)
     i = (i + 1) & m;
-  if (!tab[i].key)
+  if (!TAB_KEY(tab, i))
   {
     if (!insert)
       return NULL;
-    tab[i].key = key;
+    TAB_KEY(tab, i) = key;
     tab_n++;
   }
-  return &tab[i];
+  return &TAB_VAL(tab, i);
 }
 
 static void outline_stats_report(void)
@@ -498,7 +525,8 @@ static void plan_clear(void)
 /* End of a TU: bodies are local to the object file. */
 ST_FUNC void tcc_gen_machine_outline_reset(void)
 {
-  tcc_free(tab);
+  if (tab)
+    tab_release(tab, tab_cap);
   tab = NULL;
   tab_cap = tab_n = 0;
   tcc_free(bodies);
@@ -837,14 +865,14 @@ ST_FUNC int tcc_gen_machine_outline_analyze(TCCIRState *ir, const uint32_t *map,
       WINDOW_EXTEND(k, j, L, s, key, pass, taken);
       if (L != pass || s < OUTLINE_MIN_BYTES)
         continue;
-      OutlineEntry *e = tab_find(fnv_mix(key, (uint64_t)s), 0);
-      if (!e || (!e->body && !outline_body_pays((int)e->count + 1, s)))
+      uint32_t *e = tab_find(fnv_mix(key, (uint64_t)s), 0);
+      if (!e || (!(*e & TAB_BODY) && !outline_body_pays((int)*e + 1, s)))
         continue;
       int a = (int)map[k];
       int bi;
-      if (e->body)
+      if (*e & TAB_BODY)
       {
-        bi = e->body - 1;
+        bi = (int)(*e & ~TAB_BODY);
         if (!body_matches(bi, a, a + s))
           continue; /* a hash collision */
       }
@@ -852,7 +880,7 @@ ST_FUNC int tcc_gen_machine_outline_analyze(TCCIRState *ir, const uint32_t *map,
       {
         /* This occurrence earns the body; the ones before stay inline. */
         bi = body_create(a, a + s);
-        e->body = bi + 1;
+        *e = TAB_BODY | (uint32_t)bi;
         st_bodies++;
         st_saved -= s + 2;
       }
@@ -877,8 +905,9 @@ ST_FUNC int tcc_gen_machine_outline_analyze(TCCIRState *ir, const uint32_t *map,
         break;
       if (s >= OUTLINE_MIN_BYTES)
       {
-        OutlineEntry *e = tab_find(fnv_mix(key, (uint64_t)s), 1);
-        e->count++;
+        uint32_t *e = tab_find(fnv_mix(key, (uint64_t)s), 1);
+        if (*e < TAB_BODY - 1) /* a count; a body's word stays as it is */
+          (*e)++;
       }
     }
   }

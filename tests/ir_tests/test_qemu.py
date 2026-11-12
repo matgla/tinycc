@@ -1624,6 +1624,9 @@ TEST_FILES = [
     # liveness through function-pointer tables, block-scope prototypes, used
     # and alias targets -- all deferred to the end of the TU and still defined.
     ("475_drop_unused_statics.c", 0),
+    # The end-of-TU GC erases a dead object at an odd .rodata offset from its
+    # own first byte, not one early (the Thumb bit is for code symbols only).
+    ("bug_gc_statics_odd_data_symbol.c", 0),
 
     # Write-only statics lose their stores and their bytes, but only when no
     # path reads them: through a call, a data pointer, a function table, or a
