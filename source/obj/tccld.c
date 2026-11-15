@@ -50,6 +50,13 @@ typedef struct LDParser
   int expr_has_loadaddr;
   int expr_loadaddr_section_idx;
   char expr_loadaddr_name[64];
+  /* LOADADDR() is only known after layout, so an expression holding it is
+     evaluated with LOADADDR = 0 -- its addend -- and the coefficient of
+     LOADADDR in the value just parsed rides along: assigning the result
+     needs coefficient 1 (`LOADADDR(.data) - 0x20000`), anything else
+     (`0 - LOADADDR(.x)`, `LOADADDR(.x) & ~3`) cannot be resolved. */
+  addr_t expr_coef;
+  int expr_loadaddr_nonlinear;
   int expr_uses_dot; /* the expression read the location counter */
 } LDParser;
 
@@ -378,9 +385,12 @@ static void ld_free_patterns(LDOutputSection *os)
 
 static addr_t ld_parse_expr(LDParser *p);
 
+static addr_t ld_parse_or(LDParser *p);
+
 static addr_t ld_parse_primary(LDParser *p)
 {
   addr_t val = 0;
+  addr_t coef = 0;
   addr_t align;
   int idx;
 
@@ -460,14 +470,19 @@ static addr_t ld_parse_primary(LDParser *p)
         /* The section may be defined further down the script
            (`__data_start_flash__ = LOADADDR(.data);` before `.data`):
            keep the name and resolve it once the script is parsed. */
+        /* One section per expression: a second, different one has no
+           single LMA to add an addend to. */
+        if (p->expr_has_loadaddr && strcmp(p->expr_loadaddr_name, p->tok_buf))
+          p->expr_loadaddr_nonlinear = 1;
         p->expr_has_loadaddr = 1;
         p->expr_loadaddr_section_idx = ld_script_find_output_section(p->ld, p->tok_buf);
         pstrcpy(p->expr_loadaddr_name, sizeof(p->expr_loadaddr_name), p->tok_buf);
         ld_next_token(p);
       }
       ld_expect(p, ')');
-      /* LOADADDR is resolved after layout; evaluate to 0 for now. */
+      /* LOADADDR is resolved after layout: 0 here, coefficient 1. */
       val = 0;
+      coef = 1;
     }
     else if (!strcmp(p->tok_buf, "DEFINED"))
     {
@@ -486,52 +501,97 @@ static addr_t ld_parse_primary(LDParser *p)
       /* Symbol reference */
       int idx = ld_script_find_or_create_symbol(p->ld, p->tok_buf);
       if (idx >= 0 && p->ld->symbols[idx].defined)
-        val = p->ld->symbols[idx].value;
+      {
+        LDSymbol *sym = &p->ld->symbols[idx];
+        val = sym->value;
+        if (sym->has_loadaddr)
+        {
+          /* A symbol that is itself LOADADDR(x) + addend: its value here
+             is the addend, and it carries x along. */
+          val = sym->loadaddr_addend;
+          coef = 1;
+          if (p->expr_has_loadaddr && strcmp(p->expr_loadaddr_name, sym->loadaddr_name))
+            p->expr_loadaddr_nonlinear = 1;
+          p->expr_has_loadaddr = 1;
+          p->expr_loadaddr_section_idx = sym->loadaddr_section_idx;
+          pstrcpy(p->expr_loadaddr_name, sizeof(p->expr_loadaddr_name), sym->loadaddr_name);
+        }
+      }
       ld_next_token(p);
     }
   }
   else if (p->tok == '(')
   {
+    /* ld_parse_or, not ld_parse_expr: a nested expression must not reset
+       what the enclosing one has seen (`LOADADDR(.x) + (4)`). */
     ld_next_token(p);
-    val = ld_parse_expr(p);
+    val = ld_parse_or(p);
+    coef = p->expr_coef;
     ld_expect(p, ')');
   }
   else if (p->tok == '~')
   {
     ld_next_token(p);
     val = ~ld_parse_primary(p);
+    if (p->expr_coef)
+      p->expr_loadaddr_nonlinear = 1;
   }
   else if (p->tok == '-')
   {
     ld_next_token(p);
     val = -ld_parse_primary(p);
+    coef = -p->expr_coef;
   }
 
+  p->expr_coef = coef;
   return val;
+}
+
+/* For an operator that cannot keep LOADADDR linear (/ % << >> & ^ |). */
+static void ld_expr_nonlinear_if(LDParser *p, addr_t coef1, addr_t coef2)
+{
+  if (coef1 || coef2)
+    p->expr_loadaddr_nonlinear = 1;
+  p->expr_coef = 0;
 }
 
 static addr_t ld_parse_mul(LDParser *p)
 {
   addr_t val = ld_parse_primary(p);
+  addr_t coef = p->expr_coef;
   while (p->tok == '*' || p->tok == '/' || p->tok == '%')
   {
     int op = p->tok;
-    addr_t val2;
+    addr_t val2, coef2;
     ld_next_token(p);
     val2 = ld_parse_primary(p);
+    coef2 = p->expr_coef;
     if (op == '*')
+    {
+      /* (a + c1*L) * (b + c2*L) stays linear only when one side is constant */
+      if (coef && coef2)
+        p->expr_loadaddr_nonlinear = 1;
+      coef = coef * val2 + coef2 * val;
       val *= val2;
-    else if (op == '/' && val2)
-      val /= val2;
-    else if (op == '%' && val2)
-      val %= val2;
+    }
+    else
+    {
+      ld_expr_nonlinear_if(p, coef, coef2);
+      coef = 0;
+      if (op == '/' && val2)
+        val /= val2;
+      else if (op == '%' && val2)
+        val %= val2;
+    }
   }
+  p->expr_coef = coef;
   return val;
 }
 
 static addr_t ld_parse_add(LDParser *p)
 {
   addr_t val = ld_parse_mul(p);
+  addr_t coef = p->expr_coef;
   addr_t val2;
   while (p->tok == '+' || p->tok == '-')
   {
@@ -539,60 +599,83 @@ static addr_t ld_parse_add(LDParser *p)
     ld_next_token(p);
     val2 = ld_parse_mul(p);
     if (op == '+')
+    {
       val += val2;
+      coef += p->expr_coef;
+    }
     else
+    {
       val -= val2;
+      coef -= p->expr_coef;
+    }
   }
+  p->expr_coef = coef;
   return val;
 }
 
 static addr_t ld_parse_shift(LDParser *p)
 {
   addr_t val = ld_parse_add(p);
+  addr_t coef = p->expr_coef;
   addr_t val2;
   while ((p->tok == '<' && p->tok_buf[1] == '<') || (p->tok == '>' && p->tok_buf[1] == '>'))
   {
     int op = p->tok;
     ld_next_token(p);
     val2 = ld_parse_add(p);
+    ld_expr_nonlinear_if(p, coef, p->expr_coef);
+    coef = 0;
     if (op == '<')
       val <<= val2;
     else
       val >>= val2;
   }
+  p->expr_coef = coef;
   return val;
 }
 
 static addr_t ld_parse_and(LDParser *p)
 {
   addr_t val = ld_parse_shift(p);
+  addr_t coef = p->expr_coef;
   while (p->tok == '&')
   {
     ld_next_token(p);
     val &= ld_parse_shift(p);
+    ld_expr_nonlinear_if(p, coef, p->expr_coef);
+    coef = 0;
   }
+  p->expr_coef = coef;
   return val;
 }
 
 static addr_t ld_parse_xor(LDParser *p)
 {
   addr_t val = ld_parse_and(p);
+  addr_t coef = p->expr_coef;
   while (p->tok == '^')
   {
     ld_next_token(p);
     val ^= ld_parse_and(p);
+    ld_expr_nonlinear_if(p, coef, p->expr_coef);
+    coef = 0;
   }
+  p->expr_coef = coef;
   return val;
 }
 
 static addr_t ld_parse_or(LDParser *p)
 {
   addr_t val = ld_parse_xor(p);
+  addr_t coef = p->expr_coef;
   while (p->tok == '|')
   {
     ld_next_token(p);
     val |= ld_parse_xor(p);
+    ld_expr_nonlinear_if(p, coef, p->expr_coef);
+    coef = 0;
   }
+  p->expr_coef = coef;
   return val;
 }
 
@@ -602,7 +685,32 @@ static addr_t ld_parse_expr(LDParser *p)
   p->expr_loadaddr_section_idx = -1;
   p->expr_loadaddr_name[0] = '\0';
   p->expr_uses_dot = 0;
+  p->expr_coef = 0;
+  p->expr_loadaddr_nonlinear = 0;
   return ld_parse_or(p);
+}
+
+/* `sym = <expr holding LOADADDR(x)>`: keep x and the expression's value
+   with LOADADDR = 0 as the addend; layout adds x's LMA to it.  Only an
+   expression of the form LOADADDR(x) + constant can be resolved that way;
+   anything else is refused rather than given a wrong address. */
+static int ld_symbol_set_loadaddr(LDParser *p, LDSymbol *sym, addr_t val)
+{
+  TCCState *s1 = p->s1;
+  if (!p->expr_has_loadaddr)
+    return 0;
+  if (p->expr_loadaddr_nonlinear || (p->expr_coef != 0 && p->expr_coef != 1))
+    return tcc_error_noabort("linker script: %s: LOADADDR() can only have a constant added to or "
+                             "subtracted from it",
+                             sym->name);
+  if (p->expr_coef == 0)
+    return 0; /* LOADADDR(x) - LOADADDR(x): it cancelled out, a plain constant */
+  sym->has_loadaddr = 1;
+  sym->loadaddr_section_idx = p->expr_loadaddr_section_idx;
+  sym->loadaddr_addend = val;
+  pstrcpy(sym->loadaddr_name, sizeof(sym->loadaddr_name), p->expr_loadaddr_name);
+  sym->section_offset = val;
+  return 0;
 }
 
 /* ================= Command Parsers ================= */
@@ -856,6 +964,24 @@ static int ld_parse_section_pattern(LDParser *p, LDOutputSection *os, int keep)
   return 0;
 }
 
+/* `AT(lma)` between an output section header's ':' and its '{': the load
+   address, given outright.  LOADADDR() has no value yet at this point. */
+static int ld_parse_header_at(LDParser *p, LDOutputSection *os)
+{
+  TCCState *s1 = p->s1;
+  if (p->tok != LDTOK_NAME || strcmp(p->tok_buf, "AT"))
+    return 0;
+  ld_next_token(p);
+  if (p->tok != '(')
+    return tcc_error_noabort("linker script: %s: expected '(' after AT", os->name);
+  ld_next_token(p);
+  os->load_address = ld_parse_expr(p);
+  if (p->expr_has_loadaddr)
+    return tcc_error_noabort("linker script: %s: LOADADDR() in AT() is not supported", os->name);
+  os->has_load_address = 1;
+  return ld_expect(p, ')');
+}
+
 static int ld_parse_output_section_contents(LDParser *p, LDOutputSection *os)
 {
   /* Save the location counter at section entry to compute relative offsets */
@@ -907,13 +1033,8 @@ static int ld_parse_output_section_contents(LDParser *p, LDOutputSection *os)
                * current_offset */
               p->ld->symbols[idx].section_offset = val - os->start_lc;
               p->ld->symbols[idx].patterns_before = os->nb_patterns;
-              if (p->expr_has_loadaddr)
-              {
-                p->ld->symbols[idx].has_loadaddr = 1;
-                p->ld->symbols[idx].loadaddr_section_idx = p->expr_loadaddr_section_idx;
-                pstrcpy(p->ld->symbols[idx].loadaddr_name, sizeof(p->ld->symbols[idx].loadaddr_name), p->expr_loadaddr_name);
-                p->ld->symbols[idx].section_offset = val;
-              }
+              if (ld_symbol_set_loadaddr(p, &p->ld->symbols[idx], val))
+                return -1;
               p->ld->symbols[idx].defined = 1;
               p->ld->symbols[idx].section_idx = p->ld->current_section_idx;
               /* `sym = ORIGIN(romfs)` inside a section reads no '.': an absolute
@@ -950,13 +1071,8 @@ static int ld_parse_output_section_contents(LDParser *p, LDOutputSection *os)
              */
             p->ld->symbols[idx].section_offset = val - os->start_lc;
             p->ld->symbols[idx].patterns_before = os->nb_patterns;
-            if (p->expr_has_loadaddr)
-            {
-              p->ld->symbols[idx].has_loadaddr = 1;
-              p->ld->symbols[idx].loadaddr_section_idx = p->expr_loadaddr_section_idx;
-              pstrcpy(p->ld->symbols[idx].loadaddr_name, sizeof(p->ld->symbols[idx].loadaddr_name), p->expr_loadaddr_name);
-              p->ld->symbols[idx].section_offset = val;
-            }
+            if (ld_symbol_set_loadaddr(p, &p->ld->symbols[idx], val))
+              return -1;
             p->ld->symbols[idx].defined = 1;
             p->ld->symbols[idx].section_idx = p->ld->current_section_idx;
             /* `sym = ORIGIN(romfs)` inside a section reads no '.': an absolute
@@ -1074,6 +1190,8 @@ static int ld_parse_sections(LDParser *p)
       {
         ld_next_token(p);
       }
+      if (ld_parse_header_at(p, os))
+        return -1;
 
       /* Track section start for relative offset calculation */
       os->current_offset = 0;
@@ -1153,13 +1271,8 @@ static int ld_parse_sections(LDParser *p)
           ld_next_token(p);
           addr_t val = ld_parse_expr(p);
           p->ld->symbols[idx].value = val;
-          if (p->expr_has_loadaddr)
-          {
-            p->ld->symbols[idx].has_loadaddr = 1;
-            p->ld->symbols[idx].loadaddr_section_idx = p->expr_loadaddr_section_idx;
-            pstrcpy(p->ld->symbols[idx].loadaddr_name, sizeof(p->ld->symbols[idx].loadaddr_name), p->expr_loadaddr_name);
-            p->ld->symbols[idx].section_offset = val;
-          }
+          if (ld_symbol_set_loadaddr(p, &p->ld->symbols[idx], val))
+            return -1;
           p->ld->symbols[idx].defined = 1;
           if (p->tok == ';')
             ld_next_token(p);
@@ -1224,6 +1337,8 @@ static int ld_parse_sections(LDParser *p)
 
         if (p->tok == ':')
           ld_next_token(p);
+        if (ld_parse_header_at(p, os))
+          return -1;
 
         os->start_lc = p->ld->location_counter;
 
@@ -1401,12 +1516,10 @@ int ld_script_parse(TCCState *s1, LDScript *ld, int fd)
             ld_next_token(&parser);
             addr_t val = ld_parse_expr(&parser);
             ld->symbols[idx].value = val;
-            if (parser.expr_has_loadaddr)
+            if (ld_symbol_set_loadaddr(&parser, &ld->symbols[idx], val))
             {
-              ld->symbols[idx].has_loadaddr = 1;
-              ld->symbols[idx].loadaddr_section_idx = parser.expr_loadaddr_section_idx;
-              pstrcpy(ld->symbols[idx].loadaddr_name, sizeof(ld->symbols[idx].loadaddr_name), parser.expr_loadaddr_name);
-              ld->symbols[idx].section_offset = val;
+              ret = -1;
+              break;
             }
             ld->symbols[idx].defined = 1;
             if (parser.tok == ';')
@@ -1514,6 +1627,7 @@ int ld_script_find_or_create_symbol(LDScript *ld, const char *name)
   ld->symbols[idx].section_idx = -1;
   ld->symbols[idx].has_loadaddr = 0;
   ld->symbols[idx].loadaddr_section_idx = -1;
+  ld->symbols[idx].loadaddr_addend = 0;
   return idx;
 }
 

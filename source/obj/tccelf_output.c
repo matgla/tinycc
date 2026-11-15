@@ -1433,10 +1433,13 @@ static int elf_output_file(TCCState *s1, const char *filename)
       int j, k;
       for (j = 0; j < ld->nb_output_sections; j++)
       {
-        if (ld->output_sections[j].load_memory_region_idx >= 0 && ld->output_sections[j].memory_region_idx >= 0 &&
-            ld->output_sections[j].load_memory_region_idx != ld->output_sections[j].memory_region_idx)
+        LDOutputSection *os = &ld->output_sections[j];
+        if ((os->load_memory_region_idx >= 0 && os->memory_region_idx >= 0 &&
+             os->load_memory_region_idx != os->memory_region_idx) ||
+            os->has_load_address)
         {
-          /* This output section has AT > (LMA in different region than VMA).
+          /* This output section has AT > (LMA in different region than VMA),
+             or AT(lma) in its header.
              Its inputs may sit in several LOAD segments (code, read-only
              and data get their own); each keeps its offset from the
              section's start in the load image. */

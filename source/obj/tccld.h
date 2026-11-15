@@ -87,6 +87,8 @@ typedef struct LDOutputSection
   int load_memory_region_idx; /* index into memory_regions for LMA, -1 if none */
   int phdr_idx;               /* index into phdrs, -1 if none */
   int has_address;            /* 1 if address explicitly set */
+  addr_t load_address;        /* AT(lma) in the section header: explicit load address */
+  int has_load_address;       /* 1 if load_address is set */
   int noload;                 /* (NOLOAD): occupies memory, no file contents */
 
   /* Section patterns to include - dynamically allocated */
@@ -106,6 +108,8 @@ typedef struct LDSymbol
   int section_idx;          /* output section index where defined, -1 if absolute */
   int has_loadaddr;         /* 1 if value is LOADADDR of a section */
   int loadaddr_section_idx; /* output section index for LOADADDR */
+  addr_t loadaddr_addend;   /* the value is LOADADDR(section) + this: what the
+                               expression gave with LOADADDR = 0 */
   int applied;              /* 1 once ld_apply_symbols has defined it in the ELF symtab */
   char loadaddr_name[64];   /* LOADADDR(name): resolved after parsing, so a symbol
                                may name an output section defined later */
