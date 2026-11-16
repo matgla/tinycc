@@ -863,6 +863,19 @@ void ld_update_symbol_values(TCCState *s1, LDScript *ld)
         int load_mr = ld->output_sections[j].load_memory_region_idx;
         int vma_mr = ld->output_sections[j].memory_region_idx;
         int mr = (load_mr >= 0) ? load_mr : vma_mr;
+        /* AT(lma) in the header names the load address outright, and a
+           section at an explicit address with no region loads where it
+           runs; neither moves a region's load counter. */
+        if (ld->output_sections[j].has_load_address)
+        {
+          output_section_loadaddrs[j] = ld->output_sections[j].load_address;
+          continue;
+        }
+        if (ld->output_sections[j].has_address && load_mr < 0 && vma_mr < 0)
+        {
+          output_section_loadaddrs[j] = output_section_addrs[j];
+          continue;
+        }
         if (mr < 0)
           mr = 0;
         if (mr >= 0 && mr < ld->nb_memory_regions)
@@ -1000,7 +1013,7 @@ void ld_update_symbol_values(TCCState *s1, LDScript *ld)
     if (sym->has_loadaddr && sym->loadaddr_section_idx >= 0 && sym->loadaddr_section_idx < ld->nb_output_sections)
     {
       addr_t lma = output_section_loadaddrs[sym->loadaddr_section_idx];
-      sym->value = lma;
+      sym->value = lma + sym->loadaddr_addend;
       sym->defined = 1;
     }
   }

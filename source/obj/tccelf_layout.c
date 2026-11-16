@@ -672,6 +672,12 @@ int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
   /* Add extra segments for memory regions (each region may need new PT_LOAD) */
   if (s1->ld_script && s1->ld_script->nb_memory_regions > 1)
     phnum += s1->ld_script->nb_memory_regions - 1;
+  /* An output section at an explicit address (`.x 0x1c000000 :`) gets a
+     PT_LOAD of its own, and the section after it another one. */
+  if (s1->ld_script)
+    for (i = 0; i < s1->ld_script->nb_output_sections; i++)
+      if (s1->ld_script->output_sections[i].has_address)
+        phnum += 2;
   d->phnum = phnum;
   d->phdr = tcc_mallocz(phnum * sizeof(ElfW(Phdr)));
 
@@ -722,9 +728,13 @@ int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
   // addr += file_offset;
   elf_header_offset = file_offset;
 
-  /* Track per-memory-region address counters for linker script placement */
+  /* Track per-memory-region address counters for linker script placement.
+     cur_mr is -1 while placing an output section at an explicit address:
+     it belongs to no region and must not move any region's counter. */
   addr_t mr_addr[LD_MAX_MEMORY_REGIONS];
   int cur_mr = 0;
+  int first_at_base = 0; /* the first PT_LOAD was stretched down to `base` */
+  int explicit_started[LD_MAX_OUTPUT_SECTIONS] = {0};
   if (s1->ld_script && s1->ld_script->nb_memory_regions > 0)
   {
     for (int mr = 0; mr < s1->ld_script->nb_memory_regions; mr++)
@@ -779,12 +789,27 @@ int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
       {
         LDOutputSection *os = &s1->ld_script->output_sections[ld_idx];
         int new_mr = os->memory_region_idx;
-        if (new_mr >= 0 && new_mr < s1->ld_script->nb_memory_regions)
+        if (os->has_address && ld_idx < LD_MAX_OUTPUT_SECTIONS)
+        {
+          /* `.x ADDR :` -- its first input starts at ADDR, outside every
+             region; the inputs after it follow on from there. */
+          if (!explicit_started[ld_idx])
+          {
+            explicit_started[ld_idx] = 1;
+            if (cur_mr >= 0)
+              mr_addr[cur_mr] = addr;
+            cur_mr = -1;
+            addr = os->address;
+            f |= 1 << 8;
+          }
+        }
+        else if (new_mr >= 0 && new_mr < s1->ld_script->nb_memory_regions)
         {
           if (new_mr != cur_mr)
           {
             /* Save current region's address and switch to new region */
-            mr_addr[cur_mr] = addr;
+            if (cur_mr >= 0)
+              mr_addr[cur_mr] = addr;
             cur_mr = new_mr;
             addr = mr_addr[cur_mr];
             /* Force new program header when changing memory regions */
@@ -838,14 +863,20 @@ int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
       ph->p_offset = file_offset;
       ph->p_vaddr = addr;
 
-      if (n == 0)
+      if (n == 0 && cur_mr == 0)
       {
         /* Make the first PT_LOAD segment include the program
            headers itself (and the ELF header as well), it'll
            come out with same memory use but will make various
-           tools like binutils strip work better.  */
+           tools like binutils strip work better.  Only when that
+           segment starts in the region `base` came from: a first
+           section in another region, or at an explicit address
+           (an RP2350 partition table at 0x1c000000), stretched
+           down to the first region's origin claimed everything in
+           between and took its LMA with it. */
         // ph->p_offset = 0;
         ph->p_vaddr = base;
+        first_at_base = 1;
       }
       ph->p_paddr = ph->p_vaddr;
       ++n;
@@ -871,7 +902,7 @@ int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
     {
       ph->p_filesz = file_offset - ph->p_offset;
       ph->p_memsz = addr - ph->p_vaddr;
-      if (n == 1)
+      if (n == 1 && first_at_base)
       {
         ph->p_memsz += elf_header_offset;
       }

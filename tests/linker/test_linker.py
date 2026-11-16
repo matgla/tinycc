@@ -1492,3 +1492,107 @@ def test_gc_sections_aggressive_is_plain_gc_sections(tinycc_root):
     ).stdout
     assert len(re.findall(r"\s\.data\s", sections)) == 1, sections
     assert len(re.findall(r"\s\.text\s", sections)) == 1, sections
+
+
+def _readelf_loads(elf):
+    """PT_LOAD program headers as (vaddr, paddr, filesz, memsz) tuples."""
+    result = subprocess.run(
+        [READELF, "-lW", str(elf)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace"
+    )
+    assert result.returncode == 0, f"readelf -l failed for {elf}: {result.stderr}"
+    loads = []
+    for line in result.stdout.splitlines():
+        m = re.match(r"\s*LOAD\s+0x[0-9a-f]+\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)", line)
+        if m:
+            loads.append(tuple(int(g, 16) for g in m.groups()))
+    return loads
+
+
+def _load_address(elf, vaddr):
+    """The LMA (p_paddr) of the byte that runs at `vaddr`."""
+    for seg_vaddr, seg_paddr, filesz, _ in _readelf_loads(elf):
+        if filesz and seg_vaddr <= vaddr < seg_vaddr + filesz:
+            return seg_paddr + (vaddr - seg_vaddr)
+    raise AssertionError(f"no loaded segment holds {vaddr:#x}: {_readelf_loads(elf)}")
+
+
+def _partition_link(script):
+    obj = _compile_to_object("14_partition_layout", "sections")
+    out = BUILD_DIR / "sections" / f"14_{script}.elf"
+    # -g: a static link writes no .symtab without it, and the LOADADDR test reads symbols.
+    extra = ["-static", "-g", "-Wl,-oformat=elf32-littlearm", "-T", str(LINKER_DIR / "sections" / f"14_{script}.ld")]
+    result = _link(ROOT, [obj], out, extra)
+    assert result.returncode == 0, f"link failed: {result.cmd}\n{result.stdout}\n{result.stderr}"
+    return out
+
+
+def _check_kernel_sections(elf):
+    """.text runs at 0x10000000 and loads at 0x10020000; .data runs in RAM
+    and loads right after .text -- the part every layout here shares."""
+    text = _section_addr(elf, ".text")
+    data = _section_addr(elf, ".data")
+    assert text == 0x10000000, f".text runs at {text:#x}"
+    assert _load_address(elf, text) == 0x10020000, f".text loads at {_load_address(elf, text):#x}"
+    assert data == 0x20000000, f".data runs at {data:#x}"
+    data_lma = _load_address(elf, data)
+    # Right after the flash image in the load region: the end of what runs in
+    # flash, moved to the load region and aligned for .data.  Exact, so it
+    # does not depend on how much code this compiler made of the case.
+    sections = _readelf_sections(elf)
+    flash_end = max(
+        int(s["addr"], 16) + int(s["size"], 16)
+        for s in sections
+        if "A" in s["flags"] and 0x10000000 <= int(s["addr"], 16) < 0x10100000
+    )
+    load_end = 0x10020000 + (flash_end - 0x10000000)
+    align = max(next(s["al"] for s in sections if s["name"] == ".data"), 1)
+    expected = (load_end + align - 1) & ~(align - 1)
+    assert data_lma == expected, f".data loads at {data_lma:#x}, the flash image ends at {load_end:#x}"
+    return data_lma
+
+
+@pytest.mark.linker
+@pytest.mark.linker_section
+@pytest.mark.parametrize("script", ["partition_at_addr", "partition_at_regions"])
+def test_section_with_separate_run_and_load_address(script):
+    """A data-only section linked at one address and loaded at another, the
+    way an RP2350 partition table is: run 0x1c000000 (the untranslated XIP
+    alias), load 0x10000000 (flash offset 0).  Both GNU spellings -- the
+    `ADDR : AT(LMA)` header and `> run AT> load` regions -- must place it, and
+    the sections after it must keep their own placement.  `AT(` used to be
+    unparsed (the rest of SECTIONS was misread), and a data-only section's
+    regions were ignored (it landed on top of .text's addresses)."""
+    elf = _partition_link(script)
+    pt = _section_addr(elf, ".partition_table")
+    assert pt == 0x1c000000, f".partition_table runs at {pt:#x}"
+    assert _load_address(elf, pt) == 0x10000000, f".partition_table loads at {_load_address(elf, pt):#x}"
+    assert _section_word(elf, pt) == 0xFFFFDED3
+    _check_kernel_sections(elf)
+
+
+@pytest.mark.linker
+@pytest.mark.linker_symbol
+def test_loadaddr_inside_arithmetic():
+    """LOADADDR() is evaluated after layout; the arithmetic around it must
+    survive that.  `x = LOADADDR(.data) - 0x20000` used to come out as the
+    bare LOADADDR(.data), the subtraction dropped."""
+    elf = _partition_link("loadaddr_arith")
+    data_lma = _check_kernel_sections(elf)
+    syms = {s["name"]: int(s["value"], 16) for s in _readelf_syms(elf)}
+    assert syms["data_load"] == data_lma
+    assert syms["data_load_minus"] == data_lma - 0x20000, f"{syms['data_load_minus']:#x}"
+    assert syms["data_load_plus"] == data_lma + 4, f"{syms['data_load_plus']:#x}"
+    assert syms["data_load_rhs"] == data_lma + 0x100, f"{syms['data_load_rhs']:#x}"
+
+
+@pytest.mark.linker
+@pytest.mark.linker_symbol
+def test_loadaddr_nonlinear_is_refused():
+    """`0x100 - LOADADDR(.data)` has no LMA + constant form: the link must
+    fail and say so, not come out with an address."""
+    obj = _compile_to_object("14_partition_layout", "sections")
+    out = BUILD_DIR / "sections" / "14_loadaddr_nonlinear.elf"
+    extra = ["-static", "-Wl,-oformat=elf32-littlearm", "-T", str(LINKER_DIR / "sections" / "14_loadaddr_nonlinear.ld")]
+    result = _link(ROOT, [obj], out, extra)
+    assert result.returncode != 0, f"expected a link error: {result.cmd}\n{result.stdout}\n{result.stderr}"
+    assert "data_load_rhs: LOADADDR() can only have a constant added to or subtracted from it" in result.stderr
