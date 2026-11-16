@@ -1253,7 +1253,8 @@ $(COV_STAMP8):
 	@touch $@
 
 UT8_MODULE_SRCS := \
-	$(TOP)/source/driver/tcctools.c
+	$(TOP)/source/driver/tcctools.c \
+	$(TOP)/source/driver/tcchelpers.c
 UT8_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR8)/%.o,$(UT8_MODULE_SRCS))
 
 UT8_LOCAL_SRCS := \

@@ -12,9 +12,9 @@
  *   - the global TCCState pointer (supplied separately by tcc_state_stub.c)
  *
  *  The read16le/write16le/read32le/write32le/add32le/read64le/write64le
- *  helpers and the le2belong/escape_target_dep internals live in the REAL
- *  tcctools.c linked into this binary; redefining any of them here would be
- *  a multiple-definition error.
+ *  helpers (the REAL tcchelpers.c) and the le2belong/escape_target_dep
+ *  internals (the REAL tcctools.c) are linked into this binary; redefining
+ *  any of them here would be a multiple-definition error.
  */
 
 #include <stdarg.h>

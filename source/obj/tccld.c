@@ -800,7 +800,6 @@ static int ld_parse_memory(LDParser *p)
         ld_next_token(p);
         ld_expect(p, '=');
         mr->origin = ld_parse_expr(p);
-        printf("Memory region %s: ORIGIN=0x%llx\n", mr->name, (unsigned long long)mr->origin);
       }
 
       /* Expect ',' */
