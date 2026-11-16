@@ -358,13 +358,17 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   if (func_var || (ir && ir->push_arg_regs))
   {
     ot_check(th_push((1 << R0) | (1 << R1) | (1 << R2) | (1 << R3)));
+    tcc_debug_cfi_push(tcc_state, 0xfu);
     vararg_push_size = 16;
   }
 
   offset_to_args = registers_count * 4 + (func_var ? vararg_push_size : 0);
 
   if (registers_count > 0)
+  {
     ot_check(th_push(registers_to_push));
+    tcc_debug_cfi_push(tcc_state, registers_to_push);
+  }
 
   pushed_registers = registers_to_push;
 
@@ -403,6 +407,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
       fprintf(stderr, "compiler_error: prolog frame pointer setup failed\n");
       exit(1);
     }
+    tcc_debug_cfi_frame_pointer(tcc_state, R_FP);
   }
 
   /* SP (and the frame pointer) is lower by the full SUB SP amount (locals +
@@ -887,7 +892,10 @@ static void epilogue_return_over_pushed_args(uint32_t saved_with_lr)
 {
   uint32_t rest = saved_with_lr & ~(1u << R_LR);
   if (rest)
+  {
     ot_check(th_pop(rest));
+    tcc_debug_cfi_pop(tcc_state, rest);
+  }
   ot_check(th_ldr_imm(R_PC, R_SP, 4 + vararg_push_size, 3 /* post-indexed, add, writeback */,
                       ENFORCE_ENCODING_32BIT));
 }
@@ -903,7 +911,10 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
    * the prologue left; then leave as a frame without one does (the pushed
    * registers include r7). */
   if (tcc_state->need_frame_pointer && (tcc_state->func_dynamic_sp || tcc_state->force_frame_pointer))
+  {
     ot_check_mov_reg(R_SP, R_FP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+    tcc_debug_cfi_frame_pointer(tcc_state, R_SP);
+  }
   if (epilogue_stack_dealloc > 0)
     gadd_sp_ex(epilogue_stack_dealloc, R3);
   if (vararg_push_size > 0 && lr_saved)
@@ -914,7 +925,10 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
   else if (vararg_push_size > 0)
   {
     if (pushed_registers > 0)
+    {
       ot_check(th_pop(pushed_registers));
+      tcc_debug_cfi_pop(tcc_state, pushed_registers);
+    }
     gadd_sp_ex(vararg_push_size, R3);
     ot_check(th_bx_reg(R_LR));
   }
@@ -927,7 +941,10 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
   else
   {
     if (pushed_registers > 0)
+    {
       ot_check(th_pop(pushed_registers));
+      tcc_debug_cfi_pop(tcc_state, pushed_registers);
+    }
     ot_check(th_bx_reg(R_LR));
   }
 

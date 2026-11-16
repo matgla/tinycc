@@ -831,7 +831,7 @@ def test_yaff_output_structure(tinycc_root):
         # tccyaff.h) instead of the "this is ARM" constant format 1 wrote, and
         # backs it with the YaffArchSection at arch_section_offset.
         assert arch == 4  # YAFF_ARCH_ARMV8_M
-        assert yaff_version == 5
+        assert yaff_version == 6
 
         # YaffArchSection sits at arch_section_offset (u32 at 72 since format
         # 3) and starts with its own size, so a loader can read the prefix it
@@ -1116,6 +1116,120 @@ def test_yaff_memory_flags(tinycc_root, flags, expected):
     data = out.read_bytes()
     assert data[:4] == b"YAFF"
     assert unpack_from("<I", data, 132)[0] == expected
+
+
+# The data is reached only from data: an address in code needs the YasOS
+# build's PIC defaults, and the CI cross is a plain one.
+_DEBUG_SRC = """\
+static int counter = 3;
+int table[4] = {1, 2, 3, 4};
+int *table_ref = table;
+int *counter_ref = &counter;
+static int add(int a, int b) { return a + b; }
+int f(int x)
+{
+  return add(x, 2 * x);
+}
+"""
+
+
+def _debug_module(name, extra):
+    src = BUILD_DIR / "yaff" / "debug_module.c"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text(_DEBUG_SRC)
+    out = BUILD_DIR / "yaff" / name
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [str(TCC), "-nostdlib", "-nodefaultlibs", "-shared", *extra, str(src), "-o", str(out)]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+    assert result.returncode == 0, f"{' '.join(cmd)}\n{result.stderr}"
+    return out
+
+
+def _dwarf_variable_addrs(elf):
+    """{variable name: DW_OP_addr} from readelf's .debug_info dump."""
+    dump = subprocess.run(
+        [READELF, "--debug-dump=info", str(elf)], stdout=subprocess.PIPE, text=True, errors="replace"
+    ).stdout
+    addrs, name = {}, None
+    for line in dump.splitlines():
+        m = re.search(r"DW_AT_name\s*:\s*(?:\(indirect string, offset: 0x[0-9a-f]+\):\s*)?(\S+)", line)
+        if m:
+            name = m.group(1)
+        m = re.search(r"DW_OP_addr: ([0-9a-f]+)", line)
+        if m and name:
+            addrs[name] = int(m.group(1), 16)
+    return addrs
+
+
+@pytest.mark.linker
+@pytest.mark.linker_symbol
+def test_debug_info_addresses_of_exported_data_in_shared_output():
+    """A -shared link leaves an ABS32 against an exported symbol to the dynamic
+    loader.  Unallocated .debug_info is never loaded, so the same rule there
+    left every exported variable's DW_OP_addr at 0 -- while statics, resolved
+    locally, were right."""
+    lib = _debug_module("debug_module.so", ["-g", "-Wl,-oformat=elf32-littlearm"])
+    syms = {s["name"]: int(s["value"], 16) for s in _readelf_syms(lib)}
+    addrs = _dwarf_variable_addrs(lib)
+    assert addrs["table"] == syms["table"] != 0
+    assert addrs["counter"] == syms["counter"]
+
+
+def _yaff_debug_tool():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("yaff_debug_to_elf", ROOT / "scripts" / "yaff_debug_to_elf.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.linker
+@pytest.mark.linker_yaff
+def test_yaff_debug_data():
+    """-g: the YAFF image carries a YDBG blob after everything the loader reads
+    (YaffDebugHeader in tccyaff.h); without -g the image is unchanged and says
+    it has none.  The blob converts to an ELF debug file whose DWARF, symbols
+    and region map are the link's."""
+    # One basename: the image records it, and a longer one shifts every table.
+    plain = _debug_module("plain/debug.yaff", ["-Wl,-oformat=yaff"]).read_bytes()
+    debug_path = _debug_module("g/debug.yaff", ["-g", "-Wl,-oformat=yaff"])
+    debug = debug_path.read_bytes()
+
+    assert unpack_from("<II", plain, 136) == (0, 0)
+    debug_offset, debug_length = unpack_from("<II", debug, 136)
+    assert debug_offset % 4 == 0
+    assert debug_offset + debug_length == len(debug)
+    assert debug[debug_offset : debug_offset + 4] == b"YDBG"
+    # What the loader reads is what the plain link wrote, the two debug fields
+    # aside, padded to debug_offset.
+    image = bytearray(debug[:debug_offset])
+    image[136:144] = bytes(8)
+    assert bytes(image[: len(plain)]) == plain
+    assert image[len(plain) :] == bytes(debug_offset - len(plain)) and debug_offset - len(plain) < 4
+    blob = debug[debug_offset:]
+    _, version, count, size, _, _, _, crc = unpack_from("<4sHHIIIII", blob, 0)
+    assert (version, size, crc) == (1, debug_length, 0)
+
+    tool = _yaff_debug_tool()
+    sections = {s["name"]: s["fields"] for s in tool.parse_blob(blob)["sections"]}
+    assert {".text", ".data", ".bss", ".got", ".debug_info", ".debug_line", ".symtab", ".strtab"} <= set(sections)
+    assert sections[".text"][1] == 8 and sections[".text"][3] == 0  # NOBITS at 0
+    assert sections[".text"][5] == unpack_from("<I", debug, 8)[0]  # code_length
+
+    elf = BUILD_DIR / "yaff" / "g" / "debug.elf"
+    elf.write_bytes(tool.to_elf(blob))
+    syms = {s["name"]: s for s in _readelf_syms(elf)}
+    # Locals and statics too, not only the exports the image keeps.
+    assert syms["add"]["bind"] == "LOCAL" and syms["counter"]["bind"] == "LOCAL"
+    assert syms["f"]["bind"] == "GLOBAL"
+    addrs = _dwarf_variable_addrs(elf)
+    assert addrs["table"] == int(syms["table"]["value"], 16) != 0
+    assert addrs["counter"] == int(syms["counter"]["value"], 16)
+    lines = subprocess.run(
+        [READELF, "--debug-dump=decodedline", str(elf)], stdout=subprocess.PIPE, text=True, errors="replace"
+    ).stdout
+    assert re.search(r"debug_module\.c\s+8\s", lines), lines
 
 
 @pytest.mark.linker

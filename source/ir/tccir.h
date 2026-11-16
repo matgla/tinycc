@@ -1026,6 +1026,7 @@ int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc);
  * (the SValues the front end saved with the statement): 1 and *off, or 0 when
  * there are no more. */
 int tcc_ir_asm_frame_ref(TCCIRState *ir, int k, int *off);
+int tcc_ir_frame_range_referenced(TCCIRState *ir, int off, int size);
 /* The function calls setjmp, vfork or another function that returns twice, so
  * a frame slot live only on one return may still be read on the other. */
 int tcc_ir_calls_returns_twice(TCCIRState *ir);

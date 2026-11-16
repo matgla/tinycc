@@ -551,7 +551,18 @@ int th_patch_call(int t, int a)
  *   >= 0  : use that specific physical register (caller guarantees it's free)
  *   < 0   : default to R_IP (safe in prologue/epilogue where R0-R3 hold args)
  */
+static void gadd_sp_emit(int val, int scratch_reg);
+
+/* SP += val.  Every SP adjustment of the prologue, the epilogue and a call's
+ * argument window comes through here, which is where the CFI hears of it. */
 void gadd_sp_ex(int val, int scratch_reg)
+{
+  gadd_sp_emit(val, scratch_reg);
+  if (val && thumb_cfi())
+    tcc_debug_cfi_sp_moved(tcc_state, val);
+}
+
+static void gadd_sp_emit(int val, int scratch_reg)
 {
   if (val == 0)
     return;

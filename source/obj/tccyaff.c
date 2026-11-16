@@ -1535,6 +1535,187 @@ static void tcc_yaff_write_section_image(Section *s, FILE *f)
     fputc(0, f);
 }
 
+static void tcc_yaff_pad4(FILE *f)
+{
+  long at = ftell(f);
+  while (at & 3)
+  {
+    fputc(0, f);
+    ++at;
+  }
+}
+
+/* A section whose contents the debug blob carries: the DWARF a -g compile
+ * produced, never its relocations (already applied).  Its sh_size is 0 here --
+ * layout zeroes every unallocated section of a non-ELF output -- so the size
+ * is what it holds. */
+static int tcc_yaff_is_debug_section(Section *s)
+{
+  return s && s->sh_type != SHT_RELX && !strncmp(s->name, ".debug_", 7) && s->data_offset;
+}
+
+/* The debug blob (YaffDebugHeader, see tccyaff.h) at the end of the file.
+ * Returns its length; the caller has 4-aligned the file and records where. */
+static uint32_t tcc_yaff_write_debug(TCCState *s1, FILE *f)
+{
+  Section *regions[6];
+  Section *symtab = s1->symtab, *strtab = s1->symtab ? s1->symtab->link : NULL;
+  int nb_regions = 0, i, count, at;
+  uint32_t names_size, offset, start = (uint32_t)ftell(f);
+  YaffDebugHeader dh = {};
+  YaffDebugSection *table;
+  int *index; /* ELF section number -> debug section number, 0 when absent */
+  char *names;
+
+  regions[nb_regions++] = text_section;
+  if (s1->plt && s1->plt->sh_size)
+    regions[nb_regions++] = s1->plt;
+  regions[nb_regions++] = rodata_section;
+  regions[nb_regions++] = data_section;
+  regions[nb_regions++] = bss_section;
+  regions[nb_regions++] = s1->got;
+
+  /* Count the entries and their names: null, regions, DWARF, symtab+strtab. */
+  count = 1 + nb_regions;
+  names_size = 1;
+  for (i = 0; i < nb_regions; i++)
+    names_size += strlen(regions[i]->name) + 1;
+  for (i = 1; i < s1->nb_sections; i++)
+  {
+    if (!tcc_yaff_is_debug_section(s1->sections[i]))
+      continue;
+    count++;
+    names_size += strlen(s1->sections[i]->name) + 1;
+  }
+  if (symtab && strtab)
+  {
+    count += 2;
+    names_size += sizeof(".symtab") + sizeof(".strtab");
+  }
+
+  table = tcc_mallocz(count * sizeof(YaffDebugSection));
+  index = tcc_mallocz(s1->nb_sections * sizeof(int));
+  names = tcc_mallocz(names_size);
+
+  /* Lay the blob out: header, table, names, then the contents 4-aligned. */
+  dh.sections_offset = sizeof(YaffDebugHeader);
+  dh.names_offset = dh.sections_offset + count * sizeof(YaffDebugSection);
+  dh.names_size = names_size;
+  offset = (dh.names_offset + names_size + 3) & ~3u;
+
+  at = 1;
+  names_size = 1;
+#define YAFF_DEBUG_ENTRY(sec, entry_type)                                       \
+  do                                                                            \
+  {                                                                             \
+    YaffDebugSection *e = &table[at];                                           \
+    size_t len = strlen((sec)->name) + 1;                                       \
+    memcpy(names + names_size, (sec)->name, len);                               \
+    e->name = names_size;                                                       \
+    names_size += len;                                                          \
+    e->type = (entry_type);                                                     \
+    e->flags = (sec)->sh_flags;                                                 \
+    e->address = (entry_type) == SHT_NOBITS ? (uint32_t)(sec)->sh_addr : 0;     \
+    e->size = (uint32_t)(sec)->sh_size;                                         \
+    e->alignment = (sec)->sh_addralign;                                         \
+    e->entry_size = (sec)->sh_entsize;                                          \
+    if ((entry_type) != SHT_NOBITS)                                             \
+    {                                                                           \
+      e->offset = offset;                                                       \
+      offset = (offset + e->size + 3) & ~3u;                                    \
+    }                                                                           \
+    /* reorder_sections numbered what it kept; a dropped one is not mapped */  \
+    if ((sec)->sh_num > 0 && (sec)->sh_num < s1->nb_sections &&                 \
+        s1->sections[(sec)->sh_num] == (sec))                                   \
+      index[(sec)->sh_num] = at;                                                \
+    at++;                                                                       \
+  } while (0)
+
+  for (i = 0; i < nb_regions; i++)
+    YAFF_DEBUG_ENTRY(regions[i], SHT_NOBITS);
+  for (i = 1; i < s1->nb_sections; i++)
+  {
+    Section *s = s1->sections[i];
+    if (!tcc_yaff_is_debug_section(s))
+      continue;
+    section_materialize(s1, s);
+    s->sh_size = s->data_offset;
+    YAFF_DEBUG_ENTRY(s, SHT_PROGBITS);
+  }
+  if (symtab && strtab)
+  {
+    int symtab_at = at;
+    symtab->sh_size = symtab->data_offset;
+    strtab->sh_size = strtab->data_offset;
+    YAFF_DEBUG_ENTRY(symtab, SHT_SYMTAB);
+    YAFF_DEBUG_ENTRY(strtab, SHT_STRTAB);
+    table[symtab_at].link = symtab_at + 1;
+    /* Written locals first (below), as ELF wants: info is the first global. */
+    {
+      ElfW(Sym) *sym;
+      uint32_t locals = 0;
+      for_each_elem(symtab, 0, sym, ElfW(Sym)) if (ELFW(ST_BIND)(sym->st_info) == STB_LOCAL) locals++;
+      table[symtab_at].info = locals;
+    }
+    table[symtab_at].entry_size = sizeof(ElfW(Sym));
+  }
+#undef YAFF_DEBUG_ENTRY
+
+  memcpy(dh.magic, YAFF_DEBUG_MAGIC, 4);
+  dh.version = YAFF_DEBUG_VERSION;
+  dh.section_count = count;
+  dh.size = offset;
+  dh.image_crc = 0; /* describes the file it is in; strip sets it */
+
+  fwrite(&dh, 1, sizeof dh, f);
+  fwrite(table, sizeof(YaffDebugSection), count, f);
+  fwrite(names, 1, dh.names_size, f);
+  tcc_yaff_pad4(f);
+  for (i = 1; i < count; i++)
+  {
+    YaffDebugSection *e = &table[i];
+    Section *s = NULL;
+    int k;
+    if (e->type == SHT_NOBITS)
+      continue;
+    for (k = 1; k < s1->nb_sections; k++)
+      if (index[k] == i)
+      {
+        s = s1->sections[k];
+        break;
+      }
+    if (e->type == SHT_SYMTAB)
+    {
+      /* st_shndx into the debug section table; a symbol of a section the blob
+       * does not describe keeps its value as an absolute.  Locals first: the
+       * YAFF link never sorted .symtab (its relocations index it), and nothing
+       * in the blob refers to a symbol by index. */
+      ElfW(Sym) *sym;
+      int pass;
+      for (pass = 0; pass < 2; pass++)
+        for_each_elem(s, 0, sym, ElfW(Sym))
+        {
+          ElfW(Sym) copy = *sym;
+          if ((ELFW(ST_BIND)(copy.st_info) == STB_LOCAL) != (pass == 0))
+            continue;
+          if (copy.st_shndx != SHN_UNDEF && copy.st_shndx < SHN_LORESERVE)
+            copy.st_shndx = copy.st_shndx < s1->nb_sections && index[copy.st_shndx] ? index[copy.st_shndx] : SHN_ABS;
+          fwrite(&copy, 1, sizeof copy, f);
+        }
+    }
+    else
+    {
+      tcc_yaff_write_section_image(s, f);
+    }
+    tcc_yaff_pad4(f);
+  }
+
+  tcc_free(table);
+  tcc_free(index);
+  tcc_free(names);
+  return (uint32_t)ftell(f) - start;
+}
+
 ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
 {
   int i, file_type;
@@ -1834,6 +2015,13 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
    * any alignment padding before it) is zero-initialized by the loader.
    * bss_length already accounts for the alignment gap. */
   tcc_yaff_write_section_image(s1->got, f);
+  /* -g: the debug data, after everything the loader reads. */
+  if (s1->do_debug)
+  {
+    tcc_yaff_pad4(f);
+    header.debug_offset = ftell(f);
+    header.debug_length = tcc_yaff_write_debug(s1, f);
+  }
   fseek(f, 0, SEEK_SET);
   fwrite(&header, 1, sizeof(YaffHeader), f);
   fflush(f);

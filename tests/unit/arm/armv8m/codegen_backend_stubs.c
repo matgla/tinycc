@@ -130,3 +130,39 @@ void tcc_opt_fp_mat_cache_record(TCCIRState *ir, int offset, int phys_reg)
 {
   (void)ir; (void)offset; (void)phys_reg;
 }
+
+/* Call-frame-information hooks of tccdbg.c (not linked here): the prologue,
+ * epilogue and sp adjustments report to them. */
+void tcc_debug_cfi_sp_moved(TCCState *s1, int delta)
+{
+  (void)s1;
+  (void)delta;
+}
+
+void tcc_debug_cfi_push(TCCState *s1, unsigned mask)
+{
+  (void)s1;
+  (void)mask;
+}
+
+void tcc_debug_cfi_pop(TCCState *s1, unsigned mask)
+{
+  (void)s1;
+  (void)mask;
+}
+
+void tcc_debug_cfi_frame_pointer(TCCState *s1, int reg)
+{
+  (void)s1;
+  (void)reg;
+}
+
+void tcc_debug_cfi_remember_state(TCCState *s1)
+{
+  (void)s1;
+}
+
+void tcc_debug_cfi_restore_state(TCCState *s1)
+{
+  (void)s1;
+}

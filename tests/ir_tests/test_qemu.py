@@ -3345,6 +3345,7 @@ def test_gnu89_inline_bugs(test_file, expected_exit_code, opt_level, tmp_path):
 INLINE_ATOMICS_TEST_FILES = [
     ("bug_asm_goto_select_join.c", 0),
     ("bug_asm_goto_branch_thread.c", 0),
+    ("bug_dwarf_frame_base.c", 0),  # gdb reads it too: test_debug_frame_gdb.py
     ("bug_small_struct_copy_padding.c", 0),
     # Every op, size and order inline; narrow signed values, the failure
     # write-back, a body that is only the atomic (no tail call to a helper that
