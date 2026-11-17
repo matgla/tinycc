@@ -22,8 +22,12 @@
  *        region has to start. The loader put it wherever its allocator
  *        returned, so an object aligned past that -- `static int buf[4]
  *        __attribute__((aligned(64)))` -- was aligned only against a base the
- *        linker assumed and nothing reproduced. */
-#define YAFF_VERSION 5
+ *        linker assumed and nothing reproduced.
+ *   5 -- memory_flags.
+ *   6 -- debug_offset and debug_length: the debug data of a -g link (a
+ *        YaffDebugHeader blob) after everything the loader reads.  A loader
+ *        copying an image into RAM reads only [0, debug_offset). */
+#define YAFF_VERSION 6
 
 typedef struct {
   uint32_t nbucket;
@@ -197,7 +201,83 @@ typedef struct __attribute__((packed)) YaffHeader {
   uint32_t data_alignment_offset;
   /* YAFF_MEMORY_*: where the process's memory should go (-slow-memory). */
   uint32_t memory_flags;
+  /* The debug data (YAFF_VERSION 6), a YaffDebugHeader blob of debug_length
+   * bytes at debug_offset, 4-aligned.  Everything the loader uses lies before
+   * debug_offset, so a loader that copies the image reads only that much.  Both
+   * 0 when the image carries none: linked without -g, or stripped bare. */
+  uint32_t debug_offset;
+  uint32_t debug_length;
 } YaffHeader;
+
+/* ---- Debug data ----------------------------------------------------------
+ *
+ * A -g link appends a blob to the image:
+ *
+ *   YaffDebugHeader
+ *   YaffDebugSection[section_count]    at sections_offset
+ *   section names (NUL-terminated)     at names_offset, names_size bytes
+ *   section contents, each 4-aligned   at YaffDebugSection.offset
+ *
+ * Every offset is from the start of the blob, so the blob is position
+ * independent: `strip -f FILE` copies it out verbatim as a separate debug
+ * file, which is the same blob with nothing in front of it.
+ *
+ * YaffDebugSection has the layout and meaning of an Elf32_Shdr, with offsets
+ * relative to the blob: an ELF debug file for a host debugger is one ELF
+ * header in front of the table.  Entry 0 is the null section.  The entries:
+ *
+ *   SHT_NOBITS .text .plt .rodata .data .bss .got -- the image's regions, with
+ *       their link-time addresses and sizes.  The bytes are in the image, not
+ *       here (the same convention as `objcopy --only-keep-debug`).
+ *   SHT_PROGBITS .debug_* -- DWARF, relocated to link-time addresses.
+ *   SHT_SYMTAB .symtab + SHT_STRTAB .strtab -- every symbol, locals and
+ *       statics included (the image keeps only its exports).  st_value is the
+ *       link-time address, st_shndx an index into this section table.
+ *   YAFF_SHT_DEBUGLINK .yaff_debuglink -- in a stripped image, in place of the
+ *       rest: the name of the separate debug file, NUL-terminated.
+ *
+ * Link-time addresses are the module's own offset space: .text at 0.  At run
+ * time the code (.text, .plt, and .rodata when shared) sits at the image's
+ * code base, and the per-process data region -- starting with what is left of
+ * .rodata, through .got -- at the process's data base, so a debugger maps an
+ * address through the region it falls in (see /proc/<pid>/maps).
+ *
+ * image_crc ties a separate debug file to the image it came from: the CRC-32
+ * (IEEE 802.3, the zlib one) of the image's bytes [0, debug_offset), with the
+ * header's debug_offset and debug_length counted as zero.  strip writes it
+ * into the debug file it splits off and into the debuglink blob it leaves;
+ * a debugger that finds them different has the wrong file.  0 in the blob a
+ * -g link embeds, which describes the file it is in. */
+#define YAFF_DEBUG_MAGIC "YDBG"
+#define YAFF_DEBUG_VERSION 1
+
+typedef struct __attribute__((packed)) YaffDebugHeader {
+  uint8_t magic[4];       /* YAFF_DEBUG_MAGIC */
+  uint16_t version;       /* YAFF_DEBUG_VERSION */
+  uint16_t section_count; /* entries in the section table, the null one included */
+  uint32_t size;          /* bytes in the whole blob */
+  uint32_t sections_offset;
+  uint32_t names_offset;
+  uint32_t names_size;
+  uint32_t image_crc;
+} YaffDebugHeader;
+
+typedef struct __attribute__((packed)) YaffDebugSection {
+  uint32_t name; /* offset into the names */
+  uint32_t type; /* SHT_* (elf.h), or YAFF_SHT_DEBUGLINK */
+  uint32_t flags;
+  uint32_t address;
+  uint32_t offset; /* from the start of the blob; 0 for SHT_NOBITS */
+  uint32_t size;
+  uint32_t link;
+  uint32_t info;
+  uint32_t alignment;
+  uint32_t entry_size;
+} YaffDebugSection;
+
+/* SHT_LOUSER + 1: the separate debug file's name. */
+#define YAFF_SHT_DEBUGLINK 0x80000001u
+#define YAFF_DEBUGLINK_NAME ".yaff_debuglink"
 
 /* Start the process's stack, data and thunks in the slowest memory with room:
  * for programs that mostly wait on others, like the shell, and should not take

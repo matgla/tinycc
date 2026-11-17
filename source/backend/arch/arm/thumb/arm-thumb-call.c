@@ -3413,6 +3413,10 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
     func_mop.u.reg.r0 = target_arg_reg;
 
   /* === Tail call: tear down frame before branching === */
+  /* The code after the branch runs with this function's frame still up. */
+  const int cfi_leaves = thumb_cfi() && tail_call_pending;
+  if (cfi_leaves)
+    tcc_debug_cfi_remember_state(tcc_state);
   if (tail_call_pending)
   {
     /* For indirect calls, the target may be in a callee-saved register that
@@ -3440,9 +3444,14 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
     if (non_callee_bytes > 0)
       gadd_sp_ex(non_callee_bytes, R_IP);
     if (callee_pop)
+    {
       ot_check(th_pop(callee_pop));
+      if (cfi_leaves)
+        tcc_debug_cfi_pop(tcc_state, callee_pop);
+    }
   }
 
+  int cfi_noreturn_push = 0;
   /* A leaf whose calls are all noreturn saves LR here, in the cold block, not
    * in the prologue (tcc_ir_call_saves_lr_itself): the hot path keeps its
    * `bx lr`, the callee still finds our caller's return address on the stack,
@@ -3454,7 +3463,15 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
   {
     if (stack_size || dyn_extra)
       tcc_ice("noreturn call with stack arguments in a leaf function");
-    ot_check(th_push((uint16_t)((scratch_push_sp_bias() & 4 ? 0 : 1u << R3) | (1u << ARM_LR))));
+    const uint16_t saved = (uint16_t)((scratch_push_sp_bias() & 4 ? 0 : 1u << R3) | (1u << ARM_LR));
+    ot_check(th_push(saved));
+    if (thumb_cfi())
+    {
+      /* The call does not come back: what follows has the frame without it. */
+      tcc_debug_cfi_remember_state(tcc_state);
+      tcc_debug_cfi_push(tcc_state, saved);
+      cfi_noreturn_push = 1;
+    }
   }
 
   /* === Emit call === */
@@ -3463,6 +3480,8 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
     ot_check(th_vldmstm(vfp_load, 0, R0, 0, (1u << vfp_xfer) - 1u, 0));
   else if (tail_call_pending || !thumb_inline_aligned_copy_call(ir, func_mop, ctx.args, ctx.argc))
     gcall_or_jump_mop(0, func_mop);
+  if (cfi_leaves || cfi_noreturn_push)
+    tcc_debug_cfi_restore_state(tcc_state);
   if (dyn_extra)
   {
     /* A scratch PUSHed inside the window would be popped after SP moved back

@@ -665,6 +665,24 @@ static int frame_operand_offset(IROperand op, int bottom, int *off)
   return frame_operand_concrete(op, off) && *off >= bottom && *off < 0;
 }
 
+/* Whether any operand still names a byte of the frame object at [OFF, OFF +
+ * SIZE) -- its frame slot holds the variable only then.  A local the optimizer
+ * turned into registers leaves none, and debug info must not send a debugger
+ * to its old bytes.  The same whole-pool scan as frame_build_segments. */
+int tcc_ir_frame_range_referenced(TCCIRState *ir, int off, int size)
+{
+  int o;
+  if (!ir || size <= 0)
+    return 0;
+  for (int i = 0; i < ir->iroperand_pool_count; i++)
+    if (frame_operand_concrete(ir->iroperand_pool[i], &o) && o >= off && o < off + size)
+      return 1;
+  for (int k = 0; tcc_ir_asm_frame_ref(ir, k, &o); k++)
+    if (o >= off && o < off + size)
+      return 1;
+  return 0;
+}
+
 int tcc_ir_asm_frame_ref(TCCIRState *ir, int k, int *off)
 {
 #ifdef CONFIG_TCC_ASM

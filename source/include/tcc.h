@@ -1899,6 +1899,8 @@ struct TCCState
   Section *dwarf_ranges_section;
   Section *dwarf_str_section;
   Section *dwarf_line_str_section;
+  Section *dwarf_frame_section; /* .debug_frame: call-frame information (Thumb) */
+  Section *dwarf_loclists_section; /* .debug_loclists: register-held variables (Thumb, DWARF 5) */
   int dwlo, dwhi; /* dwarf section range */
   /* test coverage */
   Section *tcov_section;
@@ -3507,6 +3509,15 @@ ST_FUNC void tcc_debug_save_state(TCCState *s1, void **saved_info, void **saved_
 ST_FUNC void tcc_debug_restore_state(TCCState *s1, void *saved_info, void *saved_root);
 ST_FUNC void tcc_debug_funcstart(TCCState *s1, Sym *sym);
 ST_FUNC void tcc_debug_prolog_epilog(TCCState *s1, int value);
+/* Call-frame information for .debug_frame (tccdbg.c), reported by the backend
+ * as it emits the code that moves SP or saves registers, at the current `ind`.
+ * No-ops without -g, and the backend skips them in its dry runs. */
+ST_FUNC void tcc_debug_cfi_sp_moved(TCCState *s1, int delta);
+ST_FUNC void tcc_debug_cfi_push(TCCState *s1, unsigned mask);
+ST_FUNC void tcc_debug_cfi_pop(TCCState *s1, unsigned mask);
+ST_FUNC void tcc_debug_cfi_frame_pointer(TCCState *s1, int reg);
+ST_FUNC void tcc_debug_cfi_remember_state(TCCState *s1);
+ST_FUNC void tcc_debug_cfi_restore_state(TCCState *s1);
 ST_FUNC void tcc_debug_funcend(TCCState *s1, int size);
 ST_FUNC void tcc_debug_extern_sym(TCCState *s1, Sym *sym, int sh_num, int sym_bind, int sym_type);
 ST_FUNC void tcc_debug_typedef(TCCState *s1, Sym *sym);
@@ -3814,6 +3825,7 @@ ST_FUNC int tcc_has_quadruple_64bit_operand(SValue *src1, SValue *src2, SValue *
 #define dwarf_ranges_section s1->dwarf_ranges_section
 #define dwarf_str_section s1->dwarf_str_section
 #define dwarf_line_str_section s1->dwarf_line_str_section
+#define dwarf_frame_section s1->dwarf_frame_section
 
 /* default dwarf version for "-gdwarf" */
 #ifdef TCC_TARGET_MACHO

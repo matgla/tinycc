@@ -200,6 +200,16 @@ static void relocate_section(TCCState *s1, Section *s, Section *sr)
       add32le(ptr, tgt - s1->sections[sym->st_shndx]->sh_addr);
       continue;
     }
+    if (is_dwarf && type == R_DATA_32DW)
+    {
+      /* code/data reference from debug section: the link-time address, as the
+       * lazy path above writes it.  relocate() would leave an exported
+       * symbol's word to a dynamic relocation in a -shared output, and debug
+       * sections are never loaded, so DW_OP_addr of every exported variable
+       * read 0. */
+      add32le(ptr, tgt);
+      continue;
+    }
     addr = s->sh_addr + rel->r_offset;
     relocate(s1, rel, type, ptr, addr, tgt);
   }

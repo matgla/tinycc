@@ -33,12 +33,22 @@ jobs:
       packages: read
     container:
       image: ghcr.io/matgla/tinycc-armv8m:0.1.0
-      options: --user root
+      # --privileged for the mmap randomisation step below (vm.* is not
+      # namespaced, so a plain container cannot write it).
+      options: --user root --privileged
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
+      - name: Address-space randomisation ASan fits in
+        # ubuntu-latest is Ubuntu 26.04 now; its kernel randomises mmap with
+        # 32 bits, so shared libraries land inside the shadow range of the
+        # image's libasan and every sanitized tcc aborts at start ("Shadow
+        # memory range interleaves with an existing memory mapping"). 28 bits
+        # is what 24.04 used.
+        run: echo 28 > /proc/sys/vm/mmap_rnd_bits
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -136,12 +146,16 @@ jobs:
       packages: read
     container:
       image: ghcr.io/matgla/tinycc-armv8m:0.1.0
-      options: --user root
+      options: --user root --privileged
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
+      - name: Address-space randomisation ASan fits in
+        # The cross below is an --enable-asan build; see build-and-test.
+        run: echo 28 > /proc/sys/vm/mmap_rnd_bits
+
       - name: Checkout repository
         # submodules: recursive provides the newlib libc headers the corpus
         # compiles need (compile-only -- no newlib build / QEMU here). record.py

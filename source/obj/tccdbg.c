@@ -123,6 +123,10 @@ static const struct
 #define DWARF_ABBREV_SUBROUTINE_EMPTY_TYPE 25
 #define DWARF_ABBREV_FORMAL_PARAMETER2 26
 #define DWARF_ABBREV_COMPILE_UNIT_RANGES 27
+/* A local / a parameter whose DW_AT_location is a location list
+ * (.debug_loclists, DWARF 5): a value in a register only over its live range. */
+#define DWARF_ABBREV_VARIABLE_LOCAL_LOCLIST 28
+#define DWARF_ABBREV_FORMAL_PARAMETER_LOCLIST 29
 
 /* all entries should have been generated with dwarf_uleb128 except
    has_children. All values are currently below 128 so this currently
@@ -503,6 +507,28 @@ static const unsigned char dwarf_abbrev_init[] = {DWARF_ABBREV_COMPILE_UNIT,
                                                   DW_FORM_sec_offset,
                                                   0,
                                                   0,
+                                                  DWARF_ABBREV_VARIABLE_LOCAL_LOCLIST,
+                                                  DW_TAG_variable,
+                                                  0,
+                                                  DW_AT_name,
+                                                  DW_FORM_strp,
+                                                  DW_AT_type,
+                                                  DW_FORM_ref4,
+                                                  DW_AT_location,
+                                                  DW_FORM_sec_offset,
+                                                  0,
+                                                  0,
+                                                  DWARF_ABBREV_FORMAL_PARAMETER_LOCLIST,
+                                                  DW_TAG_formal_parameter,
+                                                  0,
+                                                  DW_AT_name,
+                                                  DW_FORM_strp,
+                                                  DW_AT_type,
+                                                  DW_FORM_ref4,
+                                                  DW_AT_location,
+                                                  DW_FORM_sec_offset,
+                                                  0,
+                                                  0,
                                                   0};
 
 static const unsigned char dwarf_line_opcodes[] = {0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1};
@@ -611,8 +637,33 @@ struct _tccdbg
     Sym *func;
     int line;
     int func_section_sym; /* Section symbol for current function (for -ffunction-sections) */
+    int prologue_end; /* ind at the end of the current function's prologue, 0 before it */
+    int loclists_header; /* 1 + offset of this unit's .debug_loclists header, 0 none yet */
     int base_type_used[N_DEFAULT_DEBUG];
   } dwarf_info;
+
+  /* Call-frame information of the function being generated (.debug_frame).
+   * The backend reports what its code does to SP and the saved registers;
+   * this keeps the CFA rule those events imply -- `cfa_reg` + `cfa_off`, and
+   * `sp_cfa` = CFA - SP, tracked also while the CFA hangs off the frame
+   * pointer -- and buffers the DW_CFA program until tcc_debug_funcend writes
+   * the FDE. */
+  struct
+  {
+    unsigned char *ops;
+    int len, cap;
+    int active;
+    int base; /* func_ind the rows count from */
+    int pc;   /* address the last row is at */
+    int cfa_reg, cfa_off, sp_cfa;
+    struct
+    {
+      int cfa_reg, cfa_off, sp_cfa;
+    } saved[4];
+    int depth;
+    int cie_done;
+    unsigned long cie_offset;
+  } cfi;
 
   /* test coverage */
   struct
@@ -675,11 +726,25 @@ ST_FUNC void tcc_debug_new(TCCState *s1)
   dwarf_line_section = new_section(s1, ".debug_line", SHT_PROGBITS, shf);
   dwarf_aranges_section = new_section(s1, ".debug_aranges", SHT_PROGBITS, shf);
   dwarf_ranges_section = new_section(s1, ".debug_ranges", SHT_PROGBITS, shf);
+#if defined TCC_TARGET_ARM_THUMB
+  /* Inside [dwlo, dwhi): an FDE's pointer to its CIE is a DWARF-to-DWARF
+   * offset, relocated like .debug_info's to .debug_abbrev. */
+  dwarf_frame_section = new_section(s1, ".debug_frame", SHT_PROGBITS, shf);
+  dwarf_frame_section->sh_addralign = 4;
+#endif
   shf |= SHF_MERGE | SHF_STRINGS;
   dwarf_str_section = new_section(s1, ".debug_str", SHT_PROGBITS, shf);
   dwarf_str_section->sh_entsize = 1;
   dwarf_info_section->sh_addralign = dwarf_abbrev_section->sh_addralign = dwarf_line_section->sh_addralign =
       dwarf_aranges_section->sh_addralign = dwarf_ranges_section->sh_addralign = dwarf_str_section->sh_addralign = 1;
+#if defined TCC_TARGET_ARM_THUMB
+  if (s1->dwarf >= 5)
+  {
+    /* Plain data: not the string sections' merge flags. */
+    s1->dwarf_loclists_section = new_section(s1, ".debug_loclists", SHT_PROGBITS, shf & ~(SHF_MERGE | SHF_STRINGS));
+    s1->dwarf_loclists_section->sh_addralign = 1;
+  }
+#endif
   if (s1->dwarf >= 5)
   {
     dwarf_line_str_section = new_section(s1, ".debug_line_str", SHT_PROGBITS, shf);
@@ -1538,6 +1603,19 @@ ST_FUNC void tcc_debug_start(TCCState *s1)
 /* put end of translation unit info */
 ST_FUNC void tcc_debug_end(TCCState *s1)
 {
+  if (s1->dState && dwarf_info.loclists_header)
+  {
+    Section *ll = s1->dwarf_loclists_section;
+    unsigned long at = dwarf_info.loclists_header - 1;
+    write32le(ll->data + at, ll->data_offset - at - 4);
+    dwarf_info.loclists_header = 0;
+  }
+  if (s1->dState)
+  {
+    tcc_free(s1->dState->cfi.ops);
+    s1->dState->cfi.ops = NULL;
+    s1->dState->cfi.len = s1->dState->cfi.cap = 0;
+  }
   if (!s1->do_debug || debug_next_type == 0)
     return;
 
@@ -2184,6 +2262,87 @@ static void dwarf_emit_regpair_expr(Section *sec, int reg0, int reg1, int piece_
   dwarf_uleb128(sec, (unsigned long long)piece_size);
 }
 
+/* One DW_LLE_start_length entry: [lo, hi) of the current function, the value
+ * in reg0 (and reg1, a pair of pieces). */
+static void dwarf_loclist_entry(TCCState *s1, Section *ll, int lo, int hi, int reg0, int reg1, int piece_size)
+{
+  if (hi <= lo)
+    return;
+  dwarf_data1(ll, DW_LLE_start_length);
+  dwarf_reloc(ll, dwarf_info.func_section_sym, R_DATA_PTR);
+  dwarf_data4(ll, lo);
+  dwarf_uleb128(ll, hi - lo);
+  if (reg1 >= 0)
+  {
+    dwarf_uleb128(ll, dwarf_loc_regpair_len(reg0, reg1, piece_size));
+    dwarf_emit_regpair_expr(ll, reg0, reg1, piece_size);
+  }
+  else
+  {
+    dwarf_uleb128(ll, dwarf_loc_reg_op_len(reg0));
+    dwarf_emit_reg_op(ll, reg0);
+  }
+}
+
+/* The code address of IR instruction `i`, or -1 where codegen left none. */
+static int dwarf_code_of(TCCIRState *ir, uint32_t i)
+{
+  if (!ir->ir_to_code_mapping || i >= (uint32_t)ir->ir_to_code_mapping_size)
+    return -1;
+  return ir->ir_to_code_mapping[i] == 0xFFFFFFFFu ? -1 : (int)ir->ir_to_code_mapping[i];
+}
+
+/* A location list for a variable the allocator keeps in a register: the
+ * register only over the interval it holds the value (a parameter, before
+ * that, in the register it arrived in, through the prologue), nothing
+ * elsewhere -- where a single DW_OP_reg would show whatever the register
+ * holds later.  Returns 1 + the list's offset in .debug_loclists, 0 when no
+ * list can be made (no code map, or an empty range). */
+static unsigned long dwarf_loclist_for(TCCState *s1, const struct debug_sym *s, const IRLiveInterval *iv, int reg0,
+                                       int reg1, int body)
+{
+  Section *ll = s1->dwarf_loclists_section;
+  TCCIRState *ir = s1->ir;
+  int piece_size = dwarf_reg_piece_size_for_sym(s);
+  int body_lo, body_hi, entry_hi, start = -1;
+  unsigned long off;
+  if (!ll || !ir || !ir->ir_to_code_mapping)
+    return 0;
+  body_lo = dwarf_code_of(ir, iv->start);
+  body_hi = dwarf_code_of(ir, iv->end + 1 < (uint32_t)ir->next_instruction_index ? iv->end + 1
+                                                                                  : (uint32_t)ir->next_instruction_index);
+  entry_hi = dwarf_info.prologue_end > func_ind ? dwarf_info.prologue_end : func_ind;
+  if (body_lo < 0 || body_hi < 0)
+    return 0;
+  if (body_lo < entry_hi)
+    body_lo = entry_hi;
+  if (!body)
+    body_hi = body_lo; /* only where it arrived: the prologue */
+  if (body_hi <= body_lo && !(s->type == N_PSYM && iv->incoming_reg0 >= 0 && entry_hi > func_ind))
+    return 0;
+  if (!dwarf_info.loclists_header)
+  {
+    dwarf_info.loclists_header = ll->data_offset + 1;
+    dwarf_data4(ll, 0); /* unit length, tcc_debug_end */
+    dwarf_data1(ll, 5);
+    dwarf_data1(ll, 0);
+    dwarf_data1(ll, PTR_SIZE);
+    dwarf_data1(ll, 0); /* segment selector size */
+    dwarf_data4(ll, 0); /* offset entry count */
+  }
+  off = ll->data_offset;
+  if (s->type == N_PSYM && iv->incoming_reg0 >= 0)
+  {
+    start = func_ind;
+    dwarf_loclist_entry(s1, ll, start, entry_hi, iv->incoming_reg0, iv->incoming_reg1 >= 0 ? iv->incoming_reg1 : -1,
+                        piece_size);
+  }
+  if (body)
+    dwarf_loclist_entry(s1, ll, body_lo, body_hi, reg0, reg1 != PREG_NONE ? reg1 : -1, piece_size);
+  dwarf_data1(ll, DW_LLE_end_of_list);
+  return off + 1;
+}
+
 ST_FUNC void tcc_debug_stabn(TCCState *s1, int type, int value)
 {
   if (!s1->do_debug)
@@ -2743,6 +2902,7 @@ static void tcc_debug_finish(TCCState *s1, struct _debug_info *cur)
       {
         struct debug_sym *s = &cur->sym[i];
 
+        unsigned long abbrev_at = dwarf_info_section->data_offset;
         dwarf_data1(dwarf_info_section, s->type == N_PSYM    ? DWARF_ABBREV_FORMAL_PARAMETER
                                         : s->type == N_GSYM  ? DWARF_ABBREV_VARIABLE_EXTERNAL
                                         : s->type == N_STSYM ? DWARF_ABBREV_VARIABLE_STATIC
@@ -2776,11 +2936,24 @@ static void tcc_debug_finish(TCCState *s1, struct _debug_info *cur)
           int reg0 = PREG_NONE;
           int reg1 = PREG_NONE;
           long long fb_offset = (long long)s->value;
+          /* Where the value is nowhere tcc can name, the location is empty: a
+           * debugger reports it optimised out instead of reading old bytes. */
+          int has_location = 1;
+          IRLiveInterval *list_interval = NULL; /* allocated register: a location list */
+          int list_body = 1;                    /* 0: a parameter only in its incoming register */
 
+          if (s1->ir && s->vreg < 0 && s->type != N_PSYM)
+          {
+            /* A memory local keeps its frontend offset (-g turns frame relayout
+             * off) -- as long as its slot is still in use at all. */
+            has_location = tcc_ir_frame_range_referenced(s1->ir, (int)fb_offset, s->size > 0 ? s->size : 1);
+          }
           if (s1->ir && s->vreg >= 0)
           {
             IRLiveInterval *interval = tcc_ir_get_live_interval(s1->ir, s->vreg);
-            if (interval)
+            if (!interval)
+              has_location = 0;
+            else
             {
               int r0 = interval->allocation.r0;
               int r1 = interval->allocation.r1;
@@ -2795,6 +2968,7 @@ static void tcc_debug_finish(TCCState *s1, struct _debug_info *cur)
                 reg0 = r0;
                 reg1 = r1_spilled ? PREG_NONE : r1;
                 use_reg_location = 1;
+                list_interval = interval;
               }
               else if (r0 == PREG_NONE && r1 != PREG_NONE && !r1_spilled)
               {
@@ -2807,11 +2981,34 @@ static void tcc_debug_finish(TCCState *s1, struct _debug_info *cur)
                 reg0 = interval->incoming_reg0;
                 reg1 = interval->incoming_reg1;
                 use_reg_location = 1;
+                list_interval = interval;
+                list_body = 0;
+              }
+              else if (interval->allocation.offset == 0)
+              {
+                /* No register, no spill slot: the allocator never placed it,
+                 * and the frontend offset it was born with is someone else's. */
+                has_location = 0;
               }
             }
           }
 
-          if (use_reg_location && reg0 != PREG_NONE)
+          unsigned long list = 0;
+          if (has_location && list_interval && s1->dwarf >= 5)
+            list = dwarf_loclist_for(s1, s, list_interval, reg0, reg1, list_body);
+
+          if (list)
+          {
+            dwarf_info_section->data[abbrev_at] =
+                s->type == N_PSYM ? DWARF_ABBREV_FORMAL_PARAMETER_LOCLIST : DWARF_ABBREV_VARIABLE_LOCAL_LOCLIST;
+            dwarf_reloc(dwarf_info_section, dwarf_get_section_sym(s1->dwarf_loclists_section), R_DATA_32DW);
+            dwarf_data4(dwarf_info_section, list - 1);
+          }
+          else if (!has_location)
+          {
+            dwarf_data1(dwarf_info_section, 0);
+          }
+          else if (use_reg_location && reg0 != PREG_NONE)
           {
             if (reg1 != PREG_NONE && reg1 >= 0)
             {
@@ -2928,6 +3125,232 @@ ST_FUNC void tcc_debug_restore_state(TCCState *s1, void *saved_info, void *saved
 }
 
 /* put function symbol */
+/* ---- Call-frame information (.debug_frame) ---------------------------
+ *
+ * Thumb only: the backend calls these as it emits a prologue, an epilogue,
+ * a tail call's frame teardown or an SP adjustment, and tcc_debug_funcend
+ * writes the FDE.  One CIE per object: CFA = SP on entry, return address in
+ * LR (r14), code alignment 2 (Thumb halfwords), data alignment -4. */
+
+#define cfi s1->dState->cfi
+
+static int cfi_on(TCCState *s1)
+{
+  return s1->do_debug && s1->dwarf && dwarf_frame_section && s1->dState && cfi.active;
+}
+
+static void cfi_byte(TCCState *s1, int b)
+{
+  if (cfi.len == cfi.cap)
+  {
+    cfi.cap = cfi.cap ? cfi.cap * 2 : 64;
+    cfi.ops = tcc_realloc(cfi.ops, cfi.cap);
+  }
+  cfi.ops[cfi.len++] = (unsigned char)b;
+}
+
+static void cfi_uleb(TCCState *s1, unsigned long v)
+{
+  do
+  {
+    int b = v & 0x7f;
+    v >>= 7;
+    cfi_byte(s1, b | (v ? 0x80 : 0));
+  } while (v);
+}
+
+/* A row at the current address: advance the location to `ind`. */
+static void cfi_advance(TCCState *s1)
+{
+  int delta = (ind - cfi.pc) / 2;
+  if (delta <= 0)
+    return;
+  if (delta < 0x40)
+    cfi_byte(s1, DW_CFA_advance_loc | delta);
+  else if (delta < 0x100)
+  {
+    cfi_byte(s1, DW_CFA_advance_loc1);
+    cfi_byte(s1, delta);
+  }
+  else if (delta < 0x10000)
+  {
+    cfi_byte(s1, DW_CFA_advance_loc2);
+    cfi_byte(s1, delta & 0xff);
+    cfi_byte(s1, delta >> 8);
+  }
+  else
+  {
+    cfi_byte(s1, DW_CFA_advance_loc4);
+    cfi_byte(s1, delta & 0xff);
+    cfi_byte(s1, (delta >> 8) & 0xff);
+    cfi_byte(s1, (delta >> 16) & 0xff);
+    cfi_byte(s1, (delta >> 24) & 0xff);
+  }
+  cfi.pc += delta * 2;
+}
+
+static void cfi_def_cfa_offset(TCCState *s1)
+{
+  cfi_byte(s1, DW_CFA_def_cfa_offset);
+  cfi_uleb(s1, cfi.cfa_off);
+}
+
+/* A register the unwinder restores: r4-r11 and LR. r0-r3 and r12 pushed for
+ * alignment or as scratch hold nothing the caller needs back. */
+static int cfi_callee_saved(int reg)
+{
+  return (reg >= 4 && reg <= 11) || reg == 14;
+}
+
+ST_FUNC void tcc_debug_cfi_sp_moved(TCCState *s1, int delta)
+{
+  if (!cfi_on(s1) || !delta)
+    return;
+  cfi.sp_cfa -= delta;
+  if (cfi.cfa_reg != 13)
+    return; /* the CFA hangs off the frame pointer: SP is free to move */
+  cfi_advance(s1);
+  cfi.cfa_off = cfi.sp_cfa;
+  cfi_def_cfa_offset(s1);
+}
+
+ST_FUNC void tcc_debug_cfi_push(TCCState *s1, unsigned mask)
+{
+  int reg, k = 0, n = __builtin_popcount(mask & 0xffff);
+  if (!cfi_on(s1) || !n)
+    return;
+  cfi_advance(s1);
+  cfi.sp_cfa += 4 * n;
+  if (cfi.cfa_reg == 13)
+  {
+    cfi.cfa_off = cfi.sp_cfa;
+    cfi_def_cfa_offset(s1);
+  }
+  /* PUSH stores the lowest register at the lowest address, the new SP. */
+  for (reg = 0; reg < 16; reg++)
+  {
+    if (!(mask & (1u << reg)))
+      continue;
+    if (cfi_callee_saved(reg))
+    {
+      cfi_byte(s1, DW_CFA_offset | reg);
+      cfi_uleb(s1, (cfi.sp_cfa - 4 * k) / 4);
+    }
+    k++;
+  }
+}
+
+ST_FUNC void tcc_debug_cfi_pop(TCCState *s1, unsigned mask)
+{
+  int reg, n = __builtin_popcount(mask & 0xffff);
+  if (!cfi_on(s1) || !n)
+    return;
+  cfi_advance(s1);
+  cfi.sp_cfa -= 4 * n;
+  for (reg = 0; reg < 16; reg++)
+    if ((mask & (1u << reg)) && cfi_callee_saved(reg))
+      cfi_byte(s1, DW_CFA_restore | reg);
+  if (cfi.cfa_reg == 13)
+  {
+    cfi.cfa_off = cfi.sp_cfa;
+    cfi_def_cfa_offset(s1);
+  }
+}
+
+/* The CFA is computed from `reg` from here on, which holds SP's value now:
+ * r7 after the prologue's `add r7, sp, #0`; r13 again after the epilogue's
+ * `mov sp, r7`. */
+ST_FUNC void tcc_debug_cfi_frame_pointer(TCCState *s1, int reg)
+{
+  if (!cfi_on(s1))
+    return;
+  cfi_advance(s1);
+  if (reg == 13 && cfi.cfa_reg != 13)
+    cfi.sp_cfa = cfi.cfa_off;
+  cfi.cfa_reg = reg;
+  cfi.cfa_off = cfi.sp_cfa;
+  cfi_byte(s1, DW_CFA_def_cfa);
+  cfi_uleb(s1, reg);
+  cfi_uleb(s1, cfi.cfa_off);
+}
+
+/* Around code that leaves the function (a tail call's teardown, a noreturn
+ * call's own frame): what follows it runs with the body's frame again. */
+ST_FUNC void tcc_debug_cfi_remember_state(TCCState *s1)
+{
+  if (!cfi_on(s1) || cfi.depth == (int)(sizeof cfi.saved / sizeof cfi.saved[0]))
+    return;
+  cfi_advance(s1);
+  cfi.saved[cfi.depth].cfa_reg = cfi.cfa_reg;
+  cfi.saved[cfi.depth].cfa_off = cfi.cfa_off;
+  cfi.saved[cfi.depth].sp_cfa = cfi.sp_cfa;
+  cfi.depth++;
+  cfi_byte(s1, DW_CFA_remember_state);
+}
+
+ST_FUNC void tcc_debug_cfi_restore_state(TCCState *s1)
+{
+  if (!cfi_on(s1) || !cfi.depth)
+    return;
+  cfi_advance(s1);
+  cfi.depth--;
+  cfi.cfa_reg = cfi.saved[cfi.depth].cfa_reg;
+  cfi.cfa_off = cfi.saved[cfi.depth].cfa_off;
+  cfi.sp_cfa = cfi.saved[cfi.depth].sp_cfa;
+  cfi_byte(s1, DW_CFA_restore_state);
+}
+
+static void cfi_pad(Section *sec, unsigned long start)
+{
+  while ((sec->data_offset - start) & 3)
+    dwarf_data1(sec, DW_CFA_nop);
+}
+
+/* The FDE of the function just generated, and this object's CIE before the
+ * first one.  `size` is the function's length. */
+static void cfi_emit_fde(TCCState *s1, int size)
+{
+  Section *sec = dwarf_frame_section;
+  unsigned long start;
+  if (!cfi_on(s1))
+    return;
+  cfi.active = 0;
+  if (cfi.base != func_ind || cfi.depth)
+    return; /* the function moved after it started, or a state was left open */
+  if (!cfi.cie_done)
+  {
+    cfi.cie_offset = sec->data_offset;
+    start = sec->data_offset;
+    dwarf_data4(sec, 0);          /* length, below */
+    dwarf_data4(sec, 0xffffffff); /* CIE id */
+    dwarf_data1(sec, 1);          /* version */
+    dwarf_data1(sec, 0);          /* augmentation "" */
+    dwarf_uleb128(sec, 2);        /* code alignment: Thumb halfwords */
+    dwarf_sleb128(sec, -4);       /* data alignment */
+    dwarf_data1(sec, 14);         /* return address: LR */
+    dwarf_data1(sec, DW_CFA_def_cfa);
+    dwarf_uleb128(sec, 13);
+    dwarf_uleb128(sec, 0);
+    cfi_pad(sec, start);
+    write32le(sec->data + start, sec->data_offset - start - 4);
+    cfi.cie_done = 1;
+  }
+  start = sec->data_offset;
+  dwarf_data4(sec, 0); /* length, below */
+  dwarf_reloc(sec, dwarf_get_section_sym(sec), R_DATA_32DW);
+  dwarf_data4(sec, cfi.cie_offset);
+  dwarf_reloc(sec, dwarf_info.func_section_sym, R_DATA_PTR);
+  dwarf_data4(sec, func_ind);
+  dwarf_data4(sec, size);
+  if (cfi.len)
+  {
+    section_ptr_add(sec, cfi.len);
+    memcpy(sec->data + sec->data_offset - cfi.len, cfi.ops, cfi.len);
+  }
+  cfi_pad(sec, start);
+  write32le(sec->data + start, sec->data_offset - start - 4);
+}
+
 ST_FUNC void tcc_debug_funcstart(TCCState *s1, Sym *sym)
 {
   CString debug_str;
@@ -2947,8 +3370,18 @@ ST_FUNC void tcc_debug_funcstart(TCCState *s1, Sym *sym)
     tcc_debug_line(s1);
     dwarf_info.func = sym;
     dwarf_info.line = file->line_num;
+    dwarf_info.prologue_end = 0;
     /* Record the section symbol for this function (needed for -ffunction-sections) */
     dwarf_info.func_section_sym = dwarf_register_text_section(s1, cur_text_section);
+    if (dwarf_frame_section)
+    {
+      cfi.active = 1;
+      cfi.len = 0;
+      cfi.depth = 0;
+      cfi.base = cfi.pc = func_ind;
+      cfi.cfa_reg = 13;
+      cfi.cfa_off = cfi.sp_cfa = 0;
+    }
     if (s1->do_backtrace)
     {
       int i, len;
@@ -2976,6 +3409,8 @@ ST_FUNC void tcc_debug_prolog_epilog(TCCState *s1, int value)
 {
   if (!s1->do_debug)
     return;
+  if (value == 0 && s1->dState)
+    dwarf_info.prologue_end = ind;
   if (s1->dwarf)
   {
     dwarf_line_op(s1, value == 0 ? DW_LNS_set_prologue_end : DW_LNS_set_epilogue_begin);
@@ -3052,8 +3487,12 @@ ST_FUNC void tcc_debug_funcend(TCCState *s1, int size)
     }
     else
     {
-      dwarf_data1(dwarf_info_section, 1);
-      dwarf_data1(dwarf_info_section, DW_OP_call_frame_cfa);
+      /* No frame pointer: SP stays where the prologue left it for the body,
+       * and the variables' offsets are from the frame top above it. */
+      int top = tcc_gen_machine_frame_top_offset();
+      dwarf_data1(dwarf_info_section, 1 + dwarf_sleb128_size(top));
+      dwarf_data1(dwarf_info_section, DW_OP_breg13);
+      dwarf_sleb128(dwarf_info_section, top);
     }
 #else
     dwarf_data1(dwarf_info_section, 1);
@@ -3075,6 +3514,7 @@ ST_FUNC void tcc_debug_funcend(TCCState *s1, int size)
     tcc_debug_finish(s1, debug_info_root);
     dwarf_data1(dwarf_info_section, 0);
     write32le(dwarf_info_section->data + func_sib, dwarf_info_section->data_offset - dwarf_info.start);
+    cfi_emit_fde(s1, size);
   }
   else
   {

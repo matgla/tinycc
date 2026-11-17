@@ -479,6 +479,14 @@ extern int scratch_push_count;
 extern int tail_call_pending;
 extern int g_debug_current_op;
 extern CodeGenDryRunState dry_run_state;
+
+/* Whether to report call-frame information (tcc_debug_cfi_*) for code being
+ * emitted now: with -g, and never in a dry run, whose addresses are not the
+ * code's. */
+static inline int thumb_cfi(void)
+{
+  return tcc_state->do_debug && !dry_run_state.active;
+}
 extern int dry_run_rehearsal;
 extern int helper_call_sp_bias;
 extern int call_args_sp_bias;
