@@ -2,7 +2,13 @@
 #define LIBTCC_H
 
 #ifndef LIBTCCAPI
-# define LIBTCCAPI
+/* The API stays visible in a shared libtcc even when the library is built
+   with -fvisibility=hidden (as the YasOS stages are). */
+# if defined __GNUC__ || defined __TINYC__
+#  define LIBTCCAPI __attribute__((visibility("default")))
+# else
+#  define LIBTCCAPI
+# endif
 #endif
 
 #ifdef __cplusplus

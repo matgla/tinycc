@@ -108,3 +108,37 @@ def test_a_collected_function_is_never_read(tcc, tmp_path):
     move_section_past_eof(lib, ".text.dead_c")
     r, _ = link(tcc, tmp_path, main, lib)
     assert r.returncode == 0, r.stderr
+
+
+TWIN_LIB = ("__attribute__((noinline)) static int twin(int x) { return x * 5 + 3; }\n"
+            "int lib_entry(int x) { return twin(x) + 1; }\n")
+TWIN_MAIN = ("__attribute__((noinline)) static int twin(int x) { return (x ^ 0x33) - 9; }\n"
+             "extern int lib_entry(int);\n"
+             "int _start(void) { return twin(2) + lib_entry(3); }\n")
+
+
+def compile_and_link(tcc, tmp_path, *inputs):
+    """Compile the C and link in one run, as `zig build-exe -ftcc` does."""
+    out = tmp_path / "out.elf"
+    root = Path(tcc).parent
+    return subprocess.run([tcc, f"-B{root}", f"-L{root}", f"-L{root}/lib", "-O1", "-ffunction-sections",
+                           "-nostdlib", "-static", "-Wl,--gc-sections", "-Wl,-oformat=elf32-littlearm",
+                           "-Wl,-e,_start", *map(str, inputs), "-o", str(out)],
+                          capture_output=True, text=True), out
+
+
+@pytest.mark.parametrize("lib_first", [False, True], ids=["source_then_object", "object_then_source"])
+def test_a_static_function_named_like_an_objects_keeps_its_code(tcc, tmp_path, lib_first):
+    """Both .text.twin sections merge by name: the object's bytes stay on disk,
+    the source's are in memory, and both must reach .text (zig.h's static
+    zig_shr_i128 in Zig's C and in compiler_rt.o: the C's copy became the bytes
+    of whatever the buffer held before)."""
+    lib = build(tcc, tmp_path, TWIN_LIB, "lib")
+    main_obj = build(tcc, tmp_path, TWIN_MAIN, "main")
+    src = tmp_path / "twin_main.c"
+    src.write_text(TWIN_MAIN)
+    r, out = compile_and_link(tcc, tmp_path, *([lib, src] if lib_first else [src, lib]))
+    assert r.returncode == 0, r.stderr
+    text = section_bytes(out.read_bytes(), ".text")
+    assert section_bytes(lib.read_bytes(), ".text.twin") in text
+    assert section_bytes(main_obj.read_bytes(), ".text.twin") in text

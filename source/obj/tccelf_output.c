@@ -816,6 +816,18 @@ static int hot_text_listed(const Section *s, char **names, int count)
   return tcc_name_list_has_unnumbered(names, count, s->name + 6);
 }
 
+/* How many of a split input's bytes, from its offset 0, are in memory.  All of
+ * them, unless the loader merged an object's .text.<fn> into it by name
+ * (defer_split_text): those bytes stay in the object as its chunks, and the
+ * ones compiled from source -- a static function named like one of the
+ * object's -- are in memory, before or after them.  Both are its code. */
+static unsigned long split_bytes_in_memory(const Section *s)
+{
+  if (!s->data)
+    return 0;
+  return s->data_allocated < s->data_offset ? s->data_allocated : s->data_offset;
+}
+
 static int coalesce_split_sections(TCCState *s1)
 {
   int i, g, nnew, nb_inputs = 0, have_split = 0, nb_grow = 0, fd = -1, ret = 0;
@@ -835,6 +847,7 @@ static int coalesce_split_sections(TCCState *s1)
   {
     Section *target;
     unsigned char *data;
+    unsigned long data_size; /* of `data`, from offset 0: see split_bytes_in_memory */
     DeferredChunk *chunks;
     unsigned long size;
     addr_t base;
@@ -987,6 +1000,7 @@ static int coalesce_split_sections(TCCState *s1)
     in->base = base_of[i];
     in->size = s->data_offset;
     in->data = s->data;
+    in->data_size = split_bytes_in_memory(s);
     in->chunks = s->deferred_head;
     in++;
     s1->sections[i] = NULL;
@@ -1099,7 +1113,7 @@ static int coalesce_split_sections(TCCState *s1)
       {
         SpillPiece *p = &sp->pieces[sp->nb_pieces++];
         p->base = 0;
-        p->size = text_section->data_offset;
+        p->size = p->data_size = text_section->data_offset;
         p->data = text_section->data;
         p->chunks = NULL;
       }
@@ -1121,6 +1135,7 @@ static int coalesce_split_sections(TCCState *s1)
         p->base = in->base;
         p->size = in->size;
         p->data = in->data;
+        p->data_size = in->data_size;
         p->chunks = in->chunks;
       }
       else
@@ -1135,6 +1150,8 @@ static int coalesce_split_sections(TCCState *s1)
       unsigned char *p = section_ptr_add(t, in->size);
       if (in->chunks)
       {
+        if (in->data_size)
+          memcpy(p, in->data, in->data_size);
         if (deferred_chunks_read(s1, &in->chunks, p, &fd, &fd_path) < 0)
         {
           ret = -1;

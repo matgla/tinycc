@@ -208,6 +208,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   nb_pending_aliases = 0;
   gfunc_regpair_reset(s1);
   s1->tu_parsed = 0; /* a previous TU's */
+  s1->tu_first_sym = symtab_section ? symtab_section->data_offset / sizeof(ElfW(Sym)) : 1;
   nocode_wanted = DATA_ONLY_WANTED; /* no code outside of functions */
   discarded_call_vtop = NULL;
   /* an error may have left them set mid-'&' */

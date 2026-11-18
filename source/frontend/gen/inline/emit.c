@@ -1202,11 +1202,13 @@ void gc_unreferenced_statics(TCCState *s)
   const int nsec = s->nb_sections;
   ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
 
-  /* Candidate ranges: local functions and objects with a size, in an
-   * allocated section. */
+  /* Candidate ranges: this TU's local functions and objects with a size, in
+   * an allocated section.  An object loaded before it (`tcc lib.o main.c`)
+   * has statics too, called through relocations still in the file or through
+   * branches resolved with none: they are not this TU's to drop. */
   GcNode *nodes = tcc_malloc(sizeof(GcNode) * (nsyms ? nsyms : 1));
   int nn = 0;
-  for (int i = 1; i < nsyms; i++)
+  for (int i = s->tu_first_sym > 1 ? s->tu_first_sym : 1; i < nsyms; i++)
   {
     ElfW(Sym) *e = &syms[i];
     int type = ELFW(ST_TYPE)(e->st_info);
@@ -1254,6 +1256,11 @@ void gc_unreferenced_statics(TCCState *s)
     Section *sec = s->sections[sh];
     if (sec && (sec->sh_flags & SHF_ALLOC) && sec->reloc)
       nrel_total += sec->reloc->data_offset / sizeof(ElfW_Rel);
+    /* An object's bytes merged into one of this TU's sections by name stay in
+     * the file at their offsets (defer_split_text): an erase would move the
+     * TU's code over them. */
+    if (sec && sec->deferred_head)
+      pinned[sh] = 1;
   }
   int *rel_from = tcc_malloc(sizeof(int) * (nrel_total ? nrel_total : 1));
   int *rel_to = tcc_malloc(sizeof(int) * (nrel_total ? nrel_total : 1));
