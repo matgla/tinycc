@@ -317,17 +317,15 @@ static int spill_read_piece(TCCState *s1, SectionSpill *sp, int k, unsigned char
       return tcc_error_noabort("short read from '%s'", sp->path);
     return 0;
   }
+  /* The bytes in memory, then those left on disk: a .text.<fn> compiled from
+   * source and an object's of the same name are one piece with both.  Neither
+   * need cover it all: an object's .text has alignment between its
+   * functions, and the buffer is the last piece's. */
+  memset(dest, 0, p->size);
+  if (p->data && p->data_size)
+    memcpy(dest, p->data, p->data_size);
   if (p->chunks)
-  {
-    /* Chunks need not cover it all: an object's .text has alignment between
-     * its functions, and the buffer is the last piece's. */
-    memset(dest, 0, p->size);
     return deferred_chunks_read(s1, &p->chunks, dest, &sp->src_fd, &sp->src_path);
-  }
-  if (p->data)
-    memcpy(dest, p->data, p->size);
-  else
-    memset(dest, 0, p->size);
   return 0;
 }
 

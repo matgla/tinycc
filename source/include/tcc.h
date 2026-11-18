@@ -883,8 +883,9 @@ typedef struct DeferredChunk
 typedef struct SpillPiece
 {
   unsigned long base, size; /* where it goes in the section */
-  unsigned char *data;      /* its bytes, if they were in memory */
-  DeferredChunk *chunks;    /* else where they are on disk */
+  unsigned char *data;      /* its bytes that were in memory, data_size of them */
+  unsigned long data_size;
+  DeferredChunk *chunks;    /* and where the rest are on disk */
 } SpillPiece;
 
 typedef struct SectionSpill
@@ -1809,6 +1810,9 @@ struct TCCState
   /* The whole TU has been parsed: what is generated from here on (deferred
    * bodies, owed inline bodies) sees every declaration and every use. */
   int tu_parsed;
+  /* The first symbol this TU added: those before are the objects' and the
+   * earlier TUs' (gc_unreferenced_statics drops this TU's only). */
+  int tu_first_sym;
   /* Body length (saved-token ints) the function being generated may still
    * absorb by expanding called-once functions (called_once_budget_begin). */
   int called_once_budget;
