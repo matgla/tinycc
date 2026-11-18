@@ -1,0 +1,9 @@
+n-256: 0
+  --: 1 at 2
+++x: 1
+-5: 0
+second_char: -
+second_int: 22
+third_short: -3
+through_copy: 5
+plain_second: -

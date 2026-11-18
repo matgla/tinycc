@@ -51,6 +51,9 @@ int tcc_ir_opt_add_deref_fold(TCCIRState *ir)
       continue;
     if (irop_is_local(src1) || irop_is_llocal(src1))
       continue;
+    /* `*T + imm` adds to a loaded value: the base is that load, not T. */
+    if (src1.is_lval)
+      continue;
     /* Only fold PARAM bases: LOAD_INDEXED can expose stack loads to const
      * propagation that may wrongly fold across calls aliasing memory. PARAM
      * vregs point to caller-owned memory, safe from this. Peep-through: a

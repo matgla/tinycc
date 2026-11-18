@@ -475,6 +475,7 @@ TEST_FILES = [
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),
     ("bug_deref_indexed_struct_arg.c", 0),
+    ("bug_add_deref_fold_lval_base.c", 0),
 
     # GNU attributes may prefix a declarator after a comma in a declaration list
     ("bug_decl_attr_after_comma.c", 0),
