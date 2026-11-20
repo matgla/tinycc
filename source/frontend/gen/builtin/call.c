@@ -2420,11 +2420,11 @@ static void unary_funcall_body(void)
         }
 
         /* Store argument to local via IR.  If the argument is a 64-bit
-         * lval (e.g. a local long long or a dereferenced long long*),
+         * lval (a dereferenced long long* or double*, a double member),
          * emit an explicit LOAD into a temp first.  The 64-bit STORE
          * backend cannot split a DEREF source via mach_make_hi_half
          * (it needs a register pair, not a pointer). */
-        if ((arg_val.r & VT_LVAL) && (arg_val.type.t & VT_BTYPE) == VT_LLONG)
+        if ((arg_val.r & VT_LVAL) && tcc_is_64bit_type(arg_val.type.t))
         {
           SValue load_dst;
           svalue_init(&load_dst);
