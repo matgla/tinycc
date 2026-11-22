@@ -952,9 +952,9 @@ UT_TEST(test_tccelf_new_creates_bounds_sections_when_enabled)
   tccelf_new(tcc_state);
 
   UT_ASSERT(bounds_section != NULL);
-  UT_ASSERT(lbounds_section != NULL);
+  /* no .lbounds: the IR registers locals with calls (gen/op/bcheck.c) */
+  UT_ASSERT(lbounds_section == NULL);
   UT_ASSERT_STREQ(bounds_section->name, ".bounds");
-  UT_ASSERT_STREQ(lbounds_section->name, ".lbounds");
 
   tccelf_delete(tcc_state);
   return 0;

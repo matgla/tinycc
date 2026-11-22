@@ -37,7 +37,7 @@ def _assemble(tmp_path, body, *flags):
     obj = tmp_path / "blob.o"
     dep = tmp_path / "blob.d"
     proc = subprocess.run(
-        [str(TCC), "-c", *flags, "-MD", "-MF", str(dep), "-o", str(obj), "src/blob.S"],
+        [str(TCC), "-ccompat", "-c", *flags, "-MD", "-MF", str(dep), "-o", str(obj), "src/blob.S"],
         capture_output=True, text=True, cwd=tmp_path,
     )
     return proc, obj, dep

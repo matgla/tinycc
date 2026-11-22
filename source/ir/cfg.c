@@ -58,7 +58,9 @@ int tcc_ir_cfg_instr_ends_flow(TCCIRState *ir, IRQuadCompact *q)
   return tcc_ir_callee_is_noreturn(tcc_ir_op_src1_sym(ir, q));
 }
 
-static void cfg_build_edges(TCCIRState *ir, IRCFG *cfg, int fill)
+/* lbl[0..nlbl): the blocks of the function's labels, the successors of an
+ * IJUMP (a computed goto reaches any label whose address was taken). */
+static void cfg_build_edges(TCCIRState *ir, IRCFG *cfg, int fill, const int *lbl, int nlbl)
 {
   int n = cfg->num_instrs;
   /* Filling a switch block's edges: seen[to] == b once `to` is a successor
@@ -116,8 +118,12 @@ static void cfg_build_edges(TCCIRState *ir, IRCFG *cfg, int fill)
         }
       }
     }
+    else if (q->op == TCCIR_OP_IJUMP) {
+      for (int k = 0; k < nlbl; k++)
+        cfg_add_edge(cfg, b, lbl[k], fill);
+    }
     else if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
-             q->op == TCCIR_OP_IJUMP || tcc_ir_cfg_instr_ends_flow(ir, q)) {
+             tcc_ir_cfg_instr_ends_flow(ir, q)) {
       /* no successors */
     }
     else {
@@ -126,6 +132,32 @@ static void cfg_build_edges(TCCIRState *ir, IRCFG *cfg, int fill)
     }
   }
   tcc_free(seen);
+}
+
+int tcc_ir_cfg_loop_has_label_block(const IRCFG *cfg, int header_b, int latch_b)
+{
+  if (!cfg || !cfg->label_block)
+    return 0;
+  if (cfg->label_block[header_b] || cfg->label_block[latch_b])
+    return 1;
+  /* the blocks reaching the latch without passing the header */
+  unique_ptr(uint8_t) seen = tcc_mallocz(cfg->num_blocks);
+  unique_ptr(int) stack = tcc_malloc(sizeof(int) * cfg->num_blocks);
+  int sp = 0, found = 0;
+  seen[header_b] = seen[latch_b] = 1;
+  stack[sp++] = latch_b;
+  while (sp > 0 && !found) {
+    const IRBasicBlock *bb = &cfg->blocks[stack[--sp]];
+    for (int i = 0; i < bb->num_preds && !found; i++) {
+      int p = bb->preds[i];
+      if (p < 0 || p >= cfg->num_blocks || seen[p])
+        continue;
+      seen[p] = 1;
+      found = cfg->label_block[p];
+      stack[sp++] = p;
+    }
+  }
+  return found;
 }
 
 int tcc_ir_cfg_flat_has_backedge(TCCIRState *ir)
@@ -202,8 +234,10 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
   /* Recompute jump targets from scratch — don't trust stale flags. */
   uint8_t *is_leader = tcc_mallocz(n);
   is_leader[0] = 1;
+  int has_ijump = 0;
   for (int i = 0; i < n; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
+    has_ijump |= q->op == TCCIR_OP_IJUMP;
     if (q->op == TCCIR_OP_INLINE_ASM)
       for (int k = 0, target; (target = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
         if (target < n)
@@ -240,6 +274,17 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
     }
   }
 
+  /* A computed goto enters at a label no jump names: each label starts a
+   * block, which every IJUMP leads to.  Without the edges, a value set
+   * before a label dominated its reads after it, and a pass forwarded it
+   * into the loop the computed goto closes. */
+  if (has_ijump)
+    for (int k = 0; k < ir->label_count; k++) {
+      const int p = ir->label_pos[IR_LABEL_WORDS * k + 1];
+      if (p >= 0 && p < n)
+        is_leader[p] = 1;
+    }
+
   /* Count blocks */
   int nb = 0;
   for (int i = 0; i < n; i++)
@@ -270,8 +315,26 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
 
   tcc_free(is_leader);
 
+  /* The label blocks an IJUMP leads to, each once. */
+  int nlbl = 0;
+  int *lbl = NULL;
+  if (has_ijump && ir->label_count > 0) {
+    lbl = tcc_malloc(sizeof(int) * ir->label_count);
+    for (int k = 0; k < ir->label_count; k++) {
+      const int p = ir->label_pos[IR_LABEL_WORDS * k + 1];
+      if (p < 0 || p >= n)
+        continue;
+      int b = cfg->instr_to_block[p];
+      if (!cfg->label_block)
+        cfg->label_block = tcc_mallocz(cfg->num_blocks);
+      if (!cfg->label_block[b])
+        lbl[nlbl++] = b;
+      cfg->label_block[b] = 1;
+    }
+  }
+
   /* Build edges: count, carve each block's slices out of one array, fill. */
-  cfg_build_edges(ir, cfg, 0);
+  cfg_build_edges(ir, cfg, 0, lbl, nlbl);
   int total_edges = 0;
   for (int b = 0; b < cfg->num_blocks; b++)
     total_edges += cfg->blocks[b].num_succs + cfg->blocks[b].num_preds;
@@ -289,7 +352,8 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
     slot += bb->num_preds;
     bb->num_preds = 0;
   }
-  cfg_build_edges(ir, cfg, 1);
+  cfg_build_edges(ir, cfg, 1, lbl, nlbl);
+  tcc_free(lbl);
 
   return cfg;
 }
@@ -299,6 +363,7 @@ void tcc_ir_cfg_free(IRCFG *cfg)
   if (!cfg)
     return;
   tcc_free(cfg->edge_store);
+  tcc_free(cfg->label_block);
   tcc_free(cfg->df_store);
   tcc_free(cfg->dom_children_store);
   tcc_hot_free(cfg->blocks);

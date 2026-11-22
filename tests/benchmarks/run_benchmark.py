@@ -411,19 +411,47 @@ def _print_hardfault_details(serial_output: str):
                 break
 
 
-def _build_run_script(elf: str, serial_port: str = "") -> str:
+def _build_run_script(elf: str, serial_port: str = "", probe_serial: str = "") -> str:
     """Return the bash script that flashes `elf` via OpenOCD and captures the
     board's serial output.  Shared by the local and remote runners; `elf` is a
-    path valid on whichever host actually executes the script."""
+    path valid on whichever host actually executes the script.
+
+    `probe_serial` names the Debug Probe of the board to use when the host has
+    more than one (yasos.zig's scripts/rig/boards.py sets YASOS_PROBE_SERIAL
+    for the board it hands out): OpenOCD then opens only that probe and the
+    UART is that probe's, never the first /dev/serial/by-id entry, which can
+    belong to a board someone else is using."""
     return f'''#!/bin/bash
 set -e
 
     SERIAL="{serial_port}"
     ELF="{elf}"
+    PROBE="{probe_serial}"
 
 detect_serial_port() {{
     if [ -n "$SERIAL" ] && [ -e "$SERIAL" ]; then
         return 0
+    fi
+
+    if [ -n "$PROBE" ]; then
+        # This probe's UART only: its by-id link, else the tty under its USB
+        # interface in sysfs.
+        for dev in /dev/serial/by-id/*_"$PROBE"-if01; do
+            if [ -e "$dev" ]; then
+                SERIAL="$dev"
+                return 0
+            fi
+        done
+        for usb in /sys/bus/usb/devices/*; do
+            [ "$(cat "$usb/serial" 2>/dev/null)" = "$PROBE" ] || continue
+            for tty in "$usb"/"${{usb##*/}}":*/tty/*; do
+                if [ -e "$tty" ]; then
+                    SERIAL="/dev/${{tty##*/}}"
+                    return 0
+                fi
+            done
+        done
+        return 1
     fi
 
     for dev in /dev/serial/by-id/* /dev/serial/by-path/* /dev/ttyACM* /dev/ttyUSB*; do
@@ -484,12 +512,17 @@ echo "Running OpenOCD with reset..."
 INTERFACE_CFG="interface/cmsis-dap.cfg"
 TARGET_CFG="target/rp2350.cfg"
 ADAPTER_SPEED=5000
+# With more than one probe on the host, open only this board's.
+PROBE_SELECT=()
+if [ -n "$PROBE" ]; then
+    PROBE_SELECT=(-c "adapter serial $PROBE")
+fi
 
 openocd_rescue_reset() {{
     # Use the RP2350 rescue debug port to force-halt the chip.
     # This works even when the CPU is stuck running bad firmware.
     local rescue_cfg="target/rp2350-rescue.cfg"
-    if ! openocd -f "$INTERFACE_CFG" -f "$rescue_cfg" \
+    if ! openocd -f "$INTERFACE_CFG" "${{PROBE_SELECT[@]}}" -f "$rescue_cfg" \
         -c "adapter speed 5000" -c "init" -c "exit" 2>&1; then
         echo "rescue DP reset failed" >&2
         return 1
@@ -499,7 +532,7 @@ openocd_rescue_reset() {{
 }}
 
 openocd_reset_halt() {{
-    if openocd -f "$INTERFACE_CFG" -f "$TARGET_CFG" \
+    if openocd -f "$INTERFACE_CFG" "${{PROBE_SELECT[@]}}" -f "$TARGET_CFG" \
         -c "adapter speed $ADAPTER_SPEED" \
         -c "init" -c "reset halt" -c "exit" 2>/dev/null; then
         return 0
@@ -515,7 +548,7 @@ openocd_rescue_reset 2>/dev/null || true
 # Flash with retry logic
 FLASH_OK=0
 for FLASH_ATTEMPT in 1 2 3; do
-    if openocd -f "$INTERFACE_CFG" -f "$TARGET_CFG" \
+    if openocd -f "$INTERFACE_CFG" "${{PROBE_SELECT[@]}}" -f "$TARGET_CFG" \
         -c "adapter speed $ADAPTER_SPEED" \\
         -c "init" \\
         -c "reset halt" \\
@@ -668,7 +701,11 @@ def run_local(elf_path: Path) -> Tuple[bool, str, str]:
     print(f"\nRunning benchmark locally (board on this node)...")
 
     # The script self-detects the serial port at runtime, so no pre-probe needed.
-    script = _build_run_script(str(elf_path))
+    # A board handed out by yasos.zig's scripts/rig/boards.py comes with its
+    # probe serial and UART in the environment.
+    script = _build_run_script(str(elf_path),
+                               os.environ.get("SERIAL_DEVICE", ""),
+                               os.environ.get("YASOS_PROBE_SERIAL", ""))
     with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
         fh.write(script)
         script_path = fh.name
@@ -721,9 +758,13 @@ def run_remote(elf_path: Path, host: str, port: int = 22,
     sftp.put(str(elf_path), remote_elf)
 
     # Probe serial port up front for logging, but let the remote script
-    # detect it again at runtime so we don't bake in stale paths.
+    # detect it again at runtime so we don't bake in stale paths.  With
+    # YASOS_PROBE_SERIAL set (the board's Debug Probe), only that probe's UART.
+    probe_serial = os.environ.get("YASOS_PROBE_SERIAL", "")
+    serial_globs = (f"/dev/serial/by-id/*_{probe_serial}-if01" if probe_serial else
+                    "/dev/serial/by-id/* /dev/serial/by-path/* /dev/ttyACM* /dev/ttyUSB*")
     detect_serial_cmd = r'''
-for dev in /dev/serial/by-id/* /dev/serial/by-path/* /dev/ttyACM* /dev/ttyUSB*; do
+for dev in ''' + serial_globs + r'''; do
     if [ -e "$dev" ]; then
         printf "%s\n" "$dev"
         exit 0
@@ -738,7 +779,7 @@ exit 1
     else:
         print("Warning: no serial port detected before launch; remote script will probe again")
 
-    combined_script = _build_run_script(remote_elf, serial_port)
+    combined_script = _build_run_script(remote_elf, serial_port, probe_serial)
     remote_combined = "/tmp/run_test.sh"
     sftp.putfo(__import__("io").BytesIO(combined_script.encode()), remote_combined)
     ssh.exec_command(f"chmod +x {remote_combined}")

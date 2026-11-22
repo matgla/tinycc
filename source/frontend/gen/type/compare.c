@@ -38,6 +38,24 @@ void type_to_str(char *buf, int buf_size, CType *type, const char *varstr)
   bt = t & VT_BTYPE;
   buf[0] = '\0';
 
+  /* yasc: `!T`, `error NAME`, `error` */
+  if (MAYBE_ERRUNION(type) && type_is_errunion(type))
+  {
+    pstrcpy(buf, buf_size, "!");
+    type_to_str(buf + 1, buf_size - 1, &type->ref->type, varstr);
+    return;
+  }
+  if (type_is_errset(type))
+  {
+    pstrcpy(buf, buf_size, yasc_errset_name(type));
+    if (varstr)
+    {
+      pstrcat(buf, buf_size, " ");
+      pstrcat(buf, buf_size, varstr);
+    }
+    return;
+  }
+
   if (t & VT_EXTERN)
     pstrcat(buf, buf_size, "extern ");
   if (t & VT_STATIC)
@@ -166,6 +184,10 @@ void type_to_str(char *buf, int buf_size, CType *type, const char *varstr)
         pstrcat(buf1, buf_size, "volatile ");
       if (t & VT_RODATA_REL)
         pstrcat(buf1, buf_size, "__rodata_relative ");
+      if (s->yasc & YASC_OWNED)
+        pstrcat(buf1, sizeof(buf1), "owned ");
+      if (s->yasc & YASC_MAYBE)
+        pstrcat(buf1, sizeof(buf1), "maybe ");
       if (varstr)
         pstrcat(buf1, sizeof(buf1), varstr);
       type_to_str(buf, buf_size, &s->type, buf1);
@@ -192,7 +214,7 @@ static void type_incompatibility_warning(CType *st, CType *dt, const char *fmt)
   char buf1[256], buf2[256];
   type_to_str(buf1, sizeof(buf1), st, NULL);
   type_to_str(buf2, sizeof(buf2), dt, NULL);
-  tcc_warning(fmt, buf1, buf2);
+  tcc_warning_once_always(fmt, buf1, buf2);
 }
 
 int pointed_size(CType *type)
@@ -394,6 +416,10 @@ int compare_types(CType *type1, CType *type2, int unqualified)
 {
   int bt1, t1, t2;
 
+  /* yasc error unions: the same payload (their nodes are interned) */
+  if ((MAYBE_ERRUNION(type1) || MAYBE_ERRUNION(type2)) && (type_is_errunion(type1) || type_is_errunion(type2)))
+    return type1->ref == type2->ref;
+
   if (IS_ENUM(type1->t))
   {
     if (IS_ENUM(type2->t))
@@ -548,7 +574,7 @@ int combine_types(CType *dest, SValue *op1, SValue *op2, int op)
       /* accept comparison or cond-expr between pointer and integer
          with a warning */
       if ((op == '?' || op == CMP_OP) && (is_integer_btype(bt1) || is_integer_btype(bt2)))
-        tcc_warning("pointer/integer mismatch in %s", op == '?' ? "conditional expression" : "comparison");
+        tcc_warning_once(warn_int_conversion, "pointer/integer mismatch in %s", op == '?' ? "conditional expression" : "comparison");
       else if (op != '-' || !is_integer_btype(bt2))
         ret = 0;
       type = *(bt1 == VT_PTR ? type1 : type2);

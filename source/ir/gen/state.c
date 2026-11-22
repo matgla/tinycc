@@ -166,6 +166,10 @@ void tcc_ir_free(TCCIRState *ir)
   }
 
   tcc_free(ir->param_forms);
+#ifdef CONFIG_TCC_BCHECK
+  tcc_free(ir->bc_patch);
+  tcc_free(ir->bc_locals);
+#endif
   ir->param_forms = NULL;
   ir_opt_frame_ptr_free(ir);
   if (ir->frame_objs)
@@ -292,6 +296,11 @@ void tcc_ir_free(TCCIRState *ir)
 
   tcc_free(ir->codegen_return_jump_addrs);
   ir->codegen_return_jump_addrs = NULL;
+  tcc_ir_lt_free(ir);
+  tcc_ir_taint_free(ir);
+  tcc_free(ir->su_call_sig);
+  ir->su_call_sig = NULL;
+  ir->su_nb_call_sig = 0;
   tcc_free(ir->codegen_dry_insn_scratch);
   ir->codegen_dry_insn_scratch = NULL;
   tcc_free(ir->codegen_dry_insn_saves);

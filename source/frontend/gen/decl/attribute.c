@@ -36,7 +36,8 @@ ST_FUNC void inc(int post, int c)
   }
   /* add constant */
   vpushi(c - TOK_MID);
-  gen_op('+');
+  if (!(tcc_state->sanitize && ubsan_gen_op('+')))
+    gen_op('+');
 
   /* For pre-increment on captured variables (nested functions): save the new
    * value before vstore(), because vstore() uses STORE (not ASSIGN) for
@@ -50,7 +51,14 @@ ST_FUNC void inc(int post, int c)
     captured_preinc = 1;
   }
 
+  /* the variable's own frame offset, for the reload below: vstore leaves the
+     stored value's c.i on vtop, which is the variable's only by accident (a
+     sanitized add's result carries another) */
+  const SValue dest_lval = vtop[-1];
+
+  fe_conv_quiet++; /* `c++` on a char: no -Wconversion, as gcc */
   vstore(); /* store value */
+  fe_conv_quiet--;
   if (post)
     vpop(); /* if post op, return saved value */
   else if (captured_preinc)
@@ -84,7 +92,7 @@ ST_FUNC void inc(int post, int c)
       src.type = sv->type;
       src.r = VT_LOCAL | VT_LVAL;
       src.vr = sv->vr;
-      src.c.i = sv->c.i;
+      src.c.i = dest_lval.vr == sv->vr ? dest_lval.c.i : sv->c.i;
 
       SValue load_dest;
       memset(&load_dest, 0, sizeof(load_dest));
@@ -134,13 +142,241 @@ ST_FUNC int exact_log2p1(unsigned int i)
   return ret;
 }
 
-/* Parse C23 [[ ... ]] standard attribute syntax.
-   Currently we skip/ignore these attributes since TCC does not
-   perform interprocedural optimizations. Known attributes like
-   [[noreturn]] are mapped to their equivalent effect. */
+/* -Wignored-attributes: attributes that promise a check -- a reader takes
+ * `access(write_only, 1)` for one -- which tcc does not make yet.  Reported once per
+ * attribute in a unit, and not in system headers.  fallthrough marks a
+ * statement (-Wimplicit-fallthrough), and maybe_unused only silences warnings
+ * tcc does not give, so ignoring it loses nothing.  format, nonnull, returns_nonnull, malloc, alloc_size,
+ * warn_unused_result, nodiscard and deprecated are checked, stack_protect and
+ * no_stack_protector applied (-fstack-protector*), in either
+ * spelling (parse_checked_attribute). */
+static const char *const unchecked_attributes[] = {"access", NULL};
+
+static void warn_unchecked_attribute(const char *name)
+{
+  char base[32];
+  size_t n = strlen(name);
+  BufferedFile *f = file;
+  /* __format__ is format */
+  if (n > 4 && name[0] == '_' && name[1] == '_' && name[n - 1] == '_' && name[n - 2] == '_')
+    name += 2, n -= 4;
+  if (n >= sizeof base)
+    return;
+  memcpy(base, name, n);
+  base[n] = 0;
+  while (f && f->filename[0] == ':' && f->prev)
+    f = f->prev;
+  for (int i = 0; unchecked_attributes[i]; i++)
+    if (!strcmp(base, unchecked_attributes[i]))
+    {
+      if ((f && f->sys) || (tcc_state->warned_attributes & (1u << i)))
+        return;
+      tcc_state->warned_attributes |= 1u << i;
+      tcc_warning_c(warn_ignored_attributes)("'%s' attribute is not checked by tcc: ignored", base);
+      return;
+    }
+}
+
+static int attribute_carries_check(const char *name)
+{
+  size_t n = strlen(name);
+  if (n > 4 && name[0] == '_' && name[1] == '_' && name[n - 1] == '_' && name[n - 2] == '_')
+    name += 2, n -= 4;
+  for (int i = 0; unchecked_attributes[i]; i++)
+    if (strlen(unchecked_attributes[i]) == n && !strncmp(name, unchecked_attributes[i], n))
+      return 1;
+  return 0;
+}
+
+/* Is attribute token T the name N, as `N` or `__N__`? */
+static int attr_named(int t, const char *n)
+{
+  const char *s = get_tok_str(t, NULL);
+  size_t len = strlen(n);
+  if (!s)
+    return 0;
+  if (s[0] == '_' && s[1] == '_')
+    return !strncmp(s + 2, n, len) && !strcmp(s + 2 + len, "__");
+  return !strcmp(s, n);
+}
+
+/* `("text")` after deprecated or nodiscard: its token, 0 when there is none */
+static int attr_message(void)
+{
+  int t;
+  if (tok != '(')
+    return 0;
+  next();
+  t = tok_alloc_const(parse_mult_str("string literal")->data);
+  skip(')');
+  return t;
+}
+
+/* The attributes the frontend applies or checks, after their name T, in
+ * either spelling: `__attribute__((T...))` and C23 `[[gnu::T...]]`.  0 when
+ * T is not one of them (nothing consumed). */
+static int parse_checked_attribute(AttributeDef *ad, int t)
+{
+  int n;
+  if (attr_named(t, "malloc"))
+  {
+    /* malloc, or GCC 11's malloc(deallocator[, argument]) */
+    ad->attr_malloc = 1;
+    if (tok == '(')
+    {
+      next();
+      if (tok < TOK_UIDENT)
+        expect("deallocator");
+      ad->attr_dealloc = tok;
+      ad->attr_dealloc_arg = 1;
+      next();
+      if (tok == ',')
+      {
+        next();
+        ad->attr_dealloc_arg = expr_const();
+      }
+      skip(')');
+    }
+    return 1;
+  }
+  if (attr_named(t, "nonnull"))
+  {
+    if (tok == '(')
+    {
+      next();
+      for (;;)
+      {
+        n = expr_const();
+        if (n >= 1 && n <= 32)
+          ad->attr_nonnull |= 1u << (n - 1);
+        if (tok != ',')
+          break;
+        next();
+      }
+      skip(')');
+    }
+    else
+      ad->attr_nonnull_all = 1;
+    return 1;
+  }
+  if (attr_named(t, "alloc_size"))
+  {
+    /* alloc_size(a[, b]): the result's size is argument a (times b) --
+       __builtin_object_size and the checks of builtin/objsize.c */
+    int a, b = 0;
+    skip('(');
+    a = expr_const();
+    if (tok == ',')
+    {
+      next();
+      b = expr_const();
+    }
+    skip(')');
+    if (a >= 1 && a <= 255 && b >= 0 && b <= 255)
+      ad->attr_alloc_a = a, ad->attr_alloc_b = b;
+    return 1;
+  }
+  if (attr_named(t, "returns_nonnull"))
+  {
+    ad->attr_returns_nonnull = 1;
+    return 1;
+  }
+  /* -Wtainted-format's sources (ir/taint.c): the result, or what argument n
+     points to after the call, is untrusted input */
+  if (attr_named(t, "tainted_result"))
+  {
+    ad->attr_tainted_result = 1;
+    return 1;
+  }
+  if (attr_named(t, "tainted_arg"))
+  {
+    int n;
+    skip('(');
+    for (;;)
+    {
+      n = expr_const();
+      if (n >= 1 && n <= 32)
+        ad->attr_tainted_args |= 1u << (n - 1);
+      if (tok != ',')
+        break;
+      next();
+    }
+    skip(')');
+    return 1;
+  }
+  if (attr_named(t, "format"))
+  {
+    /* format(printf|scanf|..., fmt, first): -Wformat at each call */
+    int kind, idx, first;
+    skip('(');
+    if (tok < TOK_IDENT)
+      expect("format archetype");
+    kind = attr_named(tok, "printf") || attr_named(tok, "gnu_printf")       ? ATTR_FMT_PRINTF
+           : attr_named(tok, "scanf") || attr_named(tok, "gnu_scanf")       ? ATTR_FMT_SCANF
+           : attr_named(tok, "strftime") || attr_named(tok, "gnu_strftime") ? ATTR_FMT_STRFTIME
+           : attr_named(tok, "strfmon")                                     ? ATTR_FMT_STRFMON
+                                                                            : ATTR_FMT_OTHER;
+    next();
+    skip(',');
+    idx = expr_const();
+    skip(',');
+    first = expr_const();
+    skip(')');
+    if (idx < 1 || idx > 255 || first < 0 || first > 255 || (first && first <= idx))
+      tcc_warning_c(warn_format)("'format' attribute: argument numbers %d, %d are out of range: ignored", idx, first);
+    else
+    {
+      ad->attr_fmt_kind = kind;
+      ad->attr_fmt_idx = idx;
+      ad->attr_fmt_first = first;
+    }
+    return 1;
+  }
+  if (attr_named(t, "format_arg"))
+  {
+    /* format_arg(n): the result is a format when argument n is (gettext) */
+    int n;
+    skip('(');
+    n = expr_const();
+    skip(')');
+    if (n >= 1 && n <= 255)
+      ad->attr_fmt_arg = n;
+    return 1;
+  }
+  if (attr_named(t, "deprecated"))
+  {
+    int m = attr_message();
+    ad->attr_deprecated = 1;
+    if (m)
+      ad->attr_deprecated_msg = m;
+    return 1;
+  }
+  /* -fstack-protector*'s choice for this function (op/ubsan.c
+     ssp_begin_function).  Under -fstack-protector* not inlined, as gcc does
+     not inline across a mismatch: an inlined body is protected or not with
+     its caller.  Without one the attributes change nothing. */
+  if (attr_named(t, "stack_protect") || attr_named(t, "no_stack_protector"))
+  {
+    ad->attr_ssp |= attr_named(t, "stack_protect") ? SYMF_STACK_PROTECT : SYMF_NO_STACK_PROTECT;
+    if (tcc_state->stack_protector)
+      ad->f.func_noinline = 1;
+    return 1;
+  }
+  if (attr_named(t, "warn_unused_result"))
+  {
+    if (!ad->attr_unused_result)
+      ad->attr_unused_result = ATTR_WUR;
+    return 1;
+  }
+  return 0;
+}
+
 /* Parse C23 [[ ... ]] standard attributes.  Returns 1 if at least one
    attribute was consumed, 0 if the current '[' is not part of a C23
-   attribute (token stream is left unchanged in that case). */
+   attribute (token stream is left unchanged in that case).  deprecated and
+   nodiscard, and gnu:: the attributes parse_checked_attribute takes, have
+   their meaning; the others are skipped (-Wignored-attributes for those that
+   promise a check). */
 int parse_c23_attribute(AttributeDef *ad)
 {
   int found = 0;
@@ -156,16 +392,68 @@ int parse_c23_attribute(AttributeDef *ad)
     /* skip the second '[' */
     next();
     found = 1;
-    /* parse the attribute contents: handle balanced brackets */
-    int brackets = 2;
-    while (brackets > 0 && tok != TOK_EOF)
+    while (tok != ']' && tok != TOK_EOF)
     {
-      if (tok == '[')
-        brackets++;
-      else if (tok == ']')
-        brackets--;
+      int prefix = 0, name, done = 0;
+      if (tok == ',')
+      {
+        next();
+        continue;
+      }
+      if (tok < TOK_IDENT)
+        expect("attribute name");
+      name = tok;
       next();
+      if (tok == ':')
+      {
+        /* prefix::name */
+        next();
+        skip(':');
+        if (tok < TOK_IDENT)
+          expect("attribute name");
+        prefix = name;
+        name = tok;
+        next();
+      }
+      if ((!prefix || attr_named(prefix, "gnu")) && attr_named(name, "fallthrough"))
+      {
+        attr_fallthrough_seen = 1; /* a statement: -Wimplicit-fallthrough */
+        done = 1;
+      }
+      else if (!prefix && attr_named(name, "nodiscard"))
+      {
+        int m = attr_message();
+        ad->attr_unused_result = ATTR_NODISCARD;
+        if (m)
+          ad->attr_nodiscard_msg = m;
+        done = 1;
+      }
+      else if (!prefix && attr_named(name, "deprecated"))
+        done = parse_checked_attribute(ad, name);
+      else if (prefix && attr_named(prefix, "gnu"))
+        done = parse_checked_attribute(ad, name);
+      /* [[maybe_unused]], [[gnu::unused]]: no -Wunused-* for it */
+      if (!done && (prefix ? attr_named(prefix, "gnu") && attr_named(name, "unused") : attr_named(name, "maybe_unused")))
+        ad->attr_unused = 1;
+      if (!done)
+      {
+        int parens = 0;
+        warn_unchecked_attribute(get_tok_str(name, NULL));
+        /* skip its arguments, balanced */
+        while (tok == '(' || parens > 0)
+        {
+          if (tok == TOK_EOF)
+            break;
+          if (tok == '(' || tok == '[')
+            parens++;
+          else if (tok == ')' || tok == ']')
+            parens--;
+          next();
+        }
+      }
     }
+    skip(']');
+    skip(']');
   }
   return found;
 }
@@ -229,10 +517,11 @@ ST_FUNC int tcc_attribute_supported(int t)
     return 1;
   default:
     if (t >= TOK_IDENT)
-    {
-      const char *attr = get_tok_str(t, NULL);
-      return !strcmp(attr, "transparent_union") || !strcmp(attr, "__transparent_union__");
-    }
+      return attr_named(t, "transparent_union") || attr_named(t, "malloc") || attr_named(t, "nonnull") ||
+             attr_named(t, "returns_nonnull") || attr_named(t, "format") || attr_named(t, "format_arg") ||
+             attr_named(t, "deprecated") || attr_named(t, "tainted_result") || attr_named(t, "tainted_arg") ||
+             attr_named(t, "warn_unused_result") || attr_named(t, "fallthrough") ||
+             attr_named(t, "stack_protect") || attr_named(t, "no_stack_protector");
     return 0;
   }
 }
@@ -266,13 +555,14 @@ redo:
       s = sym_find(tok);
       if (!s)
       {
-        tcc_warning_c(warn_implicit_function_declaration)("implicit declaration of function '%s'",
-                                                          get_tok_str(tok, &tokc));
+        tcc_warning_once(warn_implicit_function_declaration, "implicit declaration of function '%s'",
+                         get_tok_str(tok, &tokc));
         s = external_global_sym(tok, &func_old_type);
       }
       else if ((s->type.t & VT_BTYPE) != VT_FUNC)
         tcc_error("'%s' is not declared as function", get_tok_str(tok, &tokc));
       ad->cleanup_func = s;
+      s->ymod |= SYM_UNUSED_REF; /* -Wunused-function: named */
       next();
       skip(')');
       break;
@@ -366,6 +656,7 @@ redo:
       break;
     case TOK_UNUSED1:
     case TOK_UNUSED2:
+      ad->attr_unused = 1; /* no -Wunused-* for it */
       break;
     case TOK_NORETURN1:
     case TOK_NORETURN2:
@@ -460,7 +751,9 @@ redo:
       ad->a.dllexport = 1;
       break;
     case TOK_NODECORATE:
+#ifdef TCC_TARGET_PE
       ad->a.nodecorate = 1;
+#endif
       break;
     case TOK_DLLIMPORT:
       ad->a.dllimport = 1;
@@ -479,14 +772,25 @@ redo:
       break;
     default:
     {
-      const char *attr = get_tok_str(t, NULL);
-      if (attr && (!strcmp(attr, "transparent_union") || !strcmp(attr, "__transparent_union__")))
+      if (attr_named(t, "transparent_union"))
       {
         ad->a.transparent_union = 1;
         break;
       }
+      if (parse_checked_attribute(ad, t))
+        break;
+      if (attr_named(t, "fallthrough"))
+      {
+        /* `__attribute__((fallthrough));`: block() reads it as a statement
+           (-Wimplicit-fallthrough) */
+        attr_fallthrough_seen = 1;
+        break;
+      }
     }
-      tcc_warning_c(warn_unsupported)("'%s' attribute ignored", get_tok_str(t, NULL));
+      if (attribute_carries_check(get_tok_str(t, NULL)))
+        warn_unchecked_attribute(get_tok_str(t, NULL));
+      else
+        tcc_warning_c(warn_unsupported)("'%s' attribute ignored", get_tok_str(t, NULL));
       /* skip parameters */
       if (tok == '(')
       {
@@ -523,5 +827,116 @@ void parse_decl_attributes(AttributeDef *ad)
     if (tok == '[' && parse_c23_attribute(ad))
       continue;
     break;
+  }
+}
+
+/* A pointer node with these yasc qualifiers instead of "unchecked" */
+static void attr_requalify(CType *ptr, int add)
+{
+  ptr->ref = sym_pointer_node_q(&ptr->ref->type, (type_yasc(ptr) & ~YASC_UNCHECKED) | add);
+}
+
+/* A function declarator TYPE was parsed with AD: what its GCC attributes say
+ * about pointers goes into the types.
+ * - nonnull marks the parameters, for -Wnonnull at calls;
+ * - in a yasc unit, malloc makes the result `owned maybe` (`owned` with
+ *   returns_nonnull), and malloc(dealloc, i) makes the deallocator's i-th
+ *   parameter `owned maybe drop` -- on a declaration from regular C too, over
+ *   "unchecked": a C header that says what it means is believed.
+ * Only a function type the declarator built itself: a typedef's is shared. */
+void attr_apply_pointer_facts(CType *type, AttributeDef *ad, int own_functype)
+{
+  Sym *f = type->ref, *p;
+  CType *ret;
+  int i;
+
+  if ((type->t & VT_BTYPE) != VT_FUNC || !own_functype)
+    return;
+  if (ad->attr_nonnull || ad->attr_nonnull_all)
+    for (i = 1, p = sym_first(f); p; p = p->next, i++)
+      if ((p->type.t & VT_BTYPE) == VT_PTR &&
+          (ad->attr_nonnull_all || (i <= 32 && (ad->attr_nonnull & (1u << (i - 1))))))
+        p->a.nonnull = 1;
+  /* a C header's declarations are read as C, but in a unit with yasc in it */
+  if (!tcc_yasc_unit(tcc_state) || !ad->attr_malloc)
+    return;
+  ret = &f->type;
+  if ((ret->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR)
+  {
+    attr_requalify(ret, YASC_OWNED | (ad->attr_returns_nonnull ? 0 : YASC_MAYBE));
+    /* malloc(fclose, 1): released by fclose, as `owned(fclose)` says */
+    if (ad->attr_dealloc)
+      ret->ref = sym_pointer_node_b(&ret->ref->type, ret->ref->yasc, ad->attr_dealloc);
+  }
+  if (ad->attr_dealloc)
+  {
+    Sym *d = sym_find(ad->attr_dealloc);
+    if (!d || (d->type.t & VT_BTYPE) != VT_FUNC)
+    {
+      tcc_warning("malloc: deallocator '%s' is not a function declared before", get_tok_str(ad->attr_dealloc, NULL));
+      return;
+    }
+    for (i = 1, p = sym_first(d->type.ref); p && i < ad->attr_dealloc_arg; p = p->next)
+      i++;
+    if (p && (p->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR)
+    {
+      attr_requalify(&p->type, YASC_OWNED | YASC_MAYBE | YASC_DROP);
+      p->type.ref = sym_pointer_node_b(&p->type.ref->type, p->type.ref->yasc, ad->attr_dealloc);
+    }
+  }
+}
+
+/* The checked attributes a declaration AD wrote (deprecated, nodiscard /
+ * warn_unused_result, format) go to its Sym S, merged over the earlier
+ * declarations' (SymAttr.attr_facts marks it; expr/attr_checks.c reads them
+ * at each use). */
+void attr_apply_decl_facts(Sym *s, AttributeDef *ad)
+{
+  attr_apply_decl_facts_at(s, ad, 0);
+}
+
+/* The same, the declaration at LINE of this file (0: the current line) */
+void attr_apply_decl_facts_at(Sym *s, AttributeDef *ad, int line)
+{
+  SymLocalFacts *f;
+  if (!s || !(ad->attr_deprecated | ad->attr_unused_result | ad->attr_fmt_kind | ad->attr_fmt_arg | ad->attr_alloc_a |
+               ad->attr_malloc | ad->attr_tainted_result | ad->attr_tainted_args | ad->attr_ssp))
+    return;
+  f = sym_facts(s);
+  s->a.attr_facts = 1;
+  /* stack_protect / no_stack_protector: no_stack_protector wins (gcc) */
+  if (ad->attr_ssp && (s->type.t & VT_BTYPE) == VT_FUNC)
+  {
+    f->flags |= ad->attr_ssp;
+    if ((f->flags & (SYMF_STACK_PROTECT | SYMF_NO_STACK_PROTECT)) == (SYMF_STACK_PROTECT | SYMF_NO_STACK_PROTECT))
+    {
+      f->flags &= ~SYMF_STACK_PROTECT;
+      tcc_warning_once(warn_ignored_attributes, "'stack_protect' attribute conflicts with 'no_stack_protector': ignored");
+    }
+  }
+  /* alloc_size, malloc, malloc(dealloc, i): builtin/objsize.c */
+  if ((ad->attr_alloc_a || ad->attr_malloc) && (s->type.t & VT_BTYPE) == VT_FUNC)
+    objsize_apply_alloc_attrs(s, f, ad);
+  if (ad->attr_deprecated)
+  {
+    if (!f->deprecated)
+      attr_decl_place(f, line);
+    f->deprecated = 1;
+    if (ad->attr_deprecated_msg)
+      f->deprecated_msg = ad->attr_deprecated_msg;
+  }
+  if (ad->attr_unused_result > f->unused_result)
+    f->unused_result = ad->attr_unused_result;
+  if (ad->attr_nodiscard_msg)
+    f->nodiscard_msg = ad->attr_nodiscard_msg;
+  if (ad->attr_fmt_arg)
+    f->fmt_arg = ad->attr_fmt_arg;
+  f->tainted_result |= ad->attr_tainted_result;
+  f->tainted_args |= ad->attr_tainted_args;
+  if (ad->attr_fmt_kind)
+  {
+    f->fmt_kind = ad->attr_fmt_kind;
+    f->fmt_idx = ad->attr_fmt_idx;
+    f->fmt_first = ad->attr_fmt_first;
   }
 }

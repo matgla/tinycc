@@ -109,6 +109,10 @@
     #define __STDC_UTF_32__ 1
 #endif
     #endif
+    /* C23 __has_embed results */
+    #define __STDC_EMBED_NOT_FOUND__ 0
+    #define __STDC_EMBED_FOUND__ 1
+    #define __STDC_EMBED_EMPTY__ 2
 
 #if defined _WIN32
 #define __declspec(x) __attribute__((x))

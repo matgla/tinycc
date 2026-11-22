@@ -17,8 +17,9 @@ XTCC ?= $(TOP)/$(X)tcc$(EXESUF)
 FP_CC := $(abspath $(TOP)/$(X)tcc$(EXESUF))
 XCC = $(XTCC)
 XAR = $(XTCC) -ar
-XFLAGS-unx = -B$(TOPSRC)
-XFLAGS-win = -B$(TOPSRC)/win32 -I$(TOPSRC)/include
+# -ccompat: the runtime is regular C, not the safe-by-default dialect
+XFLAGS-unx = -B$(TOPSRC) -ccompat
+XFLAGS-win = -B$(TOPSRC)/win32 -I$(TOPSRC)/include -ccompat
 XFLAGS = $(XFLAGS$(XCFG)) $(CROSS_FLAGS)
 BFLAGS = -bt
 
@@ -76,7 +77,7 @@ OBJ-arm-vfp = $(OBJ-arm)
 OBJ-arm-eabi = $(OBJ-arm)
 OBJ-arm-eabihf = $(OBJ-arm)
 OBJ-arm-wince = $(ARM_O) $(WIN_O)
-OBJ-armv8m = libtcc1.o alloca.o armeabi.o armeabi_divmod.o va_list.o builtin.o arm_string.o arm_mem.o arm_copystub.o armv8m_atomic.o
+OBJ-armv8m = libtcc1.o alloca.o armeabi.o armeabi_divmod.o va_list.o builtin.o arm_string.o arm_mem.o arm_copystub.o armv8m_atomic.o yasc.o
 OBJ-riscv64 = $(RISCV64_O) $(LIN_O)
 
 OBJ-extra = $(filter $(EXTRA_O),$(OBJ-$T))
@@ -84,11 +85,23 @@ OBJ-libtcc1 = $(addprefix $(X),$(filter-out $(OBJ-extra),$(OBJ-$T)))
 
 ALL = $(addprefix $(TOP)/,$(X)libtcc1.a $(OBJ-extra))
 
+# -fcallgraph-info: every member's .ci (frames, callees, function types,
+# address-taken functions), gathered beside the archive as $(X)libtcc1.ci for
+# scripts/stack_usage.py -- one `object NAME` section per member.  The
+# objects are the same with and without it.
+ifeq ($T,armv8m)
+XFLAGS += -fcallgraph-info=su
+ALL += $(TOP)/$(X)libtcc1.ci
+endif
+
 all: $(ALL)
 
 $(info $(TCC))
 $(TOP)/$(X)libtcc1.a : $(OBJ-libtcc1) $(TCC)
 	$S$(XAR) rcs $@ $(OBJ-libtcc1)
+
+$(TOP)/$(X)libtcc1.ci : $(TOP)/$(X)libtcc1.a
+	$S(for o in $(OBJ-libtcc1:.o=.ci); do echo "object $${o%.ci}.o"; cat $$o; done) > $@
 
 $(X)%.o : %.c $(TCC)
 	$S$(XCC) -c $< -o $@ $(XFLAGS)
@@ -138,7 +151,7 @@ $(X)armeabi.o : armeabi.c $(TCC)
 $(TCC) : ;
 
 clean :
-	rm -f *.o $(addprefix $(TOP)/,*libtcc1.a $(EXTRA_O))
+	rm -f *.o *.ci $(addprefix $(TOP)/,*libtcc1.a *libtcc1.ci $(EXTRA_O))
 	rm -rf build
 	$(MAKE) -C fp clean
 

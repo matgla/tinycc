@@ -1899,6 +1899,14 @@ LIBTCCAPI int tcc_output_file(TCCState *s, const char *filename)
 
   if (s->test_coverage)
     tcc_tcov_add_file(s, filename);
+  /* -Wcross-tu: every unit is in: compare their globals' types */
+  if (s->output_type != TCC_OUTPUT_OBJ && s->nb_typesigs)
+  {
+    int errors = s->nb_errors;
+    tcc_typesig_check(s);
+    if (s->nb_errors != errors)
+      return -1;
+  }
   if (s->output_type == TCC_OUTPUT_OBJ)
     ret = elf_output_obj(s, filename);
 #ifdef TCC_TARGET_PE

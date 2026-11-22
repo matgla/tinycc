@@ -17,38 +17,50 @@ GEN_SRC = \
 	source/frontend/gen/builtin/fp.c \
 	source/frontend/gen/builtin/fp2.c \
 	source/frontend/gen/builtin/misc.c \
+	source/frontend/gen/builtin/objsize.c \
 	source/frontend/gen/builtin/overflow.c \
 	source/frontend/gen/builtin/simd.c \
 	source/frontend/gen/builtin/string.c \
 	source/frontend/gen/core/predicates.c \
+	source/frontend/gen/core/recover.c \
 	source/frontend/gen/core/state.c \
 	source/frontend/gen/core/suppress.c \
+	source/frontend/gen/core/unused.c \
 	source/frontend/gen/decl/attribute.c \
 	source/frontend/gen/decl/btype.c \
 	source/frontend/gen/decl/decl.c \
 	source/frontend/gen/decl/declarator.c \
+	source/frontend/gen/decl/method.c \
+	source/frontend/gen/decl/module.c \
+	source/frontend/gen/decl/plain_param.c \
 	source/frontend/gen/decl/predef_protos.c \
 	source/frontend/gen/decl/struct.c \
+	source/frontend/gen/decl/typesig.c \
 	source/frontend/gen/expr/atomic.c \
+	source/frontend/gen/expr/attr_checks.c \
 	source/frontend/gen/expr/cond.c \
 	source/frontend/gen/expr/indir.c \
 	source/frontend/gen/expr/infix.c \
 	source/frontend/gen/expr/primary.c \
 	source/frontend/gen/expr/unary.c \
+	source/frontend/gen/expr/yasc_errors.c \
 	source/frontend/gen/init/alloc.c \
 	source/frontend/gen/init/initializer.c \
 	source/frontend/gen/inline/analysis.c \
 	source/frontend/gen/inline/const_eval.c \
 	source/frontend/gen/inline/emit.c \
 	source/frontend/gen/nested/nested.c \
+	source/frontend/gen/op/bcheck.c \
 	source/frontend/gen/op/complex.c \
 	source/frontend/gen/op/float.c \
 	source/frontend/gen/op/fold_math.c \
 	source/frontend/gen/op/int.c \
 	source/frontend/gen/op/op.c \
+	source/frontend/gen/op/ubsan.c \
 	source/frontend/gen/op/vector.c \
 	source/frontend/gen/stmt/block.c \
 	source/frontend/gen/stmt/cleanup.c \
+	source/frontend/gen/stmt/defer.c \
 	source/frontend/gen/stmt/ret.c \
 	source/frontend/gen/stmt/switch.c \
 	source/frontend/gen/store/struct_copy.c \

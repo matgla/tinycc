@@ -625,7 +625,7 @@ void compile_nested_functions(Sym *parent_sym)
     tcc_state->current_nested_func = nf;
 
     /* Replay saved token stream (same as inline function expansion) */
-    tccpp_setfile(nf->filename);
+    tccpp_setfile_replay(nf->filename);
     begin_macro_kept(nf->func_str);
     next(); /* prime the first token - should be '{' */
 
@@ -838,6 +838,7 @@ void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, NestedFunc *
       {
         /* Mark as address-taken to force stack allocation */
         s->a.addrtaken = 1;
+        s->ymod |= SYM_UNUSED_REF | SYM_UNUSED_READ; /* -Wunused-*: captured */
         /* Also mark in IR so register allocator knows to spill to stack */
         if (tcc_state->ir && s->vreg >= 0)
           tcc_ir_set_addrtaken(tcc_state->ir, s->vreg);
@@ -1058,6 +1059,7 @@ static void prescan_token_buf_for_captures(NestedFunc *nf, const int *p, Sym *pa
       if (s && ((s->r & VT_VALMASK) == VT_LOCAL || (s->r & VT_PARAM)))
       {
         s->a.addrtaken = 1;
+        s->ymod |= SYM_UNUSED_REF | SYM_UNUSED_READ; /* -Wunused-*: captured */
         if (tcc_state->ir && s->vreg >= 0)
           tcc_ir_set_addrtaken(tcc_state->ir, s->vreg);
         int already = 0;

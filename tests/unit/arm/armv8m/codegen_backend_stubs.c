@@ -166,3 +166,17 @@ void tcc_debug_cfi_restore_state(TCCState *s1)
 {
   (void)s1;
 }
+
+/* -fstack-usage / -Wframe-larger-than (backend/generators/stack_usage.c) */
+int tcc_stack_usage_wanted(TCCState *s1)
+{
+  (void)s1;
+  return 0;
+}
+
+int tcc_stack_usage_call_sig(TCCState *s1, int call_id)
+{
+  (void)s1;
+  (void)call_id;
+  return 0;
+}

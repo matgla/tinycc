@@ -785,6 +785,8 @@ void tcc_ir_codegen_params_setup(TCCIRState *ir)
   tcc_ir_register_allocation_params(ir);
 }
 
+void fe_narrow_note_bool(void); /* frontend/gen/op/op.c */
+
 void tcc_ir_codegen_cmp_jmp_set(TCCIRState *ir)
 {
   if (ir == NULL)
@@ -874,6 +876,7 @@ void tcc_ir_codegen_cmp_jmp_set(TCCIRState *ir)
 
     vtop->vr = dest.vr;
     vtop->r = 0;
+    fe_narrow_note_bool(); /* -Wconversion: still 0 or 1 */
   }
   else if ((v & ~1) == VT_JMP)
   {
@@ -928,6 +931,7 @@ void tcc_ir_codegen_cmp_jmp_set(TCCIRState *ir)
     tcc_ir_codegen_bb_start(ir);
     vtop->vr = dest.vr;
     vtop->r = 0;
+    fe_narrow_note_bool(); /* -Wconversion: still 0 or 1 */
   }
 }
 
@@ -954,6 +958,8 @@ int tcc_ir_codegen_jump_append(TCCIRState *ir, int chain, int jump)
 int tcc_ir_codegen_test_gen(TCCIRState *ir, int invert, int test)
 {
   int v;
+  if (MAYBE_ERRUNION(&vtop->type) && type_is_errunion(&vtop->type))
+    yasc_errunion_misuse();
   v = vtop->r & VT_VALMASK;
   if (v == VT_CMP)
   {
@@ -3757,7 +3763,8 @@ static int ir_codegen_scan_interleaved_word_copy(TCCIRState *ir, const uint8_t *
     stores[n++] = st;
     idx = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, st);
   }
-  if ((out->src_off & 3) || (out->dst_off & 3))
+  /* No pair at all leaves the offsets unset: decide on n before reading them. */
+  if (n < 2 || (out->src_off & 3) || (out->dst_off & 3))
     return 0;
   /* A destination above the source: only the words before the first one the
    * copy itself writes. */
@@ -5285,8 +5292,11 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         if (cg_peep && !a.src1.is_64bit && !a.dest.is_64bit &&
             ir_codegen_cmp0_fuses(ir, branch_target_reset, i, dest_ir, 1, &fused_cmp_idx))
         {
+          /* With its barrel shift: `y = x + (i << 2); if (y == 0)` became
+           * `adds y, x, i` (bug_cmp0_fusion_barrel_shift.c). */
           SCRATCH_WRAP(tcc_gen_machine_data_processing_mop_flags(
-              a.src1, a.src2, a.dest, cq->op, (uint32_t)tcc_ir_zero_half64_at(ir, cq) << 18));
+              a.src1, a.src2, a.dest, cq->op,
+              tcc_ir_barrel_shift_at(ir, cq) | (uint32_t)tcc_ir_zero_half64_at(ir, cq) << 18));
           codegen_skip_cmp = fused_cmp_idx;
           ir->codegen_flags_live = 1;
           break;

@@ -66,11 +66,81 @@ static void inline_fn_drop_tokens(InlineFunc *fn)
     tok_str_free(fn->func_str);
 }
 
-static void save_function_body(TokenString **str, int **pack, int compiled_now)
+/* An error the lexer raised while a body was saved (error1): kept for the
+   parse of the saved part to raise where it reads the marker. */
+ST_FUNC void save_body_error(TCCState *s1, int line, const char *msg)
 {
+  tcc_free(s1->save_body_msg);
+  s1->save_body_msg = (char *)msg;
+  s1->save_body_line = line;
+  longjmp(*s1->save_body_jmp, 1);
+}
+
+/* next() read the marker save_body_cut left: the lexer's error, here, and
+   the end of the compile as it was at -O0 */
+ST_FUNC void save_body_raise(TCCState *s1)
+{
+  char *m = s1->save_body_msg;
+  s1->save_body_msg = NULL;
+  if (!m)
+    return;
+  s1->error_fatal = 1;
+  tcc_error("%i:%s", s1->save_body_line, m); /* error1 frees nothing: m leaks with the compile */
+}
+
+/* The save of SYM's body STR stopped: STOP 1 at an error of the lexer, 2 at
+   the end of the input (no '}').  At -O0 the body is parsed as it is read:
+   the errors before that point come first, then the lexer's own or "...
+   before '<eof>'".  So the part saved is parsed now (no code: the compile
+   fails), the lexer's error raised where the parse reaches its marker.
+   Never returns: the end of the input or that error ends the compile. */
+static void save_body_cut(TokenString *str, int stop, Sym *sym)
+{
+  TCCState *s1 = tcc_state;
+  CValue cv;
+  if (stop == 2)
+  {
+    cv.i = file->line_num; /* where -O0 reads the end of the input */
+    tok_str_add2(str, TOK_LINENUM, &cv);
+  }
+  else
+  {
+    cv.i = TCC_PCH_REPLAY_ERROR << 16;
+    tok_str_add2(str, TOK_PACK_REPLAY, &cv);
+  }
+  tok_str_add(str, TOK_EOF);
+  tcc_check_scratch_begin(s1);
+  begin_macro(str, 1);
+  next();
+  gen_function_check_only(sym);
+  save_body_raise(s1);
+  tcc_error("unexpected end of file");
+}
+
+static void save_function_body(TokenString **str, int **pack, int compiled_now, Sym *sym)
+{
+  TCCState *s1 = tcc_state;
   int captures = pp_pack_captures;
+  jmp_buf jb, *const saved_jmp = s1->save_body_jmp;
+  const int saved_parse_flags = parse_flags, saved_subst = pp_subst_depth, saved_pp_expr = pp_expr;
+  const int *const saved_macro_ptr = macro_ptr;
+  TokenString *const saved_macro_stack = tok_macro_stack();
+  int stop;
   *pack = pp_pack_snapshot(tcc_state);
+  if ((stop = setjmp(jb)) != 0)
+  {
+    /* what the lexer was in the middle of is abandoned with the compile */
+    s1->save_body_jmp = saved_jmp;
+    pp_pragma_capture = NULL;
+    parse_flags = saved_parse_flags;
+    pp_subst_depth = saved_subst;
+    pp_expr = saved_pp_expr;
+    tok_macro_restore(saved_macro_stack, saved_macro_ptr);
+    save_body_cut(*str, stop, sym);
+  }
+  s1->save_body_jmp = &jb;
   skip_or_save_block(str);
+  s1->save_body_jmp = saved_jmp;
   /* Replayed after the TU is parsed, its asm must not name an r0/r1 function. */
   gfunc_regpair_note_asm_names(*str);
   if (!compiled_now && pp_pack_captures != captures)
@@ -113,7 +183,11 @@ static void define_global_function(Sym *sym, Section *ad_section)
     fn->filename = tcc_filename_intern(file->filename);
     fn->sym = sym;
     dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
-    save_function_body(&fn->func_str, &fn->pack, 0);
+    save_function_body(&fn->func_str, &fn->pack, 0, sym);
+    /* -Wunused-function/-variable: the statics it names are used, whether
+       or not anything ever parses the body */
+    if (tcc_state->unused_on)
+      unused_scan_tokens(fn->func_str, sym, 0);
 
     /* An explicit `inline` used to *disable* the inliner: this branch
      * saved the body and deferred emission, but never set
@@ -273,7 +347,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
     fn->filename = tcc_filename_intern(file->filename);
     fn->sym = sym;
     fn->func_str = NULL;
-    save_function_body(&fn->func_str, &fn->pack, 1);
+    save_function_body(&fn->func_str, &fn->pack, 1, sym);
 
     int threshold = TCC_OPT(tcc_state, opt_inline_limit) > 0 ? TCC_OPT(tcc_state, opt_inline_limit)
                                                     : (TCC_OPT(tcc_state, opt_inline_functions) ? 60 : 30);
@@ -585,7 +659,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
       fn->filename = tcc_filename_intern(file->filename);
       fn->sym = sym;
       fn->func_str = NULL;
-      save_function_body(&fn->func_str, &fn->pack, 1);
+      save_function_body(&fn->func_str, &fn->pack, 1, sym);
       int body_len = fn->func_str ? fn->func_str->len : 0;
       if (fn->func_str && body_len > 0 && body_len <= late_reopt_cap)
       {
@@ -735,6 +809,28 @@ static int body_calls_unprototyped(Sym *sym, TokenString *body)
   return 0;
 }
 
+/* At a function definition, before it merges into the declarations before
+ * it: -Wstrict-prototypes, a definition that is not a prototype (an old-style
+ * one, or `()` before C23) with no prototype before it; -Wmissing-prototypes,
+ * a global function (not main, not inline) with no prototype before it --
+ * how a header and its source drift apart.  A yasc module's export is its
+ * declaration (the interface is made from it). */
+static void definition_prototype_checks(int v, CType *type, int line, int in_module)
+{
+  Sym *prev = sym_find(v);
+  int proto_before;
+  while (prev && prev->sym_scope)
+    prev = prev->prev_tok;
+  proto_before = prev && (prev->type.t & VT_BTYPE) == VT_FUNC && prev->type.ref->f.func_type != FUNC_OLD;
+  if (proto_before)
+    return;
+  if (type->ref->f.func_type == FUNC_OLD)
+    tcc_warning_once_at(warn_strict_prototypes, line, "function declaration isn't a prototype");
+  if (!in_module && !(type->t & (VT_STATIC | VT_INLINE)) && !type->ref->f.func_rewritten_extern_inline &&
+      strcmp(get_tok_str(v, NULL), "main"))
+    tcc_warning_once_at(warn_missing_prototypes, line, "no previous prototype for '%s'", get_tok_str(v, NULL));
+}
+
 static int defer_function_body(Sym *sym, Section *section)
 {
   if (!(TCC_OPT(tcc_state, opt_inline_called_once) || TCC_OPT(tcc_state, opt_drop_unused_statics)) || tcc_state->nb_vla_param_exprs ||
@@ -744,7 +840,7 @@ static int defer_function_body(Sym *sym, Section *section)
   d->filename = tcc_filename_intern(file->filename);
   d->sym = sym;
   d->section = section;
-  save_function_body(&d->body, &d->pack, 0);
+  save_function_body(&d->body, &d->pack, 0, sym);
   int unprototyped = body_calls_unprototyped(sym, d->body);
   tok_str_release(d->body);
   if (unprototyped)
@@ -776,7 +872,7 @@ void define_deferred_function(DeferredFunc *d)
   tcc_state->deferred_sym = d->sym;
   tcc_state->deferred_call_sites = d->call_sites;
   d->body = NULL;
-  tccpp_setfile(d->filename);
+  tccpp_setfile_replay(d->filename);
   pp_pack_enter(tcc_state, d->pack, saved_pack);
   /* Replayed through a borrowed header, so save_function_body can adopt the
    * body itself; if nothing does, it goes here as before. */
@@ -804,6 +900,7 @@ TokenString *tok_str_clone(TokenString *str)
   TokenString *copy = tok_str_alloc();
   for (const int *p = tok_str_buf(str), *end = p + str->len; p < end; p++)
     tok_str_add(copy, *p);
+  tok_str_sys_copy(str, copy);
   return copy;
 }
 
@@ -901,11 +998,11 @@ static int defer_static_data(CType *type, AttributeDef *ad, int r, int v)
 
 /* Define an object defer_static_data saved: replay its initializer through
  * the allocation it skipped. */
-void define_deferred_data(DeferredData *d)
+static void define_deferred_data_replay(void *arg)
 {
+  DeferredData *d = arg;
   TokenString *init = d->init;
   d->init = NULL;
-  tccpp_setfile(d->filename);
   begin_macro_kept(init);
   next();
   decl_initializer_alloc(&d->type, &d->ad, d->r, 1, d->sym->v, 1);
@@ -914,26 +1011,47 @@ void define_deferred_data(DeferredData *d)
   end_macro();
 }
 
+/* An error in the initializer ends its replay; the next one goes on
+   (core/recover.c). */
+void define_deferred_data(DeferredData *d)
+{
+  tccpp_setfile_replay(d->filename);
+  replay_recovering(define_deferred_data_replay, d);
+}
+
 /* Parse the initializer of an object prune_unused_statics dropped, for its
  * diagnostics only: an invalid initializer is an error whether or not the
  * object is used (96_nodata_wanted).  Under check_only nothing reaches the
  * object file; the initializer is laid out in check_scratch. */
-void check_dropped_deferred_data(DeferredData *d, TokenString *init)
+typedef struct
 {
-  int align, size = type_size(&d->type, &align);
+  DeferredData *d;
+  TokenString *init;
+} DroppedDataReplay;
+
+static void check_dropped_deferred_data_replay(void *arg)
+{
+  DroppedDataReplay *a = arg;
+  int align, size = type_size(&a->d->type, &align);
   init_params p = {0};
   p.sec = tcc_state->check_scratch;
   const unsigned long addr = section_add(p.sec, size > 0 ? size : 0, align > 0 ? align : 1);
-  const int saved_nocode_wanted = nocode_wanted;
-  nocode_wanted = DATA_ONLY_WANTED;
-  tcc_state->check_only++;
-  tccpp_setfile(d->filename);
-  begin_macro_kept(init);
+  begin_macro_kept(a->init);
   next();
-  decl_initializer(&p, &d->type, addr, DIF_FIRST, -1);
+  decl_initializer(&p, &a->d->type, addr, DIF_FIRST, -1);
   if (tok != TOK_EOF)
     expect("';'");
   end_macro();
+}
+
+void check_dropped_deferred_data(DeferredData *d, TokenString *init)
+{
+  DroppedDataReplay a = {d, init};
+  const int saved_nocode_wanted = nocode_wanted;
+  nocode_wanted = DATA_ONLY_WANTED;
+  tcc_state->check_only++;
+  tccpp_setfile_replay(d->filename);
+  replay_recovering(check_dropped_deferred_data_replay, &a); /* goes on after an error */
   tcc_state->check_only--;
   nocode_wanted = saved_nocode_wanted;
 }
@@ -942,7 +1060,7 @@ void check_dropped_deferred_data(DeferredData *d, TokenString *init)
 void check_dropped_function(DeferredFunc *d, TokenString *body)
 {
   int saved_pack[PACK_STACK_SIZE + 1];
-  tccpp_setfile(d->filename);
+  tccpp_setfile_replay(d->filename);
   pp_pack_enter(tcc_state, d->pack, saved_pack);
   begin_macro_kept(body);
   next();
@@ -951,12 +1069,113 @@ void check_dropped_function(DeferredFunc *d, TokenString *body)
   pp_pack_leave(tcc_state, saved_pack);
 }
 
+/* -Wunused-*: the variable V just declared, at LINE: a local (or static
+   local) followed to its scope's end, a file-scope static to the unit's */
+static void unused_decl_var(int l, CType *type, AttributeDef *ad, int v, int line)
+{
+  Sym *sym = sym_find(v);
+  if (!sym)
+    return;
+  if (l != VT_CONST)
+    unused_declare_local(sym, line, ad->attr_unused || ad->a.used || ad->cleanup_func);
+  else if (l == VT_CONST && (type->t & VT_STATIC))
+  {
+    if (ad->attr_unused)
+      sym->ymod |= SYM_UNUSED_OK;
+    if (!ad->a.used && !ad->section && !ad->alias_target)
+      unused_declare_static(sym, line, 0);
+  }
+}
+
+/* C23 `auto` / GNU `__auto_type` (ad->auto_tok): TYPE becomes the type of
+   the initializer after lvalue conversion -- arrays and functions decay,
+   top-level qualifiers go -- with the qualifiers and storage class written
+   in the declaration specifiers.  The initializer is read once unevaluated
+   for its type, as typeof reads its operand, and the declaration then goes
+   on as if the type had been written: tok is '=' again, its tokens follow,
+   and the ',' or ';' after them.  In yasc the pointer's qualifiers (owned,
+   maybe, view) come with the type; a copy of an owned pointer is an error,
+   since nothing says whether it moves or is borrowed. */
+static void decl_auto_infer(CType *type, CType *btype, AttributeDef *ad, int v, int first)
+{
+  const char *kw = get_tok_str(ad->auto_tok, NULL);
+  TokenString *init, *view;
+  CType it;
+  Sym *src;
+  int q, *buf;
+
+  if (type->t & VT_TYPEDEF)
+    tcc_error("'%s' declares a variable, not a typedef", kw);
+  if (!v || type->t != btype->t || type->ref != btype->ref)
+    tcc_error("'%s' declares a plain name: the type comes from the initializer", kw);
+  if (!first)
+    tcc_error("'%s' declares one variable at a time", kw);
+  if (tok != '=')
+    tcc_error("'%s' needs an initializer to take the type from", kw);
+  next();
+  if (tok == '{')
+    tcc_error("'%s' takes the type of an expression, not of a braced initializer", kw);
+  skip_or_save_block(&init); /* up to the ',' or ';', which is kept for later */
+  unget_tok(0);
+
+  view = tok_str_borrow(init, init->len);
+  begin_macro(view, 2);
+  next();
+  nocode_wanted++;
+  unevaluated_operand++;
+  expr_eq();
+  if (tok != TOK_EOF)
+    expect("',' or ';'");
+  it = vtop->type;
+  src = yasc_vtop_var();
+  vpop();
+  unevaluated_operand--;
+  nocode_wanted--;
+  end_macro_to(view);
+
+  if (it.t & VT_ARRAY)
+  {
+    it = it.ref->type;
+    mk_pointer(&it);
+  }
+  else if ((it.t & VT_BTYPE) == VT_FUNC)
+    mk_pointer(&it);
+  else if (it.t & VT_BITFIELD)
+    it.t &= ~VT_STRUCT_MASK;
+  if ((it.t & VT_BTYPE) == VT_VOID)
+    tcc_error("'%s' cannot take the type void", kw);
+  it.t &= ~(VT_STORAGE | VT_CONSTANT | VT_VOLATILE | VT_RODATA_REL);
+
+  q = type_yasc(&it);
+  if ((q & YASC_OWNED) && !(q & (YASC_FRESH | YASC_UNCHECKED)))
+  {
+    if (src)
+      tcc_error("'%s' would copy the owned pointer '%s': write move(%s) or borrow(%s)", kw, get_tok_str(src->v, NULL),
+                get_tok_str(src->v, NULL), get_tok_str(src->v, NULL));
+    tcc_error("'%s' would copy an owned pointer: write move(...) or borrow(...)", kw);
+  }
+  if (q & YASC_FRESH)
+    yasc_requalify(&it, q & ~YASC_FRESH);
+
+  if (btype->t & (VT_CONSTANT | VT_VOLATILE))
+    parse_btype_qualify(&it, btype->t & (VT_CONSTANT | VT_VOLATILE));
+  it.t |= btype->t & VT_STORAGE;
+  *type = it;
+
+  /* the initializer again, now for real: the replay ends where the saved
+     tokens do (0 instead of TOK_EOF) and the ',' or ';' ungot above follows */
+  buf = (int *)tok_str_buf(init);
+  buf[init->len - 1] = 0;
+  begin_macro(init, 1);
+  tok = '=';
+}
+
 /* 'l' is VT_LOCAL or VT_CONST to define default storage type
    or VT_CMP if parsing old style parameter list
    or VT_JMP if parsing c99 for decl: for (int i = 0, ...) */
 int decl(int l)
 {
-  int v, has_init, r, oldint, align;
+  int v, has_init, r, oldint, align, exported, this_exported, in_module;
   CType type, btype;
   Sym *sym;
   AttributeDef ad, adbase;
@@ -968,6 +1187,23 @@ int decl(int l)
       {
       tok_str_release_spilled();
       sym_params_release();
+    }
+
+    exported = 0;
+    if (l == VT_CONST)
+    {
+      /* yasc: the methods of the struct just defined (decl/method.c) */
+      if (yasc_methods_pending())
+        yasc_methods_flush();
+      yasc_exporting = 0;
+      if (tcc_state->yasc)
+      {
+        exported = yasc_file_scope_decl();
+        if (exported == -2)
+          return 0; /* the end of an imported interface's headers */
+        if (exported < 0)
+          continue;
+      }
     }
 
     oldint = 0;
@@ -1028,13 +1264,35 @@ int decl(int l)
       }
     }
 
-    while (1)
+    for (int ndecl = 0;; ndecl++)
     { /* iterate thru each declaration */
       Sym *stack_before = global_stack;
       type = btype;
       ad = adbase;
       declarator_last_functype = NULL;
+      patch_own_functype = NULL;
+      /* the declarator's line, for the definition checks */
+      const int decl_line = file->line_num - ((tok_flags & TOK_FLAG_BOL) && !macro_ptr);
+      /* a deprecated declaration names deprecated things quietly */
+      if (adbase.attr_deprecated)
+        attr_deprecated_suppress++;
+      /* yasc: a local's plain pointer waits for its body (plain_param.c) */
+      const int pp_local = l == VT_LOCAL && tcc_state->yasc ? yasc_pp_local_begin() : -1;
+      /* an error in the declarator still declares its name (core/recover.c) */
+      recover_decl.l = l == VT_CONST || l == VT_LOCAL ? l : 0;
+      recover_decl.v = 0;
+      recover_decl.storage = type.t & VT_STORAGE;
       type_decl(&type, &ad, &v, TYPE_DIRECT);
+      recover_decl.l = 0;
+      if (pp_local >= 0)
+        yasc_pp_local_end(pp_local, v,
+                          !(type.t & (VT_TYPEDEF | VT_EXTERN | VT_STATIC)) && (type.t & VT_BTYPE) != VT_FUNC);
+      if (adbase.attr_deprecated)
+        attr_deprecated_suppress--;
+      /* yasc: a plain pointer parameter waits for its definition's body */
+      yasc_pp_declarator(l == VT_CONST && tok == '{' && (type.t & VT_BTYPE) == VT_FUNC ? type.ref : NULL);
+      if (ad.auto_tok)
+        decl_auto_infer(&type, &btype, &ad, v, ndecl == 0);
       /* this declarator built the function type itself, not a typedef or typeof */
       const int own_functype = (type.t & VT_BTYPE) == VT_FUNC && type.ref && type.ref == declarator_last_functype;
       /* #pragma GCC visibility covers every declaration it encloses, extern
@@ -1045,6 +1303,9 @@ int decl(int l)
         ad.a.visibility = tcc_state->visibility_stack[tcc_state->visibility_stack_depth - 1];
         ad.a.vis_explicit = 1;
       }
+      /* yasc module: private unless exported (decl/module.c) */
+      in_module = l == VT_CONST && tcc_state->yasc_module && yasc_in_main_file();
+      this_exported = in_module ? yasc_module_linkage(&type, v, exported) : 0;
       if (ad.attr_mode && !(type.t & VT_VECTOR) && (btype.t & (VT_BTYPE | VT_LONG)) != (ad.attr_mode - 1))
       {
         int u = ad.attr_mode - 1;
@@ -1107,7 +1368,7 @@ int decl(int l)
       }
       else if (oldint)
       {
-        tcc_warning("type defaults to int");
+        tcc_warning_once(warn_implicit_int, "type defaults to int");
       }
 
       if (gnu_ext && (tok == TOK_ASM1 || tok == TOK_ASM2 || tok == TOK_ASM3))
@@ -1123,6 +1384,9 @@ int decl(int l)
 #endif
       }
 
+      /* malloc, nonnull, returns_nonnull: into the types (attribute.c) */
+      if (ad.attr_malloc || ad.attr_nonnull || ad.attr_nonnull_all)
+        attr_apply_pointer_facts(&type, &ad, own_functype);
 #ifdef TCC_TARGET_PE
       if (ad.a.dllimport || ad.a.dllexport)
       {
@@ -1221,6 +1485,9 @@ int decl(int l)
 
           /* Save the token stream (function body only, not parameters) */
           skip_or_save_block(&nf->func_str);
+          /* -Wunused-*: codegen parses the body, a check-only parse never */
+          if (tcc_state->unused_on)
+            unused_scan_tokens(nf->func_str, nf->sym, 1);
           nested_define(nf);
 
           /* Pre-scan to identify captured parent variables.
@@ -1267,6 +1534,7 @@ int decl(int l)
                 fn->func_str->allocated_len = body_len;
                 fn->func_str->len = body_len;
               }
+              tok_str_sys_copy(nf->func_str, fn->func_str);
               dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
               inline_record_def_bindings(fn, nf);
 
@@ -1464,8 +1732,34 @@ int decl(int l)
 
         /* put function symbol */
         type.t &= ~VT_EXTERN;
+        if (tcc_warn_wanted(warn_strict_prototypes) || tcc_warn_wanted(warn_missing_prototypes))
+          definition_prototype_checks(v, &type, decl_line, in_module);
+        patch_own_functype = own_functype ? type.ref : NULL;
         sym = external_sym(v, &type, 0, &ad);
-        if (!defer_function_body(sym, ad.section))
+        patch_own_functype = NULL;
+        if (tcc_state->warn_cross_tu & WARN_ON)
+          tcc_typesig_note(v, decl_line, 1); /* where, for the link's report */
+        yasc_pp_rekey(sym->type.ref); /* the prototype's type, when one came first */
+        if (TCC_SU_WANTED(tcc_state))
+          tcc_stack_usage_declarator(tcc_state, sym, v, decl_line);
+        attr_apply_decl_facts(sym, &ad);
+        if (in_module)
+          yasc_module_sym(sym, this_exported);
+        yasc_exporting = 0; /* types defined in the body are the body's */
+        if (tcc_state->unused_on)
+        {
+          if (ad.attr_unused)
+            sym->ymod |= SYM_UNUSED_OK;
+          if ((sym->type.t & VT_STATIC) && !(sym->type.t & VT_INLINE))
+            unused_declare_static(sym, decl_line, 1);
+          unused_params_bind(sym);
+        }
+        else if (tcc_warn_wanted(warn_shadow))
+          unused_params_bind(sym); /* -Wshadow gives a parameter's own line */
+        /* a plain pointer parameter waiting for this body: compiled now (an
+           error comes, nothing is written), so its report keeps its place
+           at every -O (decl/plain_param.c) */
+        if (yasc_pp_waiting(sym->type.ref) || !defer_function_body(sym, ad.section))
           define_global_function(sym, ad.section);
         break;
       }
@@ -1486,6 +1780,7 @@ int decl(int l)
           /* A float keeps its type: the double its caller passes is
              converted on entry (knr_params_receive). */
           sym->a.param_volatile = (type.t & VT_VOLATILE) != 0;
+          sym->a.param_array = (type.t & VT_ARRAY) != 0;
           convert_parameter_type(&type);
           sym->type = type;
         }
@@ -1514,10 +1809,15 @@ int decl(int l)
           else
           {
             sym = sym_push(v, &type, 0, 0);
+            if (local_stack && tcc_state->unused_on)
+              unused_declare_typedef(sym, decl_line, ad.attr_unused || ad.a.used);
           }
           sym->a = ad.a;
+          attr_apply_decl_facts(sym, &ad);
           if ((type.t & VT_BTYPE) == VT_FUNC)
             merge_funcattr(&sym->type.ref->f, &ad.f);
+          if (in_module)
+            yasc_module_sym(sym, this_exported);
           if (debug_modes)
             tcc_debug_typedef(tcc_state, sym);
         }
@@ -1558,11 +1858,18 @@ int decl(int l)
             int fresh = l == VT_CONST && (type.t & VT_BTYPE) == VT_FUNC && !ad.asm_label && !ad.alias_target &&
                         !sym_find(v);
             type.t |= VT_EXTERN;
+            patch_own_functype = own_functype ? type.ref : NULL;
             sym = external_sym(v, &type, r, &ad);
+            patch_own_functype = NULL;
+            if (tcc_state->warn_cross_tu & WARN_ON)
+              tcc_typesig_note(v, decl_line, 0);
+            attr_apply_decl_facts(sym, &ad); /* before parking: a Sym with facts is never parked */
             if (fresh && own_functype && !local_stack && sym->type.ref == type.ref)
               type.ref->a.proto_own = 1;
             if (l == VT_LOCAL && (type.t & VT_BTYPE) == VT_FUNC)
               nested_note_block_proto(v); /* `auto`: a nested function defined later */
+            if (ad.attr_unused && tcc_state->unused_on)
+              sym->ymod |= SYM_UNUSED_OK;
             /* a first prototype: kept compactly until something names it */
             if (fresh)
               sym_park_proto(sym, stack_before);
@@ -1573,17 +1880,30 @@ int decl(int l)
               r |= VT_CONST;
             else
               r |= VT_LOCAL;
+            /* yasc: a borrowing struct kept beyond a call borrows static storage */
+            if (tcc_state->yasc && (r & VT_VALMASK) == VT_CONST && yasc_borrowing_struct(&type) &&
+                !(ad.sbind_set && ad.sbind_static && !ad.sbind_nb))
+              tcc_error("'%s' outlives every call: write 'struct %s borrows(static)'", get_tok_str(v, NULL),
+                        get_tok_str(type.ref->v & ~SYM_STRUCT, NULL));
             if (has_init)
               next();
             else if (l == VT_CONST)
               /* uninitialized global variables may be overridden */
               type.t |= VT_EXTERN;
+            if (l == VT_CONST && (tcc_state->warn_cross_tu & WARN_ON))
+              tcc_typesig_note(v, decl_line, 1);
             if (!(has_init && l == VT_CONST && defer_static_data(&type, &ad, r, v)))
               decl_initializer_alloc(&type, &ad, r, has_init, v, l == VT_CONST);
+            if (ad.attr_deprecated | ad.attr_unused_result | ad.attr_fmt_kind | ad.attr_fmt_arg)
+              attr_apply_decl_facts(sym_find(v), &ad);
+            if (tcc_state->unused_on)
+              unused_decl_var(l, &type, &ad, v, decl_line);
           }
 
           if (ad.alias_target && l == VT_CONST)
             apply_alias_attribute(sym_find(v), ad.alias_target);
+          if (in_module)
+            yasc_module_sym(sym_find(v), this_exported);
         }
         if (tok != ',')
         {

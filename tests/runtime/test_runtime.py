@@ -44,7 +44,7 @@ def _cross_compile(name, compiler, extra_cflags=()):
     obj.parent.mkdir(parents=True, exist_ok=True)
 
     cflags = _base_cflags() + list(extra_cflags)
-    cmd = [str(compiler)] + cflags + [str(src), "-o", str(obj)]
+    cmd = [str(compiler), "-ccompat"] + cflags + [str(src), "-o", str(obj)]
     result = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,

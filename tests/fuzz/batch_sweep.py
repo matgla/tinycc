@@ -176,7 +176,7 @@ def compile_boot(wd: Path, tc) -> Path:
     boot.S carries .isr_vector (initial SP + reset vector), Reset_Handler and
     the fault handlers — every ELF MUST link it or the CPU boots into garbage."""
     boot_o = wd / "boot.o"
-    rc = _run([str(TCC), *CF_COMMON, "-O0", *INC, "-c",
+    rc = _run([str(TCC), "-ccompat", *CF_COMMON, "-O0", *INC, "-c",
                str(MPS / "boot.S"), "-o", str(boot_o)])
     if not boot_o.exists():
         sys.exit("failed to assemble boot.S:\n" + rc.stderr)
@@ -185,7 +185,7 @@ def compile_boot(wd: Path, tc) -> Path:
 
 
 def link_cmd(objs, out_elf, tc) -> list:
-    return [str(TCC), *CF_COMMON, *INC, *map(str, objs), tc["boot_obj"],
+    return [str(TCC), "-ccompat", *CF_COMMON, *INC, *map(str, objs), tc["boot_obj"],
             tc["crti"], tc["rdimon_crt0"], tc["crtend"], tc["crtn"],
             "-o", str(out_elf),
             "-Wl,--gc-sections", f"-B{ROOT}",
@@ -451,7 +451,7 @@ def build_runner_obj(seeds: list[int], olevel: str, wd: Path, tc, uid) -> Path:
         "}\n")
     obj = wd / f"{runner_c.stem}.o"
     # runner is trivial — compile at -O0 (no -Dmain: it owns the real main).
-    rc = _run([str(TCC), *CF_COMMON, "-O0", *INC, "-c", str(runner_c), "-o", str(obj)])
+    rc = _run([str(TCC), "-ccompat", *CF_COMMON, "-O0", *INC, "-c", str(runner_c), "-o", str(obj)])
     if not obj.exists():
         raise RuntimeError(f"runner compile failed:\n{rc.stderr}")
     return obj

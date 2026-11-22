@@ -199,6 +199,14 @@ include paths are: @file{/usr/local/include}, @file{/usr/include}
 and @file{PREFIX/lib/tcc/include}. (@file{PREFIX} is usually
 @file{/usr} or @file{/usr/local}).
 
+@item -iyasc dir
+Like @option{-I}, searched in its place among the @option{-I} directories,
+but a header found there (or a @code{"..."} header next to one) is a yasc
+file, as if it began with @code{#pragma yasc}.  The environment variable
+@env{YASC_INCLUDE_PATH} (a @samp{:}-separated list, as @env{CPATH}) adds such
+directories after the command line's.  @option{-E} writes the
+@code{#pragma yasc} at the start of each such header.
+
 @item -Dsym[=val]
 Define preprocessor symbol @samp{sym} to
 val. If val is not present, its value is @samp{1}. Function-like macros can
@@ -208,7 +216,10 @@ also be defined: @option{-DF(a)=a+1}
 Undefine preprocessor symbol @samp{sym}.
 
 @item -E
-Preprocess only, to stdout or file (with -o).
+Preprocess only, to stdout or file (with -o).  The line markers are gcc's,
+@code{# N "file" flags}: 1 entering a header, 2 returning from one, 3 in a
+system header (@code{#pragma GCC system_header} is done here and its line
+dropped).  Compiling the output reads the flags back.
 
 @end table
 
@@ -268,6 +279,29 @@ the output goes to.  It is removed when the compilation ends.
 
 @end table
 
+yasc module options (@pxref{yasc modules}):
+
+@table @option
+@item -fmodule-dir=@var{dir}
+Write a module's interface to @file{@var{dir}/a/b.ymi} for @code{module a.b;},
+and look for imported interfaces in @var{dir} first. Without it the interface
+goes next to the object, and imports are looked for there and in the
+@option{-I} directories. Can be given more than once (the first is written).
+
+@item -fmodule-deps
+Print what each input file is and imports -- a @code{module @var{name}} line,
+then an @code{import @var{name}} line per import -- and compile nothing. No
+interface needs to exist yet, so a build can order its compiles by it: a module
+before the files that import it. With several files, a @code{file @var{path}}
+line comes before each file's lines; @option{-o} writes them to a file.
+
+@item -fmodule-header=@var{dir}
+When compiling a module, also write @file{@var{dir}/a/b.h}: a C99 header of its
+interface for C callers (gcc, or tcc with @option{-ccompat}), without the yasc
+qualifiers. A module it imports is included as @code{<c/d.h>}.
+
+@end table
+
 Warning options:
 
 @table @option
@@ -295,8 +329,18 @@ Abort compilation if a warning is issued. Can be given an option to enable
 the specified warning and turn it into an error, for example
 @option{-Werror=unsupported}.
 
+@item -Wnonnull
+Warn when a null constant is passed for a parameter that
+@code{__attribute__((nonnull))} names (in @option{-Wall}).
+
 @item -Wall
 Activate some useful warnings.
+
+@item -Wsystem-headers
+Give warnings in system headers too.  As with gcc, a warning is not given in a
+system header (one found on a system include path, or after its
+@code{#pragma GCC system_header}) -- even one @option{-Werror} or the safe
+default would make an error; errors and @code{#warning} are.
 
 @end table
 
@@ -728,6 +772,50 @@ are supported.
 @code{5}).
 
 @end itemize
+
+@anchor{yasc modules}
+@section yasc modules
+
+In the yasc dialect (the default without @option{-ccompat}, or
+@option{-std=yasc}, or @code{#pragma yasc}) a file can be a module:
+
+@example
+module lib.vec;                 /* first declaration of the file */
+
+export typedef struct vec2 @{ int x, y; @} vec2_t;
+export vec2_t vec_add(vec2_t a, vec2_t b);
+static void count(void);        /* private */
+int helper(int v) @{ return v; @} /* private too: no export */
+@end example
+
+@noindent and another file uses it with @code{import lib.vec;}. @code{module},
+@code{import} and @code{export} are keywords only where a file-scope declaration
+starts, in the main file of a yasc unit; elsewhere they stay names.
+
+@itemize
+@item A module's file-scope declarations are private (internal linkage) unless
+they say @code{export}. Exported names keep their C symbol names.
+@item An export may not use a private type by value; behind a pointer a struct
+can stay opaque (@code{export typedef struct h h_t;}). An exported inline
+function may only use exported names.
+@item Compiling a module writes its interface, @file{lib/vec.ymi}: the exported
+declarations after preprocessing, function bodies left out (an inline one is
+kept). It is rewritten only when it changes, so editing a function body does not
+rebuild the importers.
+@item @code{import lib.vec;} reads that interface: first the modules it imports,
+then the headers it included, then its declarations. The importer's macros never
+change an interface, and the module's own macros never reach the importer.
+@item A pointer declared in regular C (a header, or a macro defined in one) is
+unchecked: it converts to and from owned and plain pointers silently. GCC
+attributes refine it: a @code{malloc} result is owned, @code{malloc(@var{dealloc},
+@var{n})} makes the deallocator's argument owned.
+@item @option{-fmodule-deps} prints a file's @code{module} and @code{import}
+lines for a build to order its compiles; @option{-MD} lists every interface a
+compile read. @option{-fmodule-header=} writes a C header for C callers.
+@end itemize
+
+See @file{docs/yasc_modules.md} and @file{examples/yasc_modules} in the
+tinycc tree, and @code{man yasc-modules} on YasOS.
 
 @node asm
 @chapter TinyCC Assembler

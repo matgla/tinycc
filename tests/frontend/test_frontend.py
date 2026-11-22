@@ -36,7 +36,7 @@ def _find_debug_compiler(frontend_compiler):
     Otherwise the nearby armv8m-tcc.debug binary is tried.
     """
     probe = subprocess.run(
-        [str(frontend_compiler), "-dump-ir", "-c", "-x", "c", "-", "-o", "/dev/null"],
+        [str(frontend_compiler), "-ccompat", "-dump-ir", "-c", "-x", "c", "-", "-o", "/dev/null"],
         input="int f(int x){return x;}",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -147,7 +147,7 @@ def _run_compiler(compiler, cflags, c_file, tmp_path, output_object=True):
     TCC_LOG_* scopes enabled (which log to stderr) don't pollute them, while
     diagnostics tests read stderr.
     """
-    cmd = [str(compiler), *cflags, str(c_file)]
+    cmd = [str(compiler), "-ccompat", *cflags, str(c_file)]
     if output_object:
         out_file = tmp_path / f"{c_file.stem}.o"
         cmd.extend(["-o", str(out_file)])
@@ -343,7 +343,7 @@ def test_dump_defines_lists_lazy_predefines(flag, frontend_compiler, tmp_path):
     src = tmp_path / "empty.c"
     src.write_text("")
     result = subprocess.run(
-        [str(frontend_compiler), flag, "-E", str(src)],
+        [str(frontend_compiler), "-ccompat", flag, "-E", str(src)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,

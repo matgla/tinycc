@@ -273,13 +273,31 @@ jobs:
         # and is released when the step's shell exits. -w bounds the wait so a
         # stale holder fails the job with a clear reason instead of hanging until
         # the job timeout.
+        #
+        # With more than one board on the Pi, yasos.zig's board registry
+        # (`yasos-board`, installed by its scripts/rig/boards.py install) hands
+        # out a free board of pool `ci` under that board's lock -- the CI board
+        # keeps /var/lock/rp2350-board.lock -- and sets YASOS_PROBE_SERIAL and
+        # SERIAL_DEVICE, which run_benchmark.py uses to open only that board's
+        # probe and UART. The step re-runs its own script ($0) under it;
+        # YASOS_BOARD_LOCK_HELD stops the second pass from waiting on itself.
         run: |
-          exec 9>/var/lock/rp2350-board.lock
-          flock -w 5400 9 || {
-            echo "::error::RP2350 board lock still held after 90 min --" \
-                 "another run (likely matgla/yasos.zig hardware_smoke on this Pi) owns the probe"
-            exit 1
-          }
+          board_tool=$(command -v yasos-board || echo "$HOME/.local/bin/yasos-board")
+          if [ -z "${YASOS_BOARD_LOCK_HELD:-}" ] && [ -x "$board_tool" ]; then
+            rc=0
+            "$board_tool" run --pool ci --wait 5400 \
+                --what "matgla/tinycc metrics run ${{ github.run_id }}" -- bash -e "$0" || rc=$?
+            [ $rc != 99 ] || echo "::error::no RP2350 board of pool ci free after 90 min --" \
+                "another run (likely matgla/yasos.zig hardware_smoke on this Pi) holds it"
+            exit $rc
+          elif [ -z "${YASOS_BOARD_LOCK_HELD:-}" ]; then
+            exec 9>/var/lock/rp2350-board.lock
+            flock -w 5400 9 || {
+              echo "::error::RP2350 board lock still held after 90 min --" \
+                   "another run (likely matgla/yasos.zig hardware_smoke on this Pi) owns the probe"
+              exit 1
+            }
+          fi
           python3 metrics/record.py --db "$METRICS_DB" --rev HEAD --no-correctness \
               --import-codesize-from "$RUNNER_TEMP/codesize/codesize.db" \
               --detail-db "$CODESIZE_DETAIL_DB" --detail-keep 20 \
@@ -328,13 +346,24 @@ jobs:
         # perf/codesize rows recorded.
         run: |
           set -e
-          # Same shared-board lock as the perf step above (see its comment).
-          exec 9>/var/lock/rp2350-board.lock
-          flock -w 5400 9 || {
-            echo "::error::RP2350 board lock still held after 90 min --" \
-                 "another run (likely matgla/yasos.zig hardware_smoke on this Pi) owns the probe"
-            exit 1
-          }
+          # Same shared-board lock and board registry as the perf step above
+          # (see its comment).
+          board_tool=$(command -v yasos-board || echo "$HOME/.local/bin/yasos-board")
+          if [ -z "${YASOS_BOARD_LOCK_HELD:-}" ] && [ -x "$board_tool" ]; then
+            rc=0
+            "$board_tool" run --pool ci --wait 5400 \
+                --what "matgla/tinycc fp conformance run ${{ github.run_id }}" -- bash -e "$0" || rc=$?
+            [ $rc != 99 ] || echo "::error::no RP2350 board of pool ci free after 90 min --" \
+                "another run (likely matgla/yasos.zig hardware_smoke on this Pi) holds it"
+            exit $rc
+          elif [ -z "${YASOS_BOARD_LOCK_HELD:-}" ]; then
+            exec 9>/var/lock/rp2350-board.lock
+            flock -w 5400 9 || {
+              echo "::error::RP2350 board lock still held after 90 min --" \
+                   "another run (likely matgla/yasos.zig hardware_smoke on this Pi) owns the probe"
+              exit 1
+            }
+          fi
           echo "--- soft-float baseline ---"
           python3 tests/benchmarks/run_fp_conformance.py "$PERF_HOST" \
               --identity "$PERF_IDENTITY" --opt-level 1

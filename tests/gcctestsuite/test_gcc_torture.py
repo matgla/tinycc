@@ -69,6 +69,7 @@ def _compile_test(test_case: GCCTestCase, opt_level: str, tmp_path: Path) -> tup
             compiler = Path(__file__).parent.parent.parent / "bin" / "armv8m-tcc"
         cmd = [
             str(compiler),
+            "-ccompat",
             *extra_flags.split(),
             "-c",
             str(test_case.source),

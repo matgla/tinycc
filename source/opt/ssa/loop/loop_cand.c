@@ -32,7 +32,7 @@ FieCand *fie_collect_cands(IRCFG *cfg, int *out_nc)
       int h = bb->succs[si];
       if (h < 0 || h >= cfg->num_blocks)
         continue;
-      if (!tcc_ir_cfg_dominates(cfg, h, b))
+      if (!tcc_ir_cfg_dominates(cfg, h, b) || tcc_ir_cfg_loop_has_label_block(cfg, h, b))
         continue;
       cands[nc].header_b = h;
       cands[nc].latch_b = b;
@@ -109,14 +109,20 @@ void lcs_collect_header_members(IRCFG *cfg, int header_b, uint8_t *member,
 void lcs_mark_headers(IRCFG *cfg, uint8_t *is_header)
 {
   int nb = cfg->num_blocks;
+  /* 2: a loop a computed goto may enter in the middle, which no candidate
+   * may copy or restructure */
   for (int b = 0; b < nb; b++) {
     IRBasicBlock *bb = &cfg->blocks[b];
     for (int si = 0; si < bb->num_succs; si++) {
       int h = bb->succs[si];
       if (h >= 0 && h < nb && tcc_ir_cfg_dominates(cfg, h, b))
-        is_header[h] = 1;
+        is_header[h] = tcc_ir_cfg_loop_has_label_block(cfg, h, b) ? 2 : is_header[h] ? is_header[h] : 1;
     }
   }
+  if (cfg->label_block)
+    for (int h = 0; h < nb; h++)
+      if (is_header[h] == 2)
+        is_header[h] = 0;
 }
 
 /* Contiguous single-entry span of the loop headed at header_b; max_span 0 = unbounded. */

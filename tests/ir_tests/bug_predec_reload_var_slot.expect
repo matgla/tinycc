@@ -1,0 +1,6 @@
+h 96
+int 28
+float 9 double 9
+llong 9
+ptr 41
+short 65535 char 1

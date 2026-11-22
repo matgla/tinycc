@@ -301,6 +301,8 @@ TEST_FILES = [
     ("bug_union_self_cast_typedef.c", 0),
     # (union U)x must initialise the member of x's type, not the first member
     ("bug_union_cast_member_type.c", 0),
+    # param_copy_alias onto a union cast's temporary keeps the temporary's vreg
+    ("bug_pca_temp_local_source_identity.c", 0),
     # a union initializer must not resize a struct member's flexible array type
     ("bug_union_fam_init_shared_struct_type.c", 0),
 
@@ -372,6 +374,8 @@ TEST_FILES = [
     ("bug_strlen_fold_const_pointer_var.c", 0),
     ("bug_var_tmp_fwd_lea_var0.c", 0),
     ("bug_object_size_loaded_pointer.c", 0),
+    # __builtin_object_size / __builtin_dynamic_object_size: the same at every -O
+    ("objsize_builtin.c", 0),
     ("bug_ra_widen_ijump_forward_exit_backward_reentry.c", 0),
 
     # an array's address stored into memory keeps the array's initializer
@@ -1596,6 +1600,8 @@ TEST_FILES = [
     ("nested_basic_simple.c", 0),
     ("bug_global_field_short_circuit.c", 0),
     ("bug_index_increment.c", 0),
+    # inc() reloads a pre-incremented variable from its own frame slot (test_sanitize.py adds -fsanitize)
+    ("bug_predec_reload_var_slot.c", 0),
     ("bug_irop_packed_9byte.c", 0),
     ("bug_local_var_printf_o1.c", 0),
     ("bug_macro_local_o1.c", 0),
@@ -1606,6 +1612,9 @@ TEST_FILES = [
 
     # C11 _Pragma operator: pack layout via literal + DO_PRAGMA macro idiom.
     ("343_pragma_operator.c", 5),
+
+    # C23 #embed (limit/prefix/suffix/if_empty) and __has_embed; data in embed/.
+    ("bug_pp_embed.c", 0),
 
     # #pragma pack around bodies saved as tokens (static inline, -O1 deferred
     # and called-once bodies): the token after a body's '}' was read with the
@@ -1923,6 +1932,8 @@ TEST_FILES = [
     ("706_sl_forward_whole_object_escape.c", 0),
     ("707_reroll_entry_through_init.c", 0),
     ("708_computed_goto_labels.c", 0),
+    # the CFG leads an IJUMP to every label (test_sanitize.py adds -fsanitize)
+    ("bug_cfg_label_addr_edges.c", 0),
     ("709_complex_int_narrow_parts.c", 0),
     # -Os os_const_share: a wide constant (Zig's 0xaaaaaaaa undefined fill, -1,
     # 0x2002) stored, passed and phi-copied at several sites is built once at
@@ -1950,6 +1961,8 @@ TEST_FILES = [
     # finding the NUL terminator: device-only shapes, pinned
     ("604_toysh_wildcard_literal.c", 0),
     ("605_strchr_nul_terminator.c", 0),
+    # redirected strchr/strcpy and folded memchr: the declared result type
+    ("bug_strbuiltin_declared_result.c", 0),
     # a volatile bitfield assignment's value is the value stored, not a
     # re-read of the field (it used to read the register again at -O0)
     ("620_volatile_bitfield_assign_value.c", 0),
@@ -1960,6 +1973,8 @@ TEST_FILES = [
     # frame home twice and wrote/read below SP (yasos kernel mrs psp), and
     # missed the asm's own register save when addressing off SP
     ("623_asm_spilled_operand.c", 0),
+    # an asm operand in a register the asm clobbers: an "m" base, an "=r" output's home
+    ("bug_asm_operand_in_clobbered_reg.c", 0),
     # a 64-bit equality CMP whose SELECT a tail merge moved behind a JMP took
     # the relational SBCS lowering (gen_opic's compare fold, as the native tcc)
     ("622_cmp64_eq_consumer_behind_jump.c", 0),
@@ -2057,6 +2072,8 @@ TEST_FILES = [
     # arm-none-eabi-gcc -O2.
     ("820_hazard_sandwich_alloca.c", 0),
     ("821_hazard_sandwich_apply.c", 0),
+    # ra:licm must not hoist a load out of a loop that calls __builtin_apply
+    ("bug_licm_load_across_builtin_apply.c", 0),
     ("822_hazard_sandwich_asm_clob.c", 0),
     ("823_hazard_sandwich_asm_goto.c", 0),
     ("824_hazard_sandwich_asm_m.c", 0),
@@ -2376,8 +2393,21 @@ TEST_FILES = [
     # codegen ADD/SUB+CMP#0 fusion skipped a CMP that is a loop back-edge target (and a volatile read).
     ("bug_sub_cmp0_fusion_jump_target.c", 0),
     ("bug_cmp0_fusion_deref_operand.c", 0),
+    ("bug_cmp0_fusion_barrel_shift.c", 0),
     # ra:struct_arg_split: small by-value struct args built in a slot become scalar word PARAMs.
     ("882_struct_arg_word_split.c", 0),
+    # yasc dialect: defer (docs/plans/yasc_errors.md)
+    ("yasc_defer.c", 0),
+    # yasc error unions: !T, error sets, try/catch/errdefer; +abi.c is plain C
+    (["yasc_errors.c", "yasc_errors+abi.c"], 0),
+    # yasc error_name, <yasc.h>; the names come from both files
+    (["yasc_error_name.c", "yasc_error_name+b.c"], 0),
+    # yasc methods: functions in a struct body, obj.m() / p->m() / TAG.m()
+    ("yasc_methods.c", 0),
+    # C23 auto / __auto_type: the type from the initializer, evaluated once
+    ("c23_auto.c", 0),
+    # yasc move(p) / borrow(p)
+    ("yasc_move.c", 0),
 ]
 
 # Per-test compiler defines (e.g. for missing platform macros)
@@ -2734,7 +2764,7 @@ def _run_tagged_qemu_test(test_file, tag, expected_lines, expected_exit_code, op
     """
     test_files = [CURRENT_DIR / Path(test_file)]
     safe_tag = _sanitize_tag_for_filename(tag)
-    opt_suffix = f"_{safe_tag}_{opt_level.replace('-', '')}"
+    opt_suffix = f"_{safe_tag}_{opt_level.replace('-', '').replace(' ', '_')}"
     config = CompileConfig(defines=[tag], output_suffix=opt_suffix, extra_cflags=opt_level, output_dir=output_dir)
     test_name = Path(test_file).stem
 
@@ -3032,6 +3062,186 @@ def test_abi_hfa_gcc_interop(opt_level, tmp_path):
     assert r.returncode == 0, r.stderr
     _run_qemu_test(["abi_hfa_main.c", "abi_hfa_a.c"], 0, opt_level=opt_level, output_dir=tmp_path / "build",
                    float_abi="hard", extra_objs=[gcc_obj])
+
+
+# yasc modules (docs/yasc_modules.md): geom, then shapes (which imports geom),
+# then main (which imports shapes and so geom).  An importer needs the
+# interface (.ymi) of every module it imports, so the modules are compiled here
+# in order, with the flags the QEMU Makefile gives its sources (the interface
+# records the float ABI), and linked into main's image.
+@pytest.mark.parametrize("opt_level", OPT_LEVELS, ids=[f"yasc_modules{o}" for o in OPT_LEVELS])
+def test_yasc_modules_run(opt_level, tmp_path):
+    import subprocess
+    tcc = CURRENT_DIR.parent.parent / "armv8m-tcc"
+    ifc = tmp_path / "ifc"
+    (tmp_path / "mods").mkdir()
+    objs = []
+    for name in ("yasc_module_geom", "yasc_module_shapes"):
+        obj = tmp_path / "mods" / f"{name}.o"
+        r = subprocess.run([str(tcc), "-ccompat", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft", "-nostdlib",
+                            "-fvisibility=hidden", "-ffunction-sections", opt_level, f"-fmodule-dir={ifc}",
+                            "-c", str(CURRENT_DIR / f"{name}.c"), "-o", str(obj)],
+                           capture_output=True, text=True)
+        assert r.returncode == 0 and not r.stderr, r.stderr
+        objs.append(obj)
+    assert (ifc / "geom.ymi").is_file() and (ifc / "shapes.ymi").is_file()
+    test_file = "yasc_module_main.c"
+    expected_lines, _ = load_expect_file(test_file)
+    config = CompileConfig(extra_cflags=f"{opt_level} -fmodule-dir={ifc}", output_suffix=f"_{opt_level[1:]}",
+                           output_dir=tmp_path / "build", extra_objs=objs)
+    sut, loglines = run_test(test_file, MACHINE, config=config)
+    expected_lines = _strip_compiler_output(expected_lines, loglines)
+    try:
+        for line in expected_lines:
+            _expect_line(sut, line, timeout=10)
+        sut.wait()
+        assert sut.exitstatus == 0, f"exit code {sut.exitstatus}"
+    finally:
+        sut.close()
+        sut.logfile.close()
+
+
+# yasc methods across a module (docs/yasc_methods.md): yasc_methods_mod.c
+# exports a struct with methods, yasc_methods_mod_main.c imports it and calls
+# them as methods (the interface carries each method's marker and prototype,
+# an inline one's body too).
+@pytest.mark.parametrize("opt_level", OPT_LEVELS, ids=[f"yasc_methods_module{o}" for o in OPT_LEVELS])
+def test_yasc_methods_module_run(opt_level, tmp_path):
+    import subprocess
+    tcc = CURRENT_DIR.parent.parent / "armv8m-tcc"
+    ifc = tmp_path / "ifc"
+    (tmp_path / "mods").mkdir()
+    obj = tmp_path / "mods" / "yasc_methods_mod.o"
+    r = subprocess.run([str(tcc), "-ccompat", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft", "-nostdlib",
+                        "-fvisibility=hidden", "-ffunction-sections", opt_level, f"-fmodule-dir={ifc}",
+                        "-c", str(CURRENT_DIR / "yasc_methods_mod.c"), "-o", str(obj)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and not r.stderr, r.stderr
+    assert (ifc / "shapes2.ymi").is_file()
+    test_file = "yasc_methods_mod_main.c"
+    expected_lines, _ = load_expect_file(test_file)
+    config = CompileConfig(extra_cflags=f"{opt_level} -fmodule-dir={ifc}", output_suffix=f"_{opt_level[1:]}",
+                           output_dir=tmp_path / "build", extra_objs=[obj])
+    sut, loglines = run_test(test_file, MACHINE, config=config)
+    expected_lines = _strip_compiler_output(expected_lines, loglines)
+    try:
+        for line in expected_lines:
+            _expect_line(sut, line, timeout=10)
+        sut.wait()
+        assert sut.exitstatus == 0, f"exit code {sut.exitstatus}"
+    finally:
+        sut.close()
+        sut.logfile.close()
+
+
+# The same modules called from plain C through the headers -fmodule-header=
+# writes: the C program includes shapes.h (which includes geom.h) and links
+# the modules' objects; `export inline` is defined in the module for it.
+@pytest.mark.parametrize("opt_level", OPT_LEVELS, ids=[f"yasc_modules_c_caller{o}" for o in OPT_LEVELS])
+def test_yasc_modules_c_caller(opt_level, tmp_path):
+    import subprocess
+    tcc = CURRENT_DIR.parent.parent / "armv8m-tcc"
+    ifc, hdr = tmp_path / "ifc", tmp_path / "hdr"
+    (tmp_path / "mods").mkdir()
+    objs = []
+    for name in ("yasc_module_geom", "yasc_module_shapes"):
+        obj = tmp_path / "mods" / f"{name}.o"
+        r = subprocess.run([str(tcc), "-ccompat", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft", "-nostdlib",
+                            "-fvisibility=hidden", "-ffunction-sections", opt_level, f"-fmodule-dir={ifc}",
+                            f"-fmodule-header={hdr}", "-c", str(CURRENT_DIR / f"{name}.c"), "-o", str(obj)],
+                           capture_output=True, text=True)
+        assert r.returncode == 0 and not r.stderr, r.stderr
+        objs.append(obj)
+    assert (hdr / "geom.h").is_file() and (hdr / "shapes.h").is_file()
+    test_file = "yasc_module_c_main.c"
+    expected_lines, _ = load_expect_file(test_file)
+    config = CompileConfig(extra_cflags=f"{opt_level} -I{hdr}", output_suffix=f"_{opt_level[1:]}",
+                           output_dir=tmp_path / "build", extra_objs=objs)
+    sut, loglines = run_test(test_file, MACHINE, config=config)
+    expected_lines = _strip_compiler_output(expected_lines, loglines)
+    try:
+        for line in expected_lines:
+            _expect_line(sut, line, timeout=10)
+        sut.wait()
+        assert sut.exitstatus == 0, f"exit code {sut.exitstatus}"
+    finally:
+        sut.close()
+        sut.logfile.close()
+
+
+# examples/yasc_modules as shipped: the two modules compiled the way its
+# Makefile does (yasc by default, -fmodule-header=), then main.c (yasc, imports
+# them) and c_main.c (plain C, the generated headers) run against the example's
+# own .expect files.  The QEMU Makefile passes -ccompat, so main.c gets
+# -std=yasc back.
+@pytest.mark.parametrize("opt_level", OPT_LEVELS, ids=[f"yasc_modules_example{o}" for o in OPT_LEVELS])
+def test_yasc_modules_example(opt_level, tmp_path):
+    import subprocess
+    tcc = CURRENT_DIR.parent.parent / "armv8m-tcc"
+    example = Path("..") / ".." / "examples" / "yasc_modules"
+    ifc, hdr = tmp_path / "ifc", tmp_path / "include"
+    (tmp_path / "mods").mkdir()
+    objs = []
+    for name in ("vec", "shapes"):
+        obj = tmp_path / "mods" / f"{name}.o"
+        r = subprocess.run([str(tcc), "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft", "-nostdlib",
+                            "-fvisibility=hidden", "-ffunction-sections", opt_level, f"-fmodule-dir={ifc}",
+                            f"-fmodule-header={hdr}", "-c", str(CURRENT_DIR / example / f"{name}.c"), "-o", str(obj)],
+                           capture_output=True, text=True)
+        assert r.returncode == 0 and not r.stderr, r.stderr
+        objs.append(obj)
+    for prog, flags in (("main.c", f"-std=yasc -fmodule-dir={ifc}"), ("c_main.c", f"-I{hdr}")):
+        test_file = str(example / prog)
+        expected_lines, _ = load_expect_file(test_file)
+        config = CompileConfig(extra_cflags=f"{opt_level} {flags}", output_suffix=f"_{opt_level[1:]}",
+                               output_dir=tmp_path / "build", extra_objs=objs)
+        sut, loglines = run_test(test_file, MACHINE, config=config)
+        expected_lines = _strip_compiler_output(expected_lines, loglines)
+        try:
+            for line in expected_lines:
+                _expect_line(sut, line, timeout=10)
+            sut.wait()
+            assert sut.exitstatus == 0, f"{prog}: exit code {sut.exitstatus}"
+        finally:
+            sut.close()
+            sut.logfile.close()
+
+
+# examples/yasc, the yasc tutorial: each chapter's program (with the regular
+# C file it links, built as C) runs and prints its .expect.  -Wall -Wlifetime
+# -Werror: a tutorial example must not warn (03_mistakes, which is meant to,
+# is test_yasc_examples.py's).  The QEMU Makefile passes -ccompat; the
+# chapters say #pragma yasc.
+YASC_TUTORIAL = [
+    ("01_hello", []),
+    ("02_ownership", ["mem.c"]),
+    ("04_defer", ["mem.c"]),
+    ("05_errors", ["mem.c"]),
+    ("06_c_library", ["counter.c"]),
+    ("07_methods", ["mem.c"]),
+    ("09_config", ["mem.c"]),
+]
+_YASC_TUTORIAL_PARAMS = [(ex, extra, opt) for ex, extra in YASC_TUTORIAL for opt in OPT_LEVELS]
+
+
+@pytest.mark.parametrize("example,extra,opt_level", _YASC_TUTORIAL_PARAMS,
+                         ids=[f"yasc_tutorial_{e}{o}" for e, _, o in _YASC_TUTORIAL_PARAMS])
+def test_yasc_tutorial(example, extra, opt_level, tmp_path):
+    base = Path("..") / ".." / "examples" / "yasc"
+    files = [str(base / f"{example}.c")] + [str(base / f) for f in extra]
+    expected_lines, _ = load_expect_file(files[0])
+    config = CompileConfig(extra_cflags=f"{opt_level} -Wall -Wlifetime -Werror", output_suffix=f"_{opt_level[1:]}",
+                           output_dir=tmp_path / "build")
+    sut, loglines = run_test(files, MACHINE, config=config)
+    expected_lines = _strip_compiler_output(expected_lines, loglines)
+    try:
+        for line in expected_lines:
+            _expect_line(sut, line, timeout=10)
+        sut.wait()
+        assert sut.exitstatus == 0, f"{example}: exit code {sut.exitstatus}"
+    finally:
+        sut.close()
+        sut.logfile.close()
 
 
 # Floating point matrix: every mode-agnostic FP test x FP mode x opt level.

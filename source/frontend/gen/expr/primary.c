@@ -205,6 +205,9 @@ tok_next:
       nocode_wanted = saved_nocode;
       str_lit_pool_merge(str_pre_off);
     }
+    /* -Wformat: the literal a format argument is (attr_checks.c) */
+    if (attr_format_capturing())
+      attr_format_capture(vtop->sym, (t & VT_BTYPE) != VT_BYTE);
     break;
   case TOK_SOTYPE:
   case '(':
@@ -456,11 +459,24 @@ tok_next:
   case TOK_ALIGNOF3:
     t = tok;
     next();
+    FeSpan sizeof_span = {0, 0};
+    if (fe_tokfp_on)
+      fe_span_begin(&sizeof_span); /* -Wsizeof-pointer-memaccess: the operand's tokens */
     if (tok == '(')
       tok = TOK_SOTYPE;
     expr_type(&type, unary);
+    if (fe_tokfp_on)
+      fe_span_end(&sizeof_span);
+    /* -Wpointer-arith: GNU C gives void and a function the size 1 */
+    if (((type.t & VT_BTYPE) == VT_VOID || (type.t & VT_BTYPE) == VT_FUNC) && !(type.t & VT_ARRAY) &&
+        tcc_warn_wanted(warn_pointer_arith))
+      tcc_warning_once(warn_pointer_arith, "invalid application of '%s' to a %s type",
+                       t == TOK_SIZEOF ? "sizeof" : get_tok_str(t, NULL),
+                       (type.t & VT_BTYPE) == VT_VOID ? "void" : "function");
     if (t == TOK_SIZEOF)
     {
+      if (tcc_state->warn_sizeof_array_argument || tcc_state->warn_sizeof_pointer_memaccess)
+        fe_note_sizeof(&vtop[1], &type, &sizeof_span); /* the operand, just popped */
       vpush_type_size(&type, &align);
       gen_cast_s(VT_SIZE_T);
     }
@@ -1445,6 +1461,7 @@ tok_next:
    * of its enclosing object.  Returns (size_t)-1 when the size cannot be
    * determined at compile time. */
   case TOK_builtin_object_size:
+  case TOK_builtin_dynamic_object_size:
   case TOK_builtin___memcpy_chk:
   case TOK_builtin___memmove_chk:
   case TOK_builtin___memset_chk:
@@ -1695,16 +1712,23 @@ tok_next:
   case TOK___atomic_exchange_n:
   case TOK___atomic_compare_exchange_n:
     parse_atomic(tok);
+    uv_effects++, uv_last = UV_EFFECT; /* -Wunused-value */
     break;
 
   /* pre operations */
   case TOK_INC:
   case TOK_DEC:
+  {
+    Sym *lhs;
     t = tok;
     next();
     unary();
+    lhs = unused_lhs();
     inc(0, t);
+    unused_assigned_to(lhs);
+    uv_last = UV_INCDEC;
     break;
+  }
   case '-':
     next();
     unary();
@@ -1742,6 +1766,7 @@ tok_next:
        Use -3 as special marker (distinct from valid ELF indices >= 0,
        and from -1/-2 used for type descriptors and struct definitions).
        Only set if not already marked/having an ELF symbol. */
+    s->ymod |= SYM_UNUSED_REF; /* -Wunused-label */
     if (s->c <= 0)
       s->c = -3; /* LABEL_ADDR_TAKEN marker */
     func_has_label_addr = 1;
@@ -1781,6 +1806,7 @@ tok_next:
       tcc_error("expression expected before '%s'", get_tok_str(tok, &tokc));
     t = tok;
     next();
+    uv_ident = t; /* -Wunused-value: a name, not a builtin unary() expands */
     /* Inline-eval overlay: if we're inside try_inline_const_eval and t is
      * a parameter token, push the caller's SValue directly. This preserves
      * the original sym reference + offset + type, which is essential for
@@ -1794,6 +1820,8 @@ tok_next:
         if (tcc_state->inline_eval_overlay_tok[oi2] == t)
         {
           vpushv(&tcc_state->inline_eval_overlay_sv[oi2]);
+          if (objsize_ctx)
+            objsize_param(); /* the caller's argument: not looked at */
           break;
         }
       }
@@ -1814,6 +1842,16 @@ tok_next:
           s = NULL;
           break;
         }
+    }
+    /* yasc: `TAG.method`, a struct's method through its tag (decl/method.c) */
+    if (tok == '.' && (!s || IS_ASM_SYM(s) || (s->type.t & VT_TYPEDEF)))
+    {
+      Sym *m = yasc_method_static(t, s && !IS_ASM_SYM(s) ? s : NULL);
+      if (m)
+      {
+        s = m;
+        t = m->v;
+      }
     }
     if (!s || IS_ASM_SYM(s))
     {
@@ -1846,13 +1884,17 @@ tok_next:
 
       const char *name = get_tok_str(t, NULL);
       if (tok != '(')
-        tcc_error("'%s' undeclared", name);
+        tcc_undeclared(t, name); /* once per function (core/recover.c) */
       /* for simple function calls, we tolerate undeclared
          external reference to int() function */
-      tcc_warning_c(warn_implicit_function_declaration)("implicit declaration of function '%s'", name);
+      tcc_warning_once(warn_implicit_function_declaration, "implicit declaration of function '%s'", name);
       s = external_global_sym(t, &func_old_type);
     }
   found_captured_var:
+    if (s->a.attr_facts)
+      attr_deprecated_use(s); /* -Wdeprecated-declarations */
+    if (tcc_state->unused_on)
+      unused_mention(s);
 
     r = s->r;
     /* A symbol that has a register is a local register variable,
@@ -1872,6 +1914,8 @@ tok_next:
        regvars.  */
     vtop->sym = s;
     vtop->vr = s->vreg;
+    if (objsize_ctx)
+      objsize_ident(s); /* a followed allocation, a VLA (builtin/objsize.c) */
     /* An old-style definition with a prototype in scope is called (and its
      * address typed) as the prototype says. */
     if ((s->type.t & VT_BTYPE) == VT_FUNC && s->type.ref->f.func_type == FUNC_OLD && sym_first(s->type.ref))

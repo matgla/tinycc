@@ -165,6 +165,18 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
     if (nocode_wanted & ~0x20000000)
       return -1;
   }
+#ifdef CONFIG_TCC_BCHECK
+  /* -b: an access the frontend marked is checked first (frontend/gen/op/bcheck.c) */
+  if (tcc_state->do_bounds_check)
+  {
+    if (src1 && (src1->r & VT_MUSTBOUND))
+      bcheck_ir_operand(src1);
+    if (src2 && (src2->r & VT_MUSTBOUND))
+      bcheck_ir_operand(src2);
+    if (dest && (dest->r & VT_MUSTBOUND))
+      bcheck_ir_operand(dest);
+  }
+#endif
 
   /* Ensure any anonymous symbols in the operands are registered before
    * storing them in the IR instruction. This prevents use-after-free when
@@ -172,6 +184,10 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
   ir_ensure_sym_registered(src1);
   ir_ensure_sym_registered(src2);
   ir_ensure_sym_registered(dest);
+  /* -Wlifetime: which loaded values are pointers */
+  if ((op == TCCIR_OP_LOAD || op == TCCIR_OP_ASSIGN || op == TCCIR_OP_ADD || op == TCCIR_OP_SUB) && dest && ir->lt_on &&
+      (dest->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR)
+    tcc_ir_lt_note_pointer(ir, dest->vr);
 
   SValue far_src1, far_src2, sso_src1, sso_src2;
   if (irop_config[op].has_src1 == 1)

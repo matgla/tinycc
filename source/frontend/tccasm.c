@@ -26,6 +26,7 @@
 
 static Section *last_text_section; /* to handle .previous asm directive */
 static int asmgoto_n;
+static int asmgoto_check_n; /* the check-only parses' asm goto labels */
 
 /* Assembler macro support */
 #define ASM_MACRO_MAX_ARGS 16
@@ -1742,7 +1743,7 @@ static void subst_asm_operands(ASMOperand *operands, int nb_operands, CString *o
         if (op->reg >= 0)
         {
           sv.r = op->reg;
-          if ((op->vt->r & VT_VALMASK) == VT_LLOCAL && op->is_memory)
+          if (op->is_memory)
             sv.r |= VT_LVAL;
         }
         subst_asm_operand(out_str, &sv, modifier);
@@ -1862,6 +1863,12 @@ static void parse_asm_operands(ASMOperand *operands, int *nb_operands_ptr, int i
        * means the value still equals the argument. */
       if (!is_output)
         maybe_substitute_inline_const_arg(vtop);
+#ifdef CONFIG_TCC_BCHECK
+      /* -b: checked now, before the asm's operands are set up (a call in
+         the middle of them breaks the operand registers) */
+      if (vtop->r & VT_MUSTBOUND)
+        gbound();
+#endif
       /* Record a local register variable's register now, while its Sym is in
        * scope: by the time the IR lowers the asm the value may live in any
        * register (or be spilled) and the function's locals have been popped. */
@@ -1999,11 +2006,24 @@ ST_FUNC void asm_instr(void)
               if (csym->r == LABEL_DECLARED)
                 csym->r = LABEL_FORWARD;
             }
+            csym->ymod |= SYM_UNUSED_REF; /* -Wunused-label */
             next();
-            asmname = asm_get_prefix_name(tcc_state, "LG.", ++asmgoto_n);
-            if (!csym->c)
-              put_extern_sym2(csym, SHN_UNDEF, 0, 0, 1);
-            get_asm_sym(asmname, csym);
+            if (tcc_state->check_only)
+            {
+              /* a body parsed for its diagnostics: nothing reaches the
+                 object (no ELF symbol, no asm label), and the label is
+                 matched by an id of its own (tcc_ir_asm_label_note) */
+              asmname = operands[nb_operands + nb_labels - 1].id;
+              if (!csym->c)
+                csym->c = ASM_CHECK_LABEL_ID(++asmgoto_check_n);
+            }
+            else
+            {
+              asmname = asm_get_prefix_name(tcc_state, "LG.", ++asmgoto_n);
+              if (!csym->c)
+                put_extern_sym2(csym, SHN_UNDEF, 0, 0, 1);
+              get_asm_sym(asmname, csym);
+            }
             operands[nb_operands + nb_labels - 1].is_label = asmname;
             operands[nb_operands + nb_labels - 1].label_sym = csym->c;
             operands[nb_operands + nb_labels - 1].label_jind = csym->r == LABEL_DEFINED ? csym->jind : -1;

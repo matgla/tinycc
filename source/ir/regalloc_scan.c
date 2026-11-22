@@ -2384,6 +2384,26 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
                     a->reg_type != LS_REG_TYPE_INT || a->caller_save)
                   continue;
                 int conflict = 0;
+                /* partner's register holds its whole coalesced class, whose
+                 * members keep their own vregs in the IR: a read of any of
+                 * them clobbers the share too (`T4 <- 0 - T3; T5 <- T3 & T4;
+                 * ... return T4` shared r0 with T3's class and read T3 after
+                 * `rsb r0, r0, #0`) */
+                int nmem = 0;
+                int32_t *mem = NULL;
+                if (a->co_member)
+                {
+                  for (int ci = 0; ci < count; ci++)
+                    nmem += intervals[ci].coalesce_to == a->vreg;
+                  if (nmem)
+                  {
+                    mem = tcc_malloc(sizeof(int32_t) * nmem);
+                    nmem = 0;
+                    for (int ci = 0; ci < count; ci++)
+                      if (intervals[ci].coalesce_to == a->vreg)
+                        mem[nmem++] = intervals[ci].vreg;
+                  }
+                }
                 for (int p = (int)cur->start; p <= (int)cur->end && !conflict; p++) {
                   IRQuadCompact *pq = &ir->compact_instructions[p];
                   /* Any operand reference to the partner clobbers the share:
@@ -2394,7 +2414,11 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
                    * missed a partner used as a store base and shared hr anyway,
                    * emitting `str rX, [rX]` (value written through itself). */
                   if (ra_instr_touches_vreg(ir, pq, a->vreg)) { conflict = 1; break; }
+                  for (int mi = 0; mi < nmem && !conflict; mi++)
+                    if (ra_instr_touches_vreg(ir, pq, mem[mi]))
+                      conflict = 1;
                 }
+                tcc_free(mem);
                 if (!conflict) {
                   cur->r0 = hr;
                   cur->reg_shared = 1;

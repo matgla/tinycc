@@ -38,7 +38,7 @@ def _compile(name, subdir):
         "-ffunction-sections",
         "-c",
     ]
-    cmd = [str(TCC)] + cflags + [str(src), "-o", str(obj)]
+    cmd = [str(TCC), "-ccompat"] + cflags + [str(src), "-o", str(obj)]
     result = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,

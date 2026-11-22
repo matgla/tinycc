@@ -1,0 +1,11 @@
+hello[14]: Hello, embed!
+bytes[256]: ordered=1 sum=32640 last=255
+limited[5]: Hello
+limited_macro[4]: Hell
+str[6]: Hello
+wrapped[4]: 7 72 101 9
+empty_file[1]: 42
+empty_limit[2]: -1 -2
+std_spelling[2]: 72 5
+computed[2]: He
+first=72 args=281

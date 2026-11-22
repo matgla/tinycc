@@ -192,6 +192,8 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
   func_var = 0;
   rsym = -1;
   tcc_state->in_inline_expansion = local_scope;
+  if (!saved_in_inline_expansion && tcc_state->ir && (tcc_state->ir->lt_on || tcc_state->ir->ab_on))
+    tcc_ir_lt_inline_mark(tcc_state->ir, 1);
   tcc_state->inline_return_loc = 0;
   /* -1, not 0: vreg 0 is a real vreg, and a cleanup body is void so nothing
    * should ever bind this one. */
@@ -215,10 +217,16 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
   inline_ts->len = inline_fn->func_str->len;
   int saved_pack[PACK_STACK_SIZE + 1];
   pp_pack_enter(tcc_state, inline_fn->pack, saved_pack);
+  const char *saved_diag_replay_file = tcc_state->diag_replay_file;
+  if (inline_fn->filename)
+    tcc_state->diag_replay_file = inline_fn->filename;
+  const unsigned saved_diag_parse = tcc_diag_parse_enter(tcc_state);
   begin_macro(inline_ts, 2);
   next();
   block(0);
   end_macro();
+  tcc_diag_parse_leave(tcc_state, saved_diag_parse);
+  tcc_state->diag_replay_file = saved_diag_replay_file;
   pp_pack_leave(tcc_state, saved_pack);
   inline_restore_label_bindings(inline_label_tokens, saved_inline_labels, nb_inline_label_tokens);
 
@@ -230,6 +238,8 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
 
   /* --- Restore state --- */
   nocode_wanted = saved_nocode_wanted;
+  if (!saved_in_inline_expansion && tcc_state->in_inline_expansion && tcc_state->ir && (tcc_state->ir->lt_on || tcc_state->ir->ab_on))
+    tcc_ir_lt_inline_mark(tcc_state->ir, 0);
   tcc_state->in_inline_expansion = saved_in_inline_expansion;
   tcc_state->inline_return_loc = saved_inline_return_loc;
   tcc_state->inline_return_vr = saved_inline_return_vr;
@@ -263,8 +273,16 @@ void try_call_scope_cleanup(Sym *stop)
 
   for (; cls != stop; cls = cls->next)
   {
-    Sym *fs = cls->cleanup_func;
-    Sym *vs = cls->prev_tok;
+    Sym *fs, *vs;
+
+    if (cls->type.t)
+    {
+      if (cls->type.t == CLEANUP_DEFER || cleanup_error_exit)
+        defer_replay(cls);
+      continue;
+    }
+    fs = cls->cleanup_func;
+    vs = cls->prev_tok;
 
     /* Try to inline-expand the cleanup body in place; falls back to a normal
      * PARAM/CALL when the cleanup function is too large or otherwise unsafe

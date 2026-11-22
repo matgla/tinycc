@@ -271,6 +271,7 @@ def test_gcc_compile_ir(test_case, opt_level, tmp_path):
 
     cmd = [
         str(compiler),
+        "-ccompat",
         f"-B{project_root}",
         *INCLUDE_FLAGS,
         opt_level,
@@ -360,7 +361,7 @@ def test_gcc_compile_ir_reports_known_diagnostics(tmp_path, source_name, extra_a
     output_obj = tmp_path / output_name
 
     result = subprocess.run(
-        [str(compiler), *extra_args, "-c", str(source), "-o", str(output_obj)],
+        [str(compiler), "-ccompat", *extra_args, "-c", str(source), "-o", str(output_obj)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=30,

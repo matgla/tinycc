@@ -147,9 +147,30 @@ void block(int flags);
  * its hot internal uses; expr_precedence() is the out-of-line accessor for
  * that table, since the `prec[]` array itself stays file-local. */
 int expr_precedence(int tok);
-void expr_infix(int p);
-#define expr_landor_next(op) unary(), expr_infix(expr_precedence(op) + 1)
-#define expr_lor() unary(), expr_infix(1)
+int expr_infix(int p);
+int expr_unary_infix(int p);
+void check_parentheses(int t, int l, int r);
+void fe_check_same_operands(int op);
+/* a token span's hash (fe_tokfp_*, expr/infix.c): "the same expression" */
+typedef struct FeSpan
+{
+  uint64_t h;
+  unsigned n;
+} FeSpan;
+void fe_span_begin(FeSpan *s);
+void fe_span_end(FeSpan *s);
+int fe_span_same(const FeSpan *a, const FeSpan *b);
+void fe_note_sizeof(const SValue *op, const CType *type, const FeSpan *span); /* builtin/call.c */
+void fe_bitop_reset(void);
+int fe_narrow_fits(const SValue *sv, int dtt);
+void fe_narrow_pend_begin(const SValue *arm);
+void fe_narrow_pend_end(void);
+void fe_narrow_note_type(int ret);
+void fe_note_flex_member(void);
+int fe_array_ptr_bounds(SValue *sv, int64_t *k, char *tbuf, int tsize);
+void fe_check_deref_bounds(int allow_end);
+#define expr_landor_next(op) expr_unary_infix(expr_precedence(op) + 1)
+#define expr_lor() expr_unary_infix(1)
 
 #define MAX_TEMP_LOCAL_VARIABLE_NUMBER 8
 
@@ -175,6 +196,7 @@ struct switch_t
   struct scope *scope;
   struct switch_t *prev;
   SValue sv;
+  int body_depth; /* the compound statement depth of its body (stmt/block.c) */
 };
 
 /* list of temporary local variables on the stack in the current function
@@ -341,6 +363,27 @@ void compile_nested_functions(Sym *parent_sym);
 void nested_track_captured_sym(Sym *s);
 void pop_local_syms(Sym *b, int keep);
 
+/* --- op/op.c: the frontend's constant and type checks --- */
+void gen_op_checked(int op);
+/* op/ubsan.c (-fsanitize=..., -ftrapv) */
+int ubsan_gen_op(int op);
+int ubsan_gen_neg(void);
+void ubsan_deref(void);
+void ubsan_subscript(int addr_ok);
+void ubsan_vla_bound(void);
+void ssp_note_local(const CType *type);
+void ssp_note_frame_use(int alloca_);
+void fe_check_neg(void);
+int fe_eval_checks_wanted(void);
+int fe_int_const(const SValue *sv);
+int fe_int_bits(int t);
+int fe_int_unsigned(int t);
+int64_t fe_const_value(const SValue *sv, int *big);
+/* type/assign_check.c: `x op= y` records y for the conversion check */
+extern SValue fe_compound_rhs;
+extern int fe_compound_pending;
+extern int fe_conv_quiet;
+
 /* combine_types() operator classes, shared with op/op.c's gen_op_impl(). */
 #define CMP_OP 'C'
 #define SHIFT_OP 'S'
@@ -365,6 +408,102 @@ void unary_funcall(void);
 /* --- builtin/chk.c --- */
 void unary_builtin_chk(void);
 
+/* --- builtin/objsize.c --- */
+/* What the value being parsed points into, while objsize_ctx says a pointer's
+   object is wanted (a __builtin_object_size argument, a checked call's
+   destination): set by an identifier, a member access or an allocation's
+   result, carried through [], &, *, casts and pointer +/- an integer. */
+typedef struct ObjRec
+{
+  SValue snap;                 /* the value it describes (r, vr, c, sym) */
+  long long off;               /* bytes from the start of a heap object / VLA */
+  long long sub_size, sub_off; /* the closest member: its size, the offset in it */
+  ObjHeap h;                   /* OR_HEAP: the allocation */
+  Sym *base;                   /* the followed variable, or the VLA */
+  unsigned char on, kind, form, sub, sub_flex, off_unknown, param;
+} ObjRec;
+#define OR_HEAP 1
+#define OR_VLA 2
+#define OR_DECL 3 /* base: a declared object */
+#define OR_VAL 0  /* the value (an rvalue pointer, an array) points in */
+#define OR_ADDR 1 /* the lvalue's address is in */
+typedef struct ObjInfo
+{
+  unsigned char kind; /* OI_* */
+  unsigned char known0, known1, off_unknown;
+  unsigned long long max0, min0, max1, min1; /* bytes left: whole object, closest subobject */
+  long long off;
+  Sym *obj; /* OI_DECL: the object (anonymous for a literal) */
+  Sym *vla;
+  ObjHeap h; /* OI_HEAP */
+} ObjInfo;
+#define OI_UNKNOWN 0
+#define OI_DECL 1
+#define OI_HEAP 2
+typedef struct ObjOpHook
+{
+  long long delta;
+  unsigned char active, unknown, mul, risky;
+} ObjOpHook;
+typedef struct ObjCall ObjCall;
+extern int objsize_ctx, objsize_loop_hdr;
+extern ObjRec objsize_rec;
+extern ObjCall *objsize_cur_call;
+int objsize_rec_is(const SValue *sv);
+void objsize_enter(ObjRec *saved);
+void objsize_leave(const ObjRec *saved);
+void objsize_store(SValue *dst, SValue *src);
+void objsize_addr_taken(Sym *s);
+void objsize_label(void);
+void objsize_ident(Sym *s);
+void objsize_param(void);
+int objsize_member_begin(ObjRec *saved);
+void objsize_member_end(const ObjRec *saved, int had, int arrow, Sym *field, int cumofs, int flex);
+void objsize_after_indir(void);
+void objsize_after_addr(int was_array);
+int objsize_op_begin(ObjOpHook *h, int op);
+void objsize_op_end(ObjOpHook *h);
+void objsize_info(SValue *sv, ObjInfo *oi);
+unsigned long long objsize_result(const ObjInfo *oi, int type);
+int objsize_push_dynamic(const ObjInfo *oi, int type);
+void objsize_apply_alloc_attrs(Sym *s, SymLocalFacts *f, AttributeDef *ad);
+ObjCall *objsize_call_begin(Sym *fsym);
+void objsize_call_arg_before(ObjCall *oc, int i);
+void objsize_call_arg(ObjCall *oc, int i);
+void objsize_call_args_end(ObjCall *oc);
+void objsize_call_end(ObjCall *oc, int discarded);
+int objsize_value_heap(SValue *sv, ObjHeap *h);
+void objsize_rhs_begin(ObjRec *saved);
+void objsize_rhs_end(const ObjRec *saved);
+void objsize_cond_result(const ObjHeap *t, const ObjHeap *f);
+void objsize_alloca_result(SValue *size);
+void objsize_chk_overflow(const char *name, unsigned long long n, unsigned long long size);
+int objsize_bound_fixit(ObjCall *oc, int line);
+
+typedef struct AbSub
+{
+  struct AbLoop *loop;
+  long long idx;
+  int n, line;
+  char type[64];
+} AbSub;
+extern int objsize_ab_watch;
+#define OS_FOR_COND 2
+#define OS_FOR_STEP 3
+#define OS_FOR_BODY 4
+void objsize_for_begin(void);
+void objsize_for_phase(int phase);
+void objsize_for_end(void);
+void objsize_branch(void);
+void objsize_branch_stmt(int t);
+void objsize_ab_op(int op, int after);
+void objsize_ab_store(SValue *dst, SValue *src);
+int objsize_ab_subscript_begin(AbSub *ix, int flex);
+void objsize_ab_subscript_end(AbSub *ix, int one_past_ok);
+
+/* --- stmt/block.c (objsize) --- */
+int block_declared_in_loop(Sym *s);
+
 /* --- builtin/fp.c --- */
 void unary_builtin_alloca(void);
 void unary_builtin_fp(void);
@@ -378,7 +517,7 @@ void gen_bswap(int size);
 int gcc_classify_type(CType *type);
 void gen_bitop1(TccIrOp op);
 void gen_builtin_libcall(int func_tok, int argc, int ret_type);
-void gen_ir_call_args(SValue *args, int argc, int func_tok, CType *ret_ctype);
+int gen_ir_call_args(SValue *args, int argc, int func_tok, CType *ret_ctype);
 
 /* --- builtin/overflow.c --- */
 void unary_builtin_overflow(void);
@@ -446,6 +585,7 @@ void expr_type(CType *type, void (*expr_fn)(void));
 void gfunc_param_typed(Sym *func, Sym *arg);
 void parse_builtin_params(int nc, const char *args);
 void parse_expr_type(CType *type);
+void btype_no_auto(AttributeDef *ad);
 void parse_type(CType *type);
 
 /* --- expr/infix.c --- */
@@ -460,6 +600,8 @@ int unary_primary(void);
 
 /* --- expr/unary.c --- */
 extern int unary_addr_operand;
+int fe_subscript_bounds(int64_t *idx, char *tbuf, int tsize);
+
 extern int indir_keep_lvalue;
 void unary_generic(void);
 int unary_paren(void);
@@ -497,6 +639,47 @@ void inline_record_def_bindings(InlineFunc *fn, NestedFunc *nf);
 Sym **inline_hide_label_bindings(TokenString *func_str, int **tokens_out, int *count_out);
 void inline_restore_label_bindings(int *tokens, Sym **saved_labels, int count);
 void inline_release_hidden_label_bindings(void);
+int inline_hidden_label_depth(void);
+void inline_unwind_hidden_labels(int to);
+/* error recovery (core/recover.c) */
+extern int defer_body_level, struct_body_depth;
+/* the declarator decl() is reading: an error in it still declares the name
+   (`int y[ ;`), as gcc.  l is VT_CONST or VT_LOCAL while type_decl runs
+   (0 otherwise); v, type, scope and func are set when the name is read. */
+typedef struct RecoverDecl
+{
+  int l, v, scope, storage, func;
+  CType type;
+} RecoverDecl;
+extern RecoverDecl recover_decl;
+extern int shadow_name_sys; /* sym/symtab.c: -Wshadow, the name came from a system header's macro */
+void attr_checks_recover(void);
+int yasc_methods_depth(int set);
+void yasc_plain_reset(void);
+/* decl/plain_param.c */
+extern int yasc_pp_live;
+int yasc_pp_hold(int line);
+extern int yasc_pp_local_decl, yasc_pp_binding;
+int yasc_pp_hold_local(int line);
+int yasc_pp_local_begin(void);
+void yasc_pp_local_end(int mark, int tok, int keep);
+void yasc_pp_local_bind(Sym *sym);
+void yasc_pp_name(int mark, int tok, int idx);
+int yasc_pp_mark(void);
+void yasc_pp_declarator(Sym *def);
+void yasc_pp_rekey(Sym *to);
+int yasc_pp_waiting(Sym *def);
+int yasc_pp_body_begin(Sym *sym);
+void yasc_pp_body_end(int mark);
+void yasc_pp_recover(int body);
+void yasc_pp_finish(void);
+void yasc_pp_arg(const SValue *sv, Sym *fsym, Sym *param, int idx);
+void yasc_pp_store(const SValue *dst, const SValue *val);
+void yasc_pp_return(const SValue *sv);
+void yasc_pp_compare(void);
+void block_recover_get(Sym **lt_loop, Sym **lt_switch, int *depth);
+void block_recover_set(Sym *lt_loop, Sym *lt_switch, int depth);
+void tccgen_decls_recovering(TCCState *s1);
 void inline_scan_body_features(TokenString *func_str, int *has_addr_of_label, int *has_inline_asm);
 int inline_body_asm_is_machine(TokenString *func_str);
 int inline_body_writes_ident(TokenString *func_str, int ident_tok);
@@ -527,9 +710,11 @@ void define_deferred_data(DeferredData *d);
 void check_dropped_deferred_data(DeferredData *d, TokenString *init);
 void check_dropped_function(DeferredFunc *d, TokenString *body);
 void check_dropped_statics(TCCState *s);
+void check_uncompiled_inline_functions(TCCState *s);
 void gc_unreferenced_statics(TCCState *s);
 void free_dropped_statics(TCCState *s);
 void gen_function_check_only(Sym *sym);
+void tcc_check_scratch_begin(TCCState *s);
 TokenString *tok_str_clone(TokenString *str);
 void prune_unused_statics(TCCState *s);
 int called_once_budget_begin(int own_len);
@@ -597,9 +782,144 @@ void block_cleanup(struct scope *o);
 void try_call_cleanup_goto(Sym *cleanupstate);
 void try_call_scope_cleanup(Sym *stop);
 
+/* --- decl/attribute.c: pointer facts from GCC attributes --- */
+void attr_apply_pointer_facts(CType *type, AttributeDef *ad, int own_functype);
+void attr_apply_decl_facts(Sym *s, AttributeDef *ad);
+void attr_apply_decl_facts_at(Sym *s, AttributeDef *ad, int line);
+void attr_decl_place(SymLocalFacts *f, int line);
+
+/* --- expr/attr_checks.c --- */
+/* A format(printf|scanf) call being parsed (builtin/call.c) */
+typedef struct FmtCheck
+{
+  unsigned char kind, idx, first; /* ATTR_FMT_*, the format's argument, the first formatted (from 1) */
+  unsigned char state;            /* 0 off, 1 before the format, 2 checking arguments, 3 a va_list */
+  unsigned char saved_armed, saved_seen, nonliteral, extra_reported;
+  unsigned char have_conv, cur_star, cur_conv, cur_cls, cur_lm;
+  int stars, pos, cur_start, cur_len;
+  char *fmt; /* the literal */
+  /* format_arg(n) (gettext) inside another call's format argument: the
+     literal argument n is, for the result */
+  unsigned char fa_idx, fa_saved_seen;
+  Sym *fa_saved_sym;
+  char *fa_str;
+} FmtCheck;
+extern int attr_deprecated_suppress;
+void attr_deprecated_use(Sym *s);
+void attr_dep_call_flush(void);
+int attr_dep_call_take(Sym *fsym);
+void attr_dep_call_report(Sym *fsym, int line, ObjCall *oc);
+int attr_btype_begin(void);
+void attr_btype_end(int mark, AttributeDef *ad);
+void attr_call_result(Sym *fsym);
+void attr_check_discard(void);
+void attr_format_capture(Sym *lit, int wide);
+int attr_format_capturing(void);
+void attr_format_begin(FmtCheck *fc, Sym *fsym);
+void attr_format_before(FmtCheck *fc, int argno);
+void attr_format_arg(FmtCheck *fc, int argno);
+void attr_format_end(FmtCheck *fc, int nb_args);
+void attr_checks_reset(void);
+
+/* --- decl/module.c --- */
+extern int yasc_exporting;
+int yasc_in_main_file(void);
+int yasc_file_scope_decl(void);
+int yasc_module_linkage(CType *type, int v, int exported);
+void yasc_module_sym(Sym *s, int exported);
+void yasc_export_tag(Sym *s);
+extern int yasc_export_object;
+void yasc_ymi_compiler_id(char *buf, int size);
+void yasc_module_finish(TCCState *s1);
+void yasc_module_reset(void);
+void yasc_check_export_members(Sym *s);
+
+/* --- decl/method.c --- */
+extern int yasc_method_cur_kind, yasc_method_cur_tag, yasc_method_cur_name;
+extern int funcall_self_pending;
+extern SValue funcall_self_arg;
+void yasc_methods_reset(void);
+void yasc_struct_body_begin(void);
+void yasc_struct_body_end(void);
+int yasc_method_member(Sym *tag);
+void yasc_methods_struct_done(Sym *tag);
+int yasc_methods_pending(void);
+void yasc_methods_flush(void);
+void yasc_method_marker(void);
+Sym *yasc_method_find(Sym *tag, int name);
+int yasc_method_name_of(int fn);
+int yasc_method_name_known(int name);
+int yasc_method_postfix(Sym *tag, int arrow);
+Sym *yasc_method_static(int t, Sym *s);
+TokenString *yasc_methods_strip(TokenString *str);
+void unary_take_address(void);
+/* -Waddress-of-packed-member (expr/unary.c): a member placed below its
+   type's alignment -- the last one accessed (`sv`: the value it left, to
+   recognise it), and the one the last '&' took (SValue.packed_addr) */
+typedef struct PackedMember
+{
+  SValue sv;     /* the lvalue the access left (type, place) */
+  CType st;      /* the struct (or union) type */
+  int align;     /* what the member's place guarantees */
+  int set;
+} PackedMember;
+extern PackedMember packed_member_last, packed_member_addr;
+int packed_member_is_vtop(void);
+void packed_conversion_check(CType *dt);
+void explicit_cast_checks(CType *dt);
+
+/* --- stmt/defer.c --- */
+/* A cleanup entry's type.t: 0 is __attribute__((cleanup)) (cleanup_func,
+ * prev_tok = the variable); a yasc defer keeps its body's tokens in
+ * defer_str, the local_stack top where it was written in prev_tok and the
+ * number of times it was replayed in vreg. */
+#define CLEANUP_DEFER 1
+#define CLEANUP_ERRDEFER 2 /* runs only when the function returns an error */
+int defer_body_active(void);
+void defer_stmt(int kind);
+void defer_replay(Sym *cls);
+void defer_free_entries(Sym *from, Sym *to);
+void defer_settle_return_value(void);
+extern int cleanup_error_exit;
+
+/* --- stmt/block.c: returns --- */
+extern int stmt_diverges;
+/* -Wimplicit-fallthrough: how the statement block() last parsed ends */
+enum
+{
+  FT_LABEL,    /* a label, or nothing yet: a case right after it is an empty case */
+  FT_FALLS,    /* may complete: the next case is reached by falling through */
+  FT_DIVERGES, /* cannot complete (return, break, goto, noreturn call; all arms) */
+  FT_ATTR      /* [[fallthrough]]; / __attribute__((fallthrough)); */
+};
+extern int stmt_ft, stmt_ft_line;
+extern int attr_fallthrough_seen;
+extern int expr_eq_assigned;
+int fe_check_on(unsigned char opt);
+int fe_checks_wanted(void);
+void gen_return_emit(int b, int error_exit);
+void gen_return_jump(void);
+
+/* --- expr/yasc_errors.c --- */
+void yasc_errors_reset(void);
+int type_is_errset(CType *type);
+const char *yasc_errset_name(CType *type);
+void yasc_error_type(CType *type);
+void yasc_errunion_wrap(CType *type);
+void yasc_errunion_discarded(void);
+void yasc_verify_errors_assign(CType *dt);
+void yasc_try(void);
+void yasc_catch(void);
+void yasc_return_stmt(void);
+int yasc_void_union_falls_off(void);
+int yasc_unary(void);
+void yasc_errors_emit(TCCState *s1);
+
 /* --- stmt/ret.c --- */
 void check_func_return(void);
 void gfunc_return(CType *func_type);
+void gen_return_value_now(void);
+void gen_instrument_call(Sym *cur_func_sym, const char *hook_name);
 
 /* --- stmt/switch.c --- */
 int case_cmp(uint64_t a, uint64_t b);
@@ -645,6 +965,9 @@ void sym_copy_ref(Sym *s, Sym **ps);
 /* --- sym/symtab.c --- */
 Sym *sym_malloc(void);
 int sym_scope(Sym *s);
+void check_shadow(Sym *s);
+void check_shadow_params(Sym *func);
+void shadow_free(void);
 int token_stream_references_local_object(const int *p);
 
 /* --- type/assign_check.c --- */
@@ -654,6 +977,9 @@ int is_compatible_types(CType *type1, CType *type2);
 int is_compatible_unqualified_types(CType *type1, CType *type2);
 int mark_value_bytes(CType *type, int base, unsigned char *map, int map_size);
 void verify_assign_cast(CType *dt);
+extern int yasc_returning, yasc_argument;
+Sym *yasc_vtop_var(void);
+int yasc_move_borrow(void);
 
 /* --- type/cast.c --- */
 void force_charshort_cast(void);
@@ -677,8 +1003,10 @@ CType *pointed_type(CType *type);
 
 /* --- value/load.c --- */
 int adjust_bf(SValue *sv, int bit_pos, int bit_size);
+/* -b (op/bcheck.c, CONFIG_TCC_BCHECK) */
 void gbound(void);
 void gen_bounded_ptr_add(void);
+void bcheck_local_decl(Sym *sym);
 int get_temp_local_var(int size, int align, int *vr_out);
 extern unsigned pending_call_temp_slots;
 void pin_call_arg_temp_slot(const SValue *sv);
@@ -719,5 +1047,19 @@ void vpushs(addr_t v);
 void vset_VT_JMP(void);
 void vsetc(CType *type, int r, CValue *vc);
 void vseti(int r, int v);
+
+/* -Wvla / -Walloca: the stack a body takes at run time.  Reported with the
+ * line ("%i:") so that the check-only parse of an inlined static reports it,
+ * and never from an inline expansion, which replays a body reported once
+ * already; quiet in a system header, as gcc is. */
+static inline int diag_stack_site(void)
+{
+  BufferedFile *f = file;
+  if (tcc_state->in_inline_expansion)
+    return 0;
+  while (f && f->filename[0] == ':' && f->prev)
+    f = f->prev;
+  return !f || !f->sys;
+}
 
 #endif /* TCC_GEN_PRIV_H */

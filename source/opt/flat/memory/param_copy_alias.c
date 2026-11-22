@@ -490,7 +490,13 @@ static int pca_try(TCCIRState *ir, PcaUses *u, PcaCopy *c)
         r.aux = p->aux;
       }
       else
+      {
+        /* The source's identity too: a frontend temporary (a union cast's
+         * copy) is matched by its negative vreg, and dead_temp_local dropped
+         * its stores once the reads named a plain slot. */
         r = *p;
+        irop_set_vreg(&r, irop_get_vreg(c->tmpl));
+      }
       if (p->btype == IROP_BTYPE_STRUCT)
       {
         r.u.s.ctype_idx = p->u.s.ctype_idx;

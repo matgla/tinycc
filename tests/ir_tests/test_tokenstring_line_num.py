@@ -17,7 +17,7 @@ SOURCE = ("#define M(x) x\n" + "\n" * PAD +
 
 def _tcc(args, src):
     root = TCC.parent
-    return subprocess.run([str(TCC), f"-B{root}", "-I", str(root / "include"), *args],
+    return subprocess.run([str(TCC), "-ccompat", f"-B{root}", "-I", str(root / "include"), *args],
                           input=src, capture_output=True, text=True)
 
 

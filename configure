@@ -189,6 +189,8 @@ for opt do
   ;;
   --disable-unity) confvars_set unity=no
   ;;
+  --disable-bcheck-cross) confvars_set bcheck_cross=no
+  ;;
   --enable-lsan) confvars_set lsan
   ;;
   --with-libgcc) confvars_set libgcc
@@ -279,6 +281,8 @@ Advanced options (experts only):
   --config-mingw32[=yes|no] build on windows using msys, busybox, etc.
   --config-backtrace=no    disable stack backtraces (with -run or -bt)
   --config-bcheck=no       disable bounds checker (-b)
+  --disable-bcheck-cross   no -b in the armv8m cross (on by default there, for
+                           the QEMU newlib runs; never in the device compiler)
   --config-predefs=no      do not compile tccdefs.h, instead just include
   --config-new_macho=no|yes force apple object format (autodetect osx <= 10)
   --config-new_dtags=yes   use new ELF DTAGs (DT_RUNPATH instead of DT_RPATH)

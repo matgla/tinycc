@@ -337,6 +337,13 @@ ifneq ($(X),)
 $(if $(DEF-$T),,$(error error: unknown target: '$T'))
 DEF-$(NATIVE_TARGET) =
 DEF-$T += -DCONFIG_TCC_CROSSPREFIX="\"$X\""
+# -b in the armv8m cross (QEMU runs; tcc.h).  configure --disable-bcheck-cross
+# writes CONFIG_bcheck_cross=no.
+ifeq ($T,armv8m)
+ifneq ($(CONFIG_bcheck_cross),no)
+DEF-$T += -DCONFIG_TCC_BCHECK_CROSS=1
+endif
+endif
 ifneq ($(CONFIG_WIN32),yes)
 DEF-win += -DCONFIG_TCCDIR="\"$(tccdir)/win32\""
 endif

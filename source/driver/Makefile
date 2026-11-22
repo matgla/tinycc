@@ -23,9 +23,9 @@ DRIVER_OBJ = $(call lib-objs,driver,$(DRIVER_SRC))
 DRIVER_MAIN_OBJ = $(patsubst %.c,$(X)%.o,$(DRIVER_MAIN_SRC))
 DRIVER_LIB = $(X)source/driver/libtccdriver.a
 
-# tcchelpers.c is #included by libtcc.c (and by the unit tests that compile
+# tcchelpers.c and diag_out.c are #included by libtcc.c (tcchelpers.c also by the unit tests that compile
 # tcc.c directly), never compiled on its own.
-$(X)source/driver/libtcc.o: source/driver/tcchelpers.c
+$(X)source/driver/libtcc.o: source/driver/tcchelpers.c source/driver/diag_out.c
 
 $(X)source/driver/%.o: source/driver/%.c $(DRIVER_HDRS) $(TCC_CORE_DEPS)
 	@mkdir -p $(dir $@)

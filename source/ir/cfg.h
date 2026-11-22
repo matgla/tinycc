@@ -45,12 +45,18 @@ typedef struct IRCFG
   int *dom_tin;
   int *dom_tout;
   int dom_dfs_count;
+  /* NULL without an IJUMP; else 1 for a block a computed goto may enter (a
+   * label's): such a block cannot be duplicated or given a single entry */
+  uint8_t *label_block;
 } IRCFG;
 
 IRCFG *tcc_ir_cfg_build(struct TCCIRState *ir);
 /* 1 for a TRAP or a call to a noreturn callee: ends its block, no fall-through. */
 int tcc_ir_cfg_instr_ends_flow(struct TCCIRState *ir, struct IRQuadCompact *q);
 void tcc_ir_cfg_free(IRCFG *cfg);
+/* Does the natural loop of back edge latch_b -> header_b hold a block a
+ * computed goto may enter?  It cannot be copied (unrolled, rotated) then. */
+int tcc_ir_cfg_loop_has_label_block(const IRCFG *cfg, int header_b, int latch_b);
 /* Cheap flat pre-scan: false only when the function provably has no back-edge
  * (loop passes may then skip CFG+dominator construction entirely). */
 int tcc_ir_cfg_flat_has_backedge(struct TCCIRState *ir);

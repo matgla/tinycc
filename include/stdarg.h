@@ -3,7 +3,9 @@
 
 typedef __builtin_va_list va_list;
 #define va_start __builtin_va_start
-#define va_arg __builtin_va_arg
+/* function-like, as gcc's: in yasc code its type is written in regular C,
+   as every regular-C macro's arguments are (docs/yasc_modules.md) */
+#define va_arg(ap, type) __builtin_va_arg(ap, type)
 #define va_copy __builtin_va_copy
 #define va_end __builtin_va_end
 

@@ -390,12 +390,16 @@ int __attribute__((noinline)) try_inline_multi3(const char *func_name, Sym *call
   return 1;
 }
 
-/* Redirect a call to a __tcc_* helper: NOP old params, emit new call via gen_ir_call_args. */
+/* Redirect a call to a __tcc_* helper: NOP old params, emit new call via
+ * gen_ir_call_args.  RESULT_TYPE is the declared one, yasc qualifiers and all,
+ * and -Wlifetime reads the helper call as the declared function's. */
 int redirect_call_to_tcc_helper(SValue *saved_args, int nargs, const char *helper_name, CType *result_type,
                                        int call_id, int ir_idx_before_first_param, int ir_idx_before_args)
 {
+  int new_call_id;
   nop_or_rollback_call_params(call_id, ir_idx_before_first_param, ir_idx_before_args);
-  gen_ir_call_args(saved_args, nargs, tok_alloc_const(helper_name), result_type);
+  new_call_id = gen_ir_call_args(saved_args, nargs, tok_alloc_const(helper_name), result_type);
+  tcc_ir_lt_copy_call(tcc_state->ir, call_id, new_call_id);
   vtop[-1] = vtop[0];
   --vtop;
   return 1;
@@ -454,10 +458,166 @@ static int call_result_discarded(void)
   return tok == ';' && discarded_call_vtop != NULL && vtop - 1 == discarded_call_vtop;
 }
 
+/* ---------------------------------------------------------------------
+ * -Wsizeof-array-argument and -Wsizeof-pointer-memaccess: what a sizeof
+ * was applied to (fe_note_sizeof, from primary.c), and the memory and
+ * string functions whose length argument is sizeof of a pointer argument
+ * itself -- memset(p, 0, sizeof p) -- matched by name, as gcc does.
+ * --------------------------------------------------------------------- */
+static int fe_sizeof_seq;     /* sizeof operators parsed so far */
+static Sym *fe_sizeof_sym;    /* the last one's operand when it was a whole variable */
+static CType fe_sizeof_type;  /* ... and its type */
+static FeSpan fe_sizeof_span; /* ... and its tokens (fe_tokfp_on) */
+
+/* the variable SV is as a whole (not a member, element or deref of it) */
+static Sym *fe_whole_var(const SValue *sv)
+{
+  Sym *s = sv->sym;
+  if (!(sv->r & VT_LVAL) || !s || (s->v & ~SYM_FIELD) >= SYM_FIRST_ANOM || (s->v & SYM_STRUCT) ||
+      (s->type.t & (VT_BTYPE | VT_ARRAY)) != (sv->type.t & (VT_BTYPE | VT_ARRAY)) || s->type.ref != sv->type.ref)
+    return NULL;
+  return s;
+}
+
+void fe_note_sizeof(const SValue *op, const CType *type, const FeSpan *span)
+{
+  Sym *s = fe_whole_var(op);
+  fe_sizeof_seq++;
+  fe_sizeof_sym = s;
+  fe_sizeof_type = *type;
+  fe_sizeof_span = *span;
+  if (s && s->a.param_array && (type->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && !pp_expr)
+  {
+    char tn[64];
+    CType ct = *type;
+    ct.t &= ~(VT_STORAGE | VT_CONSTANT | VT_VOLATILE);
+    type_to_str(tn, sizeof tn, &ct, NULL);
+    tcc_fe_warning_c(warn_sizeof_array_argument, "'sizeof' on array function parameter '%s' will return size of '%s'",
+                     get_tok_str(s->v & ~SYM_FIELD, NULL), tn);
+  }
+}
+
+typedef struct MemAccessFn
+{
+  const char *name;
+  signed char a, b, n; /* the pointer arguments (b: -1 none) and the length */
+  unsigned char str;   /* a string function: "provide an explicit length" */
+  unsigned char cmp;   /* the pointers are the first and second source */
+} MemAccessFn;
+
+static const MemAccessFn memaccess_fns[] = {
+    {"memset", 0, -1, 2, 0, 0},  {"memcpy", 0, 1, 2, 0, 0},      {"memmove", 0, 1, 2, 0, 0},
+    {"mempcpy", 0, 1, 2, 0, 0},  {"memcmp", 0, 1, 2, 0, 1},      {"bcmp", 0, 1, 2, 0, 1},
+    {"bzero", 0, -1, 1, 0, 0},   {"bcopy", 1, 0, 2, 0, 0},       {"strncpy", 0, 1, 2, 1, 0},
+    {"stpncpy", 0, 1, 2, 1, 0},  {"strncat", 0, 1, 2, 1, 0},     {"strncmp", 0, 1, 2, 1, 1},
+    {"strncasecmp", 0, 1, 2, 1, 1}, {"snprintf", 0, -1, 1, 1, 0}, {"vsnprintf", 0, -1, 1, 1, 0},
+};
+
+typedef struct FeMemAccess
+{
+  const MemAccessFn *fn;
+  Sym *arg_sym[3];
+  CType arg_type[3];
+  FeSpan arg_span[3]; /* the pointer arguments' tokens */
+  int have_size;
+  Sym *size_sym;
+  CType size_type;
+  FeSpan size_span;
+} FeMemAccess;
+
+static void fe_memaccess_begin(FeMemAccess *m, Sym *callee)
+{
+  const char *name;
+  m->fn = NULL;
+  m->have_size = 0;
+  if (!tcc_state->warn_sizeof_pointer_memaccess || !callee || (callee->type.t & VT_BTYPE) != VT_FUNC ||
+      !fe_eval_checks_wanted())
+    return;
+  name = get_tok_str(callee->v & ~SYM_FIELD, NULL);
+  if (!strncmp(name, "__builtin_", 10))
+    name += 10;
+  for (size_t i = 0; i < countof(memaccess_fns); i++)
+    if (!strcmp(name, memaccess_fns[i].name))
+    {
+      m->fn = &memaccess_fns[i];
+      memset(m->arg_sym, 0, sizeof m->arg_sym);
+      memset(m->arg_span, 0, sizeof m->arg_span);
+      break;
+    }
+}
+
+/* argument I is on vtop, as written; it started with a sizeof (and SEQ0 sizeofs before);
+   SPAN: its tokens (fe_span_end done) */
+static void fe_memaccess_arg(FeMemAccess *m, int i, int started_sizeof, int seq0, const FeSpan *span)
+{
+  if (i >= 3)
+    return;
+  if (i == m->fn->n)
+  {
+    m->have_size = started_sizeof && fe_sizeof_seq == seq0 + 1 && (tok == ',' || tok == ')');
+    m->size_sym = fe_sizeof_sym;
+    m->size_type = fe_sizeof_type;
+    m->size_span = fe_sizeof_span;
+  }
+  else
+  {
+    m->arg_sym[i] = fe_whole_var(vtop);
+    m->arg_type[i] = vtop->type;
+    m->arg_span[i] = *span;
+  }
+}
+
+static void fe_memaccess_end(FeMemAccess *m)
+{
+  const MemAccessFn *fn = m->fn;
+  if (!m->have_size)
+    return;
+  for (int k = 0; k < 2; k++)
+  {
+    int i = k ? fn->b : fn->a;
+    const char *role = fn->cmp ? (k ? "second source" : "first source") : k ? "source" : "destination";
+    CType *at = &m->arg_type[i];
+    if (i < 0 || (at->t & (VT_BTYPE | VT_ARRAY)) != VT_PTR)
+      continue;
+    int align, pointee = type_size(pointed_type(at), &align);
+    int str = fn->str || pointee == 1;
+    /* the same variable, or `sizeof s->p` with s->p passed (the same tokens) */
+    if ((m->size_sym && m->size_sym == m->arg_sym[i]) || (fe_tokfp_on && fe_span_same(&m->size_span, &m->arg_span[i])))
+    {
+      tcc_fe_warning_c(warn_sizeof_pointer_memaccess,
+                       "argument to 'sizeof' in '%s' call is the same expression as the %s; did you mean to %s?",
+                       fn->name, role, str ? "provide an explicit length" : "dereference it");
+      return;
+    }
+    if (!str && (m->size_type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && is_compatible_unqualified_types(&m->size_type, at))
+    {
+      char pt[64], tt[64];
+      CType ct = *at;
+      ct.t &= ~(VT_STORAGE | VT_CONSTANT | VT_VOLATILE);
+      type_to_str(pt, sizeof pt, &ct, NULL);
+      ct = *pointed_type(at);
+      ct.t &= ~(VT_STORAGE | VT_CONSTANT | VT_VOLATILE);
+      type_to_str(tt, sizeof tt, &ct, NULL);
+      tcc_fe_warning_c(warn_sizeof_pointer_memaccess,
+                       "argument to 'sizeof' in '%s' call is the same pointer type '%s' as the %s; expected '%s' or an "
+                       "explicit length",
+                       fn->name, pt, role, tt);
+      return;
+    }
+  }
+}
+
 static void unary_funcall_body(void)
 {
   int n, t, r, size, align;
   Sym *s;
+  /* yasc `obj.method(...)`: the object is the first argument, kept aside in
+     funcall_self_arg (decl/method.c) */
+  int self_pending = funcall_self_pending;
+  funcall_self_pending = 0;
+  /* builtin/objsize.c: the call unary_funcall began for this body */
+  ObjCall *oc = objsize_cur_call;
+  objsize_cur_call = NULL;
 
   SValue ret;
   Sym *sa;
@@ -492,6 +652,9 @@ static void unary_funcall_body(void)
   /* Save function symbol before switching to type ref - needed for nested_func check */
   Sym *call_func_sym = vtop->sym;
   s = vtop->type.ref;
+  if (self_pending && (tcc_state->reverse_funcargs || (call_func_sym && call_func_sym->type.ref &&
+                                                       call_func_sym->type.ref->f.func_va_arg_pack)))
+    tcc_error("a method call cannot use this calling convention");
   /* A direct call (BL to the function itself) of an internal function takes
    * its 8-byte aggregate in r0/r1 (gfunc_regpair_ret); through a pointer, the
    * address is the AAPCS adapter's. */
@@ -545,7 +708,18 @@ static void unary_funcall_body(void)
      vreg so the post-call result is pushed as a deref through it. */
   int nrvo_call_ptr_vreg = -1;
   if (!NOEVAL_WANTED && tcc_state->ir)
+  {
     call_id = tcc_state->ir->next_call_id++;
+    /* -Wlifetime: which arguments move into the callee */
+    if (tcc_state->ir->lt_on)
+      tcc_ir_lt_note_call(tcc_state->ir, call_id, s, regpair_callee);
+    /* -Wtainted-format: the sources and the format arguments */
+    if (tcc_state->ir->taint_on)
+      tcc_ir_taint_note_call(tcc_state->ir, call_id, call_func_sym && call_func_sym->type.ref == s ? call_func_sym : NULL);
+    /* -fcallgraph-info: the type an indirect call is resolved by */
+    if (tcc_state->callgraph_info)
+      tcc_stack_usage_note_call(tcc_state, call_id, s);
+  }
 
   /* An NRVO hint (expr_eq, a declaration's initializer) is for the first call
    * of the right-hand side, the outermost one: taken now, so that no call
@@ -707,6 +881,8 @@ static void unary_funcall_body(void)
         vtop--;
         nb_args++;
         nb_implicit_args++;
+        if (!NOEVAL_WANTED && tcc_state->ir && tcc_state->ir->lt_on)
+          tcc_ir_lt_note_implicit(tcc_state->ir, call_id);
       }
     }
   }
@@ -1265,8 +1441,16 @@ static void unary_funcall_body(void)
     }
   }
 
+  /* -Wformat: format(printf|scanf) checks the arguments as they come */
+  FmtCheck fc;
+  attr_format_begin(&fc, call_func_sym);
   p = NULL;
-  if (tok != ')')
+  FeMemAccess memaccess;
+  fe_memaccess_begin(&memaccess, call_func_sym &&
+                                         (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM)
+                                     ? call_func_sym
+                                     : NULL);
+  if (tok != ')' || self_pending)
   {
     r = tcc_state->reverse_funcargs;
     SValue num;
@@ -1283,7 +1467,31 @@ static void unary_funcall_body(void)
       {
         /* IR expects 0-based parameter indices.
          * Keep FUNCPARAMVAL numbering consistent across all call sites. */
-        expr_eq();
+        if (fc.state | fc.fa_idx)
+          attr_format_before(&fc, nb_args);
+        if (oc)
+          objsize_call_arg_before(oc, nb_args);
+        if (self_pending)
+          vpushv(&funcall_self_arg);
+        else if (memaccess.fn)
+        {
+          const int started_sizeof = tok == TOK_SIZEOF, seq0 = fe_sizeof_seq;
+          FeSpan arg_span = {0, 0};
+          if (fe_tokfp_on)
+            fe_span_begin(&arg_span);
+          expr_eq();
+          if (fe_tokfp_on)
+            fe_span_end(&arg_span);
+          fe_memaccess_arg(&memaccess, nb_args, started_sizeof, seq0, &arg_span);
+        }
+        else
+          expr_eq();
+        if (yasc_pp_live)
+          yasc_pp_arg(vtop, call_func_sym, sa, nb_args); /* plain_param.c */
+        if (oc)
+          objsize_call_arg(oc, nb_args);
+        if (fc.state | fc.fa_idx)
+          attr_format_arg(&fc, nb_args);
         /* Materialize comparisons before applying the parameter conversion. */
         if (!NOEVAL_WANTED)
           tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
@@ -1387,6 +1595,13 @@ static void unary_funcall_body(void)
       nb_args++;
       if (sa)
         sa = sa->next;
+      if (self_pending)
+      {
+        self_pending = 0;
+        if (tok == ')')
+          break;
+        continue;
+      }
       if (tok == ')')
         break;
       skip(',');
@@ -1394,6 +1609,12 @@ static void unary_funcall_body(void)
   }
   if (sa && s->f.func_type != FUNC_OLD)
     tcc_error("too few arguments to function");
+  if (fc.kind | fc.fa_idx)
+    attr_format_end(&fc, nb_args);
+  if (memaccess.fn)
+    fe_memaccess_end(&memaccess);
+  if (oc)
+    objsize_call_args_end(oc);
 
   if (p)
   { /* with reverse_funcargs */
@@ -2390,6 +2611,14 @@ static void unary_funcall_body(void)
         if (pv == 0)
           pv = anon_sym++;
         Sym *psym = sym_push(pv, &param_sym->type, VT_LOCAL | VT_LVAL, loc);
+        psym->a.param_array = param_sym->a.param_array; /* -Wsizeof-array-argument */
+        /* -Wlifetime: the callee's parameter, its compile reports what the
+           body does with it; binding the argument is the call's */
+        if (tcc_state->ir->lt_on)
+          tcc_ir_lt_inline_param(tcc_state->ir, psym->vreg, call_func_sym, pi);
+        /* -Wtainted-format: the expansion is a call for the summaries */
+        if (tcc_state->ir->taint_on && !tcc_state->in_inline_expansion)
+          tcc_ir_taint_inline_param(tcc_state->ir, pi, psym);
         SValue arg_val = saved_args[pi];
         inline_eval_cast_arg_to_param(&arg_val, &param_sym->type);
         /* A K&R definition's caller passes the promoted argument and the
@@ -2490,6 +2719,15 @@ static void unary_funcall_body(void)
        * body's `return` then emits a real RETURNVALUE instead of the
        * store-to-inline_return_loc + jump-to-rsym pattern. */
       uint8_t saved_in_inline_expansion = tcc_state->in_inline_expansion;
+      /* the body is parsed in its own file's dialect, not the caller's */
+      uint8_t saved_yasc = tcc_state->yasc;
+      tcc_state->yasc = tcc_state->nb_yasc_files && inline_fn->filename && tcc_yasc_file(tcc_state, inline_fn->filename);
+      /* its diagnostics name its own file, and are quiet when that is a
+         system header */
+      const char *saved_diag_replay_file = tcc_state->diag_replay_file;
+      if (inline_fn->filename)
+        tcc_state->diag_replay_file = inline_fn->filename;
+      const unsigned saved_diag_parse = tcc_diag_parse_enter(tcc_state);
       int saved_inline_return_loc = tcc_state->inline_return_loc;
       int saved_inline_return_vr = tcc_state->inline_return_vr;
       uint8_t saved_inline_return_redirected = tcc_state->inline_return_redirected;
@@ -2573,6 +2811,11 @@ static void unary_funcall_body(void)
        * suppress next() ONLY for the outermost function-body '}' of the inline
        * expansion and NOT for nested '{...}' blocks inside the inline body. */
       tcc_state->in_inline_expansion = local_scope;
+      if (!saved_in_inline_expansion && tcc_state->ir && (tcc_state->ir->lt_on || tcc_state->ir->ab_on))
+        tcc_ir_lt_inline_mark(tcc_state->ir, 1);
+      if (!saved_in_inline_expansion && tcc_state->ir && tcc_state->ir->taint_on)
+        tcc_ir_taint_inline_mark(tcc_state->ir, 1, call_func_sym, -1);
+      inline_fn->expanded = 1;
       tcc_state->inline_return_loc = inline_ret_loc;
       tcc_state->inline_return_vr = inline_ret_vr;
       tcc_state->inline_return_redirected = 0;
@@ -2594,12 +2837,10 @@ static void unary_funcall_body(void)
       inline_ts->data.str = tok_str_buf(inline_fn->func_str);
       inline_ts->allocated_len = 1;
       inline_ts->len = inline_fn->func_str->len;
+      inline_ts->src = inline_fn->func_str; /* its warnings' quiet ranges */
       int saved_pack[PACK_STACK_SIZE + 1];
       pp_pack_enter(tcc_state, inline_fn->pack, saved_pack);
-      begin_macro(inline_ts, 2);
-      next();
-      block(0);
-      end_macro();
+      replay_body_recovering(inline_ts, call_func_sym); /* begin_macro, block(0), end_macro */
       pp_pack_leave(tcc_state, saved_pack);
       inline_restore_label_bindings(inline_label_tokens, saved_inline_labels, nb_inline_label_tokens);
 
@@ -2608,6 +2849,11 @@ static void unary_funcall_body(void)
 
       /* --- 5. Backpatch return jumps --- */
       tcc_ir_backpatch_to_here(tcc_state->ir, rsym);
+      /* -Wlifetime: the result is as maybe as the call's type says */
+      if (!saved_in_inline_expansion && inline_ret_vr >= 0 && tcc_state->ir && tcc_state->ir->lt_on)
+        tcc_ir_lt_inline_result(tcc_state->ir, inline_ret_vr, s);
+      if (!saved_in_inline_expansion && tcc_state->ir && tcc_state->ir->taint_on)
+        tcc_ir_taint_inline_mark(tcc_state->ir, 0, NULL, inline_ret_vr);
 
       /* --- 6. Restore state --- */
       /* Read back inline_return_loc: the struct return handler may have
@@ -2618,7 +2864,12 @@ static void unary_funcall_body(void)
       if (tcc_state->ir)
         tcc_ir_frame_scope_end(tcc_state->ir, inl_first_obj, tcc_state->ir->next_instruction_index,
                                tcc_state->inline_return_redirected ? inline_ret_loc : 1);
+      if (!saved_in_inline_expansion && tcc_state->in_inline_expansion && tcc_state->ir && (tcc_state->ir->lt_on || tcc_state->ir->ab_on))
+        tcc_ir_lt_inline_mark(tcc_state->ir, 0);
       tcc_state->in_inline_expansion = saved_in_inline_expansion;
+      tcc_state->yasc = saved_yasc;
+      tcc_state->diag_replay_file = saved_diag_replay_file;
+      tcc_diag_parse_leave(tcc_state, saved_diag_parse);
       tcc_state->inline_return_loc = saved_inline_return_loc;
       tcc_state->inline_return_vr = saved_inline_return_vr;
       tcc_state->inline_return_redirected = saved_inline_return_redirected;
@@ -2885,6 +3136,34 @@ static void unary_funcall_body(void)
 void unary_funcall(void)
 {
   unsigned saved_pending = pending_call_temp_slots;
+  /* a direct call: the callee's name (a borrowing struct result's binding) */
+  int callee = (vtop->type.t & VT_BTYPE) == VT_FUNC && vtop->sym ? vtop->sym->v : 0;
+  Sym *fsym = vtop->sym; /* the function, or the pointer variable called through */
+  /* object sizes: allocations, and the checks at memcpy, free, ... */
+  ObjCall *oc = (vtop->type.t & VT_BTYPE) == VT_FUNC &&
+                        (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM)
+                    ? objsize_call_begin(fsym)
+                    : NULL;
+  if (!oc)
+    attr_dep_call_flush(); /* a deprecated sprintf called through a cast */
+  /* -Wconversion: the declared return type (a narrow one is promoted below) */
+  const CType *callee_ft = (vtop->type.t & VT_BTYPE) == VT_PTR ? pointed_type(&vtop->type) : &vtop->type;
+  const int ret_t = (callee_ft->t & VT_BTYPE) == VT_FUNC && callee_ft->ref ? callee_ft->ref->type.t : VT_VOID;
+  objsize_cur_call = oc;
   unary_funcall_body();
+  if (oc) /* the result is the statement's, dropped at the ';' */
+    objsize_call_end(oc, tok == ';' && discarded_call_vtop != NULL && vtop - 1 == discarded_call_vtop);
+  if (tcc_state->warn_conversion || tcc_state->warn_sign_conversion)
+    fe_narrow_note_type(ret_t);
+  /* yasc: a borrowing struct result bound to static storage, for vstore */
+  if (tcc_state->yasc && callee && yasc_borrowing_struct(&vtop->type) &&
+      yasc_struct_result_code(callee) == YASC_BORROWS_STATIC)
+    vtop->sym = &yasc_static_bound;
   pending_call_temp_slots = saved_pending;
+  /* yasc: a call's owned result is a temporary until something takes it;
+     what stores it gets the declared type, an assignment the target's */
+  if (tcc_state->yasc && (type_yasc(&vtop->type) & YASC_OWNED))
+    yasc_requalify(&vtop->type, vtop->type.ref->yasc | YASC_FRESH);
+  /* -Wunused-result: this value, if the statement drops it */
+  attr_call_result(fsym);
 }

@@ -102,7 +102,7 @@ def _find_debug_compiler(compiler_override=None):
 def _compiler_has_dump_ir_passes(compiler):
     """Sanity-check that the compiler supports -dump-ir-passes."""
     result = subprocess.run(
-        [str(compiler), "-dump-ir-passes=all", "-c", "-x", "c", "-", "-o", "/dev/null"],
+        [str(compiler), "-ccompat", "-dump-ir-passes=all", "-c", "-x", "c", "-", "-o", "/dev/null"],
         input="int f(int x){return x;}",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -180,7 +180,7 @@ def _canonicalize_symbols(text):
 def _run_compiler(compiler, cflags, c_file, tmp_path):
     """Run the compiler and return captured stdout/stderr text."""
     out_file = tmp_path / f"{c_file.stem}.o"
-    cmd = [str(compiler), *cflags, "-c", str(c_file), "-o", str(out_file)]
+    cmd = [str(compiler), "-ccompat", *cflags, "-c", str(c_file), "-o", str(out_file)]
     result = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,

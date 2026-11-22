@@ -76,6 +76,7 @@ void vsetc(CType *type, int r, CValue *vc)
   vtop->pr1_reg = PREG_REG_NONE;
   vtop->pr1_spilled = 0;
   vtop->sso_reversed = 0;
+  vtop->packed_addr = 0;
   vtop->sym = NULL;
   /* Note: jtrue/jfalse are in a union with c, so we DON'T initialize them here.
      They should only be used when r == VT_CMP, and c is used otherwise. */
@@ -148,6 +149,9 @@ ST_FUNC void gv_discarded_volatile(void)
  * value of the call that produced it, when it is the last instruction. */
 ST_FUNC void vpop_discarded(void)
 {
+  attr_check_discard();
+  if (tcc_state->yasc)
+    yasc_verify_discard();
   gv_discarded_volatile();
   if (!(vtop->r & VT_LVAL) && (vtop->r & VT_VALMASK) != VT_CONST)
     tcc_ir_codegen_drop_return_of(tcc_state->ir, vtop->vr);

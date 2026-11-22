@@ -553,6 +553,7 @@ void mach_writeback_dest(const MachineOperand *op, int reg);
 void tcc_gen_mach_load_to_reg(int dest_reg, const MachineOperand *op);
 void map_sym_d(void);
 void map_sym_t(void);
+void th_stack_prolog_done(int entry); /* arm-thumb-emit.c: -fstack-usage */
 int scratch_push_sp_bias(void);
 uint32_t literal_pool_hash_func(Sym *sym, int64_t imm);
 int literal_pool_lookup_cache_find(LiteralPoolLookupCache *cache, uint32_t full_hash, Sym *sym,

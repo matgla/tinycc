@@ -3102,6 +3102,9 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
 
   const int call_id = TCCIR_DECODE_CALL_ID(call_id_op.u.imm32);
   const int argc_hint = TCCIR_DECODE_CALL_ARGC(call_id_op.u.imm32);
+  /* -fcallgraph-info: the type of a call through a register */
+  if (ir->su_call_sig)
+    tcc_gen_machine_stack_call_sig(tcc_stack_usage_call_sig(tcc_state, call_id));
 
   /* The memory barrier of an inline atomic (parse_atomic): a call everywhere
    * before this point, so every pass treats it as touching all memory, and

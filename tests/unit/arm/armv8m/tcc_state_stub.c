@@ -97,6 +97,13 @@ __attribute__((weak)) void gen_fill_nops(int bytes)
 {
   (void)bytes;
 }
+#ifdef CONFIG_TCC_BCHECK
+/* -b (frontend/gen/op/bcheck.c): tcc_ir_put's hook, off in the unit tests */
+__attribute__((weak)) void bcheck_ir_operand(SValue *sv)
+{
+  (void)sv;
+}
+#endif
 
 #else /* UT_SSA_OPT_REAL — build_ssaopt (UT11) ===================== */
 /*
@@ -120,6 +127,13 @@ void tcc_state_free(TCCState *s)
 {
   /* Do nothing. */
 }
+#ifdef CONFIG_TCC_BCHECK
+/* -b (frontend/gen/op/bcheck.c): tcc_ir_put's hook, off in the unit tests */
+__attribute__((weak)) void bcheck_ir_operand(SValue *sv)
+{
+  (void)sv;
+}
+#endif
 #endif /* UT_SSA_OPT_REAL */
 
 /* r0/r1 aggregate returns (arm-thumb-emit.c gfunc_regpair_ret, elfsym.c

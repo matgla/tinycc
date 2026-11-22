@@ -108,22 +108,33 @@ static const char help2[] = "Tiny C Compiler " TCC_VERSION " - More Options\n"
                             "  -Wp,-opt                      same as -opt\n"
                             "  -include file                 include 'file' above each input file\n"
                             "  -isystem dir                  add 'dir' to system include path\n"
+                            "  -iyasc dir                    add 'dir' to include path, its headers are yasc\n"
                             "  -static                       link to static libraries (not "
                             "recommended)\n"
                             "  -dumpversion                  print version\n"
                             "  -print-search-dirs            print search paths\n"
                             "  -dt                           with -run/-E: auto-define 'test_...' "
                             "macros\n"
+                            "yasc modules (docs/yasc_modules.md):\n"
+                            "  -fmodule-dir=dir              write module interfaces (.ymi) to dir, "
+                            "look for them there first\n"
+                            "  -fmodule-deps                 print each file's 'module' and 'import' "
+                            "lines, compile nothing\n"
+                            "  -fmodule-header=dir           also write a module's C header, dir/a/b.h "
+                            "for module a.b\n"
                             "Ignored options:\n"
                             "  -arch -C --param -pedantic -pipe -s -traditional\n"
                             "-W[no-]... warnings:\n"
                             "  all                           turn on some (*) warnings\n"
+                            "  extra                         turn on more: fall-through, empty bodies,\n"
+                            "                                sign-compare, type-limits, unused parameters\n"
                             "  error[=warning]               stop after warning (any or specified)\n"
                             "  write-strings                 strings are const\n"
                             "  unsupported                   warn about ignored options, pragmas, "
                             "etc.\n"
                             "  implicit-function-declaration warn for missing prototype (*)\n"
                             "  discarded-qualifiers          warn when const is dropped (*)\n"
+                            "  nonnull                       warn on null for a nonnull parameter (*)\n"
                             "-f[no-]... flags:\n"
                             "  unsigned-char                 default char is unsigned\n"
                             "  signed-char                   default char is signed\n"
@@ -136,6 +147,12 @@ static const char help2[] = "Tiny C Compiler " TCC_VERSION " - More Options\n"
                             "  gnu89-inline                  'extern inline' is like 'static inline'\n"
                             "  asynchronous-unwind-tables    create eh_frame section [on]\n"
                             "  test-coverage                 create code coverage code\n"
+                            "  syntax-only                   parse and check, write nothing\n"
+                            "  diagnostics-color[=always|never|auto]\n"
+                            "                                colour errors and warnings [auto: on a terminal]\n"
+                            "  diagnostics-format=text|json|sarif\n"
+                            "                                diagnostics as gcc's JSON or SARIF 2.1.0 on stderr\n"
+                            "  diagnostics-parseable-fixits  print fix-its as 'fix-it:' lines\n"
                             "  visibility=default|hidden|internal|protected\n"
                             "                                visibility of definitions without one\n"
                             "-m... target specific options:\n"
@@ -259,6 +276,12 @@ static void set_environment(TCCState *s)
   if (path != NULL)
   {
     tcc_add_include_path(s, path);
+  }
+  /* as CPATH, for -iyasc */
+  path = getenv("YASC_INCLUDE_PATH");
+  if (path != NULL)
+  {
+    tcc_add_yasc_include_path(s, path);
   }
   path = getenv("LIBRARY_PATH");
   if (path != NULL)
@@ -410,6 +433,9 @@ redo:
   }
 
   set_environment(s);
+  /* -fsyntax-only: compile each file as for -c, and write nothing */
+  if (s->output_type == 0 && s->syntax_only)
+    s->output_type = TCC_OUTPUT_OBJ;
   if (s->output_type == 0)
     s->output_type = TCC_OUTPUT_EXE;
   tcc_set_output_type(s, s->output_type);
@@ -556,10 +582,13 @@ redo:
     {
       if (!s->outfile)
         s->outfile = default_outputfile(s, first_file);
-      if (!s->just_deps)
+      if (!s->just_deps && !s->syntax_only)
       {
         ret = tcc_output_file(s, s->outfile);
         tcc_init_stamp("write output");
+        /* -fstack-usage / -fcallgraph-info: x.su / x.ci beside x.o */
+        if (!ret && s->output_type == TCC_OUTPUT_OBJ && (s->stack_usage || s->callgraph_info))
+          tcc_stack_usage_write(s, s->outfile);
       }
       if (!ret && s->gen_deps)
         gen_makedeps(s, s->outfile, s->deps_outfile);

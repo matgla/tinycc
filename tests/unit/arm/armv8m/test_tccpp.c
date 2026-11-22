@@ -1696,17 +1696,18 @@ UT_TEST(test_preprocess_error)
 {
   ut_reset_pp_state();
   UT_ASSERT(ut_open_input("#error boom\n") == 0);
+  /* #error is an error, and the compile goes on (gcc): no longjmp */
   tcc_state->error_set_jmp_enabled = 1;
   if (setjmp(tcc_state->error_jmp_buf) == 0)
   {
     preprocess(1);
     tcc_state->error_set_jmp_enabled = 0;
     file = NULL;
-    return -1;
+    return 0;
   }
   tcc_state->error_set_jmp_enabled = 0;
   file = NULL;
-  return 0;
+  return -1;
 }
 
 UT_TEST(test_preprocess_include_errors)

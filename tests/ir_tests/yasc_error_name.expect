@@ -1,0 +1,8 @@
+BadPath ENOENT ENOENT
+(unknown error)
+other 0: OnlyInFileB
+other 1: EPERM
+other 2: BadPath
+wrapped 0 -> 16
+wrapped 1: EACCES
+wrapped 2: EINVAL

@@ -23,6 +23,26 @@
 
 int tok_flags;
 int pp_expr;
+/* error recovery (tccpp.c, frontend/gen/core/recover.c), read by error1 */
+int parse_flags;
+int pp_subst_depth;
+void tcc_recover_jump(struct TCCState *s1)
+{
+  (void)s1;
+}
+void tcc_recover_release(struct TCCState *s1)
+{
+  (void)s1;
+}
+/* a body being saved as tokens (decl.c) and system-header macros (tccpp.c) */
+void save_body_error(struct TCCState *s1, int line, const char *msg)
+{
+  (void)s1, (void)line, (void)msg;
+}
+int tcc_sys_macro_here(void)
+{
+  return 0;
+}
 const int *macro_ptr;
 struct BufferedFile *file;
 
@@ -31,6 +51,7 @@ struct BufferedFile *file;
 void preprocess_start(TCCState *s1, int filetype) { (void)s1; (void)filetype; }
 void preprocess_end(TCCState *s1) { (void)s1; }
 int tcc_preprocess(TCCState *s1) { (void)s1; return 0; }
+void yasc_module_scan(TCCState *s1) { (void)s1; }
 void pp_error(CString *cs) { (void)cs; }
 
 void tccgen_init(TCCState *s1) { (void)s1; }
@@ -187,4 +208,38 @@ int cstr_printf(CString *cstr, const char *fmt, ...)
   len = cstr_vprintf(cstr, fmt, ap);
   va_end(ap);
   return len;
+}
+
+/* -fstack-usage / -fcallgraph-info (backend/generators/stack_usage.c) */
+void tcc_stack_usage_write(TCCState *s1, const char *object)
+{
+  (void)s1;
+  (void)object;
+}
+
+/* -Wcross-tu's link table (obj/tccelf_load.c) */
+void tcc_typesig_free(TCCState *s1)
+{
+  (void)s1;
+}
+
+/* -Wcross-tu's location table (frontend/gen/decl/typesig.c) */
+void tcc_typesig_reset(void)
+{
+}
+
+void tcc_stack_usage_free(TCCState *s1)
+{
+  (void)s1;
+}
+
+void tcc_stack_usage_unit_end(TCCState *s1)
+{
+  (void)s1;
+}
+
+/* -Wunused / -Wunused-* switched (frontend/gen/core/unused.c) */
+void unused_options_changed(TCCState *s1)
+{
+  (void)s1;
 }

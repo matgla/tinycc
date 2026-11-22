@@ -70,7 +70,7 @@ def tcc(request):
 def build(tcc, tmp_path, source, level):
     src, obj = tmp_path / "t.c", tmp_path / "t.o"
     src.write_text(PRELUDE + source)
-    r = subprocess.run([tcc, level, "-nostdlib", "-c", str(src), "-o", str(obj)], capture_output=True, text=True)
+    r = subprocess.run([tcc, "-ccompat", level, "-nostdlib", "-c", str(src), "-o", str(obj)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     dis = subprocess.run(["arm-none-eabi-objdump", "-dr", str(obj)], capture_output=True, text=True, check=True).stdout
     syms = subprocess.run(["arm-none-eabi-nm", str(obj)], capture_output=True, text=True, check=True).stdout

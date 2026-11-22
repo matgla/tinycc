@@ -567,6 +567,103 @@ typedef struct IRParamForm
  * room in the frame; a frame reaching down to them is refused. */
 #define TCC_CAPTURE_SPACE (-32768 + 8)
 
+/* -Wlifetime (lifetime.c): what the frontend knows about yasc ownership and
+ * the raw IR does not.  An owned local or parameter, by its vreg. */
+typedef struct IRLtVar
+{
+  int32_t vreg;
+  int tok;            /* its name */
+  int line;           /* where it is declared */
+  uint8_t silent;     /* declared in an inlined body: its callee reports it */
+  uint8_t untracked;  /* its address is taken: the analysis cannot follow it */
+  uint8_t kind;       /* LTV_*; a plain pointer has none */
+  uint8_t arg_report; /* an inlined callee's parameter, bound at a call to report */
+  int16_t arg_index;  /* ... its argument number (from 0), -1 for any other variable */
+  int arg_callee;     /* ... the callee's name (token), 0 when called through a pointer */
+  int dealloc;        /* `owned(fclose)` as declared: the deallocator's name, 0 not said */
+} IRLtVar;
+#define LTV_OWNED 1 /* `T * owned`: followed for ownership */
+#define LTV_MAYBE 2 /* `T * maybe`: followed for null */
+#define LTV_OUT 4   /* `out T *`: the function must write *p, and not read it first */
+#define LTV_MUT 8   /* points to memory that is not const: handed on, it may be written */
+#define LTV_TAKEN 16 /* an owned parameter the function's result takes over (takes(p)) */
+#define LTV_HANDLE 32 /* an int handle (`int owned(close) maybe fd`): "null" is < 0 */
+#define LTV_OBJECT 64 /* an object owned as a whole (`regex_t owned(regfree) re`) */
+#define LTV_RESULT 128 /* an inlined call's result variable (-O1+): maybe as the call's type says */
+
+/* A `T * maybe` struct member reached through a pointer (`q->next`,
+ * `(*q).next`): the temp that holds the member's address, its offset and its
+ * name.  The checker follows each (base pointer, offset) as a variable. */
+/* An owned pointer or int handle inside a local struct or array (`b.buf`,
+ * `fds[0]`): it has no vreg, so the slot check (lifetime.c) follows it by
+ * its frame offset. */
+typedef struct IRLtSlot
+{
+  int32_t off;      /* its frame offset */
+  int32_t base;     /* the local's frame offset and size: its address used */
+  int32_t base_size; /* anywhere else stops the following of all its items */
+  int dealloc;      /* owned(dealloc), 0 not said */
+  uint8_t kind;     /* LTV_OWNED, LTV_MAYBE, LTV_HANDLE */
+  /* an element of the innermost array it is in (`a[2]`, `b[1].buf`): the
+     element's size (0 none), its index, the array's length, and where
+     "[2]" is in the name -- a variable index (`a[i]`) is followed per array */
+  uint8_t pre, suf;
+  uint8_t silent; /* declared in an inlined body: its callee's to report */
+  int16_t idx, nelem;
+  int32_t esize;
+  char name[40];
+} IRLtSlot;
+
+typedef struct IRLtMember
+{
+  int32_t vreg;
+  int offset;
+  int tok;
+  int owned; /* `T * owned maybe`: also followed for ownership */
+  int foff;  /* the member's offset in its struct (offset: from the address noted) */
+  int esize; /* the struct's size: an element of an array of them (`p[1].next`) */
+} IRLtMember;
+
+/* Before instruction `idx`: a scope's end for an owned variable, or (var
+ * LT_EV_RETURN) the jump there is a `return`. */
+typedef struct IRLtEvent
+{
+  int32_t idx;
+  int32_t var; /* index in lt_vars */
+  int line;
+} IRLtEvent;
+#define LT_EV_RETURN (-1)
+#define LT_EV_RESULT(v) (-2 - (v)) /* the inlined body whose result is variable v ends */
+
+/* A call's parameters that take ownership, by source parameter (bit i). */
+typedef struct IRLtCall
+{
+  uint32_t owned;   /* `T * owned` parameters: the argument moves */
+  uint32_t drop;    /* of them, `drop`: the callee frees it */
+  uint8_t implicit; /* hidden arguments ahead of the first (struct return) */
+  uint8_t known;     /* owned parameters recorded */
+  uint8_t ret_maybe; /* the result is `T * maybe` */
+  uint8_t in_inline; /* emitted inside an inlined body: its callee reports it */
+  uint32_t nonnull;  /* pointer parameters declared in yasc without maybe: never null */
+  uint32_t nonnull_attr; /* of them, __attribute__((nonnull)) from regular C */
+  int callee;        /* the callee's name (token), 0 through a pointer */
+  uint32_t keep;     /* parameters that cannot write through the argument: a
+                        pointer to const, or no pointer at all */
+  uint8_t nparams;   /* declared parameters (at most 32); past them, varargs */
+  uint8_t noted;     /* tcc_ir_lt_note_call saw the call */
+  uint32_t borrows;  /* a view result: the arguments it points into (borrows(...), the elision) */
+  int ret_dealloc;   /* an owned result's deallocator (owned(fclose), malloc(fclose, 1)), 0 not said */
+  int drop_dealloc;  /* the first drop parameter's own owned(...), 0 not said: then the callee's name */
+  uint32_t taken;    /* owned parameters the result takes over (takes(p)) */
+  uint32_t handles;  /* int handle parameters: invalid is < 0, not 0 */
+  uint32_t outown;     /* parameters pointing at an owned pointer (getline's lineptr): the callee may replace it */
+  uint32_t outown_out; /* of them, `out`: the callee writes one there without reading what was */
+  uint32_t outown_maybe; /* of them, the owned pointer is maybe */
+  uint32_t dropobj;  /* `drop T owned(release) * view p`: releases the object p points at */
+  int dropobj_dealloc; /* the first such parameter's deallocator */
+  uint32_t objout;   /* of outown, those that write an object owned as a whole (regcomp) */
+} IRLtCall;
+
 typedef struct TCCIRState
 {
   // number of function parameters
@@ -587,6 +684,12 @@ typedef struct TCCIRState
   uint8_t leaffunc : 1;
   uint8_t tail_call_only : 1;
   uint8_t naked : 1;
+  /* -fstack-protector chose this function: a canary below the saved
+   * registers (arm-thumb-frame.c), and no tail call */
+  uint8_t ssp : 1;
+  /* no canary whatever the body holds: no_stack_protector, or
+   * -fstack-protector-explicit without stack_protect (frontend/gen/op/ubsan.c) */
+  uint8_t ssp_off : 1;
   /* Set by noreturn_collapse when the body has been replaced with `b .`:
    * control never reaches the epilogue, so suppress emitting it (saves the
    * unreachable `bx lr` after the self-jump). Unlike `naked`, this does
@@ -686,6 +789,16 @@ typedef struct TCCIRState
   /* Compact instruction array - parallel to instructions[] for now */
   IRQuadCompact *compact_instructions;
   int compact_instructions_size;
+#ifdef CONFIG_TCC_BCHECK
+  /* -b (frontend/gen/op/bcheck.c): pairs (result vreg, symref pool index of
+   * the callee) of the __bound_ptr_add calls a dereference may turn into
+   * __bound_ptr_indirN, and the addresses of the locals registered, dropped
+   * at the function's exit */
+  int *bc_patch;
+  int bc_patch_n, bc_patch_cap;
+  struct SValue *bc_locals;
+  int bc_locals_n, bc_locals_cap;
+#endif
 
   IRLiveInterval **active_set;
 
@@ -716,6 +829,74 @@ typedef struct TCCIRState
    * 0 means "legacy/unknown" and falls back to nested-scan binding.
    */
   int next_call_id;
+  /* -fcallgraph-info: each call's function type (tcc_stack_usage_sig) by call_id */
+  unsigned short *su_call_sig;
+  int su_nb_call_sig;
+  /* -Wlifetime records (lifetime.c), freed once the function is checked */
+  IRLtVar *lt_vars;
+  int lt_nb_vars;
+  IRLtEvent *lt_events;
+  int lt_nb_events;
+  IRLtCall *lt_calls; /* by call_id, lt_nb_calls entries */
+  int lt_nb_calls;
+  int *lt_ostores; /* [from, to) pairs: what a store into an owned pointer emitted */
+  int lt_nb_ostores;
+  int *lt_fstores; /* [from, to, entry] triples: a store into a borrows(member) member */
+  int lt_nb_fstores;
+  int *lt_floads; /* [temp, entry] pairs: the temp holds a borrows(member) member's address */
+  int lt_nb_floads;
+  IRLtSlot *lt_slots;     /* owned items of local structs and arrays */
+  int lt_nb_slots;
+  int32_t *lt_inames; /* (vreg, token) pairs: the int locals and parameters, names of an index */
+  int lt_nb_inames;
+  IRLtMember *lt_members; /* maybe members read or written through a pointer */
+  /* maybe members of a global struct (`g.next`): the symbol, the member's
+     offset from it (lt_gm_syms[i], lt_gmembers[i].offset; vreg unused) */
+  IRLtMember *lt_gmembers;
+  struct Sym **lt_gm_syms;
+  int lt_nb_gmembers;
+  /* local structs (`s.next`): frame offset, size, name, silent (inlined) */
+  int *lt_fobjs; /* 5 ints each */
+  int lt_nb_fobjs;
+  /* [from, to) instruction ranges of inlined bodies (outermost only) */
+  int *lt_inl;
+  int lt_nb_inl;
+  int lt_nb_members;
+  int lt_end_line; /* the function body's closing brace */
+  uint8_t lt_on;   /* yasc and -Wlifetime: record and check this function */
+  /* -Warray-bounds=2 (bounds.c): the subscripts to check, [from, to) ranges
+     of inlined bodies (outermost only) */
+  uint8_t ab_on;
+  struct IRAbSite *ab_sites;
+  int ab_nb_sites;
+  int *ab_inl;
+  int ab_nb_inl;
+  long long *ab_said; /* (line, index) pairs the level-1 loop pattern reported */
+  int ab_nb_said;
+  /* -Wtainted-format (taint.c): the calls' facts by call_id, a source among them */
+  uint8_t taint_on, taint_sources;
+  struct IRTaintCall *taint_calls;
+  int taint_nb_calls;
+  int *taint_fobjs; /* the frame's objects: (offset, size) pairs */
+  int taint_nb_fobjs;
+  struct IRTaintInl *taint_inl; /* the inline expansions (outermost), calls for the summaries */
+  int taint_nb_inl;
+  uint8_t lt_nonnull_calls; /* a call passes something to a parameter that may not be null */
+  uint8_t lt_maybe_calls;   /* a call's result may be null (dereferenced without a name) */
+  /* -Wlifetime: the temps a LOAD gave a pointer (a bit per temp position):
+     the operand's btype says INT32 for an int and a pointer alike */
+  uint32_t *lt_ptr_temps;
+  int lt_ptr_temps_words;
+  /* -W[maybe-]uninitialized: locals declared without a value, and where
+   * (idx) each declaration makes its variable uninitialised again */
+  IRLtVar *un_vars;
+  int un_nb_vars;
+  /* -Wdangling-pointer / -Wreturn-local-addr: the pointer locals and
+   * parameters by vreg, for their names */
+  IRLtVar *dp_names;
+  int dp_nb_names;
+  IRLtEvent *un_events;
+  int un_nb_events;
   /* The VARs the last SRA run on this function created, [lo, hi); -1 when it
    * made none or did not run.  ssa_var_promotable relaxes its rules for them. */
   int sra_var_lo, sra_var_hi;
@@ -974,6 +1155,62 @@ void tcc_ir_asm_mark_targets(TCCIRState *ir);
 
 int tcc_ir_get_vreg_temp(TCCIRState *ir);
 int tcc_ir_get_vreg_var(TCCIRState *ir);
+
+/* -Wlifetime: yasc ownership flow on the raw IR (lifetime.c) */
+int tcc_ir_lt_active(void);
+void tcc_ir_lt_begin(TCCIRState *ir);
+/* -Warray-bounds=2: value ranges of subscripts on the raw IR (bounds.c) */
+int tcc_ir_ab_active(void);
+void tcc_ir_ab_begin(TCCIRState *ir);
+int tcc_ir_ab_site(TCCIRState *ir, int32_t vreg, int is_unsigned, int n, int line, const char *type);
+void tcc_ir_ab_site_mid(TCCIRState *ir, int site);
+void tcc_ir_ab_site_end(TCCIRState *ir, int site, int one_past_ok);
+void tcc_ir_ab_inline_mark(TCCIRState *ir, int begin);
+void tcc_ir_ab_said(TCCIRState *ir, int line, long long idx);
+void tcc_ir_ab_check(TCCIRState *ir);
+void tcc_ir_ab_free(TCCIRState *ir);
+/* -Wtainted-format (taint.c) */
+int tcc_ir_taint_active(void);
+void tcc_ir_taint_begin(TCCIRState *ir);
+void tcc_ir_taint_note_call(TCCIRState *ir, int call_id, struct Sym *callee);
+void tcc_ir_taint_check(TCCIRState *ir, struct Sym *func);
+void tcc_ir_taint_free(TCCIRState *ir);
+void tcc_ir_taint_add_local(TCCIRState *ir, struct Sym *sym);
+void tcc_ir_taint_inline_param(TCCIRState *ir, int index, struct Sym *psym);
+void tcc_ir_taint_inline_mark(TCCIRState *ir, int begin, struct Sym *callee, int ret_vreg);
+void tcc_ir_taint_unit_end(void);
+void tcc_ir_taint_unit_free(void);
+void tcc_ir_lt_add_var(TCCIRState *ir, int32_t vreg, struct Sym *sym);
+void tcc_ir_lt_scope_end(TCCIRState *ir, struct Sym *top, struct Sym *bottom);
+void tcc_ir_lt_return(TCCIRState *ir, int line);
+void tcc_ir_lt_inline_param(TCCIRState *ir, int32_t vreg, struct Sym *callee, int index);
+void tcc_ir_lt_inline_result(TCCIRState *ir, int32_t vreg, struct Sym *ftype);
+void tcc_ir_lt_note_call(TCCIRState *ir, int call_id, struct Sym *ftype, struct Sym *callee);
+void tcc_ir_lt_note_implicit(TCCIRState *ir, int call_id);
+void tcc_ir_lt_copy_call(TCCIRState *ir, int from, int to);
+void tcc_ir_lt_note_owned_store(TCCIRState *ir, int from, int to);
+void tcc_ir_lt_note_member(TCCIRState *ir, int32_t vreg, int offset, int tok, int owned, int esize);
+void tcc_ir_lt_note_gmember(TCCIRState *ir, struct Sym *sym, int offset, int tok, int owned, int foff, int esize);
+void tcc_ir_lt_inline_mark(TCCIRState *ir, int begin);
+void tcc_ir_lifetime_check(TCCIRState *ir, struct Sym *func);
+void tcc_ir_lt_free(TCCIRState *ir);
+int tcc_ir_un_wanted(void);
+void tcc_ir_un_add_var(TCCIRState *ir, int32_t vreg, struct Sym *sym);
+void tcc_ir_uninit_check(TCCIRState *ir);
+void tcc_ir_return_local_check(TCCIRState *ir);
+void tcc_ir_flow_checks(TCCIRState *ir, struct Sym *func);
+void tcc_ir_null_deref_check(TCCIRState *ir);
+int tcc_ir_dp_wanted(void);
+void tcc_ir_dangling_check(TCCIRState *ir, struct Sym *func);
+void tcc_ir_view_escape_check(TCCIRState *ir, struct Sym *func);
+void tcc_ir_lt_note_pointer(TCCIRState *ir, int vreg);
+void tcc_ir_dealloc_check(TCCIRState *ir);
+void tcc_ir_lt_note_slot(TCCIRState *ir, int addr, struct CType *type, int tok, int obj_dealloc);
+void tcc_ir_slot_check(TCCIRState *ir, struct Sym *func);
+void tcc_ir_lt_note_field_store(TCCIRState *ir, int from, int to, int entry);
+void tcc_ir_lt_note_field_load(TCCIRState *ir, int idx, int entry);
+void tcc_ir_dp_add_name(TCCIRState *ir, int32_t vreg, struct Sym *sym);
+int tcc_ir_flow_checks_wanted(void);
 int tcc_ir_get_vreg_param(TCCIRState *ir);
 /* Allocate static chain vreg for nested functions (live-in at R10) */
 int tcc_ir_get_vreg_static_chain(TCCIRState *ir);

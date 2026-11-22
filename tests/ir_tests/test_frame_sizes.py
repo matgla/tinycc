@@ -215,7 +215,7 @@ def frames(tmp_path_factory):
     src = d / "frames.c"
     src.write_text(SOURCE)
     obj = d / "frames.o"
-    subprocess.run([str(TCC), "-O2", "-fno-pic", "-mno-sb-relative-got",
+    subprocess.run([str(TCC), "-ccompat", "-O2", "-fno-pic", "-mno-sb-relative-got",
                     "-fno-module-local-calls", "-c", str(src), "-o", str(obj)], check=True)
     return _frames(obj)
 
@@ -290,7 +290,7 @@ def sret_frames(tmp_path_factory):
     src = d / "sret.c"
     src.write_text(SRET_SOURCE)
     obj = d / "sret.o"
-    subprocess.run([str(TCC), "-O2", "-fno-pic", "-mno-sb-relative-got",
+    subprocess.run([str(TCC), "-ccompat", "-O2", "-fno-pic", "-mno-sb-relative-got",
                     "-fno-module-local-calls", "-c", str(src), "-o", str(obj)], check=True)
     return _frames(obj)
 
@@ -329,7 +329,7 @@ def test_merge_analysis_stays_linear(tmp_path):
     src = tmp_path / "many_copies.c"
     src.write_text("\n".join(lines) + "\n")
     start = time.monotonic()
-    subprocess.run([str(TCC), "-O2", "-c", str(src), "-o", str(tmp_path / "m.o")], check=True)
+    subprocess.run([str(TCC), "-ccompat", "-O2", "-c", str(src), "-o", str(tmp_path / "m.o")], check=True)
     assert time.monotonic() - start < 15
 def test_copy_from_source_escaping_later(frames):
     # 1168 bytes when any escape anywhere blocked the copy: one object now.
@@ -396,7 +396,7 @@ def char_result_frames(tmp_path_factory):
     src = d / "char_result.c"
     src.write_text(CHAR_RESULT_SOURCE)
     obj = d / "char_result.o"
-    subprocess.run([str(TCC), "-O2", "-fno-pic", "-mno-sb-relative-got",
+    subprocess.run([str(TCC), "-ccompat", "-O2", "-fno-pic", "-mno-sb-relative-got",
                     "-fno-module-local-calls", "-c", str(src), "-o", str(obj)], check=True)
     return _frames(obj)
 
@@ -444,6 +444,6 @@ def test_dead_locals_keep_no_frame(tmp_path, opt):
     src = tmp_path / "dead_locals.c"
     src.write_text(DEAD_LOCALS_SOURCE)
     obj = tmp_path / "dead_locals.o"
-    subprocess.run([str(TCC), opt, "-fno-pic", "-mno-sb-relative-got", "-I" + str(CURRENT_DIR.parent.parent / "include"),
+    subprocess.run([str(TCC), "-ccompat", opt, "-fno-pic", "-mno-sb-relative-got", "-I" + str(CURRENT_DIR.parent.parent / "include"),
                     "-c", str(src), "-o", str(obj)], check=True)
     assert _frames(obj)["meta_eql"] == 0, _frames(obj)

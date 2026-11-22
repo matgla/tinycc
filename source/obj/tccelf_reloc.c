@@ -687,6 +687,11 @@ ST_FUNC void tcc_add_bcheck(TCCState *s1)
   if (0 == s1->do_bounds_check)
     return;
   section_ptr_add(bounds_section, sizeof(addr_t));
+#ifdef TCC_TARGET_ARM_THUMB
+  /* the globals' (address, size) pairs, ended by the zero above: read by the
+     runtime's constructor (lib/bcheck-bm.c) */
+  set_global_sym(s1, "__bound_globals", bounds_section, 0);
+#endif
 }
 #endif
 
@@ -1077,11 +1082,16 @@ ST_FUNC void tcc_add_runtime(TCCState *s1)
 #ifdef CONFIG_TCC_BCHECK
     if (s1->do_bounds_check && s1->output_type != TCC_OUTPUT_DLL)
     {
+#ifdef TCC_TARGET_ARM_THUMB
+      /* the bare-metal runtime is linked by hand (lib/bcheck-bm.c): newlib
+         under QEMU only, nothing to add for YasOS */
+#else
       tcc_add_support(s1, "bcheck.o");
 #if !(TARGETOS_OpenBSD || TARGETOS_NetBSD)
       tcc_add_library(s1, "dl");
 #endif
       lpthread = 1;
+#endif
     }
 #endif
 #ifdef CONFIG_TCC_BACKTRACE
@@ -1133,11 +1143,64 @@ ST_FUNC void tcc_add_runtime(TCCState *s1)
 /* add various standard linker symbols (must be done after the
    sections are filled (for example after allocating common
    symbols)) */
+/* yasc error names: the records every yasc file puts in yasc_errname
+   ({u16 value, u8 flags, u8 len, name}, frontend/gen/expr/yasc_errors.c).
+   One name with two values, or two names with one value where a value came
+   from a hash (flags 1), is an error; explicit aliases such as
+   `FileNotFound = ENOENT` are fine. */
+typedef struct
+{
+  unsigned value, flags, len;
+  const char *name;
+} YascErrRec;
+
+static void tcc_yasc_check_error_names(TCCState *s1)
+{
+  Section *sec = have_section(s1, YASC_ERRNAME_SECTION);
+  const unsigned char *p, *end;
+  YascErrRec *r = NULL;
+  int n = 0, i, j;
+
+  if (!sec || !sec->data_offset)
+    return;
+  for (p = sec->data, end = p + sec->data_offset; p + 4 <= end; p += (4 + p[3] + 1 + 3) & ~3u)
+  {
+    YascErrRec x;
+    x.value = p[0] | p[1] << 8;
+    x.flags = p[2];
+    x.len = p[3];
+    x.name = (const char *)p + 4;
+    if (!x.len)
+      continue; /* padding */
+    for (j = 0; j < n; j++)
+      if (r[j].value == x.value && r[j].len == x.len && !memcmp(r[j].name, x.name, x.len))
+        break;
+    if (j < n)
+      continue; /* the same record from another file */
+    r = tcc_realloc(r, (n + 1) * sizeof *r);
+    r[n++] = x;
+  }
+  for (i = 0; i < n; i++)
+    for (j = i + 1; j < n; j++)
+    {
+      const int same_name = r[i].len == r[j].len && !memcmp(r[i].name, r[j].name, r[i].len);
+      if (same_name)
+        tcc_error_noabort("error.%.*s has two values: %u and %u (a set gives it a value in one file only?)",
+                          (int)r[i].len, r[i].name, r[i].value, r[j].value);
+      else if (r[i].value == r[j].value && (r[i].flags == 1 || r[j].flags == 1))
+        tcc_error_noabort("error.%.*s and error.%.*s have the same value %u: give one of them an explicit value",
+                          (int)r[i].len, r[i].name, (int)r[j].len, r[j].name, r[i].value);
+    }
+  tcc_free(r);
+}
+
 static void tcc_add_linker_symbols(TCCState *s1)
 {
   char buf[1024];
   int i;
   Section *s;
+
+  tcc_yasc_check_error_names(s1);
 
   /* What a __rodata_relative pointer is an offset from (rodata_rel.c);
    * defined only for a module that names it. */

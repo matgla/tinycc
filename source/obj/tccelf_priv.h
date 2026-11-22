@@ -217,6 +217,8 @@ void gc_sections(TCCState *s1);
 /* Defined in tccelf_load.c. */
 ST_FUNC ssize_t full_read(int fd, void *buf, size_t count);
 ST_FUNC void *load_data(int fd, unsigned long file_offset, unsigned long size);
+ST_FUNC int tcc_typesig_section(TCCState *s1, int fd, unsigned long file_offset, const char *sh_name,
+                                ElfW(Shdr) * sh);
 ST_FUNC int tcc_object_type(int fd, ElfW(Ehdr) * h);
 ST_FUNC int tcc_group_has_satisfiable_undefs(TCCState *s1);
 

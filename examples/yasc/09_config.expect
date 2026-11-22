@@ -1,0 +1,8 @@
+line 5: NoEquals
+line 6: EmptyKey
+4 settings
+name: yasc demo
+area: 60
+depth: BadNumber
+speed: NotFound
+blocks left: 0

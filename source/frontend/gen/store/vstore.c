@@ -63,12 +63,56 @@ static int type_has_volatile(CType *t, int depth)
   return 0;
 }
 
+static void vstore_value(void);
+
 /* store vtop in lvalue pushed on stack */
 ST_FUNC void vstore(void)
+{
+  /* -Wlifetime: a store into an owned pointer in memory moves what it stores
+     (lifetime.c); what this store emits is recorded for it */
+  TCCIRState *ir = tcc_state->ir;
+  if (yasc_pp_live)
+    yasc_pp_store(vtop - 1, vtop); /* a plain pointer parameter kept (plain_param.c) */
+  /* yasc: a borrowing struct stored where it outlives the function (a
+     global, through a pointer) must be bound to static storage: another
+     global, or a result that borrows(static) */
+  if (tcc_state->yasc && yasc_borrowing_struct(&vtop[-1].type) && (vtop[-1].r & VT_LVAL) &&
+      (vtop[-1].r & VT_VALMASK) != VT_LOCAL && (vtop[-1].r & VT_VALMASK) != VT_LLOCAL &&
+      !((vtop->r & (VT_VALMASK | VT_SYM | VT_LVAL)) == (VT_CONST | VT_SYM | VT_LVAL)) && vtop->sym != &yasc_static_bound)
+    tcc_warning_once_always(
+        "a 'struct %s' borrows: stored here it outlives the function (it must borrow static storage)",
+        get_tok_str(vtop[-1].type.ref->v & ~SYM_STRUCT, NULL));
+  int owned_dst = ir && ir->lt_on && (type_yasc(&vtop[-1].type) & YASC_OWNED);
+  int field = ir && ir->lt_on ? type_borrows_field(&vtop[-1].type) : -1;
+  int from = ir ? ir->next_instruction_index : 0;
+  vstore_value();
+  if (owned_dst)
+    tcc_ir_lt_note_owned_store(ir, from, ir->next_instruction_index);
+  /* ... and a store into a borrows(member) member, checked against it */
+  if (field >= 0)
+    tcc_ir_lt_note_field_store(ir, from, ir->next_instruction_index, field);
+}
+
+static void vstore_value(void)
 {
   int sbt, dbt, ft, r, size, align, bit_size, bit_pos, delayed_cast;
   if (vtop[-1].type.t & VT_RODATA_REL)
     rodata_rel_store_error();
+#ifdef CONFIG_TCC_BCHECK
+  /* -b: a scalar's destination and source are checked here (a struct copy
+     checks both before it takes their addresses, below) */
+  if ((vtop[-1].type.t & VT_BTYPE) != VT_STRUCT)
+  {
+    if (vtop->r & VT_MUSTBOUND)
+      gbound();
+    if (vtop[-1].r & VT_MUSTBOUND)
+    {
+      vswap();
+      gbound();
+      vswap();
+    }
+  }
+#endif
   /* A byte-reversed (big-endian scalar_storage_order) member is read through
      gv() and written by sso_store_reversed(), never copied as raw memory. */
   if ((vtop->r & VT_LVAL) && vtop->sso_reversed)
@@ -1307,7 +1351,9 @@ ST_FUNC void vstore(void)
   }
   else if (ft & VT_BITFIELD)
   {
-    /* bitfield store handling */
+    /* bitfield store handling: the field's conversion was checked above;
+       the stores of its storage unit below are the compiler's own */
+    fe_conv_quiet++;
 
     /* The value of an assignment is the value stored (C11 6.5.16p3).  For an
      * ordinary field the lvalue stands in for it -- re-reading the field is
@@ -1406,6 +1452,7 @@ ST_FUNC void vstore(void)
         }
       }
     }
+    fe_conv_quiet--;
   }
   else if (dbt == VT_VOID)
   {
@@ -1629,6 +1676,9 @@ ST_FUNC void vstore(void)
       }
 
       update_local_scalar_max_bound(&orig_dst, &orig_src);
+      objsize_store(&orig_dst, &orig_src); /* the allocation tracker */
+      if (objsize_ab_watch)
+        objsize_ab_store(&orig_dst, &orig_src); /* -Warray-bounds in loops */
     }
     vswap();
     vtop--; /* NOT vpop() because on x86 it would flush the fp stack */

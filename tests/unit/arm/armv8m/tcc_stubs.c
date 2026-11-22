@@ -191,3 +191,10 @@ void tcc_link_arena_prepare(struct TCCState *s1)
 {
   (void)s1;
 }
+
+/* -fstack-usage / -fcallgraph-info (backend/generators/stack_usage.c) */
+void tcc_stack_usage_write(struct TCCState *s1, const char *object)
+{
+  (void)s1;
+  (void)object;
+}

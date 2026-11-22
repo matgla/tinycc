@@ -190,6 +190,30 @@ void regpair_store_call_result(CType *type, int addr)
 /* ------------------------------------------------------------------------- */
 /* return from function */
 #ifndef TCC_TARGET_ARM64
+/* RETURNVALUE of vtop.  -finstrument-functions: the exit hook first, with
+   the value already computed -- a RETURNVALUE returns, so the hook at the
+   common return point (gen_function) never runs after one. */
+void gen_return_value_now(void)
+{
+  Sym *fs = tcc_state->cur_func_sym;
+  if (tcc_state->instrument_functions && !tcc_state->in_inline_expansion && !nocode_wanted && fs && fs->type.ref &&
+      !fs->type.ref->f.func_no_instrument)
+  {
+    if (vtop->r & VT_LVAL)
+    {
+      SValue dest;
+      svalue_init(&dest);
+      dest.type = vtop->type;
+      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &dest);
+      vtop->vr = dest.vr;
+      vtop->r = 0;
+    }
+    gen_instrument_call(fs, "__cyg_profile_func_exit");
+  }
+  tcc_ir_gen_return_value(tcc_state->ir, vtop);
+}
+
 void gfunc_return(CType *func_type)
 {
   /* Complex types are composite (two elements) and must follow the same
@@ -714,7 +738,7 @@ void gfunc_return(CType *func_type)
          value into the return register (r0).  Without this the vreg
          produced by gv() is never connected to the physical return
          register and the caller receives garbage. */
-      tcc_ir_gen_return_value(tcc_state->ir, vtop);
+      gen_return_value_now();
     }
   }
   else
@@ -740,7 +764,7 @@ void gfunc_return(CType *func_type)
         gfunc_return_keep_zext_promise();
     }
     tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
-    tcc_ir_gen_return_value(tcc_state->ir, vtop);
+    gen_return_value_now();
   }
   vtop--; /* NOT vpop() because on x86 it would flush the fp stack */
   print_vstack("gfunc_return");
@@ -762,6 +786,6 @@ void check_func_return(void)
   {
     /* Skip during the end-of-TU re-compile: the warning was already emitted
      * during the first-pass compile, and re-emitting would double-report. */
-    tcc_warning("function might return no value: '%s'", funcname);
+    tcc_warning_once(warn_return_type, "function might return no value: '%s'", funcname);
   }
 }

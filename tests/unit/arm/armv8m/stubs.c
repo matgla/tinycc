@@ -688,29 +688,96 @@ struct BufferedFile *file = NULL;
 const int *macro_ptr = NULL;
 int tok_flags = 0;
 int pp_expr = 0;
+/* error recovery (tccpp.c, frontend/gen/core/recover.c), read by error1 */
+int parse_flags;
+int pp_subst_depth;
+void tcc_recover_jump(void *s1)
+{
+  (void)s1;
+}
+void tcc_recover_release(void *s1)
+{
+  (void)s1;
+}
+/* a body being saved as tokens (decl.c) and system-header macros (tccpp.c) */
+void save_body_error(void *s1, int line, const char *msg)
+{
+  (void)s1, (void)line, (void)msg;
+}
+int tcc_sys_macro_here(void)
+{
+  return 0;
+}
 
 void pp_error(void *cs)
 {
   (void)cs;
 }
 
-void cstr_new(void *cs)
+/* error1 builds its message in a CString (driver/diag_out.c too): real ones.
+ * tcc.h is not included here: the layout is CString's. */
+struct ut_cstr
 {
-  memset(cs, 0, sizeof(void *) * 2);
+  int size;
+  int size_allocated;
+  char *data;
+};
+#define CString struct ut_cstr
+void *tcc_realloc(void *ptr, unsigned long size);
+void tcc_free(void *ptr);
+void cstr_new(CString *cs)
+{
+  memset(cs, 0, sizeof *cs);
 }
 
-void cstr_free(void *cs)
+void cstr_free(CString *cs)
 {
-  (void)cs;
+  tcc_free(cs->data);
 }
 
-int cstr_vprintf(void *cs, const char *fmt, va_list ap)
+void cstr_reset(CString *cs)
 {
-  (void)cs;
-  return vfprintf(stderr, fmt, ap);
+  cs->size = 0;
 }
 
-int cstr_printf(void *cs, const char *fmt, ...)
+static void ut_cstr_grow(CString *cs, int size)
+{
+  if (size > cs->size_allocated)
+  {
+    cs->size_allocated = size * 2 + 16;
+    cs->data = tcc_realloc(cs->data, cs->size_allocated);
+  }
+}
+
+void cstr_ccat(CString *cs, int ch)
+{
+  ut_cstr_grow(cs, cs->size + 1);
+  cs->data[cs->size++] = (char)ch;
+}
+
+void cstr_cat(CString *cs, const char *str, int len)
+{
+  if (len <= 0)
+    len = (int)strlen(str) + 1 + len;
+  ut_cstr_grow(cs, cs->size + len);
+  memmove(cs->data + cs->size, str, len);
+  cs->size += len;
+}
+
+int cstr_vprintf(CString *cs, const char *fmt, va_list ap)
+{
+  va_list v;
+  int len;
+  va_copy(v, ap);
+  len = vsnprintf(NULL, 0, fmt, v);
+  va_end(v);
+  ut_cstr_grow(cs, cs->size + len + 1);
+  vsnprintf(cs->data + cs->size, len + 1, fmt, ap);
+  cs->size += len;
+  return len;
+}
+
+int cstr_printf(CString *cs, const char *fmt, ...)
 {
   va_list ap;
   va_start(ap, fmt);
@@ -718,6 +785,7 @@ int cstr_printf(void *cs, const char *fmt, ...)
   va_end(ap);
   return n;
 }
+#undef CString
 #endif /* UT_SSA_OPT_REAL */
 
 /* tccgen's current-function name, read by narrow.c's float-demote
@@ -727,3 +795,18 @@ int cstr_printf(void *cs, const char *fmt, ...)
 #ifdef UT_SSA_OPT_REAL
 const char *funcname;
 #endif
+
+/* yasc error unions (frontend/gen/expr/yasc_errors.c): ir/codegen.c's test
+ * generation asks whether vtop is one; no unit-test binary but build_tccgen
+ * (which includes the real file and not this one) ever builds one.  Both
+ * builds link codegen.c, so these are outside the guard. */
+struct CType;
+int type_is_errunion(struct CType *type)
+{
+  (void)type;
+  return 0;
+}
+
+void yasc_errunion_misuse(void)
+{
+}

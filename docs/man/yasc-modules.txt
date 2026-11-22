@@ -1,0 +1,172 @@
+YASC-MODULES(7)                  YasOS Manual                  YASC-MODULES(7)
+
+NAME
+       yasc-modules - modules in yasc: module, export, import
+
+SYNOPSIS
+       module NAME;                 the first declaration of a module's file
+       export DECLARATION           visible to importers
+       import NAME;                 use a module
+
+       tcc -c mod.c                 also writes the interface, NAME.ymi
+       tcc -fmodule-deps FILE...    what each file is and imports
+       tcc -fmodule-dir=DIR ...     where interfaces are written and read
+       tcc -fmodule-header=DIR ...  also write a C header of a module
+
+DESCRIPTION
+       yasc is tcc's C dialect, on by default (tcc without -ccompat; or
+       -std=yasc, or #pragma yasc). #include stays what it is in C: legacy
+       text. A yasc file shares its declarations as a module instead:
+
+           module lib.vec;
+
+           export typedef struct vec2 { int x, y; } vec2_t;
+           export vec2_t vec_add(vec2_t a, vec2_t b);
+           static int helper(int v);         /* private */
+           int count(void) { return 0; }      /* private too */
+
+       and another file says
+
+           import lib.vec;
+
+       A dotted NAME is a path: lib.vec is lib/vec.ymi. One file is one
+       module. module, import and export are keywords only where a
+       file-scope declaration starts, in the main file of a yasc unit; a
+       variable or member may still be called import, and headers are never
+       affected.
+
+EXPORTS
+       In a module every file-scope declaration is private -- internal
+       linkage, as if static -- unless it says export. Exported names keep
+       their C symbol names: C code links against a module directly, and two
+       modules' private helpers never clash.
+
+       export works on functions, objects, typedefs and struct, union and
+       enum definitions. The definition of an exported prototype is
+       exported without saying it again. extern still names something
+       outside the module.
+
+       export inline F
+              Importers get the body and may inline it; the module also
+              defines F, for C callers.
+
+       export static inline F
+              No symbol: the body goes to importers only.
+
+       What an importer could not resolve is an error when the module is
+       compiled:
+       - a private struct or union used by value, or a private enum;
+       - a private typedef, or an enumerator of a private enum (an array
+         size);
+       - in an exported inline function: a private function or object, or
+         a struct whose body is private.
+
+       A struct can stay opaque behind a pointer: export typedef struct h
+       h_t; with the body private. export under #pragma pack is an error
+       for now; __attribute__((packed)) works.
+
+INTERFACES
+       Compiling a module writes its interface, NAME.ymi, next to the
+       object (or in the first -fmodule-dir=): the exported declarations
+       after preprocessing, function bodies left out (an inline one is
+       kept), objects as extern. It also lists the modules it imports and
+       the headers it included. It is written again only when its bytes
+       change, so an edited function body leaves it -- and every importer --
+       alone.
+
+       import NAME reads it, looking in each -fmodule-dir=, the object's
+       directory, then the -I directories: first the modules it imports
+       (importing shapes brings the lib.vec it imports), then its headers,
+       then its declarations. A second import of a module does nothing.
+
+       Macros never cross an import: an interface is replayed without macro
+       expansion, so the importer's macros cannot change it, and the
+       module's own #defines never reach the importer. The headers a module
+       included are included for the importer too, macros and all.
+
+       An interface records the compiler and the ABI (float ABI, char
+       signedness, ...): one built by another compiler, or for another ABI,
+       is an error that says to rebuild that module. So are a missing
+       interface, a damaged file, a module importing itself and modules
+       importing each other.
+
+BUILD ORDER
+       A module is compiled before the files that import it.
+       tcc -fmodule-deps FILE prints, without compiling anything:
+
+           module shapes
+           import lib.vec
+
+       With several files, a "file PATH" line comes before each one's
+       lines; -o writes them to a file. #if and macros count, as in a
+       compile.
+
+       A make rule makes each object depend on the interfaces it imports;
+       -MD adds every interface a compile read, imports of imports too:
+
+           %.mdep: %.c
+               tcc -fmodule-deps $< | awk -v o=$*.o \
+                 '{ i = $$2; gsub(/\./, "/", i); i = i ".ymi" }
+                  $$1 == "module" { print i ": " o " ;" }
+                  $$1 == "import" { print o ": " i }' > $@
+
+REGULAR C
+       A file is yasc when it is the main file of a yasc unit, says
+       #pragma yasc, or is an imported interface; an #include starts in
+       regular C. C says nothing about ownership, so a pointer written in
+       regular C -- in a header, or in a macro defined in one -- is
+       unchecked: it converts to and from owned and view pointers without
+       a diagnostic, it is neither maybe nor null, and the checks start at
+       the yasc variable it lands in.
+
+           char * owned p = c_name();       /* silent: c_name is C */
+           char * owned q = y_view();       /* warns: y_view is yasc */
+
+       Handing an owned result to a C function is silent too; to a view
+       declared in yasc it warns (never freed). A header written in yasc
+       says #pragma yasc at its top, and its pointers are checked.
+
+       GCC attributes in a C header are believed over "unchecked": a
+       function with __attribute__((malloc)) returns an owned pointer (owned
+       maybe; owned with returns_nonnull), and malloc(dealloc, n) makes the
+       deallocator's n-th argument owned. The YasOS libc says so for malloc,
+       calloc, strdup, fopen, opendir and the others, so
+
+           char * owned maybe s = strdup(name);   /* the yasc way */
+           char * view t = strdup(name);    /* warns: never freed */
+           char * owned u = malloc(n);      /* warns: may be null */
+           free(y_view());                  /* warns: owns nothing */
+
+       nonnull marks parameters: a null constant for one is a -Wnonnull
+       warning (in -Wall).
+
+C CALLERS
+       -fmodule-header=DIR, given when compiling a module, also writes
+       DIR/a/b.h for module a.b: a C99 header of its interface (an include
+       guard, the module's #includes, <c/d.h> for each module it imports,
+       the declarations without the yasc qualifiers). Compile the C code
+       with -ccompat and -IDIR; gcc takes the headers too. yasc code should
+       import the module instead: the header has no qualifiers.
+
+EXAMPLES
+       Two modules and a program:
+
+           tcc -c vec.c -o vec.o          # module lib.vec: lib/vec.ymi
+           tcc -c shapes.c -o shapes.o    # imports lib.vec: shapes.ymi
+           tcc -c main.c -o main.o        # imports shapes
+           tcc main.o shapes.o vec.o -o demo
+
+       The tinycc tree has the full example, with a Makefile and a plain C
+       caller, in examples/yasc_modules.
+
+NOTES
+       Not yet: re-export (export import), several files per module,
+       exporting macros (use enum, const and export inline). Until the
+       dialect is set per file, "the module" is the main file: declarations
+       from an #include keep C linkage.
+
+       The design and the interface format: docs/yasc_modules.md in the
+       tinycc tree.
+
+SEE ALSO
+       tcc(1), tcc-options(1)

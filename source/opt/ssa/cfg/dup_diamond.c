@@ -106,6 +106,10 @@ static int dd_diamond_at(IRSSAOptCtx *ctx, int b, DDiamond *d)
   d->join = a0->succs[0];
   if (d->join == b || d->join == d->arm[0] || d->join == d->arm[1] || cfg->blocks[d->join].num_preds != 2)
     return 0;
+  /* a block a computed goto may enter is not the diamond's alone */
+  if (cfg->label_block && (cfg->label_block[b] || cfg->label_block[d->arm[0]] || cfg->label_block[d->arm[1]] ||
+                           cfg->label_block[d->join]))
+    return 0;
   return dd_arm_reaches(ctx, d->arm[0], b, d->join) && dd_arm_reaches(ctx, d->arm[1], b, d->join);
 }
 

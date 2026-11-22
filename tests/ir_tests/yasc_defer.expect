@@ -1,0 +1,43 @@
+body
+d2
+d2b
+cleanup 7
+d1
+x at defer 1
+ret 1
+late
+outer
+early 0 -> 0
+inner end
+inner
+late
+outer
+early 1 -> 0
+inner
+outer
+early 2 -> 2
+iter 0
+iter 0 done
+iter 1 done
+iter 2
+iter 2 done
+iter 3 done
+j 3
+k 20
+leave 1
+leave 2
+leave 3
+out
+m 1
+m 2
+done
+case 1 out
+case 2
+inner x 2
+bound x 1
+inline 6 4 calls 2
+stmt expr
+v 42
+nested outer
+nested inner
+loop in defer 3
