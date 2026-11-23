@@ -954,7 +954,7 @@ warn-check: armv8m-tcc$(EXESUF) patch-newlib
 	@fail=0 ; \
 	wc_inc="-nostdinc -I$(IRTESTS_DIR)/libc_includes -I$(IRTESTS_DIR)/libc_imports -I$(IRTESTS_DIR)/libc_includes/newlib -Iinclude" ; \
 	for f in $(WARN_CHECK_SRCS); do \
-		out=$$(./armv8m-tcc$(EXESUF) $$wc_inc -c "$$f" -o /dev/null 2>&1) ; \
+		out=$$(./armv8m-tcc$(EXESUF) -ccompat $$wc_inc -c "$$f" -o /dev/null 2>&1) ; \
 		if echo "$$out" | grep -qE 'warning:|error:'; then \
 			echo "FAIL: $$f:" ; \
 			echo "$$out" | grep -E 'warning:|error:' ; \
