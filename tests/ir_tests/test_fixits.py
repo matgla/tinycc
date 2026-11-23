@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+from cross_includes import INCLUDE_FLAGS
+
 CURRENT_DIR = Path(__file__).parent
 TCC = CURRENT_DIR.parent.parent / "armv8m-tcc"
 
@@ -86,7 +88,7 @@ def _write(tmp_path, name, src):
 
 
 def _tcc(tmp_path, *args):
-    return subprocess.run([str(TCC), *map(str, args)], capture_output=True, text=True, cwd=tmp_path)
+    return subprocess.run([str(TCC), *INCLUDE_FLAGS, *map(str, args)], capture_output=True, text=True, cwd=tmp_path)
 
 
 def _json(tmp_path, src, *flags, name="t.c"):

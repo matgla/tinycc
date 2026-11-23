@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from cross_includes import INCLUDE_FLAGS
+
 from qemu_run import CompileConfig, build_qemu_command, compile_testcase
 
 CURRENT_DIR = Path(__file__).parent
@@ -129,7 +131,7 @@ def test_off_means_no_change(tmp_path, opt):
         outs = []
         for flags in [[], ["-fstack-protector-all", "-fno-stack-protector"]]:
             obj = tmp_path / f"{src.stem}{len(flags)}.o"
-            proc = subprocess.run([str(TCC), "-ccompat", "-c", opt, *flags, str(src), "-o", str(obj)],
+            proc = subprocess.run([str(TCC), *INCLUDE_FLAGS, "-ccompat", "-c", opt, *flags, str(src), "-o", str(obj)],
                                   capture_output=True, text=True)
             assert proc.returncode == 0, proc.stderr
             outs.append(obj.read_bytes())
@@ -216,7 +218,7 @@ def test_explicit_leaves_others_unchanged(tmp_path, opt):
         outs = []
         for flags in [[], ["-fstack-protector-explicit"]]:
             obj = tmp_path / f"{src.stem}{len(flags)}.o"
-            proc = subprocess.run([str(TCC), "-ccompat", "-c", opt, *flags, str(src), "-o", str(obj)],
+            proc = subprocess.run([str(TCC), *INCLUDE_FLAGS, "-ccompat", "-c", opt, *flags, str(src), "-o", str(obj)],
                                   capture_output=True, text=True)
             assert proc.returncode == 0, proc.stderr
             outs.append(obj.read_bytes())

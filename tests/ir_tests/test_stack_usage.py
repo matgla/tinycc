@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from cross_includes import INCLUDE_FLAGS
+
 CURRENT_DIR = Path(__file__).parent
 ROOT = CURRENT_DIR.parent.parent
 TCC = ROOT / "armv8m-tcc"
@@ -44,7 +46,7 @@ int vla(int n) { char b[n]; b[0] = 0; return use(b); }
 def _cc(tmp_path, body, *flags, name="t.c", obj="t.o", ccompat=True):
     src = tmp_path / name
     src.write_text(body)
-    cmd = [str(TCC)] + (["-ccompat"] if ccompat else []) + ["-c", *flags, str(src), "-o", str(tmp_path / obj)]
+    cmd = [str(TCC), *INCLUDE_FLAGS] + (["-ccompat"] if ccompat else []) + ["-c", *flags, str(src), "-o", str(tmp_path / obj)]
     return subprocess.run(cmd, capture_output=True, text=True, cwd=tmp_path)
 
 

@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from cross_includes import INCLUDE_FLAGS
+
 CURRENT_DIR = Path(__file__).parent
 TCC = CURRENT_DIR.parent.parent / "armv8m-tcc"
 
@@ -31,7 +33,7 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 def _run(tmp_path, body, *flags, ccompat=True, name="t.c"):
     src = tmp_path / name
     src.write_text(body)
-    cmd = [str(TCC)] + (["-ccompat"] if ccompat else []) + ["-c", *flags, str(src), "-o", str(tmp_path / "t.o")]
+    cmd = [str(TCC), *INCLUDE_FLAGS] + (["-ccompat"] if ccompat else []) + ["-c", *flags, str(src), "-o", str(tmp_path / "t.o")]
     return subprocess.run(cmd, capture_output=True, text=True, cwd=tmp_path)
 
 

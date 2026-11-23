@@ -79,7 +79,8 @@ def _includes():
     sysroot = subprocess.run(["arm-none-eabi-gcc", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft",
                               "--print-sysroot"], capture_output=True, text=True).stdout.strip()
     inc = CURRENT_DIR / "libc_includes"
-    return [f"-I{inc}", f"-I{CURRENT_DIR / 'libc_imports'}", f"-I{inc / 'newlib'}", f"-I{sysroot}/include"]
+    return [f"-I{inc}", f"-I{CURRENT_DIR / 'libc_imports'}", f"-I{inc / 'newlib'}", f"-I{sysroot}/include",
+            f"-I{ROOT / 'include'}"]
 
 
 @pytest.fixture(scope="module")

@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from cross_includes import INCLUDE_FLAGS
+
 CURRENT_DIR = Path(__file__).parent
 TCC = CURRENT_DIR.parent.parent / "armv8m-tcc"
 
@@ -65,7 +67,7 @@ def _compile(tmp_path, body, *flags, header=None):
     src = tmp_path / "t.c"
     src.write_text(body + "\n")
     return subprocess.run(
-        [str(TCC), "-c", "-Wno-lifetime", f"-I{tmp_path}", *flags, str(src), "-o", str(tmp_path / "t.o")],
+        [str(TCC), *INCLUDE_FLAGS, "-c", "-Wno-lifetime", f"-I{tmp_path}", *flags, str(src), "-o", str(tmp_path / "t.o")],
         capture_output=True,
         text=True,
     )
@@ -149,7 +151,7 @@ int f(const char * view s)
     (tmp_path / "h.h").write_text(HEADER)
     src.write_text(body + "\n")
     proc = subprocess.run(
-        [str(TCC), "-c", "-std=yasc", f"-I{tmp_path}", str(src), "-o", str(tmp_path / "t.o")],
+        [str(TCC), *INCLUDE_FLAGS, "-c", "-std=yasc", f"-I{tmp_path}", str(src), "-o", str(tmp_path / "t.o")],
         capture_output=True,
         text=True,
     )

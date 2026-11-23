@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from cross_includes import INCLUDE_FLAGS
+
 CURRENT_DIR = Path(__file__).parent
 TCC = CURRENT_DIR.parent.parent / "armv8m-tcc"
 NM = shutil.which("arm-none-eabi-nm")
@@ -23,7 +25,7 @@ def _compile(tmp_path, body, *flags):
     src = tmp_path / "t.c"
     src.write_text(body)
     return subprocess.run(
-        [str(TCC), "-ccompat", "-c", *flags, str(src), "-o", str(tmp_path / "t.o")],
+        [str(TCC), *INCLUDE_FLAGS, "-ccompat", "-c", *flags, str(src), "-o", str(tmp_path / "t.o")],
         capture_output=True,
         text=True,
     )
@@ -261,7 +263,7 @@ def _module(tmp_path, body, *flags, out="m.o"):
     src = tmp_path / "m.c"
     src.write_text("#pragma yasc\n" + body)
     return subprocess.run(
-        [str(TCC), "-ccompat", "-c", *flags, str(src), "-o", str(tmp_path / out)],
+        [str(TCC), *INCLUDE_FLAGS, "-ccompat", "-c", *flags, str(src), "-o", str(tmp_path / out)],
         capture_output=True,
         text=True,
     )
@@ -372,7 +374,7 @@ def _cc(tmp_path, name, body, *flags):
     src = tmp_path / f"{name}.c"
     src.write_text("#pragma yasc\n" + body)
     return subprocess.run(
-        [str(TCC), "-ccompat", "-c", *flags, str(src), "-o", str(tmp_path / f"{name}.o")],
+        [str(TCC), *INCLUDE_FLAGS, "-ccompat", "-c", *flags, str(src), "-o", str(tmp_path / f"{name}.o")],
         capture_output=True,
         text=True,
     )

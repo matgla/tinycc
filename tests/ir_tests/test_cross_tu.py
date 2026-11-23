@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from cross_includes import INCLUDE_FLAGS
+
 CURRENT_DIR = Path(__file__).parent
 TCC = CURRENT_DIR.parent.parent / "armv8m-tcc"
 BASE_TCC_ENV = "TCC_BASELINE"
@@ -52,7 +54,7 @@ START = "void _start(void) {}\n"
 def _tcc(tmp_path, *args):
     # the link's runtime libraries (libtcc1, fp/lib*.a) are in the tree, not
     # where the cross is configured to install them (test_yasc_error_names.py)
-    libs = [] if args[0] == "-ar" else [f"-B{TCC.parent}", f"-L{TCC.parent}/lib", f"-L{TCC.parent}/lib/fp"]
+    libs = [] if args[0] == "-ar" else [*INCLUDE_FLAGS, f"-B{TCC.parent}", f"-L{TCC.parent}/lib", f"-L{TCC.parent}/lib/fp"]
     return subprocess.run([str(TCC), *libs, *map(str, args)], capture_output=True, text=True, cwd=tmp_path)
 
 

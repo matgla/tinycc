@@ -1,6 +1,7 @@
 import pytest
 import re
 from pathlib import Path
+from cross_includes import INCLUDE_FLAGS
 from qemu_run import run_test, compile_testcase, CompileConfig, prepare_test, ASAN_ENABLED, VALGRIND_ENABLED
 
 
@@ -3071,7 +3072,7 @@ def test_abi_hfa_gcc_interop(opt_level, tmp_path):
 # in order, with the flags the QEMU Makefile gives its sources (the interface
 # records the float ABI), and linked into main's image.  Bare metal as the
 # Makefile's: no R9 GOT base (a YasOS cross defaults to SB-relative globals).
-BARE_METAL_FLAGS = ("-fno-pic", "-mno-sb-relative-got")
+BARE_METAL_FLAGS = ("-fno-pic", "-mno-sb-relative-got", *INCLUDE_FLAGS)
 @pytest.mark.parametrize("opt_level", OPT_LEVELS, ids=[f"yasc_modules{o}" for o in OPT_LEVELS])
 def test_yasc_modules_run(opt_level, tmp_path):
     import subprocess

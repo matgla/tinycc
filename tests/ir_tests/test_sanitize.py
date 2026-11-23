@@ -138,7 +138,8 @@ def test_cfg_label_addr_edges(tmp_path, opt):
 
 def _obj(tmp_path, src, *flags):
     out = tmp_path / (src.stem + "".join(f.strip("-=,") for f in flags) + ".o")
-    proc = subprocess.run([str(TCC), "-ccompat", "-c", *flags, str(src), "-o", str(out)], capture_output=True, text=True)
+    proc = subprocess.run([str(TCC), *INCLUDE_FLAGS, "-ccompat", "-c", *flags, str(src), "-o", str(out)],
+                          capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
     return out.read_bytes()
 
