@@ -115,7 +115,11 @@ LDFLAGS_TAIL :=
 .DEFAULT_GOAL := all
 
 ifneq (,$(findstring armv8m-tcc,$(CC)))
-CFLAGS += -I$(LIBC_INCLUDES) -I$(LIBC_IMPORTS) -I$(NEWLIB_INCLUDES) -I$(ARM_SYSROOT)/include -I$(TCC_PATH)/include
+# System headers (-isystem), as in a real sysroot: quiet like gcc's.  Without
+# __GNUC__ (an ARM Linux cross) newlib turns its `static __inline` helpers into
+# plain statics, which -Wunused-function would report in every test.
+CFLAGS += -isystem$(LIBC_INCLUDES) -isystem$(LIBC_IMPORTS) -isystem$(NEWLIB_INCLUDES) -isystem$(ARM_SYSROOT)/include \
+          -isystem$(TCC_PATH)/include
 TCC_FLAGS += -B$(TCC_PATH)
 # These images are bare metal: nothing sets up a GOT base in R9, so the
 # SB-relative addressing a YASOS build defaults to has no runtime to back it.

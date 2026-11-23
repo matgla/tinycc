@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from cross_includes import INCLUDE_FLAGS
 from qemu_run import CompileConfig, build_qemu_command, compile_testcase
 
 CURRENT_DIR = Path(__file__).parent
@@ -39,9 +40,7 @@ def _runtime(tmp_path):
     out = tmp_path / "ubsan_runtime.o"
     if not out.exists():
         proc = subprocess.run([str(TCC), "-ccompat", "-Wall", "-Werror", "-nostdlib", "-fno-pic", "-mno-sb-relative-got",
-                               "-O1", "-c", "-I", str(CURRENT_DIR / "libc_includes"), "-I",
-                               str(CURRENT_DIR / "libc_imports"), "-I", str(CURRENT_DIR / "libc_includes" / "newlib"),
-                               "-I", str(ROOT / "include"), str(CURRENT_DIR / "ubsan_runtime.c"), "-o", str(out)],
+                               "-O1", "-c", *INCLUDE_FLAGS, str(CURRENT_DIR / "ubsan_runtime.c"), "-o", str(out)],
                               capture_output=True, text=True)
         assert proc.returncode == 0, proc.stderr
     return out

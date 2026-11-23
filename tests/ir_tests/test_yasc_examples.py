@@ -41,8 +41,9 @@ def _newlib_flags():
     sysroot = subprocess.run([gcc, "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft", "--print-sysroot"],
                              capture_output=True, text=True).stdout.strip()
     inc = CURRENT_DIR / "libc_includes"
-    return ["-nostdinc", f"-I{TOP / 'include'}", f"-I{inc}", f"-I{CURRENT_DIR / 'libc_imports'}", f"-I{inc / 'newlib'}",
-            f"-I{sysroot}/include"]
+    # system headers, as in a real sysroot (cross_includes.py)
+    dirs = [TOP / "include", inc, CURRENT_DIR / "libc_imports", inc / "newlib", f"{sysroot}/include"]
+    return ["-nostdinc"] + [f"-isystem{d}" for d in dirs]
 
 
 @pytest.mark.parametrize("example", ["01_hello", "02_ownership", "04_defer", "05_errors", "06_c_library", "07_methods", "09_config"])
