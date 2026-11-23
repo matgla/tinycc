@@ -119,6 +119,10 @@ errdefer free(buf);                   /* runs only when the function returns an 
   calls `error_name` also records every errno macro its errno.h defines, so
   an errno from `error_from(errno)` has a name even if no file spells it.
   Plain C files emit nothing. The records survive `--gc-sections`.
+  A YAFF module (the device's executables) has no place for another
+  section: the linker moves the records to the end of `.rodata` and defines
+  the two symbols there (`yaff_merge_yasc_errname`,
+  `source/obj/tccelf_output.c`; test `test_yasc_errname_yaff.py`).
 - The linker (`tcc_yasc_check_error_names`, `source/obj/tccelf_reloc.c`)
   reads the same records: one name with two values, or two names with one
   value where one of them is hashed, is an error. Explicit aliases are fine.
