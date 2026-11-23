@@ -1546,6 +1546,22 @@ static void diag_text_out(TCCState *s1, const char *line)
 
 /* tag: printed after "error: " -- keeps the internal-compiler-error prefix
  * in one place instead of in every message literal */
+/* An error's way out: to the recovery point (core/recover.c) when it is not
+   FATAL, else out of the compile. */
+static NORETURN void error_longjmp(TCCState *s1, int fatal)
+{
+  s1->error_fatal = 0;
+  s1->max_errors_defer = s1->max_errors_hit = 0;
+  if (s1->recover && !fatal && !s1->fe_speculative)
+    tcc_recover_jump(s1); /* returns when this error cannot be recovered from */
+  if (!s1->fe_speculative)
+    tcc_recover_release(s1);
+  while (nb_stk_data)
+    tcc_free(*(void **)stk_data[--nb_stk_data]);
+  s1->diag_noabort = 0;
+  longjmp(s1->error_jmp_buf, 1);
+}
+
 static void error1(int mode, const char *tag, const char *fmt, va_list ap)
 {
   BufferedFile **pf, *f;
@@ -1556,6 +1572,10 @@ static void error1(int mode, const char *tag, const char *fmt, va_list ap)
 
   tcc_exit_state(s1);
   s1->diag_any_header = 0;
+  /* -fmax-errors was reached where the stop waits (tcc_max_errors_defer):
+     nothing more is said until it comes */
+  if (s1->max_errors_hit && mode != ERROR_ERROR)
+    return;
 
   if (mode == ERROR_NOTE)
   {
@@ -1718,28 +1738,41 @@ static void error1(int mode, const char *tag, const char *fmt, va_list ap)
       }
       else
         s1->error_func(s1->error_opaque, stop);
+      if (s1->max_errors_defer && mode != ERROR_ERROR)
+      {
+        /* the caller holds what a longjmp would leak: it stops the
+           compile itself (tcc_max_errors_stop) */
+        s1->max_errors_hit = 1;
+        return;
+      }
       s1->error_fatal = 1;
       mode = ERROR_ERROR;
     }
   }
 raise:
   if (mode == ERROR_ERROR && s1->error_set_jmp_enabled)
-  {
     /* go on after it when the state allows (core/recover.c): not inside a
        preprocessor directive, a macro's substitution or inline asm, nor
        after an internal error */
-    const int fatal = s1->error_fatal || tag || pp_expr || pp_subst_depth ||
-                      (parse_flags & (PARSE_FLAG_LINEFEED | PARSE_FLAG_ASM_FILE));
-    s1->error_fatal = 0;
-    if (s1->recover && !fatal && !s1->fe_speculative)
-      tcc_recover_jump(s1); /* returns when this error cannot be recovered from */
-    if (!s1->fe_speculative)
-      tcc_recover_release(s1);
-    while (nb_stk_data)
-      tcc_free(*(void **)stk_data[--nb_stk_data]);
-    s1->diag_noabort = 0;
-    longjmp(s1->error_jmp_buf, 1);
-  }
+    error_longjmp(s1, s1->error_fatal || tag || pp_expr || pp_subst_depth ||
+                          (parse_flags & (PARSE_FLAG_LINEFEED | PARSE_FLAG_ASM_FILE)));
+}
+
+/* -fmax-errors in a section whose allocations an error's longjmp would leak
+   (tcc_ir_flow_checks): the Nth error says it stops, the ones after it are
+   not said, and tcc_max_errors_stop ends the compile once the section has
+   freed what it holds. */
+ST_FUNC void tcc_max_errors_defer(TCCState *s1)
+{
+  s1->max_errors_defer = 1;
+}
+
+ST_FUNC void tcc_max_errors_stop(TCCState *s1)
+{
+  const int hit = s1->max_errors_hit;
+  s1->max_errors_defer = s1->max_errors_hit = 0;
+  if (hit && s1->error_set_jmp_enabled)
+    error_longjmp(s1, 1);
 }
 
 /* The error message MSG (from its locus on) was printed in this unit already;

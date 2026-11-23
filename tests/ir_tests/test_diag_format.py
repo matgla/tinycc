@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from cross_includes import INCLUDE_FLAGS
+
 CURRENT_DIR = Path(__file__).parent
 TCC = CURRENT_DIR.parent.parent / "armv8m-tcc"
 
@@ -57,7 +59,7 @@ def _write(tmp_path, name, src):
 
 
 def _tcc(tmp_path, *args, cwd=None):
-    return subprocess.run([str(TCC), *map(str, args)], capture_output=True, text=True, cwd=cwd or tmp_path)
+    return subprocess.run([str(TCC), *INCLUDE_FLAGS, *map(str, args)], capture_output=True, text=True, cwd=cwd or tmp_path)
 
 
 def _json(tmp_path, src, *flags, name="t.c"):
@@ -189,6 +191,9 @@ def test_max_errors(tmp_path):
     assert proc.returncode == 1
     assert proc.stderr.count("error:") == 1
     assert "compilation terminated due to -fmax-errors=1." in proc.stderr
+    # the stop comes from inside the lifetime check: an ASan build reports what
+    # the check had allocated if the compile ends there (tcc_ir_flow_checks)
+    assert "Sanitizer" not in proc.stderr, proc.stderr
     proc, diags = _json(tmp_path, src, "-Werror=lifetime", "-Wno-unused", "-fmax-errors=1")
     assert len(diags) == 1 and diags[0]["kind"] == "error"
 

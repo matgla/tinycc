@@ -2254,6 +2254,7 @@ struct TCCState
    * next external declaration, or the next statement of a function body,
    * until max_errors (-fmax-errors=N, 0 = no limit) have been reported. */
   int max_errors;
+  unsigned char max_errors_defer, max_errors_hit; /* tcc_max_errors_defer / _stop */
   struct TCCRecover *recover;  /* the innermost armed recovery point, or NULL */
   unsigned char error_fatal;   /* the error being raised leaves no state to go on from */
   unsigned char recover_syntax_only; /* syntax_only before the first error turned it on */
@@ -3584,6 +3585,8 @@ ST_FUNC int tccgen_compile(TCCState *s1);
 ST_FUNC int tcc_error_seen(TCCState *s1, const char *msg, int len);
 ST_FUNC void tcc_recover_jump(TCCState *s1);
 ST_FUNC void tcc_recover_release(TCCState *s1);
+ST_FUNC void tcc_max_errors_defer(TCCState *s1);
+ST_FUNC void tcc_max_errors_stop(TCCState *s1);
 ST_FUNC void save_body_error(TCCState *s1, int line, const char *msg); /* longjmps */
 ST_FUNC void save_body_raise(TCCState *s1);
 ST_FUNC void tcc_undeclared(int t, const char *name);

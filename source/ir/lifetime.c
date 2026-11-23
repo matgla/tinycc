@@ -6321,6 +6321,9 @@ void tcc_ir_flow_checks(TCCIRState *ir, Sym *func)
     tcc_ir_ab_free(ir);
     return;
   }
+  /* the checks hold their scratch until they return: -fmax-errors stops
+     the compile after them */
+  tcc_max_errors_defer(tcc_state);
   if (ir->ab_nb_sites)
     tcc_ir_ab_check(ir);
   if (ir->taint_on)
@@ -6340,6 +6343,7 @@ void tcc_ir_flow_checks(TCCIRState *ir, Sym *func)
     tcc_ir_return_local_check(ir);
   if (tcc_ir_dp_wanted())
     tcc_ir_dangling_check(ir, func);
+  tcc_max_errors_stop(tcc_state);
 }
 
 /* Is any of them on?  Then a body nothing generates still wants a parse. */
