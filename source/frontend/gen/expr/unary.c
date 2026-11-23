@@ -190,118 +190,149 @@ static int is_init_constant(SValue *sv)
          sv->sym->v >= SYM_FIRST_ANOM;
 }
 
+/* GNU cast to union, `(union U)x`, after unary() parsed x. */
+static __attribute__((noinline)) void unary_union_cast(CType *type)
+{
+  if ((vtop->type.t & VT_BTYPE) == VT_STRUCT && compare_types(type, &vtop->type, 1))
+  {
+    /* the operand already has the union type */
+    gen_cast(type);
+  }
+  else
+  {
+    CType mtype = union_cast_member_type(type);
+
+    if (global_expr && is_init_constant(vtop))
+    {
+      /* static initializer: build the union in an anonymous object that
+         init_putv copies, as for a compound literal */
+      init_params ip = {data_section};
+      int u_align;
+      int u_size = type_size(type, &u_align);
+      unsigned long offset;
+      if (NOSTATIC_WANTED)
+        u_size = 0, u_align = 1;
+      offset = section_add(ip.sec, u_size, u_align);
+      vpush_ref(type, ip.sec, offset, u_size);
+      vswap();
+      init_putv(&ip, &mtype, offset, -1);
+      vtop->r |= VT_LVAL;
+    }
+    else if (nocode_wanted)
+    {
+      vtop->type = *type;
+    }
+    else
+    {
+      int u_align;
+      int u_size = type_size(type, &u_align);
+      int vr_tmp;
+      int tmp_loc = get_temp_local_var(u_size, u_align, &vr_tmp);
+
+      gen_cast(&mtype);
+
+      SValue dst_sv;
+      memset(&dst_sv, 0, sizeof(dst_sv));
+      dst_sv.type = mtype;
+      dst_sv.r = VT_LOCAL | VT_LVAL;
+      dst_sv.vr = vr_tmp;
+      dst_sv.c.i = tmp_loc;
+
+      vpushv(&dst_sv);
+      vswap();
+      vstore();
+      vtop--;
+
+      dst_sv.type = *type;
+      vpushv(&dst_sv);
+    }
+  }
+}
+
+/* What unary_paren_type() found after '(' */
+enum
+{
+  PAREN_NOT_TYPE,  /* an expression: nothing read */
+  PAREN_SIZEOF,    /* sizeof/alignof (type): the type is pushed */
+  PAREN_LITERAL,   /* a compound literal: done */
+  PAREN_CAST,      /* (type) -- the operand is next */
+  PAREN_UNION_CAST /* (union type) -- a GNU cast to union */
+};
+
+/* The type name of a cast, compound literal or sizeof/alignof operand after
+   '(' (T: the token before it), into *TYPE.  Out of line: AttributeDef and
+   the compound literal's locals stay out of unary_paren(), which recursion
+   through nested parentheses stacks once a level. */
+static __attribute__((noinline)) int unary_paren_type(int t, CType *type)
+{
+  int n, r;
+  AttributeDef ad;
+
+  if (!parse_btype(type, &ad, 0))
+    return PAREN_NOT_TYPE;
+  btype_no_auto(&ad);
+  type_decl(type, &ad, &n, TYPE_ABSTRACT);
+  skip(')');
+  /* check ISOC99 compound literal */
+  if (tok == '{')
+  {
+    /* data is allocated locally by default */
+    if (global_expr)
+      r = VT_CONST;
+    else
+      r = VT_LOCAL;
+    /* all except arrays are lvalues */
+    if (!(type->t & VT_ARRAY))
+      r |= VT_LVAL;
+    memset(&ad, 0, sizeof(AttributeDef));
+    int lit_ir_start = tcc_state->ir ? tcc_state->ir->next_instruction_index : 0;
+    /* sizeof/typeof operand at file scope: DATA_ONLY_WANTED makes the sign
+     * bit win over the no-eval count, so the literal would still be laid
+     * out in .data.  Drop it so only the type is completed. */
+    int saved_nocode = nocode_wanted;
+    if (global_expr && unevaluated_operand)
+      nocode_wanted &= ~DATA_ONLY_WANTED;
+    decl_initializer_alloc(type, &ad, r, 1, 0, 0);
+    nocode_wanted = saved_nocode;
+    /* A fully-constant vector compound literal only ever writes its own
+     * brand-new stack object, whose address nothing else can hold yet.  Mark
+     * the materialising stores/copy so an in-flight vector recipe is not
+     * invalidated by them (see gen_op_vector's element-major fusion). */
+    if (tcc_state->ir && (type->t & VT_VECTOR) && find_sv_vec_literal_init(vtop, 1))
+      vec_emit_range_record(lit_ir_start, tcc_state->ir->next_instruction_index);
+    return PAREN_LITERAL;
+  }
+  if (t == TOK_SOTYPE)
+  { /* from sizeof/alignof (...) */
+    vpush(type);
+    return PAREN_SIZEOF;
+  }
+  return IS_UNION(type->t) ? PAREN_UNION_CAST : PAREN_CAST;
+}
+
 /* Parenthesized expression, cast, compound literal, or statement expression.
    Extracted from unary_primary() to keep its locals out of the main frame.
    Returns 1 for sizeof/alignof type-only operand (early return), 0 otherwise. */
 __attribute__((noinline)) int unary_paren(void)
 {
-  int t, n, r;
+  int t, k;
   CType type;
-  AttributeDef ad;
 
   type.ref = NULL;
   t = tok;
   next();
   /* cast ? */
-  if (parse_btype(&type, &ad, 0))
+  if ((k = unary_paren_type(t, &type)) != PAREN_NOT_TYPE)
   {
-    btype_no_auto(&ad);
-    type_decl(&type, &ad, &n, TYPE_ABSTRACT);
-    skip(')');
-    /* check ISOC99 compound literal */
-    if (tok == '{')
-    {
-      /* data is allocated locally by default */
-      if (global_expr)
-        r = VT_CONST;
-      else
-        r = VT_LOCAL;
-      /* all except arrays are lvalues */
-      if (!(type.t & VT_ARRAY))
-        r |= VT_LVAL;
-      memset(&ad, 0, sizeof(AttributeDef));
-      int lit_ir_start = tcc_state->ir ? tcc_state->ir->next_instruction_index : 0;
-      /* sizeof/typeof operand at file scope: DATA_ONLY_WANTED makes the sign
-       * bit win over the no-eval count, so the literal would still be laid
-       * out in .data.  Drop it so only the type is completed. */
-      int saved_nocode = nocode_wanted;
-      if (global_expr && unevaluated_operand)
-        nocode_wanted &= ~DATA_ONLY_WANTED;
-      decl_initializer_alloc(&type, &ad, r, 1, 0, 0);
-      nocode_wanted = saved_nocode;
-      /* A fully-constant vector compound literal only ever writes its own
-       * brand-new stack object, whose address nothing else can hold yet.  Mark
-       * the materialising stores/copy so an in-flight vector recipe is not
-       * invalidated by them (see gen_op_vector's element-major fusion). */
-      if (tcc_state->ir && (type.t & VT_VECTOR) && find_sv_vec_literal_init(vtop, 1))
-        vec_emit_range_record(lit_ir_start, tcc_state->ir->next_instruction_index);
-    }
-    else if (t == TOK_SOTYPE)
-    { /* from sizeof/alignof (...) */
-      vpush(&type);
+    if (k == PAREN_SIZEOF)
       return 1; /* early return - skip postfix ops */
-    }
-    else if (IS_UNION(type.t))
+    if (k == PAREN_UNION_CAST)
     {
       /* GCC extension: (union_type) expr */
       unary();
-
-      if ((vtop->type.t & VT_BTYPE) == VT_STRUCT && compare_types(&type, &vtop->type, 1))
-      {
-        /* the operand already has the union type */
-        gen_cast(&type);
-      }
-      else
-      {
-        CType mtype = union_cast_member_type(&type);
-
-        if (global_expr && is_init_constant(vtop))
-        {
-          /* static initializer: build the union in an anonymous object that
-             init_putv copies, as for a compound literal */
-          init_params ip = {data_section};
-          int u_align;
-          int u_size = type_size(&type, &u_align);
-          unsigned long offset;
-          if (NOSTATIC_WANTED)
-            u_size = 0, u_align = 1;
-          offset = section_add(ip.sec, u_size, u_align);
-          vpush_ref(&type, ip.sec, offset, u_size);
-          vswap();
-          init_putv(&ip, &mtype, offset, -1);
-          vtop->r |= VT_LVAL;
-        }
-        else if (nocode_wanted)
-        {
-          vtop->type = type;
-        }
-        else
-        {
-          int u_align;
-          int u_size = type_size(&type, &u_align);
-          int vr_tmp;
-          int tmp_loc = get_temp_local_var(u_size, u_align, &vr_tmp);
-
-          gen_cast(&mtype);
-
-          SValue dst_sv;
-          memset(&dst_sv, 0, sizeof(dst_sv));
-          dst_sv.type = mtype;
-          dst_sv.r = VT_LOCAL | VT_LVAL;
-          dst_sv.vr = vr_tmp;
-          dst_sv.c.i = tmp_loc;
-
-          vpushv(&dst_sv);
-          vswap();
-          vstore();
-          vtop--;
-
-          dst_sv.type = type;
-          vpushv(&dst_sv);
-        }
-      }
+      unary_union_cast(&type);
     }
-    else
+    else if (k == PAREN_CAST)
     {
       unary();
       if ((type.t & VT_BTYPE) == VT_PTR)
@@ -462,9 +493,377 @@ int unary_addr_operand;
 /* indir() must leave its result an lvalue: the operand of '&' is built. */
 int indir_keep_lvalue;
 
-ST_FUNC HOT void unary(void)
+/* The postfix '.' / '->' of unary(): a member access (or a yasc method
+   call).  Out of line, as unary_subscript() below: unary() recurses once per
+   nested parenthesis, and these locals in its frame cost the device's 32 KiB
+   stack hundreds of bytes a level (tests/ir_tests/test_parse_stack_depth.py).
+   Returns -1 after a method call, else whether the member is a flexible-like
+   array (-Warray-bounds). */
+static __attribute__((noinline)) int unary_member(void)
 {
   Sym *s;
+  int qualifiers, cumofs, arrow = tok == TOK_ARROW, name_read = 0;
+  int member_flex = 0; /* -Warray-bounds: it named a flexible-like array */
+  /* yasc: `obj.method(...)` or `p->method(...)` (decl/method.c) */
+  {
+    const CType *st = &vtop->type;
+    if (arrow)
+      st = (st->t & VT_BTYPE) == VT_PTR ? pointed_type(&vtop->type) : NULL;
+    if (st && (st->t & VT_BTYPE) == VT_STRUCT && (st->ref->ymod & YASC_HAS_METHODS))
+    {
+      next();
+      if (yasc_method_postfix(st->ref, arrow))
+      {
+        uv_effects++, uv_last = UV_EFFECT;
+        return -1;
+      }
+      name_read = 1;
+    }
+  }
+  /* -Wunused-but-set-variable: `s.f = 1` with the address not folded */
+  unsigned char uu_nr = 0;
+  Sym *uu_base = !arrow && tcc_state->unused_on ? unused_part_begin(&uu_nr, 0) : NULL;
+  /* __builtin_object_size: the member is the closest subobject */
+  ObjRec os_saved;
+  const int os_had = objsize_ctx ? objsize_member_begin(&os_saved) : 0;
+  /* -Waddress-of-packed-member: `a.b.c` -- what `a.b` guaranteed */
+  int pm_base_align = 0;
+  CType pm_base_st = {0, NULL};
+  if (!arrow && packed_member_last.set && tcc_warn_wanted(warn_address_of_packed_member) &&
+      packed_member_is_vtop())
+    pm_base_align = packed_member_last.align, pm_base_st = packed_member_last.st;
+  /* field */
+  if (arrow && tcc_state->warn_array_bounds)
+    fe_check_deref_bounds(0); /* `(a + 4)->m` */
+  if (arrow)
+    indir();
+  qualifiers = vtop->type.t & (VT_CONSTANT | VT_VOLATILE);
+  test_lvalue();
+  /* expect pointer on structure */
+  if (!name_read)
+    next();
+  CType struct_type = vtop->type; /* save before find_field/type changes */
+  s = find_field(&vtop->type, tok, &cumofs);
+  if (s && s->a.attr_facts)
+    attr_deprecated_use(s); /* a deprecated member */
+  /* 64-bit deref alignment tracking: the member access is possibly
+   * under-aligned (< 4) when the base lvalue already was (chained packed
+   * access), when the struct type itself has alignment < 4 (packed /
+   * #pragma pack), or when the member offset is not word-aligned.  The
+   * mark is consumed by svalue_to_iroperand to keep 64-bit accesses off
+   * the LDRD/STRD path, which faults on unaligned addresses. */
+  int member_underaligned;
+  {
+    int salign;
+    type_size(&struct_type, &salign);
+    member_underaligned = vtop->underaligned || salign < 4 || (cumofs & 3) != 0;
+  }
+  /* Union-member accesses keep the alias-class marks off their IR loads
+   * and stores: C permits reading a union member other than the one last
+   * written, so pointer/non-pointer type-based disambiguation (C11 6.5p7)
+   * must not apply across them.  Sticky in the lvalue like `underaligned`
+   * above — the array-member offset arithmetic below mutates this SValue
+     in place but never rebuilds it. */
+  if (IS_UNION(struct_type.t))
+    vtop->union_member = 1;
+  /* -Warray-bounds: a trailing array member is taken as flexible (as gcc
+     does), unless it has two or more elements and the struct is a named
+     object, not reached through a pointer */
+  if (s && (s->type.t & VT_ARRAY) && !s->next)
+    member_flex = arrow || (s->type.t & VT_VLA) || s->type.ref->c <= 1 ||
+                  !((vtop->r & VT_LVAL) && ((vtop->r & VT_VALMASK) == VT_LOCAL ||
+                                            (vtop->r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM)));
+  /* add field offset to pointer */
+  if (struct_has_vla_member(&vtop->type) && (vtop->r & VT_VALMASK) == VT_LOCAL)
+  {
+    /* VLA struct stored via pointer indirection: load the data pointer
+       from the pointer slot instead of computing its address.
+       Works whether VT_LVAL is already set (normal variable reference)
+       or not (e.g. from declaration context). */
+    vtop->type = char_pointer_type;
+    vtop->r |= VT_LVAL;
+  }
+  else
+  {
+    gaddrof();
+    vtop->type = char_pointer_type; /* change type to 'char *' */
+  }
+  /* Check if any VLA field precedes the target field.  If so, the
+     compile-time cumofs does not account for VLA field sizes and we
+     must compute the full offset dynamically at runtime. */
+  {
+    int has_preceding_vla = 0;
+    if ((struct_type.t & VT_BTYPE) == VT_STRUCT && struct_has_vla_member(&struct_type) &&
+        struct_type.ref->type.t != VT_UNION)
+    {
+      Sym *f;
+      for (f = sym_first(struct_type.ref); f && f != s; f = f->next)
+      {
+        if (f->type.t & VT_VLA)
+        {
+          has_preceding_vla = 1;
+          break;
+        }
+      }
+    }
+    if (has_preceding_vla)
+    {
+      /* Walk all fields in order, computing the cumulative byte
+         offset at runtime.  For each field we align to its
+         required alignment, then (unless it is the target) add
+         its runtime or compile-time size. */
+      Sym *f;
+      vpushi(0); /* running integer offset */
+      for (f = sym_first(struct_type.ref); f; f = f->next)
+      {
+        int f_align, f_size;
+        if (f->type.t & VT_VLA)
+        {
+          f_size = 0; /* determined at runtime */
+          type_size(&f->type.ref->type, &f_align);
+        }
+        else
+        {
+          f_size = type_size(&f->type, &f_align);
+          if (f_size < 0)
+            f_size = 0;
+        }
+        /* honour explicit alignment attribute on the field */
+        if (f->a.aligned)
+        {
+          int ea = 1 << (f->a.aligned - 1);
+          if (ea > f_align)
+            f_align = ea;
+        }
+        /* runtime: offset = (offset + align-1) & -align */
+        if (f_align > 1)
+        {
+          vpushi(f_align - 1);
+          gen_op('+');
+          vpushi(~(f_align - 1));
+          gen_op('&');
+        }
+        if (f == s)
+          break; /* aligned to target field — done */
+        /* add this field's size to the running offset */
+        if (f->type.t & VT_VLA)
+        {
+          vset(&int_type, VT_LOCAL | VT_LVAL, f->type.ref->c);
+        }
+        else
+        {
+          vpushi(f_size);
+        }
+        gen_op('+');
+      }
+      gen_op('+'); /* pointer + computed_offset */
+    }
+    else
+    {
+      vpushi(cumofs);
+      gen_op('+');
+    }
+  }
+  /* change type to field type, and set to lvalue */
+  vtop->type = s->type;
+  vtop->type.t |= qualifiers;
+  /* An array member of a qualified struct has qualified ELEMENTS: once
+   * `r->ch` decays, `r->ch[1]` takes its type from the element, so a
+   * qualifier left on the array type alone is lost there and two volatile
+   * accesses to `r->ch[1]` fold into one. */
+  if ((vtop->type.t & VT_ARRAY) && qualifiers)
+    parse_btype_qualify(&vtop->type, qualifiers);
+  /* Set even for array-typed members (no VT_LVAL): the mark rides the
+   * SValue into pointer decay and gen_op('+') propagates it, so
+   * packed->arr[i] still reaches the deref marked. */
+  vtop->underaligned = member_underaligned;
+  /* A scalar member of a big-endian scalar_storage_order aggregate, or an
+   * array of them, is stored byte-reversed.  Set (or cleared) on every
+   * access, like the alignment mark: the base may itself have been one. */
+  vtop->sso_reversed = s->a.sso_be && sso_scalar_size(&vtop->type) != 0;
+  /* -Wlifetime: a `* maybe` member is followed for null like a variable
+     (lifetime.c), which needs the member's name and offset: the IR has
+     lost member types.  What is recorded is the temp that holds the
+     member's address; the checker finds the base pointer from the IR. */
+  int lt_align, lt_esize = 0;
+  if (tcc_state->ir && tcc_state->ir->lt_on && (struct_type.t & (VT_BTYPE | VT_ARRAY)) == VT_STRUCT)
+    lt_esize = type_size(&struct_type, &lt_align);
+  if (tcc_state->ir && tcc_state->ir->lt_on && !nocode_wanted &&
+      (s->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR &&
+      (type_yasc(&s->type) & (YASC_MAYBE | YASC_UNCHECKED)) == YASC_MAYBE &&
+      (vtop->r & VT_VALMASK) < VT_CONST && TCCIR_DECODE_VREG_TYPE(vtop->vr) == TCCIR_VREG_TYPE_TEMP)
+    tcc_ir_lt_note_member(tcc_state->ir, vtop->vr, cumofs, s->v & ~SYM_FIELD,
+                          (type_yasc(&s->type) & YASC_OWNED) != 0, lt_esize);
+  /* ... of a global struct (`g.next`): the address is a symbol plus an
+     offset, used in place */
+  else if (tcc_state->ir && tcc_state->ir->lt_on && !nocode_wanted &&
+           (s->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR &&
+           (type_yasc(&s->type) & (YASC_MAYBE | YASC_UNCHECKED)) == YASC_MAYBE &&
+           (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM) && vtop->sym)
+    tcc_ir_lt_note_gmember(tcc_state->ir, vtop->sym, (int)vtop->c.i, s->v & ~SYM_FIELD,
+                           (type_yasc(&s->type) & YASC_OWNED) != 0, cumofs, lt_esize);
+  /* ... and a borrows(member) member: reads of it are checked against
+     its source member being freed or changed */
+  if (tcc_state->ir && tcc_state->ir->lt_on && !nocode_wanted && type_borrows_field(&s->type) >= 0 &&
+      (vtop->r & VT_VALMASK) < VT_CONST && TCCIR_DECODE_VREG_TYPE(vtop->vr) == TCCIR_VREG_TYPE_TEMP)
+    tcc_ir_lt_note_field_load(tcc_state->ir, vtop->vr, type_borrows_field(&s->type));
+  uv_last = UV_VALUE;
+  /* an array (or VLA) is never an lvalue */
+  if (!(vtop->type.t & (VT_ARRAY | VT_VLA)))
+  {
+    vtop->r |= VT_LVAL;
+#ifdef CONFIG_TCC_BCHECK
+    /* if bound checking, the referenced pointer must be checked */
+    if (tcc_state->do_bounds_check)
+      vtop->r |= VT_MUSTBOUND;
+#endif
+  }
+  if (member_underaligned && tcc_warn_wanted(warn_address_of_packed_member))
+    packed_member_note(&struct_type, s, cumofs, pm_base_align, &pm_base_st);
+  if (member_flex && tcc_state->warn_array_bounds)
+    fe_note_flex_member(); /* `s.tail + 4` is not checked either */
+  if (uu_base)
+    unused_part_end(uu_base, uu_nr, 0);
+  if (objsize_ctx)
+    objsize_member_end(&os_saved, os_had, arrow, s, cumofs, member_flex);
+  next();
+  return member_flex;
+}
+
+/* What unary_subscript() keeps across the index expression, for
+   unary_subscript_end(). */
+typedef struct SubscriptState
+{
+  Sym *uu_base;      /* -Wunused-but-set-variable: `a[i] = 0` */
+  CType pm_st;       /* -Waddress-of-packed-member: the packed array member's */
+  int pm_align;      /* struct and what its place guarantees, when pm_set */
+  unsigned char flex, addr_operand, uu_nr, pm_set;
+} SubscriptState;
+
+/* The index of base[index] while __builtin_object_size follows a pointer:
+   the index is not the pointer whose object is wanted. */
+static __attribute__((noinline)) void subscript_index_objsize(void)
+{
+  ObjRec os_saved = objsize_rec;
+  const int os_ctx = objsize_ctx;
+  objsize_ctx = 0;
+  gexpr();
+  objsize_ctx = os_ctx;
+  objsize_rec = os_saved;
+}
+
+/* unary_subscript() after the index: base and index on the value stack. */
+static __attribute__((noinline)) void unary_subscript_end(const SubscriptState *ss)
+{
+  const int flex = ss->flex, addr_operand = ss->addr_operand;
+  int64_t bounds_idx = 0;
+  int bounds_n = -1, ab_site = -1;
+  char bounds_type[64];
+  int pm_k = ss->pm_set && fe_int_const(vtop), big;
+  int64_t pm_idx = pm_k ? fe_const_value(vtop, &big) : 0;
+  if (tcc_state->warn_array_bounds && !flex && fe_eval_checks_wanted() && !(nocode_wanted & CODE_OFF_BIT))
+    bounds_n = fe_subscript_bounds(&bounds_idx, bounds_type, sizeof bounds_type);
+  /* ... and a loop's last trip: a[i] for (i = 0; i <= N; i++) (objsize.c) */
+  AbSub ab_sub;
+  const int ab_hit = objsize_ab_watch && fe_eval_checks_wanted() && objsize_ab_subscript_begin(&ab_sub, flex);
+  if (is_vector_type(&vtop[-1].type))
+  {
+    /* GCC vector subscript: vec[i] -> element of the vector. */
+    gen_vec_subscript();
+  }
+  else
+  {
+    /* A subscript `base[idx]` on a VT_SYM global (array or pointer) is
+     * treated as a potential write path: gen_op('+') below will often
+     * materialize the base into a register, stripping VT_SYM from the
+     * resulting lvalue, so vstore's sym-based poisoning can't catch a
+     * later store through this lvalue.  Poison here if the pointee is
+     * non-const.  Cost: blocks `*&g` scalar folds for syms that are
+     * also subscripted — but scalar syms aren't subscripted. */
+    if (!nocode_wanted && (vtop[-1].r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM) && vtop[-1].sym)
+    {
+      CType *pointed = NULL;
+      if (vtop[-1].type.t & VT_ARRAY)
+        pointed = &vtop[-1].type; /* array element type */
+      else if ((vtop[-1].type.t & VT_BTYPE) == VT_PTR)
+        pointed = pointed_type(&vtop[-1].type);
+      if (pointed && !(pointed->t & VT_CONSTANT))
+        vtop[-1].sym->a.possibly_written = 1;
+    }
+    if ((tcc_state->sanitize & SAN_BOUNDS) && !flex)
+      ubsan_subscript(addr_operand);
+    if (tcc_state->ir && tcc_state->ir->ab_on && !flex && !nocode_wanted && !tcc_state->in_inline_expansion &&
+        fe_eval_checks_wanted())
+      ab_site = fe_ab_site_begin();
+    gen_op('+');
+    if (ab_site >= 0)
+      tcc_ir_ab_site_mid(tcc_state->ir, ab_site);
+    indir();
+  }
+  if (ss->uu_base)
+    unused_part_end(ss->uu_base, ss->uu_nr, 1);
+  if (ss->pm_set)
+  {
+    int ealign, esize = type_size(&vtop->type, &ealign);
+    int64_t off = pm_k ? pm_idx * esize : esize;
+    int align = ss->pm_align;
+    if (off && (int)(off & -off) < align)
+      align = (int)(off & -off);
+    if (esize > 0 && align < ealign)
+    {
+      packed_member_last.sv = *vtop;
+      packed_member_last.st = ss->pm_st;
+      packed_member_last.align = align;
+      packed_member_last.set = 1;
+    }
+  }
+  skip(']');
+  if (ab_hit)
+    objsize_ab_subscript_end(&ab_sub, addr_operand && !(tok == '[' || tok == '.' || tok == TOK_ARROW || tok == '(' ||
+                                                        tok == TOK_INC || tok == TOK_DEC));
+  if (ab_site >= 0)
+    tcc_ir_ab_site_end(tcc_state->ir, ab_site,
+                       addr_operand && !(tok == '[' || tok == '.' || tok == TOK_ARROW || tok == '(' ||
+                                         tok == TOK_INC || tok == TOK_DEC));
+  /* one past the end is a valid address, &a[n], not an element */
+  if (bounds_n >= 0 &&
+      (bounds_idx < 0 || bounds_idx > bounds_n ||
+       (bounds_idx == bounds_n && (!addr_operand || tok == '[' || tok == '.' || tok == TOK_ARROW || tok == '(' ||
+                                   tok == TOK_INC || tok == TOK_DEC))))
+    tcc_fe_warning_c(warn_array_bounds, "array subscript %lld is %s array bounds of '%s'", (long long)bounds_idx,
+                     bounds_idx < 0 ? "below" : "above", bounds_type);
+  uv_last = UV_VALUE;
+}
+
+/* The postfix '[' of unary(): base[index].  FLEX: the base is a
+   flexible-like array member; ADDR_OPERAND: the operand of '&'.  Its frame
+   is on the recursive path of an index expression: what the rest needs
+   waits in a SubscriptState, the rest is unary_subscript_end(). */
+static __attribute__((noinline)) void unary_subscript(int flex, int addr_operand)
+{
+  SubscriptState ss;
+  ss.flex = flex;
+  ss.addr_operand = addr_operand;
+  /* -Waddress-of-packed-member: an element of a packed array member
+     (`&p->arr[i]`, `&p->items[i].x`) is no better aligned than it */
+  ss.pm_set = packed_member_last.set && (vtop->type.t & VT_ARRAY) &&
+              tcc_warn_wanted(warn_address_of_packed_member) && packed_member_is_vtop();
+  ss.pm_align = 0;
+  ss.pm_st.t = 0, ss.pm_st.ref = NULL;
+  if (ss.pm_set)
+    ss.pm_st = packed_member_last.st, ss.pm_align = packed_member_last.align;
+  ss.uu_nr = 0;
+  ss.uu_base = tcc_state->unused_on ? unused_part_begin(&ss.uu_nr, 1) : NULL; /* `a[i] = 0` */
+  next();
+  if (objsize_ctx)
+    subscript_index_objsize();
+  else
+    gexpr();
+  unary_subscript_end(&ss);
+}
+
+ST_FUNC HOT void unary(void)
+{
   /* This is the operand of '&': it stays the lvalue it names -- indir()
      folds no load into a constant, a __rodata_relative pointer stays a word.
      The flag is the caller's: the expressions nested in this one get 0. */
@@ -634,331 +1033,14 @@ postfix:
     }
     else if (tok == '.' || tok == TOK_ARROW)
     {
-      int qualifiers, cumofs, arrow = tok == TOK_ARROW, name_read = 0;
-      /* yasc: `obj.method(...)` or `p->method(...)` (decl/method.c) */
-      {
-        const CType *st = &vtop->type;
-        if (arrow)
-          st = (st->t & VT_BTYPE) == VT_PTR ? pointed_type(&vtop->type) : NULL;
-        if (st && (st->t & VT_BTYPE) == VT_STRUCT && (st->ref->ymod & YASC_HAS_METHODS))
-        {
-          next();
-          if (yasc_method_postfix(st->ref, arrow))
-          {
-            uv_effects++, uv_last = UV_EFFECT;
-            continue;
-          }
-          name_read = 1;
-        }
-      }
-      /* -Wunused-but-set-variable: `s.f = 1` with the address not folded */
-      unsigned char uu_nr = 0;
-      Sym *uu_base = !arrow && tcc_state->unused_on ? unused_part_begin(&uu_nr, 0) : NULL;
-      /* __builtin_object_size: the member is the closest subobject */
-      ObjRec os_saved;
-      const int os_had = objsize_ctx ? objsize_member_begin(&os_saved) : 0;
-      /* -Waddress-of-packed-member: `a.b.c` -- what `a.b` guaranteed */
-      int pm_base_align = 0;
-      CType pm_base_st = {0, NULL};
-      if (!arrow && packed_member_last.set && tcc_warn_wanted(warn_address_of_packed_member) &&
-          packed_member_is_vtop())
-        pm_base_align = packed_member_last.align, pm_base_st = packed_member_last.st;
-      /* field */
-      if (arrow && tcc_state->warn_array_bounds)
-        fe_check_deref_bounds(0); /* `(a + 4)->m` */
-      if (arrow)
-        indir();
-      qualifiers = vtop->type.t & (VT_CONSTANT | VT_VOLATILE);
-      test_lvalue();
-      /* expect pointer on structure */
-      if (!name_read)
-        next();
-      CType struct_type = vtop->type; /* save before find_field/type changes */
-      s = find_field(&vtop->type, tok, &cumofs);
-      if (s && s->a.attr_facts)
-        attr_deprecated_use(s); /* a deprecated member */
-      /* 64-bit deref alignment tracking: the member access is possibly
-       * under-aligned (< 4) when the base lvalue already was (chained packed
-       * access), when the struct type itself has alignment < 4 (packed /
-       * #pragma pack), or when the member offset is not word-aligned.  The
-       * mark is consumed by svalue_to_iroperand to keep 64-bit accesses off
-       * the LDRD/STRD path, which faults on unaligned addresses. */
-      int member_underaligned;
-      {
-        int salign;
-        type_size(&struct_type, &salign);
-        member_underaligned = vtop->underaligned || salign < 4 || (cumofs & 3) != 0;
-      }
-      /* Union-member accesses keep the alias-class marks off their IR loads
-       * and stores: C permits reading a union member other than the one last
-       * written, so pointer/non-pointer type-based disambiguation (C11 6.5p7)
-       * must not apply across them.  Sticky in the lvalue like `underaligned`
-       * above — the array-member offset arithmetic below mutates this SValue
-         in place but never rebuilds it. */
-      if (IS_UNION(struct_type.t))
-        vtop->union_member = 1;
-      /* -Warray-bounds: a trailing array member is taken as flexible (as gcc
-         does), unless it has two or more elements and the struct is a named
-         object, not reached through a pointer */
-      if (s && (s->type.t & VT_ARRAY) && !s->next)
-        member_flex = arrow || (s->type.t & VT_VLA) || s->type.ref->c <= 1 ||
-                      !((vtop->r & VT_LVAL) && ((vtop->r & VT_VALMASK) == VT_LOCAL ||
-                                                (vtop->r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM)));
-      /* add field offset to pointer */
-      if (struct_has_vla_member(&vtop->type) && (vtop->r & VT_VALMASK) == VT_LOCAL)
-      {
-        /* VLA struct stored via pointer indirection: load the data pointer
-           from the pointer slot instead of computing its address.
-           Works whether VT_LVAL is already set (normal variable reference)
-           or not (e.g. from declaration context). */
-        vtop->type = char_pointer_type;
-        vtop->r |= VT_LVAL;
-      }
-      else
-      {
-        gaddrof();
-        vtop->type = char_pointer_type; /* change type to 'char *' */
-      }
-      /* Check if any VLA field precedes the target field.  If so, the
-         compile-time cumofs does not account for VLA field sizes and we
-         must compute the full offset dynamically at runtime. */
-      {
-        int has_preceding_vla = 0;
-        if ((struct_type.t & VT_BTYPE) == VT_STRUCT && struct_has_vla_member(&struct_type) &&
-            struct_type.ref->type.t != VT_UNION)
-        {
-          Sym *f;
-          for (f = sym_first(struct_type.ref); f && f != s; f = f->next)
-          {
-            if (f->type.t & VT_VLA)
-            {
-              has_preceding_vla = 1;
-              break;
-            }
-          }
-        }
-        if (has_preceding_vla)
-        {
-          /* Walk all fields in order, computing the cumulative byte
-             offset at runtime.  For each field we align to its
-             required alignment, then (unless it is the target) add
-             its runtime or compile-time size. */
-          Sym *f;
-          vpushi(0); /* running integer offset */
-          for (f = sym_first(struct_type.ref); f; f = f->next)
-          {
-            int f_align, f_size;
-            if (f->type.t & VT_VLA)
-            {
-              f_size = 0; /* determined at runtime */
-              type_size(&f->type.ref->type, &f_align);
-            }
-            else
-            {
-              f_size = type_size(&f->type, &f_align);
-              if (f_size < 0)
-                f_size = 0;
-            }
-            /* honour explicit alignment attribute on the field */
-            if (f->a.aligned)
-            {
-              int ea = 1 << (f->a.aligned - 1);
-              if (ea > f_align)
-                f_align = ea;
-            }
-            /* runtime: offset = (offset + align-1) & -align */
-            if (f_align > 1)
-            {
-              vpushi(f_align - 1);
-              gen_op('+');
-              vpushi(~(f_align - 1));
-              gen_op('&');
-            }
-            if (f == s)
-              break; /* aligned to target field — done */
-            /* add this field's size to the running offset */
-            if (f->type.t & VT_VLA)
-            {
-              vset(&int_type, VT_LOCAL | VT_LVAL, f->type.ref->c);
-            }
-            else
-            {
-              vpushi(f_size);
-            }
-            gen_op('+');
-          }
-          gen_op('+'); /* pointer + computed_offset */
-        }
-        else
-        {
-          vpushi(cumofs);
-          gen_op('+');
-        }
-      }
-      /* change type to field type, and set to lvalue */
-      vtop->type = s->type;
-      vtop->type.t |= qualifiers;
-      /* An array member of a qualified struct has qualified ELEMENTS: once
-       * `r->ch` decays, `r->ch[1]` takes its type from the element, so a
-       * qualifier left on the array type alone is lost there and two volatile
-       * accesses to `r->ch[1]` fold into one. */
-      if ((vtop->type.t & VT_ARRAY) && qualifiers)
-        parse_btype_qualify(&vtop->type, qualifiers);
-      /* Set even for array-typed members (no VT_LVAL): the mark rides the
-       * SValue into pointer decay and gen_op('+') propagates it, so
-       * packed->arr[i] still reaches the deref marked. */
-      vtop->underaligned = member_underaligned;
-      /* A scalar member of a big-endian scalar_storage_order aggregate, or an
-       * array of them, is stored byte-reversed.  Set (or cleared) on every
-       * access, like the alignment mark: the base may itself have been one. */
-      vtop->sso_reversed = s->a.sso_be && sso_scalar_size(&vtop->type) != 0;
-      /* -Wlifetime: a `* maybe` member is followed for null like a variable
-         (lifetime.c), which needs the member's name and offset: the IR has
-         lost member types.  What is recorded is the temp that holds the
-         member's address; the checker finds the base pointer from the IR. */
-      int lt_align, lt_esize = 0;
-      if (tcc_state->ir && tcc_state->ir->lt_on && (struct_type.t & (VT_BTYPE | VT_ARRAY)) == VT_STRUCT)
-        lt_esize = type_size(&struct_type, &lt_align);
-      if (tcc_state->ir && tcc_state->ir->lt_on && !nocode_wanted &&
-          (s->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR &&
-          (type_yasc(&s->type) & (YASC_MAYBE | YASC_UNCHECKED)) == YASC_MAYBE &&
-          (vtop->r & VT_VALMASK) < VT_CONST && TCCIR_DECODE_VREG_TYPE(vtop->vr) == TCCIR_VREG_TYPE_TEMP)
-        tcc_ir_lt_note_member(tcc_state->ir, vtop->vr, cumofs, s->v & ~SYM_FIELD,
-                              (type_yasc(&s->type) & YASC_OWNED) != 0, lt_esize);
-      /* ... of a global struct (`g.next`): the address is a symbol plus an
-         offset, used in place */
-      else if (tcc_state->ir && tcc_state->ir->lt_on && !nocode_wanted &&
-               (s->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR &&
-               (type_yasc(&s->type) & (YASC_MAYBE | YASC_UNCHECKED)) == YASC_MAYBE &&
-               (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM) && vtop->sym)
-        tcc_ir_lt_note_gmember(tcc_state->ir, vtop->sym, (int)vtop->c.i, s->v & ~SYM_FIELD,
-                               (type_yasc(&s->type) & YASC_OWNED) != 0, cumofs, lt_esize);
-      /* ... and a borrows(member) member: reads of it are checked against
-         its source member being freed or changed */
-      if (tcc_state->ir && tcc_state->ir->lt_on && !nocode_wanted && type_borrows_field(&s->type) >= 0 &&
-          (vtop->r & VT_VALMASK) < VT_CONST && TCCIR_DECODE_VREG_TYPE(vtop->vr) == TCCIR_VREG_TYPE_TEMP)
-        tcc_ir_lt_note_field_load(tcc_state->ir, vtop->vr, type_borrows_field(&s->type));
-      uv_last = UV_VALUE;
-      /* an array (or VLA) is never an lvalue */
-      if (!(vtop->type.t & (VT_ARRAY | VT_VLA)))
-      {
-        vtop->r |= VT_LVAL;
-#ifdef CONFIG_TCC_BCHECK
-        /* if bound checking, the referenced pointer must be checked */
-        if (tcc_state->do_bounds_check)
-          vtop->r |= VT_MUSTBOUND;
-#endif
-      }
-      if (member_underaligned && tcc_warn_wanted(warn_address_of_packed_member))
-        packed_member_note(&struct_type, s, cumofs, pm_base_align, &pm_base_st);
-      if (member_flex && tcc_state->warn_array_bounds)
-        fe_note_flex_member(); /* `s.tail + 4` is not checked either */
-      if (uu_base)
-        unused_part_end(uu_base, uu_nr, 0);
-      if (objsize_ctx)
-        objsize_member_end(&os_saved, os_had, arrow, s, cumofs, member_flex);
-      next();
+      const int mf = unary_member();
+      if (mf < 0)
+        continue;
+      member_flex = mf;
     }
     else if (tok == '[')
     {
-      int64_t bounds_idx = 0;
-      int bounds_n = -1, ab_site = -1;
-      char bounds_type[64];
-      /* -Waddress-of-packed-member: an element of a packed array member
-         (`&p->arr[i]`, `&p->items[i].x`) is no better aligned than it */
-      PackedMember pm_arr;
-      pm_arr.set = packed_member_last.set && (vtop->type.t & VT_ARRAY) &&
-                   tcc_warn_wanted(warn_address_of_packed_member) && packed_member_is_vtop();
-      if (pm_arr.set)
-        pm_arr = packed_member_last;
-      unsigned char uu_nr = 0;
-      Sym *uu_base = tcc_state->unused_on ? unused_part_begin(&uu_nr, 1) : NULL; /* `a[i] = 0` */
-      next();
-      if (objsize_ctx)
-      {
-        /* the index is not the pointer whose object is wanted */
-        ObjRec os_saved = objsize_rec;
-        const int os_ctx = objsize_ctx;
-        objsize_ctx = 0;
-        gexpr();
-        objsize_ctx = os_ctx;
-        objsize_rec = os_saved;
-      }
-      else
-        gexpr();
-      int pm_k = pm_arr.set && fe_int_const(vtop), big;
-      int64_t pm_idx = pm_k ? fe_const_value(vtop, &big) : 0;
-      if (tcc_state->warn_array_bounds && !flex && fe_eval_checks_wanted() && !(nocode_wanted & CODE_OFF_BIT))
-        bounds_n = fe_subscript_bounds(&bounds_idx, bounds_type, sizeof bounds_type);
-      /* ... and a loop's last trip: a[i] for (i = 0; i <= N; i++) (objsize.c) */
-      AbSub ab_sub;
-      const int ab_hit = objsize_ab_watch && fe_eval_checks_wanted() && objsize_ab_subscript_begin(&ab_sub, flex);
-      if (is_vector_type(&vtop[-1].type))
-      {
-        /* GCC vector subscript: vec[i] -> element of the vector. */
-        gen_vec_subscript();
-      }
-      else
-      {
-        /* A subscript `base[idx]` on a VT_SYM global (array or pointer) is
-         * treated as a potential write path: gen_op('+') below will often
-         * materialize the base into a register, stripping VT_SYM from the
-         * resulting lvalue, so vstore's sym-based poisoning can't catch a
-         * later store through this lvalue.  Poison here if the pointee is
-         * non-const.  Cost: blocks `*&g` scalar folds for syms that are
-         * also subscripted — but scalar syms aren't subscripted. */
-        if (!nocode_wanted && (vtop[-1].r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM) && vtop[-1].sym)
-        {
-          CType *pointed = NULL;
-          if (vtop[-1].type.t & VT_ARRAY)
-            pointed = &vtop[-1].type; /* array element type */
-          else if ((vtop[-1].type.t & VT_BTYPE) == VT_PTR)
-            pointed = pointed_type(&vtop[-1].type);
-          if (pointed && !(pointed->t & VT_CONSTANT))
-            vtop[-1].sym->a.possibly_written = 1;
-        }
-        if ((tcc_state->sanitize & SAN_BOUNDS) && !flex)
-          ubsan_subscript(addr_operand);
-        if (tcc_state->ir && tcc_state->ir->ab_on && !flex && !nocode_wanted && !tcc_state->in_inline_expansion &&
-            fe_eval_checks_wanted())
-          ab_site = fe_ab_site_begin();
-        gen_op('+');
-        if (ab_site >= 0)
-          tcc_ir_ab_site_mid(tcc_state->ir, ab_site);
-        indir();
-      }
-      if (uu_base)
-        unused_part_end(uu_base, uu_nr, 1);
-      if (pm_arr.set)
-      {
-        int ealign, esize = type_size(&vtop->type, &ealign);
-        int64_t off = pm_k ? pm_idx * esize : esize;
-        int align = pm_arr.align;
-        if (off && (int)(off & -off) < align)
-          align = (int)(off & -off);
-        if (esize > 0 && align < ealign)
-        {
-          pm_arr.sv = *vtop;
-          pm_arr.align = align;
-          packed_member_last = pm_arr;
-        }
-      }
-      skip(']');
-      if (ab_hit)
-        objsize_ab_subscript_end(&ab_sub, addr_operand && !(tok == '[' || tok == '.' || tok == TOK_ARROW || tok == '(' ||
-                                                            tok == TOK_INC || tok == TOK_DEC));
-      if (ab_site >= 0)
-        tcc_ir_ab_site_end(tcc_state->ir, ab_site,
-                           addr_operand && !(tok == '[' || tok == '.' || tok == TOK_ARROW || tok == '(' ||
-                                             tok == TOK_INC || tok == TOK_DEC));
-      /* one past the end is a valid address, &a[n], not an element */
-      if (bounds_n >= 0 &&
-          (bounds_idx < 0 || bounds_idx > bounds_n ||
-           (bounds_idx == bounds_n && (!addr_operand || tok == '[' || tok == '.' || tok == TOK_ARROW || tok == '(' ||
-                                       tok == TOK_INC || tok == TOK_DEC))))
-        tcc_fe_warning_c(warn_array_bounds, "array subscript %lld is %s array bounds of '%s'", (long long)bounds_idx,
-                         bounds_idx < 0 ? "below" : "above", bounds_type);
-      uv_last = UV_VALUE;
+      unary_subscript(flex, addr_operand);
     }
     else if (tok == '(')
     {
