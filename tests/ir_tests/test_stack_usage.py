@@ -456,7 +456,7 @@ extern cb_t handlers[];
 extern int ext_cb(int);
 int dispatch(int i, int x) { char b[16]; b[x & 15] = 0; return handlers[i](x + b[1]); }
 int (*other)(void *) ;
-int via_void(void *p) { return other(p); }
+int via_void(void *p) { return other(p) + 1; } /* not a tail call: an ARM Linux cross makes one */
 cb_t pick(void) { return ext_cb; }
 int main(void) { return dispatch(0, 1); }
 """

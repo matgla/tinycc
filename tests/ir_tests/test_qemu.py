@@ -3069,7 +3069,9 @@ def test_abi_hfa_gcc_interop(opt_level, tmp_path):
 # then main (which imports shapes and so geom).  An importer needs the
 # interface (.ymi) of every module it imports, so the modules are compiled here
 # in order, with the flags the QEMU Makefile gives its sources (the interface
-# records the float ABI), and linked into main's image.
+# records the float ABI), and linked into main's image.  Bare metal as the
+# Makefile's: no R9 GOT base (a YasOS cross defaults to SB-relative globals).
+BARE_METAL_FLAGS = ("-fno-pic", "-mno-sb-relative-got")
 @pytest.mark.parametrize("opt_level", OPT_LEVELS, ids=[f"yasc_modules{o}" for o in OPT_LEVELS])
 def test_yasc_modules_run(opt_level, tmp_path):
     import subprocess
@@ -3080,7 +3082,7 @@ def test_yasc_modules_run(opt_level, tmp_path):
     for name in ("yasc_module_geom", "yasc_module_shapes"):
         obj = tmp_path / "mods" / f"{name}.o"
         r = subprocess.run([str(tcc), "-ccompat", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft", "-nostdlib",
-                            "-fvisibility=hidden", "-ffunction-sections", opt_level, f"-fmodule-dir={ifc}",
+                            "-fvisibility=hidden", "-ffunction-sections", *BARE_METAL_FLAGS, opt_level, f"-fmodule-dir={ifc}",
                             "-c", str(CURRENT_DIR / f"{name}.c"), "-o", str(obj)],
                            capture_output=True, text=True)
         assert r.returncode == 0 and not r.stderr, r.stderr
@@ -3114,7 +3116,7 @@ def test_yasc_methods_module_run(opt_level, tmp_path):
     (tmp_path / "mods").mkdir()
     obj = tmp_path / "mods" / "yasc_methods_mod.o"
     r = subprocess.run([str(tcc), "-ccompat", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft", "-nostdlib",
-                        "-fvisibility=hidden", "-ffunction-sections", opt_level, f"-fmodule-dir={ifc}",
+                        "-fvisibility=hidden", "-ffunction-sections", *BARE_METAL_FLAGS, opt_level, f"-fmodule-dir={ifc}",
                         "-c", str(CURRENT_DIR / "yasc_methods_mod.c"), "-o", str(obj)],
                        capture_output=True, text=True)
     assert r.returncode == 0 and not r.stderr, r.stderr
@@ -3148,7 +3150,7 @@ def test_yasc_modules_c_caller(opt_level, tmp_path):
     for name in ("yasc_module_geom", "yasc_module_shapes"):
         obj = tmp_path / "mods" / f"{name}.o"
         r = subprocess.run([str(tcc), "-ccompat", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft", "-nostdlib",
-                            "-fvisibility=hidden", "-ffunction-sections", opt_level, f"-fmodule-dir={ifc}",
+                            "-fvisibility=hidden", "-ffunction-sections", *BARE_METAL_FLAGS, opt_level, f"-fmodule-dir={ifc}",
                             f"-fmodule-header={hdr}", "-c", str(CURRENT_DIR / f"{name}.c"), "-o", str(obj)],
                            capture_output=True, text=True)
         assert r.returncode == 0 and not r.stderr, r.stderr
@@ -3186,7 +3188,7 @@ def test_yasc_modules_example(opt_level, tmp_path):
     for name in ("vec", "shapes"):
         obj = tmp_path / "mods" / f"{name}.o"
         r = subprocess.run([str(tcc), "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft", "-nostdlib",
-                            "-fvisibility=hidden", "-ffunction-sections", opt_level, f"-fmodule-dir={ifc}",
+                            "-fvisibility=hidden", "-ffunction-sections", *BARE_METAL_FLAGS, opt_level, f"-fmodule-dir={ifc}",
                             f"-fmodule-header={hdr}", "-c", str(CURRENT_DIR / example / f"{name}.c"), "-o", str(obj)],
                            capture_output=True, text=True)
         assert r.returncode == 0 and not r.stderr, r.stderr
