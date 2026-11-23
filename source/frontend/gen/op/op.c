@@ -786,17 +786,31 @@ static void fe_narrow_reset(void)
 
 static void gen_op_checked_1(int op);
 
-ST_FUNC void gen_op_checked(int op)
+/* -Wconversion's record of the operands: in its own frame, the operator is
+   at the end of every expression's recursion (the deepest point of the
+   parse, with the code generation below it) */
+static __attribute__((noinline)) void gen_op_checked_narrow(int op)
 {
   FeNarrow nr;
-  const int narrow = (tcc_state->warn_conversion || tcc_state->warn_sign_conversion) && fe_eval_checks_wanted() &&
-                     fe_narrow_begin(op, &nr);
+  const int narrow = fe_narrow_begin(op, &nr);
   gen_op_checked_1(op);
   if (narrow)
     fe_narrow_end(&nr);
 }
 
-static void gen_op_checked_1(int op)
+ST_FUNC void gen_op_checked(int op)
+{
+  if ((tcc_state->warn_conversion || tcc_state->warn_sign_conversion) && fe_eval_checks_wanted())
+    gen_op_checked_narrow(op);
+  else
+    gen_op_checked_1(op);
+}
+
+/* The checks of OP before it is generated, in a frame of their own (their
+   helpers inline into it): 1 when they generated it too (array arithmetic,
+   a sanitizer), 2 + I for a bitwise and/or whose value fe_bitop[I] records
+   once it is there, 0 otherwise */
+static __attribute__((noinline)) int gen_op_checks(int op)
 {
   TCCState *s = tcc_state;
   if ((op == '+' || op == '-') && s->warn_array_bounds && fe_eval_checks_wanted() && !(nocode_wanted & CODE_OFF_BIT) &&
@@ -805,7 +819,7 @@ static void gen_op_checked_1(int op)
     if (s->warn_overflow)
       fe_check_overflow(op);
     fe_array_arith(op);
-    return;
+    return 1;
   }
   if ((op == '&' || op == '|') && s->warn_tautological_compare && fe_eval_checks_wanted() &&
       fe_int_const(vtop) != fe_int_const(vtop - 1) && is_integer_btype(vtop[-1].type.t & VT_BTYPE) &&
@@ -816,10 +830,7 @@ static void gen_op_checked_1(int op)
     fe_bitop_next ^= 1;
     fe_bitop[i].op = op;
     fe_bitop[i].c = (uint64_t)fe_const_value(fe_int_const(vtop) ? vtop : vtop - 1, &big);
-    gen_op(op);
-    fe_bitop[i].at = vtop;
-    fe_bitop[i].sv = *vtop;
-    return;
+    return 2 + i;
   }
   if (fe_eval_checks_wanted())
   {
@@ -847,8 +858,21 @@ static void gen_op_checked_1(int op)
     }
   }
   if (s->sanitize && ubsan_gen_op(op))
+    return 1;
+  return 0;
+}
+
+static void gen_op_checked_1(int op)
+{
+  const int k = gen_op_checks(op);
+  if (k == 1)
     return;
   gen_op(op);
+  if (k >= 2)
+  {
+    fe_bitop[k - 2].at = vtop;
+    fe_bitop[k - 2].sv = *vtop;
+  }
 }
 
 /* generic gen_op: handles types problems */

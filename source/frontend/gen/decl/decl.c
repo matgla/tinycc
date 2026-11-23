@@ -1173,6 +1173,18 @@ static void decl_auto_infer(CType *type, CType *btype, AttributeDef *ad, int v, 
 /* 'l' is VT_LOCAL or VT_CONST to define default storage type
    or VT_CMP if parsing old style parameter list
    or VT_JMP if parsing c99 for decl: for (int i = 0, ...) */
+/* A nested function's assembler name, "name.N" (N counts every nested
+   function of the unit).  Out of line: the buffer would sit in decl()'s
+   frame, which a declaration's initializer puts on the parser's recursive
+   path (calls in it, inline expansions). */
+static __attribute__((noinline)) int nested_func_label(int v)
+{
+  static int nested_func_uid = 0;
+  char mangled[256];
+  snprintf(mangled, sizeof(mangled), "%s.%d", get_tok_str(v, NULL), nested_func_uid++);
+  return tok_alloc(mangled, strlen(mangled))->tok;
+}
+
 int decl(int l)
 {
   int v, has_init, r, oldint, align, exported, this_exported, in_module;
@@ -1473,12 +1485,7 @@ int decl(int l)
           /* Name mangling: use "parent.nested.N" to ensure global uniqueness.
            * Use a persistent counter so names don't collide across parent functions
            * (nb_nested_funcs resets per parent, but this counter does not). */
-          {
-            static int nested_func_uid = 0;
-            char mangled[256];
-            snprintf(mangled, sizeof(mangled), "%s.%d", get_tok_str(v, NULL), nested_func_uid++);
-            nf->sym->asm_label = tok_alloc(mangled, strlen(mangled))->tok;
-          }
+          nf->sym->asm_label = nested_func_label(v);
 
           /* Create placeholder address for the function */
           put_extern_sym(nf->sym, cur_text_section, 0, 0);

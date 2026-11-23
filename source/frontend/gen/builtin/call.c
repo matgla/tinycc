@@ -607,6 +607,682 @@ static void fe_memaccess_end(FeMemAccess *m)
   }
 }
 
+/* The printf family, by name: where the format, the FILE and the variadic
+   arguments are among the call's arguments (99: in a va_list), and the
+   fewest arguments a call can have */
+typedef struct PrintfFamily
+{
+  const char *name;
+  signed char file_idx, fmt_idx, vararg_idx, min_args;
+} PrintfFamily;
+
+static const PrintfFamily printf_family[] = {
+    /* printf family (stdout, variadic) */
+    {"printf", -1, 0, 1, 1},
+    {"printf_unlocked", -1, 0, 1, 1},
+    {"__builtin_printf", -1, 0, 1, 1},
+    {"__builtin_printf_unlocked", -1, 0, 1, 1},
+    {"__printf_chk", -1, 1, 2, 2}, /* [0]=flag */
+    /* fprintf family (FILE*, variadic) */
+    {"fprintf", 0, 1, 2, 2},
+    {"fprintf_unlocked", 0, 1, 2, 2},
+    {"__builtin_fprintf_unlocked", 0, 1, 2, 2},
+    {"__fprintf_chk", 0, 2, 3, 3}, /* [1]=flag */
+    /* vprintf family (stdout, va_list -- no vararg access) */
+    {"vprintf", -1, 0, 99, 2},       /* fmt + va_list */
+    {"__vprintf_chk", -1, 1, 99, 3}, /* flag + fmt + va_list */
+    /* vfprintf family (FILE*, va_list -- no vararg access) */
+    {"vfprintf", 0, 1, 99, 3},       /* file + fmt + va_list */
+    {"__vfprintf_chk", 0, 2, 99, 4}, /* file + flag + fmt + va_list */
+};
+
+static const PrintfFamily *printf_family_lookup(const char *func_name)
+{
+  for (size_t i = 0; i < countof(printf_family); i++)
+    if (strcmp(func_name, printf_family[i].name) == 0)
+      return &printf_family[i];
+  return NULL;
+}
+
+/* A printf-family call whose result is dropped, as a cheaper call (or none):
+   1 when it was replaced -- its arguments' FUNCPARAMVALs are gone and vtop
+   holds the result.  Out of line: unary_funcall_body is on the parser's
+   recursive path (arguments that are calls, inline expansions). */
+static __attribute__((noinline)) int funcall_printf_family(const PrintfFamily *pf, SValue *saved_args, int nb_args,
+                                                           int call_id, int ir_idx_before_first_param,
+                                                           int ir_idx_before_args)
+{
+  int optimized = 0;
+  int fmt_len = 0;
+  const char *fmt = try_get_constant_string(&saved_args[pf->fmt_idx], &fmt_len);
+  if (fmt)
+  {
+    int has_file = (pf->file_idx >= 0); /* fprintf-family vs printf-family */
+    int has_varargs = (nb_args > pf->vararg_idx);
+
+    /* Classify the format pattern:
+     *  PF_OPT_NOP           = empty output
+     *  PF_OPT_PUTCHAR_CONST = putchar/fputc with a constant char
+     *  PF_OPT_FWRITE        = fwrite (fprintf-family) or puts (printf-family, trailing \n)
+     *  PF_OPT_PUTCHAR_ARG   = putchar/fputc from %c vararg
+     *  PF_OPT_FPUTS_ARG     = fputs from %s vararg
+     *  PF_OPT_PUTS_ARG      = puts from %s\n vararg */
+    enum
+    {
+      PF_OPT_NONE = 0,
+      PF_OPT_NOP,
+      PF_OPT_PUTCHAR_CONST,
+      PF_OPT_FWRITE,
+      PF_OPT_PUTS_CHOPPED,
+      PF_OPT_PUTCHAR_ARG,
+      PF_OPT_FPUTS_ARG,
+      PF_OPT_PUTS_ARG
+    };
+    int opt_kind = PF_OPT_NONE;
+    int putchar_val = 0;
+    /* For fwrite: which SValue to write and its known length */
+    SValue *write_str_sv = NULL;
+    int write_len = 0;
+    /* For puts with trailing-\n chopped: the string to analyze */
+    const char *puts_src = NULL;
+    int puts_src_len = 0;
+
+    if (strchr(fmt, '%') == NULL)
+    {
+      /* No format specifiers — output is the format string itself */
+      if (fmt_len == 0)
+      {
+        opt_kind = PF_OPT_NOP;
+      }
+      else if (has_file)
+      {
+        opt_kind = PF_OPT_FWRITE;
+        write_str_sv = &saved_args[pf->fmt_idx];
+        write_len = fmt_len;
+      }
+      else if (fmt_len == 1)
+      {
+        opt_kind = PF_OPT_PUTCHAR_CONST;
+        putchar_val = (unsigned char)fmt[0];
+      }
+      else if (fmt[fmt_len - 1] == '\n')
+      {
+        opt_kind = PF_OPT_PUTS_CHOPPED;
+        puts_src = fmt;
+        puts_src_len = fmt_len;
+      }
+      /* else: multi-char without trailing \n to stdout → not optimized */
+    }
+    else if (strcmp(fmt, "%s") == 0 && has_varargs)
+    {
+      int slen = 0;
+      const char *sval = try_get_constant_string(&saved_args[pf->vararg_idx], &slen);
+      if (sval)
+      {
+        if (slen == 0)
+        {
+          opt_kind = PF_OPT_NOP;
+        }
+        else if (has_file)
+        {
+          opt_kind = PF_OPT_FWRITE;
+          write_str_sv = &saved_args[pf->vararg_idx];
+          write_len = slen;
+        }
+        else if (slen == 1)
+        {
+          opt_kind = PF_OPT_PUTCHAR_CONST;
+          putchar_val = (unsigned char)sval[0];
+        }
+        else if (sval[slen - 1] == '\n')
+        {
+          opt_kind = PF_OPT_PUTS_CHOPPED;
+          puts_src = sval;
+          puts_src_len = slen;
+        }
+      }
+      else if (has_file)
+      {
+        opt_kind = PF_OPT_FPUTS_ARG;
+      }
+      /* non-constant string to stdout → skip */
+    }
+    else if (strcmp(fmt, "%c") == 0 && has_varargs)
+    {
+      opt_kind = PF_OPT_PUTCHAR_ARG;
+    }
+    else if (!has_file && strcmp(fmt, "%s\n") == 0 && has_varargs)
+    {
+      opt_kind = PF_OPT_PUTS_ARG; /* puts appends \n automatically */
+    }
+
+    if (opt_kind != PF_OPT_NONE)
+    {
+      /* Remove FUNCPARAMVAL ops while preserving argument-evaluation IR.
+       * With forward args, arg-evaluation IR for args 1+ is interleaved
+       * with FUNCPARAMVALs.  A blanket rollback of next_instruction_index
+       * would also erase those definitions (e.g. LEA for &a[1]), leaving
+       * dangling vreg references.  Instead, NOP out only the FUNCPARAMVAL
+       * instructions for the original call. */
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            /* Only NOP FUNCPARAMVALs belonging to the original call_id,
+             * not those from nested calls (e.g., memcmp inside printf). */
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      if (opt_kind == PF_OPT_NOP)
+      {
+        /* Empty output — no call needed, result is 0 chars written. */
+        vpushi(0);
+        vtop[-1] = vtop[0];
+        --vtop;
+      }
+      else if (opt_kind == PF_OPT_PUTCHAR_CONST)
+      {
+        /* putchar(constant_char) or fputc(constant_char, f) */
+        SValue ch_sv;
+        svalue_init(&ch_sv);
+        ch_sv.r = VT_CONST;
+        ch_sv.c.i = putchar_val;
+        ch_sv.type.t = VT_INT;
+        ch_sv.vr = -1;
+
+        if (has_file)
+        {
+          SValue pf_args[2];
+          pf_args[0] = ch_sv;
+          pf_args[1] = saved_args[pf->file_idx];
+          gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputc"));
+        }
+        else
+        {
+          gen_ir_void_call_args(&ch_sv, 1, tok_alloc_const("putchar"));
+        }
+        vpushi(1);
+        vtop[-1] = vtop[0];
+        --vtop;
+      }
+      else if (opt_kind == PF_OPT_FWRITE)
+      {
+        /* fwrite(str, 1, len, f) — always goes to a FILE* */
+        SValue fw_args[4];
+        fw_args[0] = *write_str_sv;
+        svalue_init(&fw_args[1]);
+        fw_args[1].r = VT_CONST;
+        fw_args[1].c.i = 1;
+        fw_args[1].type.t = VT_INT;
+        fw_args[1].vr = -1;
+        svalue_init(&fw_args[2]);
+        fw_args[2].r = VT_CONST;
+        fw_args[2].c.i = write_len;
+        fw_args[2].type.t = VT_INT;
+        fw_args[2].vr = -1;
+        fw_args[3] = saved_args[pf->file_idx];
+        gen_ir_void_call_args(fw_args, 4, tok_alloc_const("fwrite"));
+        vpushi(write_len);
+        vtop[-1] = vtop[0];
+        --vtop;
+      }
+      else if (opt_kind == PF_OPT_PUTS_CHOPPED)
+      {
+        /* puts(string_without_trailing_newline)
+         * Create a new string constant in rodata with the trailing \n removed.
+         * Copy puts_src first because it may point into rodata_section->data
+         * and section_ptr_add can reallocate that buffer. */
+        int new_len = puts_src_len - 1;
+        char *puts_copy = tcc_malloc(new_len);
+        memcpy(puts_copy, puts_src, new_len);
+        addr_t new_off = rodata_section->data_offset;
+        char *new_ptr = section_ptr_add(rodata_section, new_len + 1);
+        memcpy(new_ptr, puts_copy, new_len);
+        tcc_free(puts_copy);
+        new_ptr[new_len] = '\0';
+
+        SValue new_str_sv;
+        svalue_init(&new_str_sv);
+        new_str_sv.type = char_pointer_type;
+        new_str_sv.r = VT_CONST | VT_SYM;
+        new_str_sv.sym = get_sym_ref(&char_type, rodata_section, new_off, new_len + 1);
+        new_str_sv.c.i = 0;
+        new_str_sv.vr = -1;
+
+        gen_ir_void_call_args(&new_str_sv, 1, tok_alloc_const("puts"));
+        vpushi(puts_src_len);
+        vtop[-1] = vtop[0];
+        --vtop;
+      }
+      else if (opt_kind == PF_OPT_PUTCHAR_ARG)
+      {
+        /* putchar(arg) or fputc(arg, f) — for "%c" format */
+        if (has_file)
+        {
+          SValue pf_args[2];
+          pf_args[0] = saved_args[pf->vararg_idx];
+          pf_args[1] = saved_args[pf->file_idx];
+          gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputc"));
+        }
+        else
+        {
+          gen_ir_void_call_args(&saved_args[pf->vararg_idx], 1, tok_alloc_const("putchar"));
+        }
+        vpushi(1);
+        vtop[-1] = vtop[0];
+        --vtop;
+      }
+      else if (opt_kind == PF_OPT_FPUTS_ARG)
+      {
+        /* fputs(arg, f) — for fprintf-family "%s" format. */
+        SValue pf_args[2];
+        pf_args[0] = saved_args[pf->vararg_idx];
+        pf_args[1] = saved_args[pf->file_idx];
+        gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputs"));
+        vpushi(0);
+        vtop[-1] = vtop[0];
+        --vtop;
+      }
+      else if (opt_kind == PF_OPT_PUTS_ARG)
+      {
+        /* puts(arg) — for "%s\n" format. puts() appends \n automatically. */
+        gen_ir_void_call_args(&saved_args[pf->vararg_idx], 1, tok_alloc_const("puts"));
+        vpushi(0);
+        vtop[-1] = vtop[0];
+        --vtop;
+      }
+      optimized = 1;
+    }
+  }
+  return optimized;
+}
+
+/* A call of a variadic inline function using __builtin_va_arg_pack(): its
+   clone with the variadic arguments as parameters becomes the callee (the
+   steps are at the call, in unary_funcall_body).  Out of line: the clone's
+   bookkeeping is cold, and unary_funcall_body is on the parser's recursive
+   path (arguments that are calls, inline expansions). */
+static __attribute__((noinline)) void funcall_va_pack_clone(Sym **pcall_func_sym, Sym **ps, Sym **psa)
+{
+  Sym *call_func_sym = *pcall_func_sym, *s = *ps, *sa = *psa;
+  {
+    /* Find the InlineFunc for this symbol */
+    struct InlineFunc *orig_fn = NULL;
+    for (int fi = 0; fi < tcc_state->nb_inline_fns; fi++)
+    {
+      if (tcc_state->inline_fns[fi]->sym == call_func_sym)
+      {
+        orig_fn = tcc_state->inline_fns[fi];
+        break;
+      }
+    }
+
+    if (orig_fn && orig_fn->func_str)
+    {
+      /* Count named params */
+      int n_named = 0;
+      Sym *param;
+      for (param = sym_first(call_func_sym->type.ref); param; param = param->next)
+        n_named++;
+
+      /* Save all argument tokens (everything until matching ')') */
+      TokenString *all_args = tok_str_alloc();
+      int paren_depth = 0;
+      while (tok != ')' || paren_depth > 0)
+      {
+        if (tok == '(')
+          paren_depth++;
+        else if (tok == ')')
+          paren_depth--;
+        if (tok == TOK_EOF)
+          tcc_error("unexpected end of file in function call");
+        tok_str_add_tok(all_args);
+        next();
+      }
+      tok_str_add(all_args, TOK_EOF);
+      /* tok is now ')' - don't consume it; file position is past ')' */
+
+      /* Find the variadic args: they follow the n_named-th comma at
+       * depth 0 (a compound literal's braces nest too). */
+      const int *ap = tok_str_buf(all_args);
+      TokenString *va_args = tok_str_alloc();
+
+      int arg_idx = 0;
+      int depth = 0;
+
+      if (n_named == 0)
+      {
+        /* All args are variadic, no fixed args */
+        const int *cp = tok_str_buf(all_args);
+        while (1)
+        {
+          int t;
+          CValue cv;
+          tok_get(&t, &cp, &cv);
+          if (t == TOK_EOF || t == 0)
+            break;
+          tok_str_add2(va_args, t, &cv);
+        }
+      }
+      else
+      {
+        while (1)
+        {
+          int t;
+          CValue cv;
+          tok_get(&t, &ap, &cv);
+
+          if (t == TOK_EOF || t == 0)
+            break;
+
+          if (t == '(' || t == '[' || t == '{')
+            depth++;
+          else if (t == ')' || t == ']' || t == '}')
+            depth--;
+
+          if (t == ',' && depth == 0)
+          {
+            arg_idx++;
+            if (arg_idx == n_named)
+            {
+              /* Everything after this comma is variadic args */
+              while (1)
+              {
+                tok_get(&t, &ap, &cv);
+                if (t == TOK_EOF || t == 0)
+                  break;
+                tok_str_add2(va_args, t, &cv);
+              }
+              break;
+            }
+          }
+        }
+      }
+
+      tok_str_add(va_args, TOK_EOF);
+
+      /* The variadic args' types, parsed without code in the caller's scope:
+       * each becomes a parameter of the clone. */
+      static int va_pack_clone_id = 0;
+      int clone_id = va_pack_clone_id++;
+      int nb_va = 0;
+      CType *va_types = NULL;
+      int *va_toks = NULL;
+      {
+        const int *vcheck = tok_str_buf(va_args);
+        int vt;
+        CValue vcv;
+        tok_get(&vt, &vcheck, &vcv);
+        if (vt != TOK_EOF && vt != 0)
+        {
+          TokenString *scan = tok_str_alloc();
+          const int *vp = tok_str_buf(va_args);
+          while (1)
+          {
+            tok_get(&vt, &vp, &vcv);
+            if (vt == TOK_EOF || vt == 0)
+              break;
+            tok_str_add2(scan, vt, &vcv);
+          }
+          tok_str_add(scan, TOK_EOF);
+          tok_str_add(scan, 0);
+          begin_macro(scan, 1);
+          next();
+          while (1)
+          {
+            CType ty;
+            char pname[64];
+            expr_type(&ty, expr_eq);
+            if (ty.t & VT_BITFIELD)
+              ty.t &= VT_BTYPE | VT_UNSIGNED;
+            ty.t &= ~(VT_STORAGE | VT_INLINE);
+            convert_parameter_type(&ty);
+            va_types = tcc_realloc(va_types, sizeof *va_types * (nb_va + 1));
+            va_toks = tcc_realloc(va_toks, sizeof *va_toks * (nb_va + 1));
+            va_types[nb_va] = ty;
+            snprintf(pname, sizeof pname, "__va_pack_%d_arg%d", clone_id, nb_va);
+            va_toks[nb_va] = tok_alloc(pname, strlen(pname))->tok;
+            nb_va++;
+            if (tok != ',')
+              break;
+            next();
+          }
+          if (tok != TOK_EOF)
+            expect(",");
+          end_macro();
+        }
+      }
+      int va_args_empty = nb_va == 0;
+
+      /* Create clone body: copy orig_fn->func_str, replacing
+       * __builtin_va_arg_pack ( ) with variadic arg tokens.
+       * When variadic args are empty, also remove the preceding comma. */
+      TokenString *clone_body = tok_str_alloc();
+      const int *bp = tok_str_buf(orig_fn->func_str);
+      int last_comma_len = -1; /* clone_body->len before last ',' was added */
+      int ident_ord = 0;       /* names so far, numbered as inline_body_free_names_unsafe walks them */
+      scoped_vector(int) spliced = {0};
+      while (1)
+      {
+        int t;
+        CValue cv;
+        tok_get(&t, &bp, &cv);
+        if (t == TOK_EOF || t == 0)
+          break;
+
+        if (t == TOK_builtin_va_arg_pack)
+        {
+          /* Skip the following '(' and ')' tokens */
+          int t2;
+          CValue cv2;
+          tok_get(&t2, &bp, &cv2); /* skip '(' */
+          tok_get(&t2, &bp, &cv2); /* skip ')' */
+
+          if (va_args_empty)
+          {
+            /* Remove preceding comma if present */
+            if (last_comma_len >= 0)
+              clone_body->len = last_comma_len;
+          }
+          else
+          {
+            /* Insert the clone's variadic parameters (its own names: the
+             * free-name walk skips them as spliced). */
+            vector_push_back(&spliced, ident_ord);
+            for (int vi = 0; vi < nb_va; vi++)
+            {
+              if (vi)
+                tok_str_add(clone_body, ',');
+              tok_str_add(clone_body, va_toks[vi]);
+              ident_ord++;
+            }
+            vector_push_back(&spliced, ident_ord);
+          }
+          last_comma_len = -1;
+          continue;
+        }
+
+        if (t == ',')
+          last_comma_len = clone_body->len;
+        else
+          last_comma_len = -1;
+
+        ident_ord += t >= TOK_UIDENT;
+        tok_str_add2(clone_body, t, &cv);
+      }
+      tok_str_add(clone_body, TOK_EOF);
+
+      /* Create a unique symbol for the clone */
+      char *clone_name = tcc_malloc(256);
+      snprintf(clone_name, 256, "__va_pack_%s_%d", get_tok_str(call_func_sym->v, NULL), clone_id);
+      int clone_tok_id = tok_alloc(clone_name, strlen(clone_name))->tok;
+      tcc_free(clone_name);
+
+      /* Create clone function type: same as original but non-variadic */
+      CType clone_type;
+      clone_type = call_func_sym->type;
+
+      /* Create a new type ref with FUNC_NEW (non-variadic) */
+      Sym *orig_ref = call_func_sym->type.ref;
+      Sym *clone_ref = sym_push2(&global_stack, SYM_FIELD, orig_ref->type.t, 0);
+      clone_ref->type = orig_ref->type;
+      clone_ref->f = orig_ref->f;
+      clone_ref->f.func_type = FUNC_NEW; /* non-variadic */
+      clone_ref->f.func_va_arg_pack = 0;
+
+      /* Copy named parameters */
+      Sym **pparam = &clone_ref->next;
+      for (param = sym_first(orig_ref); param; param = param->next)
+      {
+        Sym *new_param = sym_push2(&global_stack, param->v, param->type.t, param->c);
+        new_param->type = param->type;
+        *pparam = new_param;
+        pparam = &new_param->next;
+      }
+      for (int vi = 0; vi < nb_va; vi++)
+      {
+        int align;
+        Sym *new_param = sym_push2(&global_stack, va_toks[vi] | SYM_FIELD, va_types[vi].t, 0);
+        new_param->type = va_types[vi];
+        *pparam = new_param;
+        pparam = &new_param->next;
+        clone_ref->f.func_args += (type_size(&va_types[vi], &align) + PTR_SIZE - 1) / PTR_SIZE;
+      }
+      *pparam = NULL;
+      tcc_free(va_types);
+      tcc_free(va_toks);
+
+      clone_type.ref = clone_ref;
+      clone_type.t &= ~VT_EXTERN;
+      clone_type.t |= VT_STATIC;
+
+      /* Create clone symbol */
+      AttributeDef clone_ad;
+      memset(&clone_ad, 0, sizeof(clone_ad));
+      Sym *clone_sym = external_sym(clone_tok_id, &clone_type, 0, &clone_ad);
+      clone_sym->type.t |= VT_INLINE;
+
+      /* Register clone as inline function */
+      struct InlineFunc *clone_fn;
+      clone_fn = tcc_mallocz(sizeof *clone_fn);
+      clone_fn->filename = orig_fn->filename;
+      clone_fn->sym = clone_sym;
+      clone_fn->func_str = clone_body;
+      /* the caller's arguments bind at the call site: [count, start, end, ...] */
+      int *sp = inline_func_rare(clone_fn)->spliced = tcc_malloc(sizeof(int) * (spliced.size + 1));
+      sp[0] = (int)spliced.size / 2;
+      if (spliced.size)
+        memcpy(sp + 1, spliced.data, sizeof(int) * spliced.size);
+      /* the clone replays the original's body: same #pragma pack state */
+      if (orig_fn->pack)
+      {
+        size_t pack_size = sizeof(int) * (orig_fn->pack[0] + 2);
+        clone_fn->pack = tcc_malloc(pack_size);
+        memcpy(clone_fn->pack, orig_fn->pack, pack_size);
+      }
+      dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, clone_fn);
+
+      /* Mark the clone as used so gen_inline_functions compiles it */
+      if (!clone_sym->c)
+        put_extern_sym(clone_sym, cur_text_section ? cur_text_section : text_section, 0, 0);
+
+      /* Switch call target: replace vtop (function pointer) with clone */
+      vtop->type = clone_type;
+      vtop->sym = clone_sym;
+      vtop->r = VT_CONST | VT_SYM;
+      vtop->c.i = 0;
+
+      /* Update s (callee type ref) for argument parsing */
+      s = clone_ref;
+      sa = sym_first(s);
+      call_func_sym = clone_sym;
+
+      /* Replay all the args + ')' via macro so normal call parsing handles
+       * them, the variadic ones as the clone's extra parameters.  When the
+       * macro ends (0 marker), next() restores file-level reading at the
+       * position just past the original ')'. */
+      TokenString *replay_args = tok_str_alloc();
+      const int *rp = tok_str_buf(all_args);
+      while (1)
+      {
+        int t;
+        CValue cv;
+        tok_get(&t, &rp, &cv);
+        if (t == TOK_EOF || t == 0)
+          break;
+        tok_str_add2(replay_args, t, &cv);
+      }
+      tok_str_add(replay_args, ')');
+      tok_str_add(replay_args, 0);
+      begin_macro(replay_args, 1);
+      next(); /* prime first token from replay_args */
+
+      tok_str_free(all_args);
+      tok_str_free(va_args);
+    }
+  }
+  *pcall_func_sym = call_func_sym;
+  *ps = s;
+  *psa = sa;
+}
+
+/* The argument checks of a call (-Wformat, -Wsizeof-pointer-memaccess): on
+   the heap and only for a callee they apply to.  unary_funcall_body's frame
+   is on the parser's recursive path twice -- arguments that are calls, and
+   inline expansions, which replay a body inside it -- and the two states
+   (168 bytes on the device) were live across both. */
+typedef struct CallArgChecks
+{
+  FmtCheck fc;
+  FeMemAccess ma;
+} CallArgChecks;
+
+static __attribute__((noinline)) CallArgChecks *call_arg_checks_begin(Sym *fsym, Sym *memsym)
+{
+  CallArgChecks ck, *p;
+  attr_format_begin(&ck.fc, fsym);
+  fe_memaccess_begin(&ck.ma, memsym);
+  if (!(ck.fc.state | ck.fc.fa_idx | ck.fc.kind) && !ck.ma.fn)
+    return NULL;
+  p = tcc_malloc(sizeof *p);
+  *p = ck;
+  return p;
+}
+
+/* argument NB_ARGS of a call whose sizeof-memaccess check is on */
+static __attribute__((noinline)) void call_arg_memaccess(CallArgChecks *ck, int nb_args)
+{
+  const int started_sizeof = tok == TOK_SIZEOF, seq0 = fe_sizeof_seq;
+  FeSpan arg_span = {0, 0};
+  if (fe_tokfp_on)
+    fe_span_begin(&arg_span);
+  expr_eq();
+  if (fe_tokfp_on)
+    fe_span_end(&arg_span);
+  fe_memaccess_arg(&ck->ma, nb_args, started_sizeof, seq0, &arg_span);
+}
+
+static __attribute__((noinline)) void call_arg_checks_end(CallArgChecks *ck, int nb_args)
+{
+  if (ck->fc.kind | ck->fc.fa_idx)
+    attr_format_end(&ck->fc, nb_args);
+  if (ck->ma.fn)
+    fe_memaccess_end(&ck->ma);
+  tcc_free(ck);
+}
+
 static void unary_funcall_body(void)
 {
   int n, t, r, size, align;
@@ -1017,83 +1693,10 @@ static void unary_funcall_body(void)
    * We recognize standard (printf, fprintf), unlocked stdio variants,
    * v-variants (vprintf, vfprintf), and fortified (_chk) variants.
    * For each, we track the index of key arguments in saved_args[].
-   * For v-variants, varargs are in a va_list (opaque), so pf_vararg_idx is
+   * For v-variants, varargs are in a va_list (opaque), so its vararg_idx is
    * set past the arg count to prevent %s/%c optimization — only constant
    * format strings without specifiers can be optimized. */
-  int can_optimize_printf_family = 0;
-  int pf_fmt_idx = -1;    /* index of the format string in saved_args[] */
-  int pf_file_idx = -1;   /* index of FILE* arg, or -1 for stdout */
-  int pf_vararg_idx = -1; /* index of first vararg in saved_args[], or high value for va_list fns */
-  int pf_min_args = 0;    /* minimum number of args for a valid call */
-  if (func_name && TCC_OPT(tcc_state, optimize) > 0)
-  {
-    /* --- printf family (stdout, variadic) --- */
-    if (strcmp(func_name, "printf") == 0 || strcmp(func_name, "printf_unlocked") == 0 ||
-        strcmp(func_name, "__builtin_printf") == 0 || strcmp(func_name, "__builtin_printf_unlocked") == 0)
-    {
-      can_optimize_printf_family = 1;
-      pf_fmt_idx = 0;
-      pf_vararg_idx = 1;
-      pf_min_args = 1;
-    }
-    else if (strcmp(func_name, "__printf_chk") == 0)
-    {
-      can_optimize_printf_family = 1;
-      pf_fmt_idx = 1; /* [0]=flag */
-      pf_vararg_idx = 2;
-      pf_min_args = 2;
-    }
-    /* --- fprintf family (FILE*, variadic) --- */
-    else if (strcmp(func_name, "fprintf") == 0 || strcmp(func_name, "fprintf_unlocked") == 0 ||
-             strcmp(func_name, "__builtin_fprintf_unlocked") == 0)
-    {
-      can_optimize_printf_family = 1;
-      pf_file_idx = 0;
-      pf_fmt_idx = 1;
-      pf_vararg_idx = 2;
-      pf_min_args = 2;
-    }
-    else if (strcmp(func_name, "__fprintf_chk") == 0)
-    {
-      can_optimize_printf_family = 1;
-      pf_file_idx = 0;
-      pf_fmt_idx = 2; /* [1]=flag */
-      pf_vararg_idx = 3;
-      pf_min_args = 3;
-    }
-    /* --- vprintf family (stdout, va_list — no vararg access) --- */
-    else if (strcmp(func_name, "vprintf") == 0)
-    {
-      can_optimize_printf_family = 1;
-      pf_fmt_idx = 0;
-      pf_vararg_idx = 99; /* va_list: varargs inaccessible */
-      pf_min_args = 2;    /* fmt + va_list */
-    }
-    else if (strcmp(func_name, "__vprintf_chk") == 0)
-    {
-      can_optimize_printf_family = 1;
-      pf_fmt_idx = 1; /* [0]=flag */
-      pf_vararg_idx = 99;
-      pf_min_args = 3; /* flag + fmt + va_list */
-    }
-    /* --- vfprintf family (FILE*, va_list — no vararg access) --- */
-    else if (strcmp(func_name, "vfprintf") == 0)
-    {
-      can_optimize_printf_family = 1;
-      pf_file_idx = 0;
-      pf_fmt_idx = 1;
-      pf_vararg_idx = 99;
-      pf_min_args = 3; /* file + fmt + va_list */
-    }
-    else if (strcmp(func_name, "__vfprintf_chk") == 0)
-    {
-      can_optimize_printf_family = 1;
-      pf_file_idx = 0;
-      pf_fmt_idx = 2; /* [1]=flag */
-      pf_vararg_idx = 99;
-      pf_min_args = 4; /* file + flag + fmt + va_list */
-    }
-  }
+  const PrintfFamily *pf = func_name && TCC_OPT(tcc_state, optimize) > 0 ? printf_family_lookup(func_name) : NULL;
 
   /* Save IR instruction index before argument emission.
    * If constant folding succeeds we roll back to discard orphaned
@@ -1124,332 +1727,13 @@ static void unary_funcall_body(void)
    */
   if (call_func_sym && call_func_sym->type.ref && call_func_sym->type.ref->f.func_va_arg_pack &&
       (call_func_sym->type.t & VT_INLINE) && !tcc_state->check_only && !nocode_wanted)
-  {
-    /* Find the InlineFunc for this symbol */
-    struct InlineFunc *orig_fn = NULL;
-    for (int fi = 0; fi < tcc_state->nb_inline_fns; fi++)
-    {
-      if (tcc_state->inline_fns[fi]->sym == call_func_sym)
-      {
-        orig_fn = tcc_state->inline_fns[fi];
-        break;
-      }
-    }
-
-    if (orig_fn && orig_fn->func_str)
-    {
-      /* Count named params */
-      int n_named = 0;
-      Sym *param;
-      for (param = sym_first(call_func_sym->type.ref); param; param = param->next)
-        n_named++;
-
-      /* Save all argument tokens (everything until matching ')') */
-      TokenString *all_args = tok_str_alloc();
-      int paren_depth = 0;
-      while (tok != ')' || paren_depth > 0)
-      {
-        if (tok == '(')
-          paren_depth++;
-        else if (tok == ')')
-          paren_depth--;
-        if (tok == TOK_EOF)
-          tcc_error("unexpected end of file in function call");
-        tok_str_add_tok(all_args);
-        next();
-      }
-      tok_str_add(all_args, TOK_EOF);
-      /* tok is now ')' - don't consume it; file position is past ')' */
-
-      /* Find the variadic args: they follow the n_named-th comma at
-       * depth 0 (a compound literal's braces nest too). */
-      const int *ap = tok_str_buf(all_args);
-      TokenString *va_args = tok_str_alloc();
-
-      int arg_idx = 0;
-      int depth = 0;
-
-      if (n_named == 0)
-      {
-        /* All args are variadic, no fixed args */
-        const int *cp = tok_str_buf(all_args);
-        while (1)
-        {
-          int t;
-          CValue cv;
-          tok_get(&t, &cp, &cv);
-          if (t == TOK_EOF || t == 0)
-            break;
-          tok_str_add2(va_args, t, &cv);
-        }
-      }
-      else
-      {
-        while (1)
-        {
-          int t;
-          CValue cv;
-          tok_get(&t, &ap, &cv);
-
-          if (t == TOK_EOF || t == 0)
-            break;
-
-          if (t == '(' || t == '[' || t == '{')
-            depth++;
-          else if (t == ')' || t == ']' || t == '}')
-            depth--;
-
-          if (t == ',' && depth == 0)
-          {
-            arg_idx++;
-            if (arg_idx == n_named)
-            {
-              /* Everything after this comma is variadic args */
-              while (1)
-              {
-                tok_get(&t, &ap, &cv);
-                if (t == TOK_EOF || t == 0)
-                  break;
-                tok_str_add2(va_args, t, &cv);
-              }
-              break;
-            }
-          }
-        }
-      }
-
-      tok_str_add(va_args, TOK_EOF);
-
-      /* The variadic args' types, parsed without code in the caller's scope:
-       * each becomes a parameter of the clone. */
-      static int va_pack_clone_id = 0;
-      int clone_id = va_pack_clone_id++;
-      int nb_va = 0;
-      CType *va_types = NULL;
-      int *va_toks = NULL;
-      {
-        const int *vcheck = tok_str_buf(va_args);
-        int vt;
-        CValue vcv;
-        tok_get(&vt, &vcheck, &vcv);
-        if (vt != TOK_EOF && vt != 0)
-        {
-          TokenString *scan = tok_str_alloc();
-          const int *vp = tok_str_buf(va_args);
-          while (1)
-          {
-            tok_get(&vt, &vp, &vcv);
-            if (vt == TOK_EOF || vt == 0)
-              break;
-            tok_str_add2(scan, vt, &vcv);
-          }
-          tok_str_add(scan, TOK_EOF);
-          tok_str_add(scan, 0);
-          begin_macro(scan, 1);
-          next();
-          while (1)
-          {
-            CType ty;
-            char pname[64];
-            expr_type(&ty, expr_eq);
-            if (ty.t & VT_BITFIELD)
-              ty.t &= VT_BTYPE | VT_UNSIGNED;
-            ty.t &= ~(VT_STORAGE | VT_INLINE);
-            convert_parameter_type(&ty);
-            va_types = tcc_realloc(va_types, sizeof *va_types * (nb_va + 1));
-            va_toks = tcc_realloc(va_toks, sizeof *va_toks * (nb_va + 1));
-            va_types[nb_va] = ty;
-            snprintf(pname, sizeof pname, "__va_pack_%d_arg%d", clone_id, nb_va);
-            va_toks[nb_va] = tok_alloc(pname, strlen(pname))->tok;
-            nb_va++;
-            if (tok != ',')
-              break;
-            next();
-          }
-          if (tok != TOK_EOF)
-            expect(",");
-          end_macro();
-        }
-      }
-      int va_args_empty = nb_va == 0;
-
-      /* Create clone body: copy orig_fn->func_str, replacing
-       * __builtin_va_arg_pack ( ) with variadic arg tokens.
-       * When variadic args are empty, also remove the preceding comma. */
-      TokenString *clone_body = tok_str_alloc();
-      const int *bp = tok_str_buf(orig_fn->func_str);
-      int last_comma_len = -1; /* clone_body->len before last ',' was added */
-      int ident_ord = 0;       /* names so far, numbered as inline_body_free_names_unsafe walks them */
-      scoped_vector(int) spliced = {0};
-      while (1)
-      {
-        int t;
-        CValue cv;
-        tok_get(&t, &bp, &cv);
-        if (t == TOK_EOF || t == 0)
-          break;
-
-        if (t == TOK_builtin_va_arg_pack)
-        {
-          /* Skip the following '(' and ')' tokens */
-          int t2;
-          CValue cv2;
-          tok_get(&t2, &bp, &cv2); /* skip '(' */
-          tok_get(&t2, &bp, &cv2); /* skip ')' */
-
-          if (va_args_empty)
-          {
-            /* Remove preceding comma if present */
-            if (last_comma_len >= 0)
-              clone_body->len = last_comma_len;
-          }
-          else
-          {
-            /* Insert the clone's variadic parameters (its own names: the
-             * free-name walk skips them as spliced). */
-            vector_push_back(&spliced, ident_ord);
-            for (int vi = 0; vi < nb_va; vi++)
-            {
-              if (vi)
-                tok_str_add(clone_body, ',');
-              tok_str_add(clone_body, va_toks[vi]);
-              ident_ord++;
-            }
-            vector_push_back(&spliced, ident_ord);
-          }
-          last_comma_len = -1;
-          continue;
-        }
-
-        if (t == ',')
-          last_comma_len = clone_body->len;
-        else
-          last_comma_len = -1;
-
-        ident_ord += t >= TOK_UIDENT;
-        tok_str_add2(clone_body, t, &cv);
-      }
-      tok_str_add(clone_body, TOK_EOF);
-
-      /* Create a unique symbol for the clone */
-      char *clone_name = tcc_malloc(256);
-      snprintf(clone_name, 256, "__va_pack_%s_%d", get_tok_str(call_func_sym->v, NULL), clone_id);
-      int clone_tok_id = tok_alloc(clone_name, strlen(clone_name))->tok;
-      tcc_free(clone_name);
-
-      /* Create clone function type: same as original but non-variadic */
-      CType clone_type;
-      clone_type = call_func_sym->type;
-
-      /* Create a new type ref with FUNC_NEW (non-variadic) */
-      Sym *orig_ref = call_func_sym->type.ref;
-      Sym *clone_ref = sym_push2(&global_stack, SYM_FIELD, orig_ref->type.t, 0);
-      clone_ref->type = orig_ref->type;
-      clone_ref->f = orig_ref->f;
-      clone_ref->f.func_type = FUNC_NEW; /* non-variadic */
-      clone_ref->f.func_va_arg_pack = 0;
-
-      /* Copy named parameters */
-      Sym **pparam = &clone_ref->next;
-      for (param = sym_first(orig_ref); param; param = param->next)
-      {
-        Sym *new_param = sym_push2(&global_stack, param->v, param->type.t, param->c);
-        new_param->type = param->type;
-        *pparam = new_param;
-        pparam = &new_param->next;
-      }
-      for (int vi = 0; vi < nb_va; vi++)
-      {
-        int align;
-        Sym *new_param = sym_push2(&global_stack, va_toks[vi] | SYM_FIELD, va_types[vi].t, 0);
-        new_param->type = va_types[vi];
-        *pparam = new_param;
-        pparam = &new_param->next;
-        clone_ref->f.func_args += (type_size(&va_types[vi], &align) + PTR_SIZE - 1) / PTR_SIZE;
-      }
-      *pparam = NULL;
-      tcc_free(va_types);
-      tcc_free(va_toks);
-
-      clone_type.ref = clone_ref;
-      clone_type.t &= ~VT_EXTERN;
-      clone_type.t |= VT_STATIC;
-
-      /* Create clone symbol */
-      AttributeDef clone_ad;
-      memset(&clone_ad, 0, sizeof(clone_ad));
-      Sym *clone_sym = external_sym(clone_tok_id, &clone_type, 0, &clone_ad);
-      clone_sym->type.t |= VT_INLINE;
-
-      /* Register clone as inline function */
-      struct InlineFunc *clone_fn;
-      clone_fn = tcc_mallocz(sizeof *clone_fn);
-      clone_fn->filename = orig_fn->filename;
-      clone_fn->sym = clone_sym;
-      clone_fn->func_str = clone_body;
-      /* the caller's arguments bind at the call site: [count, start, end, ...] */
-      int *sp = inline_func_rare(clone_fn)->spliced = tcc_malloc(sizeof(int) * (spliced.size + 1));
-      sp[0] = (int)spliced.size / 2;
-      if (spliced.size)
-        memcpy(sp + 1, spliced.data, sizeof(int) * spliced.size);
-      /* the clone replays the original's body: same #pragma pack state */
-      if (orig_fn->pack)
-      {
-        size_t pack_size = sizeof(int) * (orig_fn->pack[0] + 2);
-        clone_fn->pack = tcc_malloc(pack_size);
-        memcpy(clone_fn->pack, orig_fn->pack, pack_size);
-      }
-      dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, clone_fn);
-
-      /* Mark the clone as used so gen_inline_functions compiles it */
-      if (!clone_sym->c)
-        put_extern_sym(clone_sym, cur_text_section ? cur_text_section : text_section, 0, 0);
-
-      /* Switch call target: replace vtop (function pointer) with clone */
-      vtop->type = clone_type;
-      vtop->sym = clone_sym;
-      vtop->r = VT_CONST | VT_SYM;
-      vtop->c.i = 0;
-
-      /* Update s (callee type ref) for argument parsing */
-      s = clone_ref;
-      sa = sym_first(s);
-      call_func_sym = clone_sym;
-
-      /* Replay all the args + ')' via macro so normal call parsing handles
-       * them, the variadic ones as the clone's extra parameters.  When the
-       * macro ends (0 marker), next() restores file-level reading at the
-       * position just past the original ')'. */
-      TokenString *replay_args = tok_str_alloc();
-      const int *rp = tok_str_buf(all_args);
-      while (1)
-      {
-        int t;
-        CValue cv;
-        tok_get(&t, &rp, &cv);
-        if (t == TOK_EOF || t == 0)
-          break;
-        tok_str_add2(replay_args, t, &cv);
-      }
-      tok_str_add(replay_args, ')');
-      tok_str_add(replay_args, 0);
-      begin_macro(replay_args, 1);
-      next(); /* prime first token from replay_args */
-
-      tok_str_free(all_args);
-      tok_str_free(va_args);
-    }
-  }
+    funcall_va_pack_clone(&call_func_sym, &s, &sa);
 
   /* -Wformat: format(printf|scanf) checks the arguments as they come */
-  FmtCheck fc;
-  attr_format_begin(&fc, call_func_sym);
   p = NULL;
-  FeMemAccess memaccess;
-  fe_memaccess_begin(&memaccess, call_func_sym &&
-                                         (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM)
-                                     ? call_func_sym
-                                     : NULL);
+  CallArgChecks *ck = call_arg_checks_begin(
+      call_func_sym,
+      call_func_sym && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM) ? call_func_sym : NULL);
   if (tok != ')' || self_pending)
   {
     r = tcc_state->reverse_funcargs;
@@ -1467,31 +1751,22 @@ static void unary_funcall_body(void)
       {
         /* IR expects 0-based parameter indices.
          * Keep FUNCPARAMVAL numbering consistent across all call sites. */
-        if (fc.state | fc.fa_idx)
-          attr_format_before(&fc, nb_args);
+        if (ck && (ck->fc.state | ck->fc.fa_idx))
+          attr_format_before(&ck->fc, nb_args);
         if (oc)
           objsize_call_arg_before(oc, nb_args);
         if (self_pending)
           vpushv(&funcall_self_arg);
-        else if (memaccess.fn)
-        {
-          const int started_sizeof = tok == TOK_SIZEOF, seq0 = fe_sizeof_seq;
-          FeSpan arg_span = {0, 0};
-          if (fe_tokfp_on)
-            fe_span_begin(&arg_span);
-          expr_eq();
-          if (fe_tokfp_on)
-            fe_span_end(&arg_span);
-          fe_memaccess_arg(&memaccess, nb_args, started_sizeof, seq0, &arg_span);
-        }
+        else if (ck && ck->ma.fn)
+          call_arg_memaccess(ck, nb_args);
         else
           expr_eq();
         if (yasc_pp_live)
           yasc_pp_arg(vtop, call_func_sym, sa, nb_args); /* plain_param.c */
         if (oc)
           objsize_call_arg(oc, nb_args);
-        if (fc.state | fc.fa_idx)
-          attr_format_arg(&fc, nb_args);
+        if (ck && (ck->fc.state | ck->fc.fa_idx))
+          attr_format_arg(&ck->fc, nb_args);
         /* Materialize comparisons before applying the parameter conversion. */
         if (!NOEVAL_WANTED)
           tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
@@ -1503,7 +1778,7 @@ static void unary_funcall_body(void)
         /* Save argument for potential constant folding or inline evaluation.
          * This must happen BEFORE the double-complex materialization below,
          * which converts VT_CONST to VT_LOCAL. */
-        if ((can_try_fold || can_inline_builtin || can_inline_eval || can_optimize_printf_family ||
+        if ((can_try_fold || can_inline_builtin || can_inline_eval || pf ||
              can_optimize_string_builtin || can_optimize_fputs_family) &&
             saved_arg_count < saved_args_cap && !NOEVAL_WANTED)
         {
@@ -1609,10 +1884,8 @@ static void unary_funcall_body(void)
   }
   if (sa && s->f.func_type != FUNC_OLD)
     tcc_error("too few arguments to function");
-  if (fc.kind | fc.fa_idx)
-    attr_format_end(&fc, nb_args);
-  if (memaccess.fn)
-    fe_memaccess_end(&memaccess);
+  if (ck)
+    call_arg_checks_end(ck, nb_args);
   if (oc)
     objsize_call_args_end(oc);
 
@@ -1634,7 +1907,7 @@ static void unary_funcall_body(void)
 
       /* Save argument for potential constant folding or inline evaluation (in reverse order for reverse_funcargs)
        */
-      if ((can_try_fold || can_inline_builtin || can_inline_eval || can_optimize_printf_family ||
+      if ((can_try_fold || can_inline_builtin || can_inline_eval || pf ||
            can_optimize_string_builtin) && n < saved_args_cap &&
           (nb_args - 1 - n) < saved_args_cap && !NOEVAL_WANTED)
       {
@@ -1822,263 +2095,10 @@ static void unary_funcall_body(void)
    * Also handles __printf_chk/__fprintf_chk (extra flag argument).
    * Only optimize when the call is a whole expression statement. */
   int printf_family_optimized = 0;
-  if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && can_optimize_printf_family &&
-      saved_arg_count == nb_real_args && nb_args >= pf_min_args && !nocode_wanted && call_result_discarded())
-  {
-    int fmt_len = 0;
-    const char *fmt = try_get_constant_string(&saved_args[pf_fmt_idx], &fmt_len);
-    if (fmt)
-    {
-      int has_file = (pf_file_idx >= 0); /* fprintf-family vs printf-family */
-      int has_varargs = (nb_args > pf_vararg_idx);
-
-      /* Classify the format pattern:
-       *  PF_OPT_NOP           = empty output
-       *  PF_OPT_PUTCHAR_CONST = putchar/fputc with a constant char
-       *  PF_OPT_FWRITE        = fwrite (fprintf-family) or puts (printf-family, trailing \n)
-       *  PF_OPT_PUTCHAR_ARG   = putchar/fputc from %c vararg
-       *  PF_OPT_FPUTS_ARG     = fputs from %s vararg
-       *  PF_OPT_PUTS_ARG      = puts from %s\n vararg */
-      enum
-      {
-        PF_OPT_NONE = 0,
-        PF_OPT_NOP,
-        PF_OPT_PUTCHAR_CONST,
-        PF_OPT_FWRITE,
-        PF_OPT_PUTS_CHOPPED,
-        PF_OPT_PUTCHAR_ARG,
-        PF_OPT_FPUTS_ARG,
-        PF_OPT_PUTS_ARG
-      };
-      int opt_kind = PF_OPT_NONE;
-      int putchar_val = 0;
-      /* For fwrite: which SValue to write and its known length */
-      SValue *write_str_sv = NULL;
-      int write_len = 0;
-      /* For puts with trailing-\n chopped: the string to analyze */
-      const char *puts_src = NULL;
-      int puts_src_len = 0;
-
-      if (strchr(fmt, '%') == NULL)
-      {
-        /* No format specifiers — output is the format string itself */
-        if (fmt_len == 0)
-        {
-          opt_kind = PF_OPT_NOP;
-        }
-        else if (has_file)
-        {
-          opt_kind = PF_OPT_FWRITE;
-          write_str_sv = &saved_args[pf_fmt_idx];
-          write_len = fmt_len;
-        }
-        else if (fmt_len == 1)
-        {
-          opt_kind = PF_OPT_PUTCHAR_CONST;
-          putchar_val = (unsigned char)fmt[0];
-        }
-        else if (fmt[fmt_len - 1] == '\n')
-        {
-          opt_kind = PF_OPT_PUTS_CHOPPED;
-          puts_src = fmt;
-          puts_src_len = fmt_len;
-        }
-        /* else: multi-char without trailing \n to stdout → not optimized */
-      }
-      else if (strcmp(fmt, "%s") == 0 && has_varargs)
-      {
-        int slen = 0;
-        const char *sval = try_get_constant_string(&saved_args[pf_vararg_idx], &slen);
-        if (sval)
-        {
-          if (slen == 0)
-          {
-            opt_kind = PF_OPT_NOP;
-          }
-          else if (has_file)
-          {
-            opt_kind = PF_OPT_FWRITE;
-            write_str_sv = &saved_args[pf_vararg_idx];
-            write_len = slen;
-          }
-          else if (slen == 1)
-          {
-            opt_kind = PF_OPT_PUTCHAR_CONST;
-            putchar_val = (unsigned char)sval[0];
-          }
-          else if (sval[slen - 1] == '\n')
-          {
-            opt_kind = PF_OPT_PUTS_CHOPPED;
-            puts_src = sval;
-            puts_src_len = slen;
-          }
-        }
-        else if (has_file)
-        {
-          opt_kind = PF_OPT_FPUTS_ARG;
-        }
-        /* non-constant string to stdout → skip */
-      }
-      else if (strcmp(fmt, "%c") == 0 && has_varargs)
-      {
-        opt_kind = PF_OPT_PUTCHAR_ARG;
-      }
-      else if (!has_file && strcmp(fmt, "%s\n") == 0 && has_varargs)
-      {
-        opt_kind = PF_OPT_PUTS_ARG; /* puts appends \n automatically */
-      }
-
-      if (opt_kind != PF_OPT_NONE)
-      {
-        /* Remove FUNCPARAMVAL ops while preserving argument-evaluation IR.
-         * With forward args, arg-evaluation IR for args 1+ is interleaved
-         * with FUNCPARAMVALs.  A blanket rollback of next_instruction_index
-         * would also erase those definitions (e.g. LEA for &a[1]), leaving
-         * dangling vreg references.  Instead, NOP out only the FUNCPARAMVAL
-         * instructions for the original call. */
-        if (ir_idx_before_first_param >= 0)
-        {
-          int current_end = tcc_state->ir->next_instruction_index;
-          for (int i = ir_idx_before_first_param; i < current_end; i++)
-          {
-            if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-            {
-              /* Only NOP FUNCPARAMVALs belonging to the original call_id,
-               * not those from nested calls (e.g., memcmp inside printf). */
-              IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-              int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-              if (encoded_call_id == call_id)
-                tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-            }
-          }
-        }
-        else
-        {
-          tcc_state->ir->next_instruction_index = ir_idx_before_args;
-        }
-
-        if (opt_kind == PF_OPT_NOP)
-        {
-          /* Empty output — no call needed, result is 0 chars written. */
-          vpushi(0);
-          vtop[-1] = vtop[0];
-          --vtop;
-        }
-        else if (opt_kind == PF_OPT_PUTCHAR_CONST)
-        {
-          /* putchar(constant_char) or fputc(constant_char, f) */
-          SValue ch_sv;
-          svalue_init(&ch_sv);
-          ch_sv.r = VT_CONST;
-          ch_sv.c.i = putchar_val;
-          ch_sv.type.t = VT_INT;
-          ch_sv.vr = -1;
-
-          if (has_file)
-          {
-            SValue pf_args[2];
-            pf_args[0] = ch_sv;
-            pf_args[1] = saved_args[pf_file_idx];
-            gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputc"));
-          }
-          else
-          {
-            gen_ir_void_call_args(&ch_sv, 1, tok_alloc_const("putchar"));
-          }
-          vpushi(1);
-          vtop[-1] = vtop[0];
-          --vtop;
-        }
-        else if (opt_kind == PF_OPT_FWRITE)
-        {
-          /* fwrite(str, 1, len, f) — always goes to a FILE* */
-          SValue fw_args[4];
-          fw_args[0] = *write_str_sv;
-          svalue_init(&fw_args[1]);
-          fw_args[1].r = VT_CONST;
-          fw_args[1].c.i = 1;
-          fw_args[1].type.t = VT_INT;
-          fw_args[1].vr = -1;
-          svalue_init(&fw_args[2]);
-          fw_args[2].r = VT_CONST;
-          fw_args[2].c.i = write_len;
-          fw_args[2].type.t = VT_INT;
-          fw_args[2].vr = -1;
-          fw_args[3] = saved_args[pf_file_idx];
-          gen_ir_void_call_args(fw_args, 4, tok_alloc_const("fwrite"));
-          vpushi(write_len);
-          vtop[-1] = vtop[0];
-          --vtop;
-        }
-        else if (opt_kind == PF_OPT_PUTS_CHOPPED)
-        {
-          /* puts(string_without_trailing_newline)
-           * Create a new string constant in rodata with the trailing \n removed.
-           * Copy puts_src first because it may point into rodata_section->data
-           * and section_ptr_add can reallocate that buffer. */
-          int new_len = puts_src_len - 1;
-          char *puts_copy = tcc_malloc(new_len);
-          memcpy(puts_copy, puts_src, new_len);
-          addr_t new_off = rodata_section->data_offset;
-          char *new_ptr = section_ptr_add(rodata_section, new_len + 1);
-          memcpy(new_ptr, puts_copy, new_len);
-          tcc_free(puts_copy);
-          new_ptr[new_len] = '\0';
-
-          SValue new_str_sv;
-          svalue_init(&new_str_sv);
-          new_str_sv.type = char_pointer_type;
-          new_str_sv.r = VT_CONST | VT_SYM;
-          new_str_sv.sym = get_sym_ref(&char_type, rodata_section, new_off, new_len + 1);
-          new_str_sv.c.i = 0;
-          new_str_sv.vr = -1;
-
-          gen_ir_void_call_args(&new_str_sv, 1, tok_alloc_const("puts"));
-          vpushi(puts_src_len);
-          vtop[-1] = vtop[0];
-          --vtop;
-        }
-        else if (opt_kind == PF_OPT_PUTCHAR_ARG)
-        {
-          /* putchar(arg) or fputc(arg, f) — for "%c" format */
-          if (has_file)
-          {
-            SValue pf_args[2];
-            pf_args[0] = saved_args[pf_vararg_idx];
-            pf_args[1] = saved_args[pf_file_idx];
-            gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputc"));
-          }
-          else
-          {
-            gen_ir_void_call_args(&saved_args[pf_vararg_idx], 1, tok_alloc_const("putchar"));
-          }
-          vpushi(1);
-          vtop[-1] = vtop[0];
-          --vtop;
-        }
-        else if (opt_kind == PF_OPT_FPUTS_ARG)
-        {
-          /* fputs(arg, f) — for fprintf-family "%s" format. */
-          SValue pf_args[2];
-          pf_args[0] = saved_args[pf_vararg_idx];
-          pf_args[1] = saved_args[pf_file_idx];
-          gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputs"));
-          vpushi(0);
-          vtop[-1] = vtop[0];
-          --vtop;
-        }
-        else if (opt_kind == PF_OPT_PUTS_ARG)
-        {
-          /* puts(arg) — for "%s\n" format. puts() appends \n automatically. */
-          gen_ir_void_call_args(&saved_args[pf_vararg_idx], 1, tok_alloc_const("puts"));
-          vpushi(0);
-          vtop[-1] = vtop[0];
-          --vtop;
-        }
-        printf_family_optimized = 1;
-      }
-    }
-  }
+  if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && pf && saved_arg_count == nb_real_args &&
+      nb_args >= pf->min_args && !nocode_wanted && call_result_discarded())
+    printf_family_optimized =
+        funcall_printf_family(pf, saved_args, nb_args, call_id, ir_idx_before_first_param, ir_idx_before_args);
 
   /* Optimize fputs-family calls in void context.
    * When the result is unused, lowering to strlen+fwrite preserves side

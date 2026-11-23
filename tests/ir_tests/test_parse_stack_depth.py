@@ -105,3 +105,61 @@ def test_nested_expression_fits_stack_wall(tmp_path):
     of expr_unary_infix()/expr_infix_l() keep more state per level."""
     proc = _compile_limited(tmp_path, "mix", LIMITS["mix"], "-O1", "-Wall")
     assert proc.returncode == 0, proc.stderr[-2000:]
+
+
+# Nested inline expansions: at -O1/-O2 the frontend expands a small static
+# function's body at each call, replaying its tokens inside the caller's
+# parse, and an expansion's own calls expand in turn, up to INLINE_NEST_MAX
+# (32) deep -- Zig's C (called-once chains) gets there.  Each level is
+# unary_funcall_body() -> replay_body_recovering() -> replay_recovering() ->
+# replay_block() -> block() -> block() -> ... -> unary() -> unary_funcall(),
+# plus decl() and the initializer when the call initializes a local.  At
+# c35ae0af90 the error recovery's jmp_buf and saved state (replay_recovering),
+# the call's -Wformat / -Wsizeof-pointer-memaccess state and the statement
+# attributes' AttributeDef sat in those frames: the device tcc ran out of its
+# 32 KiB compiling the Zig-rendered YasOS kernel.
+INLINE_DEPTH = 40
+
+INLINE_SHAPES = {
+    # `return f(x) + 1;`
+    "ret": "static inline int f%d(int x) { return f%d(x) + 1; }",
+    # a local initialized by the call: decl() and the initializer too
+    "decl": "static inline int f%d(int x) { int y = f%d(x + 1); return y * 2; }",
+    # an if and a compound statement around it
+    "if": "static inline int f%d(int x) { if (x) { int y = f%d(x - 1); return y; } return 0; }",
+}
+
+# KiB: 471ab721f5 needed (ret 74, decl 112, if 128), c35ae0af90 112, 158,
+# 178; the fixed parser 71, 117, 136 (-O1 or -O2, whichever needs more).
+INLINE_LIMITS = {"ret": 96, "decl": 136, "if": 160}
+
+
+def _inline_source(shape):
+    lines = ["static inline int f%d(int x) { return x + 1; }" % INLINE_DEPTH]
+    for i in range(INLINE_DEPTH - 1, -1, -1):
+        lines.append(INLINE_SHAPES[shape] % (i, i + 1))
+    lines.append("int top(int x) { return f0(x); }")
+    return "\n".join(lines) + "\n"
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2"])
+@pytest.mark.parametrize("shape", sorted(INLINE_SHAPES))
+def test_nested_inline_expansion_fits_stack(tmp_path, shape, opt):
+    src = tmp_path / f"inline_{shape}.c"
+    src.write_text(_inline_source(shape))
+    kib = INLINE_LIMITS[shape]
+
+    def limit():
+        resource.setrlimit(resource.RLIMIT_STACK, (kib * 1024, kib * 1024))
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+    proc = subprocess.run(
+        [str(TCC), "-ccompat", "-nostdlib", "-c", opt, str(src), "-o", str(tmp_path / f"inline_{shape}.o")],
+        capture_output=True,
+        text=True,
+        preexec_fn=limit,
+    )
+    assert proc.returncode == 0, (
+        f"{INLINE_DEPTH} nested inline expansions ({shape}) did not compile in {kib} KiB of stack "
+        f"(rc {proc.returncode}): a frame on the expansion's recursive path grew\n{proc.stderr[-2000:]}"
+    )

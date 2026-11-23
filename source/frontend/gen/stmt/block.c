@@ -480,6 +480,86 @@ void gen_return_jump(void)
   rsym = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
 }
 
+/* block() is on the parser's recursive path (a compound statement, an if,
+   an inline expansion's body: two frames a level), so what only some
+   statements need is out of line -- an AttributeDef is 116 bytes on the
+   device, an SValue 40 -- and its frame keeps the scope and the counters. */
+
+/* A JUMP to TARGET (a chain head, -1 for a jump patched later): its index */
+static __attribute__((noinline)) int block_jump(int target)
+{
+  SValue dest;
+  svalue_init(&dest);
+  dest.vr = -1;
+  dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
+  dest.c.i = target;
+  return tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+}
+
+/* Attributes on a statement, T the first token (already read past): 1 when
+   they belong to the statement that follows, 0 when the statement is just
+   them (`[[fallthrough]];`), tok then on the ';' */
+static __attribute__((noinline)) int block_stmt_attributes(int t)
+{
+  AttributeDef ad_stmt;
+  unget_tok(t);
+  memset(&ad_stmt, 0, sizeof ad_stmt);
+  attr_fallthrough_seen = 0;
+  while (tok == TOK_ATTRIBUTE1 || tok == TOK_ATTRIBUTE2 || tok == '[')
+  {
+    if (tok == '[')
+    {
+      if (!parse_c23_attribute(&ad_stmt))
+        break;
+    }
+    else
+      parse_attribute(&ad_stmt);
+  }
+  return tok != ';';
+}
+
+/* Attributes after a label (e.g. 'unused'): whether 'unused' was one */
+static __attribute__((noinline)) int block_label_attributes(void)
+{
+  AttributeDef ad_tmp;
+  memset(&ad_tmp, 0, sizeof ad_tmp);
+  parse_attribute(&ad_tmp);
+  return ad_tmp.attr_unused;
+}
+
+/* The switch value on vtop into a new temp vreg, for the case comparisons */
+static __attribute__((noinline)) void block_switch_value_copy(void)
+{
+  SValue dest;
+  svalue_init(&dest);
+  dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+  /* Preserve the original type so the IR can tag the vreg correctly
+    (notably VT_LLONG needs 8-byte spill slots). */
+  dest.type = vtop->type;
+  tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &dest);
+  vtop->vr = dest.vr;
+  vtop->r = 0;
+}
+
+/* A non-local goto out of a nested function: longjmp through the parent's
+   jmp_buf at BUF_OFF, a capture reached through the static chain */
+static __attribute__((noinline)) void block_nonlocal_goto(int buf_off)
+{
+  /* Create SValue for buffer address via chain-relative access.
+   * vreg=-1 + VT_LOCAL + is_lval=false → MACH_OP_CHAIN_REL with no deref,
+   * giving us the address of the buffer in the parent's frame. */
+  SValue buf_sv;
+  svalue_init(&buf_sv);
+  buf_sv.type.t = VT_INT;
+  buf_sv.type.ref = NULL;
+  buf_sv.r = VT_LOCAL;  /* FP-relative in parent, becomes chain-relative */
+  buf_sv.c.i = buf_off; /* the jmp_buf capture's offset range */
+  buf_sv.vr = -1;       /* no vreg = pure stack offset → triggers CHAIN_REL */
+
+  /* Emit NL_LONGJMP: restores callee-saved regs, SP from 40-byte buffer and jumps to resume addr */
+  tcc_ir_put(tcc_state->ir, TCCIR_OP_NL_LONGJMP, &buf_sv, NULL, NULL);
+}
+
 void block(int flags)
 {
   int a, b, c, d, e, t, kind, then_diverges;
@@ -523,21 +603,7 @@ again:
     /* attributes on a statement: `[[fallthrough]];`,
        `__attribute__((fallthrough));` (in a compound statement decl() reads
        them as an empty declaration) */
-    AttributeDef ad_stmt;
-    unget_tok(t);
-    memset(&ad_stmt, 0, sizeof ad_stmt);
-    attr_fallthrough_seen = 0;
-    while (tok == TOK_ATTRIBUTE1 || tok == TOK_ATTRIBUTE2 || tok == '[')
-    {
-      if (tok == '[')
-      {
-        if (!parse_c23_attribute(&ad_stmt))
-          break;
-      }
-      else
-        parse_attribute(&ad_stmt);
-    }
-    if (tok != ';')
+    if (block_stmt_attributes(t))
       goto again; /* attributes on the statement that follows */
     next();
     ft = attr_fallthrough_seen ? FT_ATTR : -2;
@@ -567,13 +633,8 @@ again:
     if (tok == TOK_ELSE)
     {
       int if_nocode, else_nocode;
-      SValue dest;
       if_nocode = nocode_wanted; /* save reachability after if-body */
-      svalue_init(&dest);
-      dest.vr = -1;
-      dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-      dest.c.i = -1;     /* Will be patched to end of else block */
-      d = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+      d = block_jump(-1);        /* Will be patched to end of else block */
       tcc_ir_backpatch_to_here(tcc_state->ir, a);
       CODE_ON(); /* Code after if-branch is reachable via else path */
       next();
@@ -783,34 +844,24 @@ again:
   else if (t == TOK_BREAK)
   {
     /* compute jump */
-    SValue dest;
     if (!cur_scope->bsym)
       tcc_error(defer_body_active() ? "'break' out of a defer body" : "cannot break");
     if (cur_switch && cur_scope->bsym == cur_switch->bsym)
       leave_scope(cur_switch->scope, lt_switch_lstk);
     else
       leave_scope(loop_scope, lt_loop_lstk);
-    svalue_init(&dest);
-    dest.vr = -1;
-    dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-    dest.c.i = *cur_scope->bsym;
-    *cur_scope->bsym = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+    *cur_scope->bsym = block_jump(*cur_scope->bsym);
     // *cur_scope->bsym = gjmp(*cur_scope->bsym);
     skip(';');
   }
   else if (t == TOK_CONTINUE)
   {
     /* compute jump */
-    SValue dest;
     if (!cur_scope->csym)
       tcc_error(defer_body_active() ? "'continue' out of a defer body" : "cannot continue");
     leave_scope(loop_scope, lt_loop_lstk);
-    svalue_init(&dest);
-    dest.vr = -1;
-    dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-    dest.c.i = *cur_scope->csym;
     // *cur_scope->csym = gjmp(*cur_scope->csym);
-    *cur_scope->csym = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+    *cur_scope->csym = block_jump(*cur_scope->csym);
     skip(';');
   }
   else if (t == TOK_FOR)
@@ -856,12 +907,7 @@ again:
     if (tok != ')')
     {
       // e = gjmp(0);
-      SValue dest;
-      svalue_init(&dest);
-      dest.vr = -1;
-      dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-      dest.c.i = -1;
-      e = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+      e = block_jump(-1);
       // d = gind();
       c = tcc_state->ir->next_instruction_index;
       {
@@ -937,7 +983,6 @@ again:
   else if (t == TOK_SWITCH)
   {
     struct switch_t *sw;
-    SValue dest;
 
     sw = tcc_mallocz(sizeof *sw);
     sw->bsym = &a;
@@ -960,11 +1005,7 @@ again:
     sw->sv = *vtop--; /* save switch value */
     print_vstack("block(2)");
     a = -1; /* Initialize break chain with -1 sentinel */
-    svalue_init(&dest);
-    dest.vr = -1;
-    dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-    dest.c.i = -1;     /* Initial jump target, will be patched */
-    b = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+    b = block_jump(-1); /* Initial jump target, will be patched */
     // b = gjmp(0); /* jump to first case */
     stmt_ft = FT_LABEL; /* the first case is reached by no statement */
     lblock(&a, NULL);
@@ -975,9 +1016,7 @@ again:
     int switch_exits_all = sw->def_sym && (a == -1) && (nocode_wanted & CODE_OFF_BIT);
     ft = sw->def_sym && a == -1 && stmt_ft == FT_DIVERGES ? FT_DIVERGES : FT_FALLS;
     check_switch_enum(sw, line0);
-    dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-    dest.c.i = a;
-    a = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+    a = block_jump(a);
     // a = gjmp(a); /* add implicit break */
     /* case lookup */
     // gsym(b);
@@ -1015,16 +1054,7 @@ again:
                             (sv_vreg_type == TCCIR_VREG_TYPE_TEMP ||
                              (sv_vreg_type == TCCIR_VREG_TYPE_PARAM && !(vtop->r & VT_LOCAL)));
     if (!reuse_switch_vreg)
-    {
-      svalue_init(&dest);
-      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-      /* Preserve the original type so the IR can tag the vreg correctly
-        (notably VT_LLONG needs 8-byte spill slots). */
-      dest.type = vtop->type;
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &dest);
-      vtop->vr = dest.vr;
-      vtop->r = 0;
-    }
+      block_switch_value_copy();
     /* Force bitfield extraction before switch comparison / jump table.
      * The ASSIGN above copies the raw containing word into the temp vreg;
      * the bitfield bits must be extracted (SHL+SAR) now so that ALL
@@ -1174,19 +1204,7 @@ again:
               if (cur_nf->captured_tokens[ci] == -tok)
                 buf_off = tcc_state->ir->captured_vbase[ci];
 
-            /* Create SValue for buffer address via chain-relative access.
-             * vreg=-1 + VT_LOCAL + is_lval=false → MACH_OP_CHAIN_REL with no deref,
-             * giving us the address of the buffer in the parent's frame. */
-            SValue buf_sv;
-            svalue_init(&buf_sv);
-            buf_sv.type.t = VT_INT;
-            buf_sv.type.ref = NULL;
-            buf_sv.r = VT_LOCAL;  /* FP-relative in parent, becomes chain-relative */
-            buf_sv.c.i = buf_off; /* the jmp_buf capture's offset range */
-            buf_sv.vr = -1;       /* no vreg = pure stack offset → triggers CHAIN_REL */
-
-            /* Emit NL_LONGJMP: restores callee-saved regs, SP from 40-byte buffer and jumps to resume addr */
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_NL_LONGJMP, &buf_sv, NULL, NULL);
+            block_nonlocal_goto(buf_off);
             /* longjmp doesn't return - mark code as dead */
             CODE_OFF();
             is_nonlocal_goto = 1;
@@ -1295,20 +1313,14 @@ again:
       stmt_ft = FT_LABEL;
       {
         /* Accept attributes after labels (e.g. 'unused') */
-        AttributeDef ad_tmp;
-        memset(&ad_tmp, 0, sizeof ad_tmp);
-        parse_attribute(&ad_tmp);
+        const int attr_unused = block_label_attributes();
         if (tcc_state->unused_on)
-          unused_label_defined(s, label_line, ad_tmp.attr_unused);
+          unused_label_defined(s, label_line, attr_unused);
       }
       goto label_attributes_done;
 
     block_after_label:
-    {
-      /* Accept attributes after labels (e.g. 'unused') */
-      AttributeDef ad_tmp;
-      parse_attribute(&ad_tmp);
-    }
+      block_label_attributes(); /* Accept attributes after labels (e.g. 'unused') */
     label_attributes_done:
       if (debug_modes)
         tcc_tcov_reset_ind(tcc_state);

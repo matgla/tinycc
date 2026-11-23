@@ -67,6 +67,7 @@ struct TCCRecover
   struct TCCRecover *outer;
   unsigned char body;    /* RECOVER_FILE, RECOVER_BODY, RECOVER_STRUCT or RECOVER_INLINE */
   unsigned char errored; /* an error was recovered from here */
+  unsigned char heap;    /* tcc_malloc'ed (replay_recovering), not a frame's */
   unsigned char in_loop, in_switch, can_break;
   int nb_errors;         /* when armed */
   /* the state when armed */
@@ -252,12 +253,16 @@ static void recover_syntax_only(TCCState *s1)
    hold, while their frames are still there. */
 ST_FUNC void tcc_recover_release(TCCState *s1)
 {
-  for (TCCRecover *r = s1->recover; r; r = r->outer)
+  TCCRecover *r = s1->recover, *outer;
+  for (; r; r = outer)
   {
+    outer = r->outer;
     tcc_free(r->lev);
     tcc_free(r->scopes);
     r->lev = NULL;
     r->scopes = NULL;
+    if (r->heap)
+      tcc_free(r);
   }
   s1->recover = NULL;
 }
@@ -806,13 +811,16 @@ static void recover_resume(TCCRecover *r)
 ST_FUNC int gen_body_recovering(void)
 {
   TCCState *s1 = tcc_state;
-  TCCRecover r;
+  /* on the heap: the body's parse is under it, and inline expansions make
+     that deep (replay_recovering) */
+  TCCRecover *r = tcc_malloc(sizeof *r);
   int errored;
-  recover_save(&r, RECOVER_BODY);
-  r.outer = s1->recover;
-  s1->recover = &r;
+  recover_save(r, RECOVER_BODY);
+  r->heap = 1;
+  r->outer = s1->recover;
+  s1->recover = r;
   s1->undecl_func = NULL; /* a new function: its undeclared names are new */
-  if (setjmp(r.jb))
+  if (setjmp(r->jb))
   {
     TCCRecover *rp = s1->recover;
     recover_restore(rp);
@@ -823,10 +831,11 @@ ST_FUNC int gen_body_recovering(void)
   }
   else
     block(0);
-  s1->recover = r.outer;
-  errored = r.errored; /* an error that did not stop the parse leaves a sound IR */
-  tcc_free(r.lev);
-  tcc_free(r.scopes);
+  s1->recover = r->outer;
+  errored = r->errored; /* an error that did not stop the parse leaves a sound IR */
+  tcc_free(r->lev);
+  tcc_free(r->scopes);
+  tcc_free(r);
   return errored;
 }
 
@@ -890,21 +899,29 @@ static void replay_block(void *ts)
 ST_FUNC int replay_recovering(void (*fn)(void *), void *arg)
 {
   TCCState *s1 = tcc_state;
-  TCCRecover r;
-  recover_save(&r, RECOVER_INLINE);
-  r.outer = s1->recover;
-  s1->recover = &r;
-  if (setjmp(r.jb))
+  /* On the heap, not in this frame: inline expansions nest (INLINE_NEST_MAX
+     deep, called-once chains in Zig's C get there), each one a replay with
+     the parser's frames around it, and the point's jmp_buf and saved state
+     (360 bytes on the device) were a sixth of the stack an expansion level
+     takes -- the device tcc's 32 KiB ran out on the kernel's C. */
+  TCCRecover *r = tcc_malloc(sizeof *r);
+  recover_save(r, RECOVER_INLINE);
+  r->heap = 1;
+  r->outer = s1->recover;
+  s1->recover = r;
+  if (setjmp(r->jb))
   {
     TCCRecover *rp = s1->recover;
     recover_restore(rp);
     recover_body_errored(rp);
     recover_syntax_only(s1);
     s1->recover = rp->outer;
+    tcc_free(rp);
     return 1;
   }
   fn(arg);
-  s1->recover = r.outer;
+  s1->recover = r->outer;
+  tcc_free(r);
   return 0;
 }
 
