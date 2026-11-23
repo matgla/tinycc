@@ -1,0 +1,34 @@
+catch 42 -1 255
+caught Empty
+d 7
+make 0: leave
+make 0 -> 5
+make 1: undo
+make 1: leave
+make 1 failed: Empty
+make 2: undo
+make 2: leave
+make 2 failed: BadDigit
+make 3: inner undo
+make 3: undo
+make 3: leave
+make 3 failed: ENOENT
+bump failed: Overflow
+counter 4
+fwd 12
+forward done
+forward failed
+fwd -1
+forward done
+fwd 3
+open 0 -> -2
+open 1 -> -3
+open 2 -> 102
+fs 1 1 1
+any 1
+hashed 28365 22923 18830 56559
+local 5 6 -1 9
+from 13 0
+fp 200
+abi ok 42 err 0
+abi err 28365

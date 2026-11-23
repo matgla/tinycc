@@ -85,6 +85,8 @@ NEWLIB_LIBM_G = $(NEWLIB_DIR)/libm_g.a
 EXTRA_CFLAGS ?=
 # Prebuilt objects linked into the test (e.g. gcc-compiled, for ABI interop).
 EXTRA_OBJS ?=
+# Test programs are regular C: -ccompat, unless CC is gcc (comparison runs).
+CFLAGS += $(if $(findstring tcc,$(notdir $(CC))),-ccompat)
 CFLAGS += -nostdlib -fvisibility=hidden $(GCC_ABI_FLAGS) -ffunction-sections $(EXTRA_CFLAGS)
 
 # Two-phase compilation support (reduces memory usage)
@@ -113,7 +115,11 @@ LDFLAGS_TAIL :=
 .DEFAULT_GOAL := all
 
 ifneq (,$(findstring armv8m-tcc,$(CC)))
-CFLAGS += -I$(LIBC_INCLUDES) -I$(LIBC_IMPORTS) -I$(NEWLIB_INCLUDES) -I$(ARM_SYSROOT)/include -I$(TCC_PATH)/include
+# System headers (-isystem), as in a real sysroot: quiet like gcc's.  Without
+# __GNUC__ (an ARM Linux cross) newlib turns its `static __inline` helpers into
+# plain statics, which -Wunused-function would report in every test.
+CFLAGS += -isystem$(LIBC_INCLUDES) -isystem$(LIBC_IMPORTS) -isystem$(NEWLIB_INCLUDES) -isystem$(ARM_SYSROOT)/include \
+          -isystem$(TCC_PATH)/include
 TCC_FLAGS += -B$(TCC_PATH)
 # These images are bare metal: nothing sets up a GOT base in R9, so the
 # SB-relative addressing a YASOS build defaults to has no runtime to back it.
@@ -132,7 +138,7 @@ TCC_FLAGS += -fno-pic -mno-sb-relative-got
 # the shared archive: -L first so the explicit -larmv8m-libtcc1.a resolves
 # here, and -B LAST so the linker runtime's unconditional libtcc1 pull
 # (tcc_add_support; the last -B owns the {B} library paths) also lands here.
-LIBTCC1_BM_MEMBERS = libtcc1 alloca armeabi armeabi_divmod va_list builtin arm_string arm_mem arm_copystub armv8m_atomic
+LIBTCC1_BM_MEMBERS = libtcc1 alloca armeabi armeabi_divmod va_list builtin arm_string arm_mem arm_copystub armv8m_atomic yasc
 LIBTCC1_BM_CC_SUM := $(shell sha256sum "$(CC)" 2>/dev/null | cut -c1-12)
 ifeq ($(strip $(LIBTCC1_BM_CC_SUM)),)
 LIBTCC1_BM_CC_SUM := unknowncc
@@ -148,8 +154,8 @@ $(LIBTCC1_BM_A): $(wildcard $(TCC_PATH)/lib/*.c) $(wildcard $(TCC_PATH)/lib/*.S)
 	for f in $(LIBTCC1_BM_MEMBERS); do \
 	  src=$(TCC_PATH)/lib/$$f.c; \
 	  [ -f "$$src" ] || src=$(TCC_PATH)/lib/$$f.S; \
-	  $(CC_WRAPPER) $(CC) -fno-pic -mno-sb-relative-got -I$(TCC_PATH)/include -I$(TCC_PATH)/lib \
-	    -c $$src -o $$tmp/$$f.o || { rm -rf $$tmp; exit 1; }; \
+	  $(CC_WRAPPER) $(CC) $(if $(findstring tcc,$(notdir $(CC))),-ccompat) -fno-pic -mno-sb-relative-got \
+	    -I$(TCC_PATH)/include -I$(TCC_PATH)/lib -c $$src -o $$tmp/$$f.o || { rm -rf $$tmp; exit 1; }; \
 	done; \
 	ar rcs $$tmp/armv8m-libtcc1.a $(addprefix $$tmp/,$(addsuffix .o,$(LIBTCC1_BM_MEMBERS))) && \
 	  mv -f $$tmp/armv8m-libtcc1.a $@; rc=$$?; rm -rf $$tmp; exit $$rc

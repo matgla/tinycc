@@ -122,7 +122,7 @@ def _write_text(path: Path, content: str) -> None:
 
 
 def _compiler_cmd_base(compiler: Path) -> list[str]:
-    return [str(compiler), f"-B{REPO_ROOT}"]
+    return [str(compiler), "-ccompat", f"-B{REPO_ROOT}"]
 
 
 def _include_flags(include_dirs: list[Path]) -> list[str]:
@@ -426,13 +426,13 @@ def _prepare_sources(output_dir: Path) -> tuple[Path, Path]:
 
 def _compiler_metadata(compiler: Path) -> dict:
     version = subprocess.run(
-        [str(compiler), "-v"],
+        [str(compiler), "-ccompat", "-v"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
     search_dirs = subprocess.run(
-        [str(compiler), f"-B{REPO_ROOT}", "-print-search-dirs"],
+        [str(compiler), "-ccompat", f"-B{REPO_ROOT}", "-print-search-dirs"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,

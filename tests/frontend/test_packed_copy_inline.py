@@ -22,7 +22,7 @@ def tcc(request):
 def undefined_symbols(tcc, tmp_path, source, *flags):
     src, obj = tmp_path / "t.c", tmp_path / "t.o"
     src.write_text(source)
-    r = subprocess.run([tcc, "-nostdlib", *flags, "-c", str(src), "-o", str(obj)], capture_output=True, text=True)
+    r = subprocess.run([tcc, "-ccompat", "-nostdlib", *flags, "-c", str(src), "-o", str(obj)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     nm = subprocess.run(["arm-none-eabi-nm", "-u", str(obj)], capture_output=True, text=True, check=True)
     return nm.stdout

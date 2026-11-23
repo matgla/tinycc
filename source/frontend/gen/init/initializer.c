@@ -41,7 +41,7 @@ void skip_or_save_block(TokenString **str)
     *str = tok_str_alloc();
   pp_pragma_capture = str ? *str : saved_capture;
 
-  int recorded_len = 0;
+  int recorded_len = 0, sys = 0;
 
   while (1)
   {
@@ -50,9 +50,22 @@ void skip_or_save_block(TokenString **str)
       break;
     if (t == TOK_EOF)
     {
+      if (str && braces && tcc_state->save_body_jmp)
+      {
+        /* a function body missing its '}': the parse of what was saved
+           says so, as at -O0 (decl.c save_body_cut) */
+        pp_pragma_capture = saved_capture;
+        longjmp(*tcc_state->save_body_jmp, 2);
+      }
       if (str || level > 0)
       {
         pp_pragma_capture = saved_capture;
+        if (str)
+        {
+          /* the error leaves the caller: nothing else holds the tokens */
+          tok_str_free(*str);
+          *str = NULL;
+        }
         tcc_error("unexpected end of file");
       }
       else
@@ -60,15 +73,21 @@ void skip_or_save_block(TokenString **str)
     }
     if (str)
     {
+      /* where a system header's macro put its tokens (tccpp.c) */
+      if (sys || tok_macro_stack())
+        sys = tok_str_sys_save(*str, sys);
       tok_str_add_tok(*str);
       recorded_len = (*str)->len;
     }
     next();
-    if (t == '{' || t == '(' || t == '[')
+    /* A braced block counts its braces only: a stray ')' or ']' in a body
+       is the parser's error to report (and to recover from, as at -O0,
+       where the body is not saved), not the end of the body. */
+    if (braces ? t == '{' : t == '{' || t == '(' || t == '[')
     {
       level++;
     }
-    else if (t == '}' || t == ')' || t == ']')
+    else if (braces ? t == '}' : t == '}' || t == ')' || t == ']')
     {
       level--;
       if (level == 0 && braces && t == '}')
@@ -127,7 +146,16 @@ void parse_init_elem(int expr_type)
       tcc_error("initializer element is not constant");
     break;
   case EXPR_ANY:
-    expr_eq();
+    if (local_stack && !NOEVAL_WANTED)
+    {
+      /* a pointer's initializer: what it points into (builtin/objsize.c) */
+      ObjRec os_saved;
+      objsize_rhs_begin(&os_saved);
+      expr_eq();
+      objsize_rhs_end(&os_saved);
+    }
+    else
+      expr_eq();
     break;
   }
 }

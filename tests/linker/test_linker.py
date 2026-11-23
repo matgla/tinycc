@@ -50,7 +50,7 @@ def _compiler_targets_yasos():
     alternative (compiling and looking at what came out) would assert nothing.
     """
     result = subprocess.run(
-        [str(TCC), "-dM", "-E", "-xc", "/dev/null"],
+        [str(TCC), "-ccompat", "-dM", "-E", "-xc", "/dev/null"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -71,7 +71,7 @@ def _compile_to_object(name, subdir, extra_cflags=(), obj_name=None):
     obj.parent.mkdir(parents=True, exist_ok=True)
 
     cflags = _base_cflags() + ["-c"] + list(extra_cflags)
-    cmd = [str(TCC)] + cflags + [str(src), "-o", str(obj)]
+    cmd = [str(TCC), "-ccompat"] + cflags + [str(src), "-o", str(obj)]
     result = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -93,7 +93,7 @@ def _compile_and_link_asm(name, subdir):
     out = BUILD_DIR / subdir / f"{name}.elf"
     obj.parent.mkdir(parents=True, exist_ok=True)
 
-    compile_cmd = [str(TCC)] + _base_cflags() + ["-c", str(src), "-o", str(obj)]
+    compile_cmd = [str(TCC), "-ccompat"] + _base_cflags() + ["-c", str(src), "-o", str(obj)]
     result = subprocess.run(
         compile_cmd,
         stdout=subprocess.PIPE,
@@ -108,6 +108,7 @@ def _compile_and_link_asm(name, subdir):
     # plain and YasOS-configured cross compilers.
     link_cmd = [
         str(TCC),
+        "-ccompat",
         f"-B{ROOT / 'lib'}",
         f"-L{ROOT}",
         f"-L{ROOT / 'lib' / 'tcc'}",
@@ -166,7 +167,7 @@ def _compile_to_yaff(name, tinycc_root):
         f"-L{tinycc_root}/lib/fp",
         f"-L{tinycc_root}",
     ]
-    cmd = [str(TCC)] + cflags + [str(src), "-o", str(out)]
+    cmd = [str(TCC), "-ccompat"] + cflags + [str(src), "-o", str(out)]
     result = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -688,7 +689,7 @@ def test_symbol_fvisibility_flag_and_pragma(flag, plain):
     src = LINKER_DIR / "symbols" / "08_fvisibility.c"
     obj = BUILD_DIR / "symbols" / f"08_fvisibility_{plain.lower()}_{bool(flag)}.o"
     obj.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [str(TCC), *cflags, "-c", str(src), "-o", str(obj)]
+    cmd = [str(TCC), "-ccompat", *cflags, "-c", str(src), "-o", str(obj)]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
     assert result.returncode == 0, f"{cmd}\n{result.stderr}"
     vis = {s["name"]: s["vis"] for s in _readelf_syms(obj) if s["bind"] != "LOCAL"}
@@ -716,7 +717,7 @@ def test_symbol_fvisibility_flag_and_pragma(flag, plain):
 def test_symbol_fvisibility_rejects_unknown(bad):
     src = LINKER_DIR / "symbols" / "08_fvisibility.c"
     result = subprocess.run(
-        [str(TCC), "-c", bad, str(src), "-o", str(BUILD_DIR / "symbols" / "bad.o")],
+        [str(TCC), "-ccompat", "-c", bad, str(src), "-o", str(BUILD_DIR / "symbols" / "bad.o")],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace",
     )
     assert result.returncode != 0
@@ -730,7 +731,7 @@ def test_symbol_pragma_visibility_pop_without_push():
     src.parent.mkdir(parents=True, exist_ok=True)
     src.write_text("#pragma GCC visibility pop\nint x;\n")
     result = subprocess.run(
-        [str(TCC), "-c", str(src), "-o", str(src.with_suffix(".o"))],
+        [str(TCC), "-ccompat", "-c", str(src), "-o", str(src.with_suffix(".o"))],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace",
     )
     assert result.returncode != 0
@@ -888,6 +889,7 @@ def test_gc_sections_collects_dead_static_bodies(tinycc_root):
     out = BUILD_DIR / "sections" / "06_gc_sections.elf"
     cmd = [
         str(TCC),
+        "-ccompat",
         "-nostdlib",
         f"-B{tinycc_root}/lib",
         f"-L{tinycc_root}/lib/fp",
@@ -933,6 +935,7 @@ def _gc_link(tinycc_root, objs, out, extra):
     """Link objs into out with the cross; return (CompletedProcess, cmd)."""
     cmd = [
         str(TCC),
+        "-ccompat",
         "-nostdlib",
         f"-B{tinycc_root}/lib",
         f"-L{tinycc_root}/lib/fp",
@@ -1139,7 +1142,7 @@ def _debug_module(name, extra):
     src.write_text(_DEBUG_SRC)
     out = BUILD_DIR / "yaff" / name
     out.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [str(TCC), "-nostdlib", "-nodefaultlibs", "-shared", *extra, str(src), "-o", str(out)]
+    cmd = [str(TCC), "-ccompat", "-nostdlib", "-nodefaultlibs", "-shared", *extra, str(src), "-o", str(out)]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
     assert result.returncode == 0, f"{' '.join(cmd)}\n{result.stderr}"
     return out
@@ -1252,6 +1255,7 @@ def test_yaff_gc_sections_got_in_range(tinycc_root):
     out.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         str(TCC),
+        "-ccompat",
         "-O1",
         "-nostdlib",
         "-fvisibility=hidden",
@@ -1306,6 +1310,7 @@ def _link(tinycc_root, objs, out, extra):
     """Link objs into out with the cross; return the CompletedProcess."""
     cmd = [
         str(TCC),
+        "-ccompat",
         "-nostdlib",
         f"-B{tinycc_root}/lib",
         f"-L{tinycc_root}/lib/fp",
@@ -1558,7 +1563,7 @@ def test_yaff_writer_error_fails_link_and_removes_output():
     out.parent.mkdir(parents=True, exist_ok=True)
     out.unlink(missing_ok=True)
     cmd = [
-        str(TCC), "-O2", "-nostdlib", "-nodefaultlibs", "-Wl,-oformat=yaff",
+        str(TCC), "-ccompat", "-O2", "-nostdlib", "-nodefaultlibs", "-Wl,-oformat=yaff",
         str(LINKER_DIR / "yaff" / "03_abs32_in_text.c"), "-o", str(out),
     ]
     result = subprocess.run(

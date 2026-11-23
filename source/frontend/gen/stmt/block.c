@@ -71,12 +71,14 @@ static void new_scope(struct scope *o)
   /* record local declaration stack position */
   o->lstk = local_stack;
   o->llstk = local_label_stack;
+  o->kind = 0;
+  o->mserial = tok_macro_serial;
   {
     TCCIRState *ir = tcc_state ? tcc_state->ir : NULL;
     o->first_obj = ir ? ir->frame_obj_count : 0;
     o->first_insn = ir ? ir->next_instruction_index : 0;
   }
-  ++local_scope;
+  o->level = ++local_scope;
 }
 
 static void prev_scope(struct scope *o, int is_expr)
@@ -84,7 +86,19 @@ static void prev_scope(struct scope *o, int is_expr)
   vla_leave(o->prev);
 
   if (o->cl.s != o->prev->cl.s)
+  {
     block_cleanup(o->prev);
+    defer_free_entries(o->cl.s, o->prev->cl.s);
+  }
+  /* -Wlifetime: the owned locals of the block end here, after its cleanups */
+  if (tcc_state->ir && (tcc_state->ir->lt_nb_vars || tcc_state->ir->lt_nb_slots))
+  {
+    if (tcc_state->ir->lt_nb_vars)
+      tcc_ir_lt_scope_end(tcc_state->ir, local_stack, o->lstk);
+    /* the last one is the function body's closing brace */
+    if (!tcc_state->in_inline_expansion)
+      tcc_state->ir->lt_end_line = file ? file->line_num : 0;
+  }
 
   /* pop locally defined labels */
   label_pop(&local_label_stack, o->llstk, is_expr);
@@ -115,13 +129,29 @@ static void prev_scope(struct scope *o, int is_expr)
   --local_scope;
 }
 
+/* -Wlifetime: the local stack where the innermost loop body and switch body
+   began; break and continue end the scopes of what was declared since */
+static Sym *lt_loop_lstk, *lt_switch_lstk;
+
+/* objsize.c: S was declared in the innermost loop's body (so a back edge
+   finds it declared again, not carrying a later store) */
+int block_declared_in_loop(Sym *s)
+{
+  for (Sym *p = local_stack; p && p != lt_loop_lstk; p = p->prev)
+    if (p == s)
+      return 1;
+  return 0;
+}
+
 /* leave a scope via break/continue(/goto) */
-static void leave_scope(struct scope *o)
+static void leave_scope(struct scope *o, Sym *body_lstk)
 {
   if (!o)
     return;
   try_call_scope_cleanup(o->cl.s);
   vla_leave(o);
+  if (body_lstk && tcc_state->ir && tcc_state->ir->lt_nb_vars)
+    tcc_ir_lt_scope_end(tcc_state->ir, local_stack, body_lstk);
 }
 
 /* short versiona for scopes with 'if/do/while/switch' which can
@@ -145,14 +175,20 @@ static void lblock(int *bsym, int *csym)
 {
   struct scope *lo = loop_scope, *co = cur_scope;
   int *b = co->bsym, *c = co->csym;
+  Sym *lt_loop = lt_loop_lstk, *lt_switch = lt_switch_lstk;
   if (csym)
   {
     co->csym = csym;
     loop_scope = co;
+    lt_loop_lstk = local_stack;
   }
+  else
+    lt_switch_lstk = local_stack;
   co->bsym = bsym;
   block(0);
   co->bsym = b;
+  lt_loop_lstk = lt_loop;
+  lt_switch_lstk = lt_switch;
   if (csym)
   {
     co->csym = c;
@@ -160,11 +196,377 @@ static void lblock(int *bsym, int *csym)
   }
 }
 
+/* Return vtop (when B) from the current function: leave every scope up to
+ * the function's -- its defers, and its errdefers when ERROR_EXIT --, then
+ * hand the value over.  The jump to the epilogue is gen_return_jump. */
+/* Whether the statement block() last parsed cannot complete: it returns,
+ * breaks, continues, jumps or calls a noreturn function, or all its arms do.
+ * Loops and switches count as completing.  Read by yasc_catch only. */
+int stmt_diverges;
+
+/* -Wimplicit-fallthrough (FT_*): how the statement block() last parsed ends,
+ * and the line it starts on.  A statement after one that cannot complete is
+ * unreachable: it keeps FT_DIVERGES until a label.  Code generation never
+ * reads these. */
+int stmt_ft, stmt_ft_line;
+/* parse_attribute / parse_c23_attribute met `fallthrough` */
+int attr_fallthrough_seen;
+/* -Wdangling-else: the statement block() last parsed is an if with an else,
+ * or a loop whose body is one -- an `else` after it would bind to that if */
+static int stmt_dangling;
+
+/* -Wimplicit-fallthrough: a case or default label on LINE, reached from the
+ * statement above it (FT_ENTRY) */
+static void check_fallthrough(int ft_entry, int line)
+{
+  if (ft_entry != FT_FALLS || !fe_check_on(tcc_state->warn_implicit_fallthrough))
+    return;
+  /* gcc's -Wimplicit-fallthrough=3: a fall-through comment right before it */
+  if (tcc_diag_marked(tcc_state, line, DIAG_KEY_FALLTHROUGH_COMMENT))
+    return;
+  if (!tcc_diag_first(tcc_state, stmt_ft_line, DIAG_KEY_FALLTHROUGH))
+    return;
+  tcc_warning_c(warn_implicit_fallthrough)("%i:this statement may fall through", stmt_ft_line);
+  tcc_note("%i:here", line);
+}
+
+/* gcc's (unconditional) "attribute 'fallthrough' not preceding a case label
+ * or default label": a fall-through statement ending on LINE, tok the token
+ * after it.  A statement after it, or the switch body's '}', is no label; an
+ * if arm's (tcc lets it stand there: `else` follows) and an inner block's end
+ * are taken as they are. */
+static int compound_depth; /* compound statements open */
+
+static void check_fallthrough_placement(int line)
+{
+  if (!cur_switch || tok == TOK_CASE || tok == TOK_DEFAULT || tok == TOK_ELSE || !fe_check_on(WARN_ON))
+    return;
+  if (tok == '}' && compound_depth != cur_switch->body_depth)
+    return;
+  if (!tcc_diag_first(tcc_state, line, DIAG_KEY(DIAG_KEY_FALLTHROUGH, 1)))
+    return;
+  tcc_warning("%i:attribute 'fallthrough' not preceding a case label or default label", line);
+}
+
+/* -Wswitch: a switch on a value of an enum type (sw->sv keeps it): a case
+ * value no enumerator has, and, with no default, an enumerator no case
+ * handles.  Enumerators of equal value count once.  At the switch's end,
+ * before case_sort, on the unsorted cases. */
+static void check_switch_enum(struct switch_t *sw, int line)
+{
+  Sym *en = sw->sv.type.ref, *e, *e2;
+  const int t = sw->sv.type.t;
+  char name[64];
+  if (!IS_ENUM(t) || !en || !fe_check_on(tcc_state->warn_switch))
+    return;
+  if ((en->v & ~SYM_STRUCT) < SYM_FIRST_ANOM)
+    snprintf(name, sizeof name, " 'enum %s'", get_tok_str(en->v & ~SYM_STRUCT, NULL));
+  else
+    name[0] = 0;
+  for (int i = 0; i < sw->n; i++)
+  {
+    const struct case_t *cr = sw->p[i];
+    if (cr->v1 != cr->v2) /* a GNU case range */
+      continue;
+    for (e = en->next; e; e = e->next)
+      if (value64(sym_enum_val(e), t) == (uint64_t)cr->v1)
+        break;
+    if (!e && tcc_diag_first(tcc_state, cr->line, DIAG_KEY(DIAG_KEY_SWITCH, (unsigned)cr->v1 << 1 | 1)))
+      tcc_warning_c(warn_switch)("%i:case value '%lld' not in enumerated type%s", cr->line,
+                                 (t & VT_UNSIGNED) ? (long long)(uint64_t)cr->v1 : (long long)cr->v1, name);
+  }
+  if (sw->def_sym)
+    return;
+  for (e = en->next; e; e = e->next)
+  {
+    const uint64_t v = value64(sym_enum_val(e), t);
+    int handled = 0;
+    for (e2 = en->next; e2 != e; e2 = e2->next) /* the same value was reported */
+      if (value64(sym_enum_val(e2), t) == v)
+        break;
+    if (e2 != e)
+      continue;
+    for (int i = 0; i < sw->n && !handled; i++)
+      handled = (t & VT_UNSIGNED) ? (uint64_t)sw->p[i]->v1 <= v && v <= (uint64_t)sw->p[i]->v2
+                                  : sw->p[i]->v1 <= (int64_t)v && (int64_t)v <= sw->p[i]->v2;
+    if (!handled && tcc_diag_first(tcc_state, line, DIAG_KEY(DIAG_KEY_SWITCH, (unsigned)e->v << 1)))
+      tcc_warning_c(warn_switch)("%i:enumeration value '%s' not handled in switch", line, get_tok_str(e->v, NULL));
+  }
+}
+
+/* -Wempty-body: an `if` or `else` (WHAT) whose body is the `;` at LINE */
+static void check_empty_body(const char *what, int line)
+{
+  if (!fe_check_on(tcc_state->warn_empty_body) || !tcc_diag_first(tcc_state, line, DIAG_KEY_EMPTY_BODY))
+    return;
+  tcc_warning_c(warn_empty_body)("%i:suggest braces around empty body in an '%s' statement", line, what);
+}
+
+/* -Wparentheses: the condition just parsed (on LINE) is an assignment without
+ * parentheses of its own */
+static void check_cond_assign(int line)
+{
+  if (!expr_eq_assigned || !fe_check_on(tcc_state->warn_parentheses) ||
+      !tcc_diag_first(tcc_state, line, DIAG_KEY(DIAG_KEY_PARENTHESES, 1)))
+    return;
+  tcc_warning_c(warn_parentheses)("%i:suggest parentheses around assignment used as truth value", line);
+}
+
+void gen_return_emit(int b, int error_exit)
+{
+  int saved_error_exit;
+  /* The return operand may still be an lvalue (`return a[i];`).  If it lives
+   * in a VLA, leaving the scope restores SP (freeing the VLA) before the
+   * RETURNVALUE materialises the load, so the read would hit released stack.
+   * Load it into a temp first. */
+  if (b && tcc_state->ir && (func_vt.t & VT_BTYPE) != VT_STRUCT && (vtop->r & VT_LVAL))
+  {
+    struct scope *sc;
+    int has_vla = 0;
+    for (sc = cur_scope; sc && sc != root_scope; sc = sc->prev)
+      if (sc->vla.num)
+        has_vla = 1;
+    if (has_vla)
+    {
+      SValue load_dst;
+      svalue_init(&load_dst);
+      load_dst.type = vtop->type;
+      load_dst.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+      load_dst.r = 0;
+      load_dst.c.i = 0;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dst);
+      vtop->vr = load_dst.vr;
+      vtop->r = 0;
+    }
+  }
+  if (b)
+    defer_settle_return_value();
+  saved_error_exit = cleanup_error_exit;
+  cleanup_error_exit = error_exit;
+  leave_scope(root_scope, NULL);
+  cleanup_error_exit = saved_error_exit;
+#ifdef CONFIG_TCC_BCHECK
+  /* -b: the locals registered so far die here (the value read first: it may
+     be one of them); an inlined body's locals die with the caller's frame */
+  if (tcc_state->do_bounds_check && !tcc_state->in_inline_expansion && tcc_state->ir && tcc_state->ir->bc_locals_n)
+  {
+    if (b && (func_vt.t & VT_BTYPE) != VT_STRUCT)
+      gv(RC_TYPE(vtop->type.t));
+    bcheck_func_exit();
+  }
+#endif
+  if (b)
+  {
+    if (tcc_state->in_inline_expansion)
+    {
+      if ((func_vt.t & VT_BTYPE) == VT_STRUCT)
+      {
+        /* Struct return in inline expansion: instead of copying to the
+         * return slot, redirect inline_return_loc to point at the source
+         * if it's a simple stack local.  This eliminates one memmove —
+         * the caller's assignment will copy directly from the inlined
+         * function's local variable. */
+        if ((vtop->r & (VT_LOCAL | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && vtop->vr == -1 &&
+            !tcc_state->inline_return_redirected && !tcc_state->inline_return_copied)
+        {
+          /* Only the FIRST return may retarget the slot.  Retargeting again
+           * would move the caller's read away from the slot the first
+           * return left its value in — and that first return emits no copy,
+           * so its path would read an uninitialized slot (a two-return
+           * `return local;` / `return f();` body did exactly that).  Later
+           * returns take the vstore() copy below, which writes into this
+           * same retargeted slot.  Nor may a return retarget once an earlier
+           * one copied into the slot: that copy's path would read the local. */
+          LOG_INLINE_STRUCT("[inline-struct] redirect return: loc %d -> %d", (int)tcc_state->inline_return_loc,
+                            (int)vtop->c.i);
+          tcc_state->inline_return_loc = vtop->c.i;
+          tcc_state->inline_return_redirected = 1;
+          vtop--;
+        }
+        else
+        {
+          /* Fallback: copy via vstore() when source is not a simple local */
+          SValue src_save = *vtop;
+          tcc_state->inline_return_copied = 1;
+          vtop--;
+          CValue ret_cv;
+          ret_cv.i = tcc_state->inline_return_loc;
+          vsetc(&func_vt, VT_LOCAL | VT_LVAL, &ret_cv);
+          vtop->vr = -1;
+          vpushv(&src_save);
+          vstore();
+          vtop--;
+        }
+      }
+      else
+      {
+        /* Inside inline expansion: store return value to local slot
+         * instead of emitting RETURNVALUE IR op.
+         * Must materialize VT_CMP/VT_JMP (comparison flags) into a 0/1
+         * register value before the STORE, just like gfunc_return does
+         * via tcc_ir_codegen_cmp_jmp_set.  Without this, a return of a
+         * comparison expression (e.g. "return a >= b;") would store the
+         * raw operand register instead of the boolean result. */
+        tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
+        /* If vtop is an lval (e.g. "return *p;" or "return x;" where x is
+         * a local), emit an explicit LOAD into a temp first.  Without this
+         * the resulting STORE would carry a DEREF source operand, which
+         * the 64-bit store backend cannot split via mach_make_hi_half
+         * (it expects a register pair, not a pointer).  Mirrors the
+         * LOAD step in gfunc_return for the non-inline return path. */
+        if (vtop->r & VT_LVAL)
+        {
+          SValue load_dst;
+          svalue_init(&load_dst);
+          load_dst.type = vtop->type;
+          load_dst.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+          load_dst.r = 0;
+          load_dst.c.i = 0;
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dst);
+          vtop->vr = load_dst.vr;
+          vtop->r = 0;
+        }
+        SValue ret_dst;
+        svalue_init(&ret_dst);
+        ret_dst.type = func_vt;
+        /* The inline return slot is allocated at a minimum of 4 bytes (see
+         * the rsize clamp where inline_ret_loc is carved out), and the
+         * consumer of the expanded call reads it as a word.  Storing a
+         * narrow return type at its own width left the upper bytes of the
+         * slot uninitialised, so the reader tested stack garbage:
+         *   strb rX,[sp,#4] ... ldr rX,[sp,#4]; cmp rX,#0
+         * made `if (u8_returning_fn(...))` a coin flip.  The value is
+         * already zero/sign-extended in its register, so writing the whole
+         * word is correct for a narrow read of the slot as well as for the
+         * word read the consumer actually performs. */
+        {
+          int ret_bt = ret_dst.type.t & VT_BTYPE;
+          if (ret_bt == VT_BOOL || ret_bt == VT_BYTE || ret_bt == VT_SHORT)
+            ret_dst.type.t = (ret_dst.type.t & ~VT_BTYPE) | VT_INT;
+        }
+        ret_dst.r = VT_LOCAL | VT_LVAL;
+        /* The vreg (when the call site bound one) makes this a write to a
+         * compiler-generated local rather than to a raw frame slot, so the
+         * allocator can keep the inlined return value in a register. */
+        ret_dst.vr = tcc_state->inline_return_vr;
+        ret_dst.c.i = tcc_state->inline_return_loc;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, vtop, NULL, &ret_dst);
+        vtop--;
+      }
+    }
+    else
+    {
+      gfunc_return(&func_vt);
+    }
+  }
+}
+
+/* The line of the `return` whose jump comes next: the jump is emitted after
+   its ';', so file->line_num is already the next token's (-Wlifetime). */
+static int gen_return_line;
+
+/* Jump to the function's epilogue (or past an inlined body). */
+void gen_return_jump(void)
+{
+  SValue dest;
+  /* -Wlifetime: this jump past the last instruction is a return */
+  if (tcc_state->ir->lt_nb_vars && !tcc_state->in_inline_expansion)
+    tcc_ir_lt_return(tcc_state->ir, gen_return_line ? gen_return_line : file ? file->line_num : 0);
+  gen_return_line = 0;
+  svalue_init(&dest);
+  dest.vr = -1;
+  dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
+  dest.c.i = rsym;   /* Chain return jumps: point to previous rsym */
+  rsym = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+}
+
+/* block() is on the parser's recursive path (a compound statement, an if,
+   an inline expansion's body: two frames a level), so what only some
+   statements need is out of line -- an AttributeDef is 116 bytes on the
+   device, an SValue 40 -- and its frame keeps the scope and the counters. */
+
+/* A JUMP to TARGET (a chain head, -1 for a jump patched later): its index */
+static __attribute__((noinline)) int block_jump(int target)
+{
+  SValue dest;
+  svalue_init(&dest);
+  dest.vr = -1;
+  dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
+  dest.c.i = target;
+  return tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+}
+
+/* Attributes on a statement, T the first token (already read past): 1 when
+   they belong to the statement that follows, 0 when the statement is just
+   them (`[[fallthrough]];`), tok then on the ';' */
+static __attribute__((noinline)) int block_stmt_attributes(int t)
+{
+  AttributeDef ad_stmt;
+  unget_tok(t);
+  memset(&ad_stmt, 0, sizeof ad_stmt);
+  attr_fallthrough_seen = 0;
+  while (tok == TOK_ATTRIBUTE1 || tok == TOK_ATTRIBUTE2 || tok == '[')
+  {
+    if (tok == '[')
+    {
+      if (!parse_c23_attribute(&ad_stmt))
+        break;
+    }
+    else
+      parse_attribute(&ad_stmt);
+  }
+  return tok != ';';
+}
+
+/* Attributes after a label (e.g. 'unused'): whether 'unused' was one */
+static __attribute__((noinline)) int block_label_attributes(void)
+{
+  AttributeDef ad_tmp;
+  memset(&ad_tmp, 0, sizeof ad_tmp);
+  parse_attribute(&ad_tmp);
+  return ad_tmp.attr_unused;
+}
+
+/* The switch value on vtop into a new temp vreg, for the case comparisons */
+static __attribute__((noinline)) void block_switch_value_copy(void)
+{
+  SValue dest;
+  svalue_init(&dest);
+  dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+  /* Preserve the original type so the IR can tag the vreg correctly
+    (notably VT_LLONG needs 8-byte spill slots). */
+  dest.type = vtop->type;
+  tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &dest);
+  vtop->vr = dest.vr;
+  vtop->r = 0;
+}
+
+/* A non-local goto out of a nested function: longjmp through the parent's
+   jmp_buf at BUF_OFF, a capture reached through the static chain */
+static __attribute__((noinline)) void block_nonlocal_goto(int buf_off)
+{
+  /* Create SValue for buffer address via chain-relative access.
+   * vreg=-1 + VT_LOCAL + is_lval=false → MACH_OP_CHAIN_REL with no deref,
+   * giving us the address of the buffer in the parent's frame. */
+  SValue buf_sv;
+  svalue_init(&buf_sv);
+  buf_sv.type.t = VT_INT;
+  buf_sv.type.ref = NULL;
+  buf_sv.r = VT_LOCAL;  /* FP-relative in parent, becomes chain-relative */
+  buf_sv.c.i = buf_off; /* the jmp_buf capture's offset range */
+  buf_sv.vr = -1;       /* no vreg = pure stack offset → triggers CHAIN_REL */
+
+  /* Emit NL_LONGJMP: restores callee-saved regs, SP from 40-byte buffer and jumps to resume addr */
+  tcc_ir_put(tcc_state->ir, TCCIR_OP_NL_LONGJMP, &buf_sv, NULL, NULL);
+}
+
 void block(int flags)
 {
-  int a, b, c, d, e, t;
+  int a, b, c, d, e, t, kind, then_diverges;
   struct scope o;
   Sym *s;
+  /* -Wimplicit-fallthrough / -Wdangling-else bookkeeping (no code depends on it) */
+  int ft_entry, ft, line0, code_on0, dangling;
 
   if (flags & STMT_EXPR)
   {
@@ -178,39 +580,78 @@ again:
    * statement (a declaration's initializer, a nested one inside a
    * statement expression) uses it. */
   discarded_call_vtop = NULL;
-  t = tok;
+  t = kind = tok;
+  stmt_diverges = 0;
+  ft_entry = stmt_ft;
+  ft = -1; /* -1: an ordinary statement, see the end */
+  line0 = file ? file->line_num : 0;
+  code_on0 = !(nocode_wanted & CODE_OFF_BIT);
+  dangling = 0;
   /* If the token carries a value, next() might destroy it. Only with
      invalid code such as f(){"123"4;} */
   if (TOK_HAS_VALUE(t))
     goto expr;
   next();
+  if (objsize_ab_watch)
+    objsize_branch_stmt(t); /* -Warray-bounds in loops: what may skip the rest */
 
   if (debug_modes)
     tcc_tcov_check_line(tcc_state, 0), tcc_tcov_block_begin(tcc_state);
 
-  if (t == TOK_IF)
+  if (t == TOK_ATTRIBUTE1 || t == TOK_ATTRIBUTE2 || (t == '[' && tok == '['))
   {
+    /* attributes on a statement: `[[fallthrough]];`,
+       `__attribute__((fallthrough));` (in a compound statement decl() reads
+       them as an empty declaration) */
+    if (block_stmt_attributes(t))
+      goto again; /* attributes on the statement that follows */
+    next();
+    ft = attr_fallthrough_seen ? FT_ATTR : -2;
+    if (attr_fallthrough_seen)
+      check_fallthrough_placement(line0);
+  }
+  else if (t == TOK_IF)
+  {
+    int then_ft, then_line, then_dangling;
     new_scope_s(&o);
     skip('(');
     gexpr();
+    check_cond_assign(line0);
     check_nonvoid_value();
     skip(')');
     a = tcc_ir_codegen_test_gen(tcc_state->ir, 1, -1);
-    block(0);
+    {
+      const int empty_line = tok == ';' ? file->line_num : 0;
+      stmt_ft = FT_FALLS;
+      stmt_ft_line = line0;
+      block(0);
+      if (empty_line && tok != TOK_ELSE)
+        check_empty_body("if", empty_line);
+    }
+    then_diverges = stmt_diverges;
+    then_ft = stmt_ft, then_line = stmt_ft_line, then_dangling = stmt_dangling;
     if (tok == TOK_ELSE)
     {
       int if_nocode, else_nocode;
-      SValue dest;
       if_nocode = nocode_wanted; /* save reachability after if-body */
-      svalue_init(&dest);
-      dest.vr = -1;
-      dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-      dest.c.i = -1;     /* Will be patched to end of else block */
-      d = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+      d = block_jump(-1);        /* Will be patched to end of else block */
       tcc_ir_backpatch_to_here(tcc_state->ir, a);
       CODE_ON(); /* Code after if-branch is reachable via else path */
       next();
+      if (tok == ';')
+        check_empty_body("else", file->line_num);
+      stmt_ft = FT_FALLS;
+      stmt_ft_line = line0;
       block(0);
+      stmt_diverges &= then_diverges;
+      /* falls if an arm does; else marked if an arm is; else diverges */
+      if (then_ft == FT_FALLS || stmt_ft == FT_FALLS)
+        ft = FT_FALLS;
+      else if (then_ft == FT_ATTR || stmt_ft == FT_ATTR)
+        ft = FT_ATTR;
+      else
+        ft = FT_DIVERGES;
+      dangling = 1;
       else_nocode = nocode_wanted; /* save reachability after else-body */
       tcc_ir_backpatch_to_here(tcc_state->ir, d);
       /* If both branches are unreachable (both returned/broke),
@@ -224,6 +665,13 @@ again:
     {
       tcc_ir_backpatch_to_here(tcc_state->ir, a);
       CODE_ON(); /* Code after if is reachable when condition is false */
+      stmt_diverges = 0;
+      ft = FT_FALLS; /* the false path */
+      (void)then_line;
+      /* -Wdangling-else: `if (a) if (b) x; else y;` */
+      if (then_dangling && fe_check_on(tcc_state->warn_dangling_else) &&
+          tcc_diag_first(tcc_state, line0, DIAG_KEY_DANGLING_ELSE))
+        tcc_warning_c(warn_dangling_else)("%i:suggest explicit braces to avoid ambiguous 'else'", line0);
     }
     prev_scope_s(&o);
   }
@@ -233,7 +681,10 @@ again:
     d = gind();
     const_init_forget_all();
     skip('(');
+    objsize_loop_hdr++; /* runs again after the body (builtin/objsize.c) */
     gexpr();
+    objsize_loop_hdr--;
+    check_cond_assign(line0);
     check_nonvoid_value();
     skip(')');
     // fprintf(stderr, "WHILE_COND: file=%s line=%d r=0x%x type=0x%x vr=%d VT_LVAL=%d VT_VALMASK=0x%x btype=0x%x\n",
@@ -242,7 +693,11 @@ again:
     // a = gvtst(1, 0);
     a = tcc_ir_codegen_test_gen(tcc_state->ir, 1, -1);
     b = -1; /* Initialize continue chain with -1 sentinel */
+    stmt_ft = FT_FALLS;
     lblock(&a, &b);
+    dangling = stmt_dangling;
+    /* while (1) with no break: nothing after it is reached */
+    ft = a == -1 ? FT_DIVERGES : FT_FALLS;
     d = gjmp_addr(d);
     // gsym_addr(b, d);
     tcc_ir_backpatch_to_here(tcc_state->ir, a);
@@ -255,6 +710,8 @@ again:
     if (debug_modes)
       tcc_debug_stabn(tcc_state, N_LBRAC, ind - func_ind);
     new_scope(&o);
+    o.kind = flags & STMT_EXPR ? SCOPE_STMT_EXPR : SCOPE_BRACE;
+    compound_depth++;
 
     /* handle local labels declarations */
     while (tok == TOK_LABEL)
@@ -265,6 +722,9 @@ again:
         if (tok < TOK_UIDENT)
           expect("label identifier");
         Sym *lbl = label_push(&local_label_stack, tok, LABEL_DECLARED);
+        /* -Wunused-label: a nested function's goto may be its only use, and
+           nothing parses that body before the label is popped */
+        lbl->ymod |= SYM_UNUSED_OK;
         /* Allocate a 40-byte nonlocal-goto jmp_buf on the stack for each
          * __label__. The buffer stores 10 words for non-local goto:
          *   [0-28]: r4-r11 (callee-saved regs), [32]: SP, [36]: resume_addr.
@@ -282,14 +742,31 @@ again:
 
     while (tok != '}')
     {
+      const int decl_line = file->line_num;
+      attr_fallthrough_seen = 0;
       decl(VT_LOCAL);
+      /* `[[fallthrough]];` and `__attribute__((fallthrough));` read as an
+         empty declaration */
+      if (attr_fallthrough_seen && stmt_ft != FT_DIVERGES)
+        stmt_ft = FT_ATTR, stmt_ft_line = file->line_num;
+      if (attr_fallthrough_seen)
+        check_fallthrough_placement(decl_line);
       if (tok != '}')
       {
         if (flags & STMT_EXPR)
+        {
+          attr_check_discard(); /* the statement before, not the last one */
+          if (tcc_state->unused_on)
+            unused_stmt_expr_drop(); /* -Wunused-value: so is its value */
           vpop();
+        }
         block(flags | STMT_COMPOUND);
       }
     }
+    /* the block ends as its last statement; leaving the scope runs defers
+       (block() again), which must not count */
+    ft = stmt_ft, line0 = stmt_ft_line, dangling = 0;
+    compound_depth--;
 
     prev_scope(&o, flags & STMT_EXPR);
     if (debug_modes)
@@ -301,6 +778,10 @@ again:
      * the outermost '}' is exactly when local_scope equals that level. */
     if (local_scope && !(tcc_state->in_inline_expansion && local_scope == tcc_state->in_inline_expansion))
       next();
+    else if (!nocode_wanted && yasc_void_union_falls_off())
+    {
+      /* a `!void` function's end: success */
+    }
     else if (!local_scope)
     {
       /* For main(), always generate return 0 even if nocode_wanted is set
@@ -313,218 +794,93 @@ again:
   }
   else if (t == TOK_RETURN)
   {
+    const int return_line = file ? file->line_num : 0; /* past the ';' when the jump is emitted */
+    if (defer_body_active())
+      tcc_error("'return' in a defer body");
+    if (type_is_errunion(&func_vt))
+    {
+      yasc_return_stmt();
+      goto return_tail;
+    }
     b = (func_vt.t & VT_BTYPE) != VT_VOID;
     if (tok != ';')
     {
       gexpr();
       if (b)
       {
+        if (yasc_pp_live && (type_yasc(&func_vt) & YASC_OWNED))
+          yasc_pp_return(vtop); /* plain_param.c */
+        yasc_returning = 1;
         gen_assign_cast(&func_vt);
+        yasc_returning = 0;
       }
       else
       {
         if (vtop->type.t != VT_VOID)
-          tcc_warning("void function returns a value");
+          tcc_warning_once(warn_return_type, "void function returns a value");
         vtop--;
         print_vstack("block(1)");
       }
     }
     else if (b)
     {
-      tcc_warning("'return' with no value");
+      tcc_warning_once(warn_return_type, "'return' with no value");
       b = 0;
     }
-    /* The return operand may still be an lvalue (`return a[i];`).  If it lives
-     * in a VLA, leaving the scope restores SP (freeing the VLA) before the
-     * RETURNVALUE materialises the load, so the read would hit released stack.
-     * Load it into a temp first. */
-    if (b && tcc_state->ir && (func_vt.t & VT_BTYPE) != VT_STRUCT && (vtop->r & VT_LVAL))
-    {
-      struct scope *sc;
-      int has_vla = 0;
-      for (sc = cur_scope; sc && sc != root_scope; sc = sc->prev)
-        if (sc->vla.num)
-          has_vla = 1;
-      if (has_vla)
-      {
-        SValue load_dst;
-        svalue_init(&load_dst);
-        load_dst.type = vtop->type;
-        load_dst.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-        load_dst.r = 0;
-        load_dst.c.i = 0;
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dst);
-        vtop->vr = load_dst.vr;
-        vtop->r = 0;
-      }
-    }
-    leave_scope(root_scope);
-    if (b)
-    {
-      if (tcc_state->in_inline_expansion)
-      {
-        if ((func_vt.t & VT_BTYPE) == VT_STRUCT)
-        {
-          /* Struct return in inline expansion: instead of copying to the
-           * return slot, redirect inline_return_loc to point at the source
-           * if it's a simple stack local.  This eliminates one memmove —
-           * the caller's assignment will copy directly from the inlined
-           * function's local variable. */
-          if ((vtop->r & (VT_LOCAL | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && vtop->vr == -1 &&
-              !tcc_state->inline_return_redirected && !tcc_state->inline_return_copied)
-          {
-            /* Only the FIRST return may retarget the slot.  Retargeting again
-             * would move the caller's read away from the slot the first
-             * return left its value in — and that first return emits no copy,
-             * so its path would read an uninitialized slot (a two-return
-             * `return local;` / `return f();` body did exactly that).  Later
-             * returns take the vstore() copy below, which writes into this
-             * same retargeted slot.  Nor may a return retarget once an earlier
-             * one copied into the slot: that copy's path would read the local. */
-            LOG_INLINE_STRUCT("[inline-struct] redirect return: loc %d -> %d", (int)tcc_state->inline_return_loc,
-                              (int)vtop->c.i);
-            tcc_state->inline_return_loc = vtop->c.i;
-            tcc_state->inline_return_redirected = 1;
-            vtop--;
-          }
-          else
-          {
-            /* Fallback: copy via vstore() when source is not a simple local */
-            SValue src_save = *vtop;
-            tcc_state->inline_return_copied = 1;
-            vtop--;
-            CValue ret_cv;
-            ret_cv.i = tcc_state->inline_return_loc;
-            vsetc(&func_vt, VT_LOCAL | VT_LVAL, &ret_cv);
-            vtop->vr = -1;
-            vpushv(&src_save);
-            vstore();
-            vtop--;
-          }
-        }
-        else
-        {
-          /* Inside inline expansion: store return value to local slot
-           * instead of emitting RETURNVALUE IR op.
-           * Must materialize VT_CMP/VT_JMP (comparison flags) into a 0/1
-           * register value before the STORE, just like gfunc_return does
-           * via tcc_ir_codegen_cmp_jmp_set.  Without this, a return of a
-           * comparison expression (e.g. "return a >= b;") would store the
-           * raw operand register instead of the boolean result. */
-          tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
-          /* If vtop is an lval (e.g. "return *p;" or "return x;" where x is
-           * a local), emit an explicit LOAD into a temp first.  Without this
-           * the resulting STORE would carry a DEREF source operand, which
-           * the 64-bit store backend cannot split via mach_make_hi_half
-           * (it expects a register pair, not a pointer).  Mirrors the
-           * LOAD step in gfunc_return for the non-inline return path. */
-          if (vtop->r & VT_LVAL)
-          {
-            SValue load_dst;
-            svalue_init(&load_dst);
-            load_dst.type = vtop->type;
-            load_dst.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-            load_dst.r = 0;
-            load_dst.c.i = 0;
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dst);
-            vtop->vr = load_dst.vr;
-            vtop->r = 0;
-          }
-          SValue ret_dst;
-          svalue_init(&ret_dst);
-          ret_dst.type = func_vt;
-          /* The inline return slot is allocated at a minimum of 4 bytes (see
-           * the rsize clamp where inline_ret_loc is carved out), and the
-           * consumer of the expanded call reads it as a word.  Storing a
-           * narrow return type at its own width left the upper bytes of the
-           * slot uninitialised, so the reader tested stack garbage:
-           *   strb rX,[sp,#4] ... ldr rX,[sp,#4]; cmp rX,#0
-           * made `if (u8_returning_fn(...))` a coin flip.  The value is
-           * already zero/sign-extended in its register, so writing the whole
-           * word is correct for a narrow read of the slot as well as for the
-           * word read the consumer actually performs. */
-          {
-            int ret_bt = ret_dst.type.t & VT_BTYPE;
-            if (ret_bt == VT_BOOL || ret_bt == VT_BYTE || ret_bt == VT_SHORT)
-              ret_dst.type.t = (ret_dst.type.t & ~VT_BTYPE) | VT_INT;
-          }
-          ret_dst.r = VT_LOCAL | VT_LVAL;
-          /* The vreg (when the call site bound one) makes this a write to a
-           * compiler-generated local rather than to a raw frame slot, so the
-           * allocator can keep the inlined return value in a register. */
-          ret_dst.vr = tcc_state->inline_return_vr;
-          ret_dst.c.i = tcc_state->inline_return_loc;
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, vtop, NULL, &ret_dst);
-          vtop--;
-        }
-      }
-      else
-      {
-        gfunc_return(&func_vt);
-      }
-    }
+    gen_return_emit(b, 0);
+  return_tail:
     skip(';');
     /* jump unless last stmt in top-level block */
     if (tok != '}' || local_scope != 1)
     {
-      SValue dest;
-      svalue_init(&dest);
-      dest.vr = -1;
-      dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-      dest.c.i = rsym;   /* Chain return jumps: point to previous rsym */
-      rsym = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
-      // rsym = gjmp(rsym);
+      gen_return_line = return_line;
+      gen_return_jump();
     }
     if (debug_modes)
       tcc_tcov_block_end(tcc_state, -1);
     CODE_OFF();
+    stmt_diverges = 1;
   }
   else if (t == TOK_BREAK)
   {
     /* compute jump */
-    SValue dest;
     if (!cur_scope->bsym)
-      tcc_error("cannot break");
+      tcc_error(defer_body_active() ? "'break' out of a defer body" : "cannot break");
     if (cur_switch && cur_scope->bsym == cur_switch->bsym)
-      leave_scope(cur_switch->scope);
+      leave_scope(cur_switch->scope, lt_switch_lstk);
     else
-      leave_scope(loop_scope);
-    svalue_init(&dest);
-    dest.vr = -1;
-    dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-    dest.c.i = *cur_scope->bsym;
-    *cur_scope->bsym = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+      leave_scope(loop_scope, lt_loop_lstk);
+    *cur_scope->bsym = block_jump(*cur_scope->bsym);
     // *cur_scope->bsym = gjmp(*cur_scope->bsym);
     skip(';');
   }
   else if (t == TOK_CONTINUE)
   {
     /* compute jump */
-    SValue dest;
     if (!cur_scope->csym)
-      tcc_error("cannot continue");
-    leave_scope(loop_scope);
-    svalue_init(&dest);
-    dest.vr = -1;
-    dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-    dest.c.i = *cur_scope->csym;
+      tcc_error(defer_body_active() ? "'continue' out of a defer body" : "cannot continue");
+    leave_scope(loop_scope, lt_loop_lstk);
     // *cur_scope->csym = gjmp(*cur_scope->csym);
-    *cur_scope->csym = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+    *cur_scope->csym = block_jump(*cur_scope->csym);
     skip(';');
   }
   else if (t == TOK_FOR)
   {
     int saved_line_num;
     new_scope(&o);
+    o.kind = SCOPE_FOR;
 
     skip('(');
+    objsize_for_begin(); /* -Warray-bounds on the loop's last trip (objsize.c) */
     if (tok != ';')
     {
       /* c99 for-loop init decl? */
       if (!decl(VT_JMP))
       {
         /* no, regular for-loop init expr */
+        const int effects = uv_effects, line = file->line_num;
         gexpr();
+        unused_discard(effects, line, 0);
         vpop_discarded();
       }
     }
@@ -532,34 +888,51 @@ again:
     a = b = -1; /* Initialize break/continue chains with -1 sentinel */
     c = d = gind();
     const_init_forget_all();
+    if (objsize_ab_watch)
+      objsize_for_phase(OS_FOR_COND);
     if (tok != ';')
     {
+      objsize_loop_hdr++;
       gexpr();
+      objsize_loop_hdr--;
+      if (objsize_ab_watch)
+        objsize_for_phase(OS_FOR_STEP);
+      check_cond_assign(line0);
       check_nonvoid_value();
       a = tcc_ir_codegen_test_gen(tcc_state->ir, 1, -1);
     }
+    else if (objsize_ab_watch)
+      objsize_for_phase(OS_FOR_STEP);
     skip(';');
     if (tok != ')')
     {
       // e = gjmp(0);
-      SValue dest;
-      svalue_init(&dest);
-      dest.vr = -1;
-      dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-      dest.c.i = -1;
-      e = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+      e = block_jump(-1);
       // d = gind();
       c = tcc_state->ir->next_instruction_index;
-      gexpr();
+      {
+        const int effects = uv_effects, line = file->line_num;
+        objsize_loop_hdr++;
+        gexpr();
+        objsize_loop_hdr--;
+        unused_discard(effects, line, 0);
+      }
       vpop_discarded();
       gjmp_addr(d);
       tcc_ir_backpatch_to_here(tcc_state->ir, e);
       // gsym(e);
     }
     skip(')');
+    o.kind |= SCOPE_FOR_BODY;
     /* Save line number before loop body for backward jump */
     saved_line_num = file->line_num;
+    stmt_ft = FT_FALLS;
+    if (objsize_ab_watch)
+      objsize_for_phase(OS_FOR_BODY);
     lblock(&a, &b);
+    if (objsize_ab_watch)
+      objsize_for_end();
+    dangling = stmt_dangling;
     /* Temporarily restore line number for backward jump instruction */
     {
       int cur_line = file->line_num;
@@ -571,6 +944,7 @@ again:
     tcc_ir_backpatch(tcc_state->ir, b, c);
     /* If there was no exit condition and no break (a == -1 after lblock),
        the loop is infinite and code after it is unreachable. */
+    ft = a == -1 ? FT_DIVERGES : FT_FALLS;
     if (a == -1)
       nocode_wanted |= CODE_OFF_BIT;
     // gsym_addr(b, d);
@@ -583,12 +957,17 @@ again:
     a = b = -1; /* Initialize break/continue chains with -1 sentinel */
     d = gind();
     const_init_forget_all();
+    if (tok == ';' && fe_check_on(tcc_state->warn_empty_body) &&
+        tcc_diag_first(tcc_state, file->line_num, DIAG_KEY_EMPTY_BODY))
+      tcc_warning_c(warn_empty_body)("%i:suggest braces around empty body in 'do' statement", file->line_num);
+    stmt_ft = FT_FALLS;
     lblock(&a, &b);
     /* continue jumps land at the condition check of the do/while */
     tcc_ir_backpatch_to_here(tcc_state->ir, b);
     skip(TOK_WHILE);
     skip('(');
     gexpr();
+    check_cond_assign(file->line_num);
     check_nonvoid_value();
     skip(')');
     skip(';');
@@ -604,13 +983,13 @@ again:
   else if (t == TOK_SWITCH)
   {
     struct switch_t *sw;
-    SValue dest;
 
     sw = tcc_mallocz(sizeof *sw);
     sw->bsym = &a;
     sw->scope = cur_scope;
     sw->prev = cur_switch;
     sw->nocode_wanted = nocode_wanted;
+    sw->body_depth = compound_depth + 1;
     cur_switch = sw;
 
     new_scope_s(&o);
@@ -626,21 +1005,18 @@ again:
     sw->sv = *vtop--; /* save switch value */
     print_vstack("block(2)");
     a = -1; /* Initialize break chain with -1 sentinel */
-    svalue_init(&dest);
-    dest.vr = -1;
-    dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-    dest.c.i = -1;     /* Initial jump target, will be patched */
-    b = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+    b = block_jump(-1); /* Initial jump target, will be patched */
     // b = gjmp(0); /* jump to first case */
+    stmt_ft = FT_LABEL; /* the first case is reached by no statement */
     lblock(&a, NULL);
     /* If the switch has a default label, no explicit breaks were emitted
      * (a == -1), and the last case ends with dead code (return/goto/continue),
      * then ALL paths through the switch exit without reaching code after it.
      * Must be checked before the implicit break overwrites 'a'. */
     int switch_exits_all = sw->def_sym && (a == -1) && (nocode_wanted & CODE_OFF_BIT);
-    dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-    dest.c.i = a;
-    a = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+    ft = sw->def_sym && a == -1 && stmt_ft == FT_DIVERGES ? FT_DIVERGES : FT_FALLS;
+    check_switch_enum(sw, line0);
+    a = block_jump(a);
     // a = gjmp(a); /* add implicit break */
     /* case lookup */
     // gsym(b);
@@ -678,16 +1054,7 @@ again:
                             (sv_vreg_type == TCCIR_VREG_TYPE_TEMP ||
                              (sv_vreg_type == TCCIR_VREG_TYPE_PARAM && !(vtop->r & VT_LOCAL)));
     if (!reuse_switch_vreg)
-    {
-      svalue_init(&dest);
-      dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-      /* Preserve the original type so the IR can tag the vreg correctly
-        (notably VT_LLONG needs 8-byte spill slots). */
-      dest.type = vtop->type;
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_ASSIGN, vtop, NULL, &dest);
-      vtop->vr = dest.vr;
-      vtop->r = 0;
-    }
+      block_switch_value_copy();
     /* Force bitfield extraction before switch comparison / jump table.
      * The ASSIGN above copies the raw containing word into the temp vreg;
      * the bitfield bits must be extracted (SHL+SAR) now so that ALL
@@ -768,6 +1135,10 @@ again:
     struct case_t *cr;
     if (!cur_switch)
       expect("switch");
+    if (defer_body_active())
+      tcc_error("label in a defer body");
+    check_fallthrough(ft_entry, line0);
+    stmt_ft = FT_LABEL;
     cr = tcc_malloc(sizeof(struct case_t));
     dynarray_add(&cur_switch->p, &cur_switch->n, cr);
     t = cur_switch->sv.type.t;
@@ -777,7 +1148,7 @@ again:
       next();
       cr->v2 = value64(expr_const64(), t);
       if (case_cmp(cr->v2, cr->v1) < 0)
-        tcc_warning("empty case range");
+        tcc_warning_once_always("empty case range");
     }
     /* case and default are unreachable from a switch under nocode_wanted */
     if (!cur_switch->nocode_wanted)
@@ -790,14 +1161,20 @@ again:
   {
     if (!cur_switch)
       expect("switch");
+    if (defer_body_active())
+      tcc_error("label in a defer body");
     if (cur_switch->def_sym)
       tcc_error("too many 'default'");
+    check_fallthrough(ft_entry, line0);
+    stmt_ft = FT_LABEL;
     cur_switch->def_sym = cur_switch->nocode_wanted ? -1 : gind();
     skip(':');
     goto block_after_label;
   }
   else if (t == TOK_GOTO)
   {
+    if (defer_body_active())
+      tcc_error("'goto' in a defer body");
     vla_restore(cur_scope->vla.locorig);
     if (tok == '*' && gnu_ext)
     {
@@ -827,19 +1204,7 @@ again:
               if (cur_nf->captured_tokens[ci] == -tok)
                 buf_off = tcc_state->ir->captured_vbase[ci];
 
-            /* Create SValue for buffer address via chain-relative access.
-             * vreg=-1 + VT_LOCAL + is_lval=false → MACH_OP_CHAIN_REL with no deref,
-             * giving us the address of the buffer in the parent's frame. */
-            SValue buf_sv;
-            svalue_init(&buf_sv);
-            buf_sv.type.t = VT_INT;
-            buf_sv.type.ref = NULL;
-            buf_sv.r = VT_LOCAL;  /* FP-relative in parent, becomes chain-relative */
-            buf_sv.c.i = buf_off; /* the jmp_buf capture's offset range */
-            buf_sv.vr = -1;       /* no vreg = pure stack offset → triggers CHAIN_REL */
-
-            /* Emit NL_LONGJMP: restores callee-saved regs, SP from 40-byte buffer and jumps to resume addr */
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_NL_LONGJMP, &buf_sv, NULL, NULL);
+            block_nonlocal_goto(buf_off);
             /* longjmp doesn't return - mark code as dead */
             CODE_OFF();
             is_nonlocal_goto = 1;
@@ -857,6 +1222,7 @@ again:
           s = label_push(&global_label_stack, tok, LABEL_FORWARD);
         else if (s->r == LABEL_DECLARED)
           s->r = LABEL_FORWARD;
+        s->ymod |= SYM_UNUSED_REF; /* -Wunused-label */
 
         if (s->r & LABEL_FORWARD)
         {
@@ -895,12 +1261,26 @@ again:
   {
     asm_instr();
   }
+  else if (t == TOK_defer && tcc_state->yasc)
+  {
+    defer_stmt(CLEANUP_DEFER);
+  }
+  else if (t == TOK_errdefer && tcc_state->yasc)
+  {
+    if (!type_is_errunion(&func_vt))
+      tcc_error("errdefer in a function that does not return an error union");
+    defer_stmt(CLEANUP_ERRDEFER);
+  }
   else
   {
     if (tok == ':' && t >= TOK_UIDENT)
     {
       /* label case */
+      const int label_line = file->line_num;
+      if (defer_body_active())
+        tcc_error("label in a defer body");
       next();
+      objsize_label(); /* a goto back here: the followed allocations are lost */
       s = label_find(t);
       if (s)
       {
@@ -926,21 +1306,27 @@ again:
       tcc_ir_label_note(tcc_state->ir, s->jind);
       tcc_ir_asm_label_note(tcc_state->ir, s->c, s->jind);
       tcc_state->ir->basic_block_start = 1;
-      if (s->c > 0)
+      if (ASM_LABEL_ID_VALID(s->c))
         tcc_state->ir->next_insn_is_jump_target = 1;
       const_init_forget_all();
       s->cleanupstate = cur_scope->cl.s;
+      stmt_ft = FT_LABEL;
+      {
+        /* Accept attributes after labels (e.g. 'unused') */
+        const int attr_unused = block_label_attributes();
+        if (tcc_state->unused_on)
+          unused_label_defined(s, label_line, attr_unused);
+      }
+      goto label_attributes_done;
 
     block_after_label:
-    {
-      /* Accept attributes after labels (e.g. 'unused') */
-      AttributeDef ad_tmp;
-      parse_attribute(&ad_tmp);
-    }
+      block_label_attributes(); /* Accept attributes after labels (e.g. 'unused') */
+    label_attributes_done:
       if (debug_modes)
         tcc_tcov_reset_ind(tcc_state);
       vla_restore(cur_scope->vla.locorig);
 
+      ft = FT_LABEL;
       if (tok != '}')
       {
         if (0 == (flags & STMT_COMPOUND))
@@ -950,35 +1336,88 @@ again:
       else
       {
         /* we accept this, but it is a mistake */
-        tcc_warning_c(warn_all)("deprecated use of label at end of compound statement");
+        tcc_warning_once(warn_all, "deprecated use of label at end of compound statement");
       }
     }
     else
     {
       /* expression case */
+      if (t == ';')
+        ft = -2; /* the null statement: as if it were not there */
       if (t != ';')
       {
         unget_tok(t);
       expr:
         if (flags & STMT_EXPR)
         {
+          const int effects = uv_effects, line = file->line_num;
+          attr_check_discard(); /* the statement before this one */
           vpop();
           gexpr();
+          if (tcc_state->unused_on)
+            unused_stmt_expr_end(effects, line);
         }
         else
         {
+          const int effects = uv_effects, line = file->line_num;
           discarded_call_vtop = vtop;
           gexpr();
+          unused_discard(effects, line, 0);
           discarded_call_vtop = NULL;
           tcc_ir_codegen_drop_return(tcc_state->ir);
+          attr_check_discard();
+          if (tcc_state->yasc)
+            yasc_verify_discard();
           gv_discarded_volatile();
           vpop();
         }
         skip(';');
+        stmt_diverges = (nocode_wanted & CODE_OFF_BIT) != 0; /* a noreturn call */
       }
     }
   }
 
+  /* break, continue and goto leave; a loop or a switch may complete */
+  if (kind == TOK_BREAK || kind == TOK_CONTINUE || kind == TOK_GOTO)
+    stmt_diverges = 1;
+  else if (kind == TOK_WHILE || kind == TOK_FOR || kind == TOK_DO || kind == TOK_SWITCH)
+    stmt_diverges = 0;
+
+  /* -Wimplicit-fallthrough: how this statement ends (see stmt_ft) */
+  if (kind == TOK_BREAK || kind == TOK_CONTINUE || kind == TOK_GOTO || kind == TOK_RETURN)
+    ft = FT_DIVERGES;
+  else if (ft == -1)
+    /* an expression (a noreturn call turns the code off), asm, defer */
+    ft = code_on0 && (nocode_wanted & CODE_OFF_BIT) ? FT_DIVERGES : FT_FALLS;
+  if (ft == -2)
+    ft = ft_entry, line0 = stmt_ft_line;
+  else if (ft_entry == FT_DIVERGES && ft != FT_LABEL)
+    ft = FT_DIVERGES, line0 = stmt_ft_line;
+  stmt_ft = ft;
+  stmt_ft_line = line0;
+  stmt_dangling = dangling;
+
   if (debug_modes)
     tcc_tcov_check_line(tcc_state, 0), tcc_tcov_block_end(tcc_state, 0);
+}
+
+/* Error recovery (core/recover.c): the statement state an error left behind
+ * goes back to what it was when the recovery point was armed. */
+void block_recover_get(Sym **lt_loop, Sym **lt_switch, int *depth)
+{
+  *lt_loop = lt_loop_lstk;
+  *lt_switch = lt_switch_lstk;
+  *depth = compound_depth;
+}
+
+void block_recover_set(Sym *lt_loop, Sym *lt_switch, int depth)
+{
+  lt_loop_lstk = lt_loop;
+  lt_switch_lstk = lt_switch;
+  compound_depth = depth; /* -Wimplicit-fallthrough's switch body depth */
+  stmt_dangling = 0;
+  stmt_diverges = 0;
+  stmt_ft = FT_LABEL; /* nothing before it falls through into it */
+  stmt_ft_line = 0;
+  attr_fallthrough_seen = 0;
 }

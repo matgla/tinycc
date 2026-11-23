@@ -61,6 +61,9 @@ SELFHOST_COMPILE_SOURCES = [
     "source/ir/regalloc_post.c",
     "source/ir/regalloc_scan.c",
     "source/ir/ssa.c",
+    "source/ir/lifetime.c",
+    "source/ir/bounds.c",
+    "source/ir/taint.c",
     "source/ir/stack.c",
     "source/ir/type.c",
     "source/ir/vreg.c",
@@ -133,33 +136,43 @@ SELFHOST_COMPILE_SOURCES = [
     "source/backend/generators/function.c",
     "source/backend/generators/regalloc.c",
     "source/backend/generators/icf.c",
+    "source/backend/generators/stack_usage.c",
     # source/frontend/gen/builtin/
     "source/frontend/gen/builtin/call.c",
     "source/frontend/gen/builtin/chk.c",
     "source/frontend/gen/builtin/fp.c",
     "source/frontend/gen/builtin/fp2.c",
     "source/frontend/gen/builtin/misc.c",
+    "source/frontend/gen/builtin/objsize.c",
     "source/frontend/gen/builtin/overflow.c",
     "source/frontend/gen/builtin/simd.c",
     "source/frontend/gen/builtin/string.c",
     # source/frontend/gen/core/
     "source/frontend/gen/core/predicates.c",
+    "source/frontend/gen/core/recover.c",
     "source/frontend/gen/core/state.c",
     "source/frontend/gen/core/suppress.c",
+    "source/frontend/gen/core/unused.c",
     # source/frontend/gen/decl/
     "source/frontend/gen/decl/attribute.c",
     "source/frontend/gen/decl/btype.c",
     "source/frontend/gen/decl/decl.c",
     "source/frontend/gen/decl/declarator.c",
+    "source/frontend/gen/decl/method.c",
+    "source/frontend/gen/decl/module.c",
+    "source/frontend/gen/decl/plain_param.c",
     "source/frontend/gen/decl/predef_protos.c",
     "source/frontend/gen/decl/struct.c",
+    "source/frontend/gen/decl/typesig.c",
     # source/frontend/gen/expr/
     "source/frontend/gen/expr/atomic.c",
+    "source/frontend/gen/expr/attr_checks.c",
     "source/frontend/gen/expr/cond.c",
     "source/frontend/gen/expr/indir.c",
     "source/frontend/gen/expr/infix.c",
     "source/frontend/gen/expr/primary.c",
     "source/frontend/gen/expr/unary.c",
+    "source/frontend/gen/expr/yasc_errors.c",
     # source/frontend/gen/init/
     "source/frontend/gen/init/alloc.c",
     "source/frontend/gen/init/initializer.c",
@@ -170,15 +183,18 @@ SELFHOST_COMPILE_SOURCES = [
     # source/frontend/gen/nested/
     "source/frontend/gen/nested/nested.c",
     # source/frontend/gen/op/
+    "source/frontend/gen/op/bcheck.c",
     "source/frontend/gen/op/complex.c",
     "source/frontend/gen/op/float.c",
     "source/frontend/gen/op/fold_math.c",
     "source/frontend/gen/op/int.c",
     "source/frontend/gen/op/op.c",
+    "source/frontend/gen/op/ubsan.c",
     "source/frontend/gen/op/vector.c",
     # source/frontend/gen/stmt/
     "source/frontend/gen/stmt/block.c",
     "source/frontend/gen/stmt/cleanup.c",
+    "source/frontend/gen/stmt/defer.c",
     "source/frontend/gen/stmt/ret.c",
     "source/frontend/gen/stmt/switch.c",
     # source/frontend/gen/store/
@@ -466,8 +482,15 @@ def _selfhost_include_dirs(tinycc_root):
     """
     rel = [
         ".",
-        "ir",
-        "include",
+        "source/include",
+        "source/driver",
+        "source/frontend",
+        "source/frontend/gen",
+        "source/ir",
+        "source/machine",
+        "source/obj",
+        "source/support",
+        "source/opt",
         "source/opt/include",
         "source/opt/framework",
         "source/opt/ssa",
@@ -489,13 +512,25 @@ def _selfhost_include_dirs(tinycc_root):
         "source/opt/flat/ipa",
         "source/memory/include",
         "source/utils/include",
+        "source/backend/generators",
         "source/backend/arch/arm",
         "source/backend/arch/arm/thumb",
+        "include",
     ]
     return [tinycc_root / r for r in rel]
 
 
-def _selfhost_defines():
+# build_rootfs.sh's native configurations (NATIVE_TCC_DEBUG_DEFINE): the
+# default release build, and the -dump-ir one.  Each compiles different code
+# under -Wall -Werror (a static used only by -bench's allocation sites is
+# unused in the release one).
+NATIVE_CONFIGS = {
+    "release": ["TCC_DEBUG=0", "CONFIG_TCC_DEBUG_ENV=0", "CONFIG_TCC_CHECKS=0"],
+    "dump-ir": ["TCC_DEBUG=0", "CONFIG_TCC_DEBUG", "CONFIG_TCC_DEBUG_ENV=1"],
+}
+
+
+def _selfhost_defines(config="dump-ir"):
     """Target defines matching the ARMv8-M native bootstrap (build_rootfs.sh)."""
     return [
         "TCC_TARGET_ARM",
@@ -507,11 +542,7 @@ def _selfhost_defines():
         "TCC_IS_NATIVE",
         "TARGETOS_YasOS=1",
         "CONFIG_TCC_BCHECK=0",
-        # build_rootfs.sh always defines CONFIG_TCC_DEBUG for the native
-        # compiler (on-target -dump-ir support); compile the same code here.
-        "TCC_DEBUG=0",
-        "CONFIG_TCC_DEBUG",
-    ]
+    ] + NATIVE_CONFIGS[config]
 
 
 def _probe_compiler(compiler, include_dirs, defines, tmp_path):
@@ -519,7 +550,7 @@ def _probe_compiler(compiler, include_dirs, defines, tmp_path):
     probe_src = tmp_path / "probe.c"
     probe_src.write_text('#include "tcc.h"\nint main(void){return 0;}\n')
     probe_out = tmp_path / "probe.o"
-    cmd = [str(compiler), "-c", "-Werror"]
+    cmd = [str(compiler), "-ccompat", "-c", "-Werror"]
     for inc in include_dirs:
         cmd.extend(["-I", str(inc)])
     for d in defines:
@@ -550,7 +581,7 @@ def test_predefined_macros_stay_in_reserved_namespace(selfhost_compiler, tmp_pat
     empty = tmp_path / "empty.c"
     empty.write_text("\n")
     result = subprocess.run(
-        [str(selfhost_compiler), "-E", "-dD", str(empty)],
+        [str(selfhost_compiler), "-ccompat", "-E", "-dD", str(empty)],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -626,7 +657,8 @@ def test_selfhost_source_list_in_sync():
 
 @pytest.mark.selfhost
 @pytest.mark.selfhost_compile
-def test_selfhost_compile_smoke(selfhost_compiler, tmp_path):
+@pytest.mark.parametrize("config", sorted(NATIVE_CONFIGS))
+def test_selfhost_compile_smoke(selfhost_compiler, tmp_path, config):
     """The cross compiler must compile every tinycc source file to an object."""
     tinycc_root = Path(__file__).parent.parent.parent
     sources = [tinycc_root / f for f in SELFHOST_COMPILE_SOURCES]
@@ -634,7 +666,7 @@ def test_selfhost_compile_smoke(selfhost_compiler, tmp_path):
     assert not missing, f"Missing source files: {missing}"
 
     include_dirs = _selfhost_include_dirs(tinycc_root)
-    defines = _selfhost_defines()
+    defines = _selfhost_defines(config)
 
     ok, probe_output = _probe_compiler(
         selfhost_compiler, include_dirs, defines, tmp_path

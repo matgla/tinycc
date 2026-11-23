@@ -9,7 +9,8 @@ BACKEND_GENERATORS_CC = $(CC) $(CFLAGS) $(DEFINES) $(BACKEND_GENERATORS_INC)
 # Object files for the backend generator TUs.
 BACKEND_GENERATORS_SRC = source/backend/generators/function.c \
 	source/backend/generators/regalloc.c \
-	source/backend/generators/icf.c
+	source/backend/generators/icf.c \
+	source/backend/generators/stack_usage.c
 
 BACKEND_GENERATORS_OBJ = $(call lib-objs,generators,$(BACKEND_GENERATORS_SRC))
 
@@ -42,6 +43,13 @@ $(X)source/backend/generators/regalloc.o: \
 # Identical code folding: drops a generated body equal to one already emitted.
 $(X)source/backend/generators/icf.o: \
 	source/backend/generators/icf.c \
+	source/include/tcc.h $(TCC_CORE_DEPS)
+	@mkdir -p $(dir $@)
+	$(BACKEND_GENERATORS_CC) -c $< -o $@
+
+# -Wframe-larger-than=, -Wstack-usage=, -fstack-usage, -fcallgraph-info.
+$(X)source/backend/generators/stack_usage.o: \
+	source/backend/generators/stack_usage.c \
 	source/include/tcc.h $(TCC_CORE_DEPS)
 	@mkdir -p $(dir $@)
 	$(BACKEND_GENERATORS_CC) -c $< -o $@

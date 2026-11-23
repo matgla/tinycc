@@ -85,3 +85,37 @@ int gjmp_addr_acs(int a)
 }
 
 /* These are #undef'd at the end of this file */
+
+/* The frontend checks (-Wimplicit-fallthrough, -Wparentheses, -Wswitch, ...):
+ * whether one of them may report here.  OPT is its warn_ byte; with a
+ * #pragma diagnostic in the unit the option may be on at the line even when
+ * the live state says no, and error1 decides.  Never in a system header, as
+ * gcc.  Never while the inliner replays a body at a call site: its tokens carry
+ * the callee's lines under the caller's file, and the callee's own compile, or
+ * the check-only parse of a body every call inlined
+ * (check_uncompiled_inline_functions), reports it once at every -O level. */
+int fe_check_on(unsigned char opt)
+{
+  BufferedFile *f;
+  if (!(opt & WARN_ON) && !tcc_state->nb_diag_snaps)
+    return 0;
+  /* not in an #if (its expression goes through the same parser), as gcc */
+  if (tcc_state->in_inline_expansion || tcc_state->warn_none || pp_expr)
+    return 0;
+  for (f = file; f && f->filename[0] == ':' && f->prev; f = f->prev)
+    ;
+  return f && !tcc_in_sys_header();
+}
+
+/* Any frontend check that needs a body every call inlined to be parsed once
+ * more for it (check_uncompiled_inline_functions) */
+int fe_checks_wanted(void)
+{
+  TCCState *s1 = tcc_state;
+  if (s1->warn_none)
+    return 0;
+  return s1->nb_diag_snaps || ((s1->warn_implicit_fallthrough | s1->warn_parentheses | s1->warn_logical_not_parentheses |
+                                s1->warn_dangling_else |
+                                s1->warn_empty_body | s1->warn_switch | s1->warn_shadow) &
+                               WARN_ON);
+}

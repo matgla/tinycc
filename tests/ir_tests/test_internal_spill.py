@@ -42,7 +42,7 @@ def _source(path: Path) -> Path:
 
 
 def _compile(src: Path, out: Path, extra=()):
-    cmd = [str(TCC), *INCLUDE_FLAGS, *CFLAGS, *extra, str(src), "-o", str(out)]
+    cmd = [str(TCC), "-ccompat", *INCLUDE_FLAGS, *CFLAGS, *extra, str(src), "-o", str(out)]
     return subprocess.run(cmd, capture_output=True, text=True)
 
 

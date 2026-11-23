@@ -1,0 +1,14 @@
+len2 25
+scaled 6 8 100
+add 7 9 (v 6 8)
+add2 13 17
+dot 114
+sum 14 area 48
+tag call 130 symbol 130
+rvalue 5
+call result 8
+global 29
+pointer 100
+union 1 0
+counter 3
+array 15

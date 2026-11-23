@@ -19,7 +19,7 @@ from conftest import discover_gcc_compile_tests, should_skip_gcc_test
 
 def compile_test(source: Path, opt_level: str, dg_options: str = "") -> tuple:
     """Compile a single test. Returns (success, error_output)."""
-    cmd = [str(COMPILER), opt_level, "-c", str(source), "-o", "/dev/null"]
+    cmd = [str(COMPILER), "-ccompat", opt_level, "-c", str(source), "-o", "/dev/null"]
     if dg_options:
         cmd.extend(dg_options.split())
     try:

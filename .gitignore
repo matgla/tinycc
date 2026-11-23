@@ -2,6 +2,8 @@
 \#*
 .#*
 *.o
+lib/*.ci
+*-libtcc1.ci
 *.so
 *.elf
 *.a

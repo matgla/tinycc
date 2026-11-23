@@ -79,7 +79,7 @@ ST_FUNC void tccelf_new(TCCState *s)
     /* if bound checking, then add corresponding sections */
     /* (make ro after relocation done with GNU_RELRO) */
     bounds_section = new_section(s, ".bounds", SHT_PROGBITS, shf_RELRO);
-    lbounds_section = new_section(s, ".lbounds", SHT_PROGBITS, shf_RELRO);
+    /* no .lbounds: the IR registers locals with calls (gen/op/bcheck.c) */
   }
 #endif
 
@@ -986,6 +986,9 @@ ST_FUNC int tcc_load_object_file_lazy(TCCState *s1, int fd, unsigned long file_o
     obj->sections[i].sh_addralign = sh->sh_addralign;
     obj->sections[i].section = NULL;
     obj->sections[i].referenced = section_is_mandatory(sh_name);
+    /* -Wcross-tu's signatures: read now, never part of the output */
+    if (tcc_typesig_section(s1, fd, file_offset, sh_name, sh))
+      obj->sections[i].sh_type = SHT_NULL, obj->sections[i].referenced = 0;
 
     /* Track relocation section association */
     if (sh->sh_type == SHT_RELX)

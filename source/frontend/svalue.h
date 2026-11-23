@@ -62,6 +62,11 @@ typedef struct SValue
                              * it is loaded by gv() and stored by vstore() with
                              * the bytes swapped, and must never reach the IR
                              * as a plain memory operand. */
+  uint8_t packed_addr : 1;  /* -Waddress-of-packed-member: the value is `&m` of
+                             * a member placed below its type's alignment
+                             * (packed_member_addr has the details).  Set by
+                             * '&' only, cleared by the conversion that checks it
+                             * and by any arithmetic. */
 
   /* Value location and flags - union for bitfield or legacy access */
   union

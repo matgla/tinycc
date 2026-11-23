@@ -47,6 +47,8 @@ void tccgen_predef_proto_interned(TokenSym *ts) { (void)ts; }
  * preprocess_end() calls this hook to release inline-asm macros, so provide
  * the corresponding no-op for this frontend-only harness. */
 void tcc_asm_cleanup(void) {}
+/* decl.c: the lexer's error in a body being saved, raised by its marker */
+void save_body_raise(TCCState *s1) { (void)s1; }
 
 /* tccpp.c's preprocess_start() references the target machine predefs blob that
  * normally lives in the backend (arm-thumb-gen.c).  Supply a minimal ARMv8-M
@@ -113,6 +115,12 @@ void *tcc_realloc_at(void *ptr, unsigned long size, const char *file, int line)
 }
 
 void tcc_free(void *ptr)
+{
+  free(ptr);
+}
+
+/* what realpath() returned (pp_note_main_include) */
+void libc_free(void *ptr)
 {
   free(ptr);
 }
@@ -300,6 +308,68 @@ void tcc_open_bf(TCCState *s1, const char *filename, int initlen)
   bf->prev_tok_flags = tok_flags;
   file = bf;
   tok_flags = TOK_FLAG_BOL | TOK_FLAG_BOF;
+}
+
+/* the per-file yasc dialect (libtcc.c): no file is yasc here */
+int tcc_yasc_file(TCCState *s1, const char *filename)
+{
+  (void)s1;
+  (void)filename;
+  return 0;
+}
+
+void tcc_yasc_mark_file(TCCState *s1, const char *filename)
+{
+  (void)s1;
+  (void)filename;
+}
+
+/* no -iyasc directory here */
+int tcc_yasc_include_dir(TCCState *s1, const char *dir)
+{
+  (void)s1;
+  (void)dir;
+  return 0;
+}
+
+/* system headers by name and the frontend checks' place table (libtcc.c):
+   nothing recorded here */
+void tcc_sys_mark_file(TCCState *s1, const char *filename, int line)
+{
+  (void)s1;
+  (void)filename;
+  (void)line;
+}
+
+int tcc_sys_file(TCCState *s1, const char *filename, int line)
+{
+  (void)s1;
+  (void)filename;
+  (void)line;
+  return 0;
+}
+
+int tcc_diag_first(TCCState *s1, int line, int key)
+{
+  (void)s1;
+  (void)line;
+  (void)key;
+  return 1;
+}
+
+/* #pragma diagnostic (libtcc.c): nothing to switch here */
+void tcc_pragma_diagnostic(TCCState *s1, int action, const char *option, const char *file, int line)
+{
+  (void)s1;
+  (void)action;
+  (void)option;
+  (void)file;
+  (void)line;
+}
+
+void tcc_diag_reset(TCCState *s1)
+{
+  (void)s1;
 }
 
 void tcc_close(void)

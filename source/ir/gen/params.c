@@ -643,6 +643,7 @@ void tcc_ir_params_process_scalar(TCCIRState *ir, Sym *sym, CType *type, TCCAbiA
   if (!v)
     v = anon_sym++;
   Sym *ps = sym_push(v, &pushed_type, flags, addr);
+  ps->a.param_array = sym->a.param_array; /* -Wsizeof-array-argument */
   if (loc_info->kind == TCC_ABI_LOC_STACK)
     params_mark_stack(ir, ps);
   if (pf_cur && ps->vreg >= 0 && !variadic)

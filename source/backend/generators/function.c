@@ -39,6 +39,8 @@ extern void tcc_bench_log_phase(TCCState *s1, const char *operation, const char 
                                 unsigned *total_time, unsigned *count, unsigned elapsed);
 extern void check_vstack(void);
 extern void nested_names_reset(void); /* nested/nested.c */
+extern int yasc_pp_body_begin(Sym *sym); /* frontend/gen/decl/plain_param.c */
+extern void yasc_pp_body_end(int mark);
 
 /* Cross-TU globals referenced by gen_function.  Defined in tccgen.c.
  * Note: cur_scope/root_scope are declared in tcc_scope.h. */
@@ -73,20 +75,27 @@ extern CType func_vt;
 extern int func_var;
 extern int func_has_label_addr;
 extern int local_scope;
+void check_shadow_params(Sym *func);
+void fe_bitop_reset(void);
+extern int fe_conv_quiet;
 extern int loc;
 extern int nb_temp_local_vars;
 extern int rsym;
 extern void vpush_type_size(CType *type, int *a);
 
+/* as gen_priv.h: the sign bit, ON outside of functions.  (It was 2 here,
+   which left a no-eval count of 2 after every function: the frontend's
+   constant checks took the file-scope code that follows for unevaluated.) */
 #ifndef DATA_ONLY_WANTED
-#define DATA_ONLY_WANTED 2
+#define DATA_ONLY_WANTED 0x80000000
 #endif
 
 /* Helpers defined later in this TU — forward-declared so gen_function can
  * call them. */
-static void gen_instrument_call(Sym *cur_func_sym, const char *hook_name);
+void gen_instrument_call(Sym *cur_func_sym, const char *hook_name);
 static void func_vla_arg_code(Sym *arg);
 static void func_vla_arg(Sym *sym);
+void vla_param_exprs_free(TCCState *s1);
 
 /* A `V` operand (VAR vreg, is_local + is_lval) names a register-resident scalar;
  * every other lval — a stack slot, a symbol, a pointer deref — is real memory,
@@ -690,27 +699,105 @@ static void knr_params_receive(KnrConv *conv, int n)
     vset(&arrived->type, arrived->r, arrived->c);
     vtop->sym = arrived;
     vtop->vr = arrived->vreg;
+    fe_conv_quiet++; /* the K&R promotion undone: no -Wconversion */
     vstore();
+    fe_conv_quiet--;
     vpop();
   }
   tcc_free(conv);
 }
 
 static void gen_function_body(Sym *sym);
+void gen_function_check_only(Sym *sym);
+void tcc_check_scratch_begin(TCCState *s);
 
 /* The tracing cross marks each function's compile in its allocation trace
  * (scripts/alloc_trace: which blocks die before their function is done). */
 void gen_function(Sym *sym)
 {
+  /* -fsyntax-only: every body gets the check-only parse -- its diagnostics,
+     the flow checks, no code */
+  if (tcc_state->syntax_only && !tcc_state->check_only)
+  {
+    tcc_check_scratch_begin(tcc_state);
+    gen_function_check_only(sym);
+    if (sym->type.ref)
+      sym->type.ref->f.func_compiled = 1;
+    return;
+  }
   tcc_alloc_trace_mark(1);
+  const unsigned diag_parse = tcc_diag_parse_enter(tcc_state);
   gen_function_body(sym);
+  tcc_diag_parse_leave(tcc_state, diag_parse);
   tcc_alloc_trace_mark(2);
+}
+
+/* A body with an error (recover.c) is not compiled: what gen_function_body
+ * would have put back after its code, with none generated. */
+static void gen_function_errored_end(Sym *sym, Sym *global_label_stack_start, int nested_start, int outlived_mark,
+                                     struct TCCRecover *outer_recover)
+{
+  TCCIRState *ir = tcc_state->ir;
+  tcc_state->check_only++; /* nothing of it reaches the object */
+  sym_pop(&local_stack, NULL, 0);
+  sym_pop(&all_cleanups, NULL, 0);
+  /* a label a skipped statement would have defined is no error */
+  for (Sym *l = global_label_stack; l && l != global_label_stack_start; l = l->prev)
+    if (l->r == LABEL_FORWARD)
+      l->r = LABEL_DEFINED;
+  label_pop(&global_label_stack, global_label_stack_start, 0);
+  while (tcc_state->label_diff_fixups)
+  {
+    LabelDiffFixup *next = tcc_state->label_diff_fixups->next;
+    tcc_free(tcc_state->label_diff_fixups);
+    tcc_state->label_diff_fixups = next;
+  }
+  for (int i = nested_start; i < tcc_state->nb_nested_funcs; i++)
+    if (tcc_state->nested_funcs[i]->func_str)
+    {
+      tok_str_free(tcc_state->nested_funcs[i]->func_str);
+      tcc_state->nested_funcs[i]->func_str = NULL;
+    }
+  tcc_state->nb_nested_funcs = nested_start;
+  tcc_state->check_only--;
+  /* never inlined: its tokens hold the error */
+  if (sym->type.ref)
+  {
+    sym->type.ref->f.func_noinline = 1;
+    sym->type.ref->f.func_auto_inline = 0;
+    sym->type.ref->f.func_eval_only_inline = 0;
+    sym->type.ref->f.func_small_leaf = 0;
+    sym->type.ref->f.func_compiled = 1;
+  }
+  local_scope = 0;
+  cur_text_section = NULL;
+  funcname = "";
+  func_vt.t = VT_VOID;
+  func_var = 0;
+  ind = 0;
+  func_ind = -1;
+  tcc_state->split_func_start = -1;
+  tcc_state->cur_func_sym = NULL;
+  if (!--gen_function_depth)
+    funcname_copies_free();
+  nocode_wanted = DATA_ONLY_WANTED;
+  check_vstack();
+  tcc_state->recover = outer_recover;
+  next();
+  tcc_ir_free(ir);
+  tcc_state->ir = NULL;
+  sym_free_outlived_locals(outlived_mark);
 }
 
 static void gen_function_body(Sym *sym)
 {
   struct scope f = {0};
   TCCIRState *ir;
+  /* no error recovery while the parameters are set up nor while the code is
+   * generated: only the parse of the body goes on after an error */
+  struct TCCRecover *const outer_recover = tcc_state->recover;
+  const int nested_start = tcc_state->nb_nested_funcs;
+  tcc_state->recover = NULL;
   Sym *global_label_stack_start; /* save global label stack at function start */
   unsigned phase_start = 0;
   const int outlived_mark = sym_outlived_locals_mark();
@@ -747,6 +834,8 @@ static void gen_function_body(Sym *sym)
   func_align_pad = 0;
   funcname = funcname_of(sym);
   func_ind = ind;
+  /* -fstack-usage: the line the function's records carry */
+  const int su_line = file ? file->line_num : 0;
   tcc_state->split_func_start = ind;
 #ifdef CONFIG_TCC_DEBUG
   /* TCC_DUMP_FUNC=<name>: -dump-ir / -dump-ir-passes print this function only,
@@ -787,13 +876,19 @@ static void gen_function_body(Sym *sym)
   tcc_debug_funcstart(tcc_state, sym);
 
   sym_push2(&local_stack, SYM_FIELD, 0, 0);
+  Sym *const params_end = local_stack; /* -Wunused-parameter: they go above it */
   LOG_IR_GEN("Generating IR for function %s", funcname);
   ir = tcc_ir_alloc();
   tcc_state->ir = ir;
+  tcc_ir_lt_begin(ir);
   /* Vector-expression recipes index this function's IR; start clean. */
   gen_op_vector_reset();
   ir->naked = sym->a.naked;
   ir->is_variadic = func_var;
+  /* -fstack-protector-all, or stack_protect under any -fstack-protector*;
+     the other levels set it from the body (ubsan.c ssp_note_*), unless the
+     function says no_stack_protector or -explicit asks for the attribute */
+  ssp_begin_function(ir, sym);
 
   /* Every nested function keeps its incoming chain (saved at frame top - 4,
    * reloaded after each call), captures or not: a call of a sibling or an
@@ -819,6 +914,10 @@ static void gen_function_body(Sym *sym)
   int nb_knr_conv;
   KnrConv *knr_conv = knr_params_arrive(sym, &nb_knr_conv);
   tcc_ir_params_add(ir, &sym->type);
+  check_shadow_params(sym);
+  fe_bitop_reset();
+  /* yasc: its plain pointer parameters, decided by the body (plain_param.c) */
+  const int pp_mark = yasc_pp_body_begin(sym);
 
   /* Captures are addressed by offsets of their own: each gets a range at
    * the bottom of the frame offset space (TCC_CAPTURE_SPACE, where no local
@@ -843,6 +942,8 @@ static void gen_function_body(Sym *sym)
     ir->captured_space_end = cursor;
   }
   knr_params_receive(knr_conv, nb_knr_conv);
+  if (tcc_state->unused_on)
+    unused_params_begin(sym, params_end);
   nb_temp_local_vars = 0;
 
   local_scope = 0;
@@ -857,7 +958,20 @@ static void gen_function_body(Sym *sym)
   func_vla_arg(sym);
   if (tcc_state->do_bench)
     phase_start = tcc_getclock_us();
-  block(0);
+  const int body_errored = gen_body_recovering();
+  yasc_pp_body_end(pp_mark); /* before the flow checks' reports */
+  if (body_errored)
+  {
+#ifdef CONFIG_TCC_DEBUG
+    tcc_state->dump_ir = saved_dump_ir;
+    tcc_state->dump_ir_passes = saved_dump_ir_passes;
+#endif
+    gen_function_errored_end(sym, global_label_stack_start, nested_start, outlived_mark, outer_recover);
+    return;
+  }
+  /* the body's closing brace (the outermost block reads no token after it):
+     where gcc puts -Wframe-larger-than= and -Wstack-usage= */
+  const int su_end_line = file ? file->line_num : su_line;
   tcc_ir_backpatch_to_here(ir, rsym);
 
   if (ir && tcc_state->nb_nested_funcs > 0) {
@@ -978,7 +1092,14 @@ static void gen_function_body(Sym *sym)
     }
   }
 
-  /* -finstrument-functions: emit exit hook call at the common return point */
+#ifdef CONFIG_TCC_BCHECK
+  /* -b: the locals registered by the body are dead */
+  if (tcc_state->do_bounds_check)
+    bcheck_func_exit();
+#endif
+  /* -finstrument-functions: the exit hook at the common return point, which
+     the returns without a RETURNVALUE reach; a RETURNVALUE calls it itself
+     (gen_return_value_now) */
   if (tcc_state->instrument_functions && !sym->type.ref->f.func_no_instrument)
   {
     gen_instrument_call(sym, "__cyg_profile_func_exit");
@@ -1019,6 +1140,9 @@ static void gen_function_body(Sym *sym)
   if (tcc_ir_sret_dealias(ir))
     tcc_ir_dump_after_pass(ir, "sret_dealias");
   tcc_ir_settle(ir);
+  /* -Wlifetime: yasc ownership on the IR as the frontend wrote it, so that
+   * what it reports does not depend on -O (lifetime.c) */
+  tcc_ir_flow_checks(ir, sym);
   /* The temps the frontend made that nothing names (a quarter of the Zig
    * kernel's largest function) go before the passes size tables by them. */
   if (TCC_OPT(tcc_state, optimize) > 0)
@@ -1039,6 +1163,10 @@ static void gen_function_body(Sym *sym)
   tcc_ir_settle(ir);
   tcc_ir_backend_regalloc_pipeline(ir, sym, func_var, &phase_start, funcname,
                                    global_label_stack_start);
+  /* -Wnull-dereference: what the optimizer proved -- after it, unlike the
+   * checks above, so it may find more at -O2 than at -O0 */
+  if ((tcc_state->warn_null_dereference & WARN_ON) && !tcc_state->warn_none)
+    tcc_ir_null_deref_check(ir);
 
   /* Stores writing back what was just loaded from the same frame bytes:
    * copies between objects frame relayout placed on the same slot. */
@@ -1057,7 +1185,14 @@ static void gen_function_body(Sym *sym)
   if (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("branch_tidy") && tcc_ir_branch_tidy(ir))
     tcc_ir_dump_after_pass(ir, "branch_tidy");
 
+  const int su_wanted = tcc_stack_usage_wanted(tcc_state);
+  if (su_wanted)
+    tcc_gen_machine_stack_begin(sym->a.naked);
   tcc_ir_codegen_generate(ir);
+  /* -Wframe-larger-than=, -Wstack-usage=, -fstack-usage, -fcallgraph-info */
+  if (su_wanted)
+    tcc_stack_usage_function(tcc_state, sym, su_line, su_end_line, cur_text_section, func_ind, func_reloc_mark,
+                             sym->a.naked);
 
   /* The orig_index side tables (barrel_shifts, zero_half64, shift64_dead_half,
    * bfi_params) stay until tcc_ir_free: they are part of what the final IR
@@ -1541,6 +1676,7 @@ static void gen_function_body(Sym *sym)
    * callers (and by the inter-procedural noreturn propagation in general). */
   if (sym && sym->type.ref)
     sym->type.ref->f.func_compiled = 1;
+  tcc_state->recover = outer_recover;
 }
 
 /* Parse SYM's body, the current token stream from its '{', for the
@@ -1559,7 +1695,10 @@ void gen_function_check_only(Sym *sym)
   const int nested_start = tcc_state->nb_nested_funcs;
   Section *saved_text = cur_text_section;
   const int outlived_mark = sym_outlived_locals_mark();
+  struct TCCRecover *const outer_recover = tcc_state->recover; /* see gen_function_body */
 
+  tcc_state->recover = NULL;
+  const unsigned diag_parse = tcc_diag_parse_enter(tcc_state);
   tcc_state->check_only++;
   nested_names_reset();
   cur_scope = root_scope = &f;
@@ -1576,22 +1715,50 @@ void gen_function_check_only(Sym *sym)
   tcc_state->const_loop_inline_used = 0;
 
   sym_push2(&local_stack, SYM_FIELD, 0, 0);
+  Sym *const params_end = local_stack;
   TCCIRState *ir = tcc_ir_alloc();
   tcc_state->ir = ir;
+  tcc_ir_lt_begin(ir);
   gen_op_vector_reset();
   ir->is_variadic = func_var;
   local_scope = 1;
   int nb_knr_conv;
   KnrConv *knr_conv = knr_params_arrive(sym, &nb_knr_conv);
   tcc_ir_params_add(ir, &sym->type);
+  check_shadow_params(sym);
+  fe_bitop_reset();
+  const int pp_mark = yasc_pp_body_begin(sym);
   knr_params_receive(knr_conv, nb_knr_conv);
+  if (tcc_state->unused_on)
+    unused_params_begin(sym, params_end);
   nb_temp_local_vars = 0;
   local_scope = 0;
   rsym = -1;
-  block(0);
+  const int errored = gen_body_recovering();
+  yasc_pp_body_end(pp_mark);
+
+  /* the flow checks, as gen_function runs them: the body is checked even
+     when nothing of it is generated -- unless it has an error (recover.c) */
+  if (!errored)
+  {
+    tcc_ir_settle(ir);
+    tcc_ir_flow_checks(ir, sym);
+  }
+  else if (sym->type.ref)
+  {
+    sym->type.ref->f.func_noinline = 1;
+    sym->type.ref->f.func_auto_inline = 0;
+    sym->type.ref->f.func_eval_only_inline = 0;
+    sym->type.ref->f.func_small_leaf = 0;
+  }
 
   sym_pop(&local_stack, NULL, 0);
   sym_pop(&all_cleanups, NULL, 0);
+  vla_param_exprs_free(tcc_state);
+  if (errored)
+    for (Sym *l = global_label_stack; l && l != global_label_stack_start; l = l->prev)
+      if (l->r == LABEL_FORWARD)
+        l->r = LABEL_DEFINED;
   label_pop(&global_label_stack, global_label_stack_start, 0);
   while (tcc_state->label_diff_fixups && tcc_state->label_diff_fixups != fixups_start)
   {
@@ -1624,6 +1791,8 @@ void gen_function_check_only(Sym *sym)
   tcc_state->ir = NULL;
   sym_free_outlived_locals(outlived_mark);
   tcc_state->check_only--;
+  tcc_diag_parse_leave(tcc_state, diag_parse);
+  tcc_state->recover = outer_recover;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1634,7 +1803,7 @@ void gen_function_check_only(Sym *sym)
 /* Emit a call to __cyg_profile_func_enter or __cyg_profile_func_exit.
  * Used for -finstrument-functions support.
  * Arguments: (void *this_fn, void *call_site) */
-static void gen_instrument_call(Sym *cur_func_sym, const char *hook_name)
+void gen_instrument_call(Sym *cur_func_sym, const char *hook_name)
 {
   CType void_ptr_type;
   void_ptr_type.t = VT_VOID;
@@ -1708,6 +1877,18 @@ static void func_vla_arg_code(Sym *arg)
   }
 }
 
+/* The outermost VLA dimensions of the parameters the declarator saved
+ * (declarator.c post_type): gen_function evaluates them (func_vla_arg), a
+ * check-only parse never; tccgen_finish takes what an error left. */
+void vla_param_exprs_free(TCCState *s1)
+{
+  for (int i = 0; i < s1->nb_vla_param_exprs; i++)
+    tcc_free(s1->vla_param_exprs[i].tokens);
+  tcc_free(s1->vla_param_exprs);
+  s1->vla_param_exprs = NULL;
+  s1->nb_vla_param_exprs = 0;
+}
+
 static void func_vla_arg(Sym *sym)
 {
   Sym *arg;
@@ -1736,12 +1917,5 @@ static void func_vla_arg(Sym *sym)
       }
     }
   }
-  if (tcc_state->nb_vla_param_exprs)
-  {
-    for (int i = 0; i < tcc_state->nb_vla_param_exprs; i++)
-      tcc_free(tcc_state->vla_param_exprs[i].tokens);
-    tcc_free(tcc_state->vla_param_exprs);
-    tcc_state->vla_param_exprs = NULL;
-    tcc_state->nb_vla_param_exprs = 0;
-  }
+  vla_param_exprs_free(tcc_state);
 }

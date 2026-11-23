@@ -84,7 +84,7 @@ def compile_tinycc_source(compiler, sources, include_dirs, output_dir, extra_def
     output_dir.mkdir(parents=True, exist_ok=True)
     results = {}
 
-    base_cmd = [str(compiler)] + _base_cross_cflags() + ["-c", "-Werror"]
+    base_cmd = [str(compiler), "-ccompat"] + _base_cross_cflags() + ["-c", "-Wall", "-Werror"]
     for inc in include_dirs:
         base_cmd.extend(["-I", str(inc)])
     for d in extra_defines:

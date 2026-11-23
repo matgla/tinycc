@@ -390,12 +390,16 @@ int __attribute__((noinline)) try_inline_multi3(const char *func_name, Sym *call
   return 1;
 }
 
-/* Redirect a call to a __tcc_* helper: NOP old params, emit new call via gen_ir_call_args. */
+/* Redirect a call to a __tcc_* helper: NOP old params, emit new call via
+ * gen_ir_call_args.  RESULT_TYPE is the declared one, yasc qualifiers and all,
+ * and -Wlifetime reads the helper call as the declared function's. */
 int redirect_call_to_tcc_helper(SValue *saved_args, int nargs, const char *helper_name, CType *result_type,
                                        int call_id, int ir_idx_before_first_param, int ir_idx_before_args)
 {
+  int new_call_id;
   nop_or_rollback_call_params(call_id, ir_idx_before_first_param, ir_idx_before_args);
-  gen_ir_call_args(saved_args, nargs, tok_alloc_const(helper_name), result_type);
+  new_call_id = gen_ir_call_args(saved_args, nargs, tok_alloc_const(helper_name), result_type);
+  tcc_ir_lt_copy_call(tcc_state->ir, call_id, new_call_id);
   vtop[-1] = vtop[0];
   --vtop;
   return 1;
@@ -454,500 +458,465 @@ static int call_result_discarded(void)
   return tok == ';' && discarded_call_vtop != NULL && vtop - 1 == discarded_call_vtop;
 }
 
-static void unary_funcall_body(void)
+/* ---------------------------------------------------------------------
+ * -Wsizeof-array-argument and -Wsizeof-pointer-memaccess: what a sizeof
+ * was applied to (fe_note_sizeof, from primary.c), and the memory and
+ * string functions whose length argument is sizeof of a pointer argument
+ * itself -- memset(p, 0, sizeof p) -- matched by name, as gcc does.
+ * --------------------------------------------------------------------- */
+static int fe_sizeof_seq;     /* sizeof operators parsed so far */
+static Sym *fe_sizeof_sym;    /* the last one's operand when it was a whole variable */
+static CType fe_sizeof_type;  /* ... and its type */
+static FeSpan fe_sizeof_span; /* ... and its tokens (fe_tokfp_on) */
+
+/* the variable SV is as a whole (not a member, element or deref of it) */
+static Sym *fe_whole_var(const SValue *sv)
 {
-  int n, t, r, size, align;
-  Sym *s;
+  Sym *s = sv->sym;
+  if (!(sv->r & VT_LVAL) || !s || (s->v & ~SYM_FIELD) >= SYM_FIRST_ANOM || (s->v & SYM_STRUCT) ||
+      (s->type.t & (VT_BTYPE | VT_ARRAY)) != (sv->type.t & (VT_BTYPE | VT_ARRAY)) || s->type.ref != sv->type.ref)
+    return NULL;
+  return s;
+}
 
-  SValue ret;
-  Sym *sa;
-  int nb_args, ret_nregs, ret_align, regsize, variadic;
-  TokenString *p, *p2;
-
-  /* function call  */
-  if ((vtop->type.t & VT_BTYPE) != VT_FUNC)
+void fe_note_sizeof(const SValue *op, const CType *type, const FeSpan *span)
+{
+  Sym *s = fe_whole_var(op);
+  fe_sizeof_seq++;
+  fe_sizeof_sym = s;
+  fe_sizeof_type = *type;
+  fe_sizeof_span = *span;
+  if (s && s->a.param_array && (type->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && !pp_expr)
   {
-    /* pointer test (no array accepted) */
-    if ((vtop->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR)
+    char tn[64];
+    CType ct = *type;
+    ct.t &= ~(VT_STORAGE | VT_CONSTANT | VT_VOLATILE);
+    type_to_str(tn, sizeof tn, &ct, NULL);
+    tcc_fe_warning_c(warn_sizeof_array_argument, "'sizeof' on array function parameter '%s' will return size of '%s'",
+                     get_tok_str(s->v & ~SYM_FIELD, NULL), tn);
+  }
+}
+
+typedef struct MemAccessFn
+{
+  const char *name;
+  signed char a, b, n; /* the pointer arguments (b: -1 none) and the length */
+  unsigned char str;   /* a string function: "provide an explicit length" */
+  unsigned char cmp;   /* the pointers are the first and second source */
+} MemAccessFn;
+
+static const MemAccessFn memaccess_fns[] = {
+    {"memset", 0, -1, 2, 0, 0},  {"memcpy", 0, 1, 2, 0, 0},      {"memmove", 0, 1, 2, 0, 0},
+    {"mempcpy", 0, 1, 2, 0, 0},  {"memcmp", 0, 1, 2, 0, 1},      {"bcmp", 0, 1, 2, 0, 1},
+    {"bzero", 0, -1, 1, 0, 0},   {"bcopy", 1, 0, 2, 0, 0},       {"strncpy", 0, 1, 2, 1, 0},
+    {"stpncpy", 0, 1, 2, 1, 0},  {"strncat", 0, 1, 2, 1, 0},     {"strncmp", 0, 1, 2, 1, 1},
+    {"strncasecmp", 0, 1, 2, 1, 1}, {"snprintf", 0, -1, 1, 1, 0}, {"vsnprintf", 0, -1, 1, 1, 0},
+};
+
+typedef struct FeMemAccess
+{
+  const MemAccessFn *fn;
+  Sym *arg_sym[3];
+  CType arg_type[3];
+  FeSpan arg_span[3]; /* the pointer arguments' tokens */
+  int have_size;
+  Sym *size_sym;
+  CType size_type;
+  FeSpan size_span;
+} FeMemAccess;
+
+static void fe_memaccess_begin(FeMemAccess *m, Sym *callee)
+{
+  const char *name;
+  m->fn = NULL;
+  m->have_size = 0;
+  if (!tcc_state->warn_sizeof_pointer_memaccess || !callee || (callee->type.t & VT_BTYPE) != VT_FUNC ||
+      !fe_eval_checks_wanted())
+    return;
+  name = get_tok_str(callee->v & ~SYM_FIELD, NULL);
+  if (!strncmp(name, "__builtin_", 10))
+    name += 10;
+  for (size_t i = 0; i < countof(memaccess_fns); i++)
+    if (!strcmp(name, memaccess_fns[i].name))
     {
-      /* a byte-reversed pointer member (big-endian scalar_storage_order) is
-         loaded and swapped while it is still typed as a pointer */
-      if ((vtop->r & VT_LVAL) && vtop->sso_reversed)
-        gv(RC_INT);
-      vtop->type = *pointed_type(&vtop->type);
-      if ((vtop->type.t & VT_BTYPE) != VT_FUNC)
-        goto error_func;
+      m->fn = &memaccess_fns[i];
+      memset(m->arg_sym, 0, sizeof m->arg_sym);
+      memset(m->arg_span, 0, sizeof m->arg_span);
+      break;
     }
-    else
-    {
-    error_func:
-      expect("function pointer");
-    }
+}
+
+/* argument I is on vtop, as written; it started with a sizeof (and SEQ0 sizeofs before);
+   SPAN: its tokens (fe_span_end done) */
+static void fe_memaccess_arg(FeMemAccess *m, int i, int started_sizeof, int seq0, const FeSpan *span)
+{
+  if (i >= 3)
+    return;
+  if (i == m->fn->n)
+  {
+    m->have_size = started_sizeof && fe_sizeof_seq == seq0 + 1 && (tok == ',' || tok == ')');
+    m->size_sym = fe_sizeof_sym;
+    m->size_type = fe_sizeof_type;
+    m->size_span = fe_sizeof_span;
   }
   else
   {
-    vtop->r &= ~VT_LVAL; /* no lvalue */
+    m->arg_sym[i] = fe_whole_var(vtop);
+    m->arg_type[i] = vtop->type;
+    m->arg_span[i] = *span;
   }
-  /* get return type */
-  /* Save function symbol before switching to type ref - needed for nested_func check */
-  Sym *call_func_sym = vtop->sym;
-  s = vtop->type.ref;
-  /* A direct call (BL to the function itself) of an internal function takes
-   * its 8-byte aggregate in r0/r1 (gfunc_regpair_ret); through a pointer, the
-   * address is the AAPCS adapter's. */
-  Sym *regpair_callee =
-      (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM) && vtop->c.i == 0 && call_func_sym &&
-              (call_func_sym->type.t & VT_BTYPE) == VT_FUNC && call_func_sym->type.ref == s
-          ? call_func_sym
-          : NULL;
-  next();
+}
 
-  /* A call of a nested function passes its static chain, the frame of the
-   * function that defines the callee (nested_chain_level).  SET_CHAIN is
-   * emitted right before the FUNCCALL and takes effect at the branch, so the
-   * argument code still sees our own chain.  Level 1 (a sibling, our own
-   * incoming chain) is already in R10. */
-  int set_chain_level = -1;
-  /* The nested function this call targets, if any.  Its nb_real_calls counts
-   * the call sites that actually emitted a call: incremented here, decremented
-   * again below wherever the body is inlined instead.  gen_function needs the
-   * exact count — "the callee is marked auto_inline" is not the same thing as
-   * "every call site inlined it", and clearing a capture's addrtaken on that
-   * guess leaves the surviving call reading chain offset 0. */
-  NestedFunc *call_nf = NULL;
-  if (tcc_state->ir && call_func_sym && call_func_sym->a.nested_func)
+static void fe_memaccess_end(FeMemAccess *m)
+{
+  const MemAccessFn *fn = m->fn;
+  if (!m->have_size)
+    return;
+  for (int k = 0; k < 2; k++)
   {
-    for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++)
+    int i = k ? fn->b : fn->a;
+    const char *role = fn->cmp ? (k ? "second source" : "first source") : k ? "source" : "destination";
+    CType *at = &m->arg_type[i];
+    if (i < 0 || (at->t & (VT_BTYPE | VT_ARRAY)) != VT_PTR)
+      continue;
+    int align, pointee = type_size(pointed_type(at), &align);
+    int str = fn->str || pointee == 1;
+    /* the same variable, or `sizeof s->p` with s->p passed (the same tokens) */
+    if ((m->size_sym && m->size_sym == m->arg_sym[i]) || (fe_tokfp_on && fe_span_same(&m->size_span, &m->arg_span[i])))
     {
-      if (tcc_state->nested_funcs[ni]->sym == call_func_sym)
-      {
-        call_nf = tcc_state->nested_funcs[ni];
-        break;
-      }
+      tcc_fe_warning_c(warn_sizeof_pointer_memaccess,
+                       "argument to 'sizeof' in '%s' call is the same expression as the %s; did you mean to %s?",
+                       fn->name, role, str ? "provide an explicit length" : "dereference it");
+      return;
     }
-    if (call_nf)
-      call_nf->nb_real_calls++;
-    set_chain_level = nested_chain_level(call_nf);
-    if (set_chain_level == 1)
-      set_chain_level = -1;
-  }
-
-  /* Each IR-level call gets a unique call_id so FUNCPARAM* can be bound
-   * without fragile nested-depth scanning.
-   */
-  int call_id = 0;
-  /* If we claim an NRVO target as the sret buffer, remember its vreg so
-   * the post-call result push can use the same vreg as the destination —
-   * lets the IR see the call's effect and the later use as a single
-   * variable (otherwise DCE may misanalyse the dependency). */
-  int nrvo_call_vreg = -1;
-  /* When NRVO claims a register-deref destination, this holds the address
-     vreg so the post-call result is pushed as a deref through it. */
-  int nrvo_call_ptr_vreg = -1;
-  if (!NOEVAL_WANTED && tcc_state->ir)
-    call_id = tcc_state->ir->next_call_id++;
-
-  /* An NRVO hint (expr_eq, a declaration's initializer) is for the first call
-   * of the right-hand side, the outermost one: taken now, so that no call
-   * among the arguments -- whose result is not the value assigned -- can
-   * claim the destination as its buffer. */
-  const int nrvo_hint = tcc_state->nrvo_target_active;
-  tcc_state->nrvo_target_active = 0;
-
-  sa = sym_first(s); /* first parameter */
-  nb_args = regsize = 0;
-  int nb_implicit_args = 0; /* sret pointer counted in nb_args but not saved_arg_count */
-  int sret_param_idx = -1;  /* IR index of the sret pointer's FUNCPARAMVAL */
-  /* Hard-float result in s0..s(n-1) (gfunc_sret_vfp_words): the buffer gets
-   * no hidden argument; the registers are stored into it after the call. */
-  int vfp_ret_words = 0;
-  SValue vfp_ret_ptr;
-  /* compute first implicit argument if a composite type is returned */
-  if ((s->type.t & VT_BTYPE) == VT_STRUCT || (s->type.t & VT_COMPLEX))
-  {
-    variadic = (s->f.func_type == FUNC_ELLIPSIS);
-    ret_nregs = gfunc_sret_fn(regpair_callee, &s->type, variadic, &ret.type, &ret_align, &regsize);
-    if (!gfunc_regpair_ret(regpair_callee))
-      regpair_callee = NULL;
-    if (ret_nregs == 0)
-      vfp_ret_words = gfunc_sret_vfp_words(&s->type, variadic);
-    if (ret_nregs <= 0)
+    if (!str && (m->size_type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && is_compatible_unqualified_types(&m->size_type, at))
     {
-      /* get some space for the returned structure */
-      size = type_size(&s->type, &align);
-#ifdef TCC_TARGET_ARM64
-      /* On arm64, a small struct is return in registers.
-         It is much easier to write it to memory if we know
-         that we are allowed to write some extra bytes, so
-         round the allocated space up to a power of 2: */
-      if (size < 16)
-        while (size & (size - 1))
-          size = (size | (size - 1)) + 1;
-#endif
-      /* NRVO: if the caller has hinted a destination slot for this
-       * call's return, use it as the sret buffer.  Saves the temp +
-       * the temp→dst copy in the caller.  Conditions: size and
-       * alignment must match exactly so we don't write past the dst.
-       *
-       * Important: do NOT mutate `loc` here.  The destination slot was
-       * already allocated by the surrounding declaration, and `loc`
-       * already points past it.  Overwriting `loc` would let later
-       * allocations in this function overlap the destination.
-       *
-       * Skip NRVO for nested-function callees: the callee accesses outer
-       * locals via static link, and an existing IR-fold can collapse a
-       * `LEA(local_a) + 4` into a `StackLoc[N]` reference whose pool
-       * entry was originally tagged as a static-link access — emitting
-       * the wrong base register at codegen.  Triggers when the callee's
-       * local struct field offset coincides with the caller's other
-       * locals (much more likely once NRVO eliminates the temp). */
-      int nrvo_claimed = 0;
-      int nrvo_ptr_claimed = 0;
-      int nrvo_vreg = -1;
-      int nrvo_ptr_vreg = -1;
-      int sret_loc = 0;
-      int callee_is_nested = (call_func_sym && call_func_sym->a.nested_func);
-      if (ret_nregs == 0 && nrvo_hint &&
-          tcc_state->nrvo_target_size == size &&
-          tcc_state->nrvo_target_align == align &&
-          !callee_is_nested)
+      char pt[64], tt[64];
+      CType ct = *at;
+      ct.t &= ~(VT_STORAGE | VT_CONSTANT | VT_VOLATILE);
+      type_to_str(pt, sizeof pt, &ct, NULL);
+      ct = *pointed_type(at);
+      ct.t &= ~(VT_STORAGE | VT_CONSTANT | VT_VOLATILE);
+      type_to_str(tt, sizeof tt, &ct, NULL);
+      tcc_fe_warning_c(warn_sizeof_pointer_memaccess,
+                       "argument to 'sizeof' in '%s' call is the same pointer type '%s' as the %s; expected '%s' or an "
+                       "explicit length",
+                       fn->name, pt, role, tt);
+      return;
+    }
+  }
+}
+
+/* The printf family, by name: where the format, the FILE and the variadic
+   arguments are among the call's arguments (99: in a va_list), and the
+   fewest arguments a call can have */
+typedef struct PrintfFamily
+{
+  const char *name;
+  signed char file_idx, fmt_idx, vararg_idx, min_args;
+} PrintfFamily;
+
+static const PrintfFamily printf_family[] = {
+    /* printf family (stdout, variadic) */
+    {"printf", -1, 0, 1, 1},
+    {"printf_unlocked", -1, 0, 1, 1},
+    {"__builtin_printf", -1, 0, 1, 1},
+    {"__builtin_printf_unlocked", -1, 0, 1, 1},
+    {"__printf_chk", -1, 1, 2, 2}, /* [0]=flag */
+    /* fprintf family (FILE*, variadic) */
+    {"fprintf", 0, 1, 2, 2},
+    {"fprintf_unlocked", 0, 1, 2, 2},
+    {"__builtin_fprintf_unlocked", 0, 1, 2, 2},
+    {"__fprintf_chk", 0, 2, 3, 3}, /* [1]=flag */
+    /* vprintf family (stdout, va_list -- no vararg access) */
+    {"vprintf", -1, 0, 99, 2},       /* fmt + va_list */
+    {"__vprintf_chk", -1, 1, 99, 3}, /* flag + fmt + va_list */
+    /* vfprintf family (FILE*, va_list -- no vararg access) */
+    {"vfprintf", 0, 1, 99, 3},       /* file + fmt + va_list */
+    {"__vfprintf_chk", 0, 2, 99, 4}, /* file + flag + fmt + va_list */
+};
+
+static const PrintfFamily *printf_family_lookup(const char *func_name)
+{
+  for (size_t i = 0; i < countof(printf_family); i++)
+    if (strcmp(func_name, printf_family[i].name) == 0)
+      return &printf_family[i];
+  return NULL;
+}
+
+/* A printf-family call whose result is dropped, as a cheaper call (or none):
+   1 when it was replaced -- its arguments' FUNCPARAMVALs are gone and vtop
+   holds the result.  Out of line: unary_funcall_body is on the parser's
+   recursive path (arguments that are calls, inline expansions). */
+static __attribute__((noinline)) int funcall_printf_family(const PrintfFamily *pf, SValue *saved_args, int nb_args,
+                                                           int call_id, int ir_idx_before_first_param,
+                                                           int ir_idx_before_args)
+{
+  int optimized = 0;
+  int fmt_len = 0;
+  const char *fmt = try_get_constant_string(&saved_args[pf->fmt_idx], &fmt_len);
+  if (fmt)
+  {
+    int has_file = (pf->file_idx >= 0); /* fprintf-family vs printf-family */
+    int has_varargs = (nb_args > pf->vararg_idx);
+
+    /* Classify the format pattern:
+     *  PF_OPT_NOP           = empty output
+     *  PF_OPT_PUTCHAR_CONST = putchar/fputc with a constant char
+     *  PF_OPT_FWRITE        = fwrite (fprintf-family) or puts (printf-family, trailing \n)
+     *  PF_OPT_PUTCHAR_ARG   = putchar/fputc from %c vararg
+     *  PF_OPT_FPUTS_ARG     = fputs from %s vararg
+     *  PF_OPT_PUTS_ARG      = puts from %s\n vararg */
+    enum
+    {
+      PF_OPT_NONE = 0,
+      PF_OPT_NOP,
+      PF_OPT_PUTCHAR_CONST,
+      PF_OPT_FWRITE,
+      PF_OPT_PUTS_CHOPPED,
+      PF_OPT_PUTCHAR_ARG,
+      PF_OPT_FPUTS_ARG,
+      PF_OPT_PUTS_ARG
+    };
+    int opt_kind = PF_OPT_NONE;
+    int putchar_val = 0;
+    /* For fwrite: which SValue to write and its known length */
+    SValue *write_str_sv = NULL;
+    int write_len = 0;
+    /* For puts with trailing-\n chopped: the string to analyze */
+    const char *puts_src = NULL;
+    int puts_src_len = 0;
+
+    if (strchr(fmt, '%') == NULL)
+    {
+      /* No format specifiers — output is the format string itself */
+      if (fmt_len == 0)
       {
-        if (tcc_state->nrvo_target_ptr_vreg >= 0)
+        opt_kind = PF_OPT_NOP;
+      }
+      else if (has_file)
+      {
+        opt_kind = PF_OPT_FWRITE;
+        write_str_sv = &saved_args[pf->fmt_idx];
+        write_len = fmt_len;
+      }
+      else if (fmt_len == 1)
+      {
+        opt_kind = PF_OPT_PUTCHAR_CONST;
+        putchar_val = (unsigned char)fmt[0];
+      }
+      else if (fmt[fmt_len - 1] == '\n')
+      {
+        opt_kind = PF_OPT_PUTS_CHOPPED;
+        puts_src = fmt;
+        puts_src_len = fmt_len;
+      }
+      /* else: multi-char without trailing \n to stdout → not optimized */
+    }
+    else if (strcmp(fmt, "%s") == 0 && has_varargs)
+    {
+      int slen = 0;
+      const char *sval = try_get_constant_string(&saved_args[pf->vararg_idx], &slen);
+      if (sval)
+      {
+        if (slen == 0)
         {
-          /* Register-deref destination: write the sret directly through the
-           * destination's address vreg. */
-          nrvo_ptr_vreg = tcc_state->nrvo_target_ptr_vreg;
-          nrvo_ptr_claimed = 1;
+          opt_kind = PF_OPT_NOP;
+        }
+        else if (has_file)
+        {
+          opt_kind = PF_OPT_FWRITE;
+          write_str_sv = &saved_args[pf->vararg_idx];
+          write_len = slen;
+        }
+        else if (slen == 1)
+        {
+          opt_kind = PF_OPT_PUTCHAR_CONST;
+          putchar_val = (unsigned char)sval[0];
+        }
+        else if (sval[slen - 1] == '\n')
+        {
+          opt_kind = PF_OPT_PUTS_CHOPPED;
+          puts_src = sval;
+          puts_src_len = slen;
+        }
+      }
+      else if (has_file)
+      {
+        opt_kind = PF_OPT_FPUTS_ARG;
+      }
+      /* non-constant string to stdout → skip */
+    }
+    else if (strcmp(fmt, "%c") == 0 && has_varargs)
+    {
+      opt_kind = PF_OPT_PUTCHAR_ARG;
+    }
+    else if (!has_file && strcmp(fmt, "%s\n") == 0 && has_varargs)
+    {
+      opt_kind = PF_OPT_PUTS_ARG; /* puts appends \n automatically */
+    }
+
+    if (opt_kind != PF_OPT_NONE)
+    {
+      /* Remove FUNCPARAMVAL ops while preserving argument-evaluation IR.
+       * With forward args, arg-evaluation IR for args 1+ is interleaved
+       * with FUNCPARAMVALs.  A blanket rollback of next_instruction_index
+       * would also erase those definitions (e.g. LEA for &a[1]), leaving
+       * dangling vreg references.  Instead, NOP out only the FUNCPARAMVAL
+       * instructions for the original call. */
+      if (ir_idx_before_first_param >= 0)
+      {
+        int current_end = tcc_state->ir->next_instruction_index;
+        for (int i = ir_idx_before_first_param; i < current_end; i++)
+        {
+          if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
+          {
+            /* Only NOP FUNCPARAMVALs belonging to the original call_id,
+             * not those from nested calls (e.g., memcmp inside printf). */
+            IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+            int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
+            if (encoded_call_id == call_id)
+              tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          }
+        }
+      }
+      else
+      {
+        tcc_state->ir->next_instruction_index = ir_idx_before_args;
+      }
+
+      if (opt_kind == PF_OPT_NOP)
+      {
+        /* Empty output — no call needed, result is 0 chars written. */
+        vpushi(0);
+        vtop[-1] = vtop[0];
+        --vtop;
+      }
+      else if (opt_kind == PF_OPT_PUTCHAR_CONST)
+      {
+        /* putchar(constant_char) or fputc(constant_char, f) */
+        SValue ch_sv;
+        svalue_init(&ch_sv);
+        ch_sv.r = VT_CONST;
+        ch_sv.c.i = putchar_val;
+        ch_sv.type.t = VT_INT;
+        ch_sv.vr = -1;
+
+        if (has_file)
+        {
+          SValue pf_args[2];
+          pf_args[0] = ch_sv;
+          pf_args[1] = saved_args[pf->file_idx];
+          gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputc"));
         }
         else
         {
-          sret_loc = tcc_state->nrvo_target_loc;
-          nrvo_vreg = tcc_state->nrvo_target_vreg;
+          gen_ir_void_call_args(&ch_sv, 1, tok_alloc_const("putchar"));
         }
-        nrvo_claimed = 1;
+        vpushi(1);
+        vtop[-1] = vtop[0];
+        --vtop;
       }
-      else
+      else if (opt_kind == PF_OPT_FWRITE)
       {
-        /* At least word-aligned: tcc_ir_sret_dealias keeps a buffer only at
-         * a word-aligned address (an optimized callee may LDM/LDRD through
-         * it), so a char-array struct's temporary would get a second one --
-         * 256 KB more frame for tests2/119's big_struct. */
-        loc = tcc_ir_frame_alloc_ret_temp(loc, size, -(align < 4 ? 4 : align));
-        tcc_ir_frame_note_type(loc, &s->type);
-        sret_loc = loc;
+        /* fwrite(str, 1, len, f) — always goes to a FILE* */
+        SValue fw_args[4];
+        fw_args[0] = *write_str_sv;
+        svalue_init(&fw_args[1]);
+        fw_args[1].r = VT_CONST;
+        fw_args[1].c.i = 1;
+        fw_args[1].type.t = VT_INT;
+        fw_args[1].vr = -1;
+        svalue_init(&fw_args[2]);
+        fw_args[2].r = VT_CONST;
+        fw_args[2].c.i = write_len;
+        fw_args[2].type.t = VT_INT;
+        fw_args[2].vr = -1;
+        fw_args[3] = saved_args[pf->file_idx];
+        gen_ir_void_call_args(fw_args, 4, tok_alloc_const("fwrite"));
+        vpushi(write_len);
+        vtop[-1] = vtop[0];
+        --vtop;
       }
-      ret.type = s->type;
-      if (nrvo_ptr_claimed)
+      else if (opt_kind == PF_OPT_PUTS_CHOPPED)
       {
-        /* Push the destination address (held in nrvo_ptr_vreg) as the sret
-         * pointer param.  The post-call result is a deref through it. */
-        SValue ptr;
-        svalue_init(&ptr);
-        ptr.type.t = VT_PTR;
-        ptr.type.ref = s->type.ref;
-        ptr.r = 0; /* value in vreg */
-        ptr.vr = nrvo_ptr_vreg;
-        vpushv(&ptr);
-        ret.r = VT_LVAL; /* register-deref lvalue (valmask 0) */
-        nrvo_call_ptr_vreg = nrvo_ptr_vreg;
+        /* puts(string_without_trailing_newline)
+         * Create a new string constant in rodata with the trailing \n removed.
+         * Copy puts_src first because it may point into rodata_section->data
+         * and section_ptr_add can reallocate that buffer. */
+        int new_len = puts_src_len - 1;
+        char *puts_copy = tcc_malloc(new_len);
+        memcpy(puts_copy, puts_src, new_len);
+        addr_t new_off = rodata_section->data_offset;
+        char *new_ptr = section_ptr_add(rodata_section, new_len + 1);
+        memcpy(new_ptr, puts_copy, new_len);
+        tcc_free(puts_copy);
+        new_ptr[new_len] = '\0';
+
+        SValue new_str_sv;
+        svalue_init(&new_str_sv);
+        new_str_sv.type = char_pointer_type;
+        new_str_sv.r = VT_CONST | VT_SYM;
+        new_str_sv.sym = get_sym_ref(&char_type, rodata_section, new_off, new_len + 1);
+        new_str_sv.c.i = 0;
+        new_str_sv.vr = -1;
+
+        gen_ir_void_call_args(&new_str_sv, 1, tok_alloc_const("puts"));
+        vpushi(puts_src_len);
+        vtop[-1] = vtop[0];
+        --vtop;
       }
-      else
+      else if (opt_kind == PF_OPT_PUTCHAR_ARG)
       {
-        ret.r = VT_LOCAL | VT_LVAL;
-        /* pass it as 'int' to avoid structure arg passing
-           problems */
-        vseti(VT_LOCAL, sret_loc);
-        if (nrvo_claimed)
+        /* putchar(arg) or fputc(arg, f) — for "%c" format */
+        if (has_file)
         {
-          vtop->vr = nrvo_vreg;
-          nrvo_call_vreg = nrvo_vreg;
+          SValue pf_args[2];
+          pf_args[0] = saved_args[pf->vararg_idx];
+          pf_args[1] = saved_args[pf->file_idx];
+          gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputc"));
         }
-      }
-#ifdef CONFIG_TCC_BCHECK
-      /* Skip bcheck padding when NRVO reused a caller-owned slot — that
-       * slot already has whatever bcheck guards the caller installed. */
-      if (tcc_state->do_bounds_check && !nrvo_claimed)
-        --loc;
-#endif
-      ret.c = vtop->c;
-      if (ret_nregs < 0)
-      {
-        vtop--;
-        print_vstack("unary, function call");
-      }
-      else if (vfp_ret_words)
-      {
-        vfp_ret_ptr = *vtop;
-        pin_call_arg_temp_slot(vtop);
-        vtop--;
-      }
-      else
-      {
-        /* ret_nregs == 0: struct is returned via an implicit first argument
-         * (sret pointer). In IR mode we must actually emit the parameter and
-         * pop it, otherwise it stays on the value stack and triggers
-         * check_vstack() failures (vstack leak).
-         *
-         * Keep parameter indices 0-based: this implicit argument is param #0.
-         */
-        if (!NOEVAL_WANTED)
+        else
         {
-          SValue num;
-          svalue_init(&num);
-          num.vr = -1;
-          num.r = VT_CONST;
-          num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-          LOG_CODEGEN("FUNCPARAMVAL push: site=sret_param0 call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
-                      TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), vtop->r, vtop->vr);
-          sret_param_idx = tcc_ir_count(tcc_state->ir);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
-          pin_call_arg_temp_slot(vtop);
-          tcc_ir_frame_note_sret_call(call_id, size);
+          gen_ir_void_call_args(&saved_args[pf->vararg_idx], 1, tok_alloc_const("putchar"));
         }
-        vtop--;
-        nb_args++;
-        nb_implicit_args++;
+        vpushi(1);
+        vtop[-1] = vtop[0];
+        --vtop;
       }
+      else if (opt_kind == PF_OPT_FPUTS_ARG)
+      {
+        /* fputs(arg, f) — for fprintf-family "%s" format. */
+        SValue pf_args[2];
+        pf_args[0] = saved_args[pf->vararg_idx];
+        pf_args[1] = saved_args[pf->file_idx];
+        gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputs"));
+        vpushi(0);
+        vtop[-1] = vtop[0];
+        --vtop;
+      }
+      else if (opt_kind == PF_OPT_PUTS_ARG)
+      {
+        /* puts(arg) — for "%s\n" format. puts() appends \n automatically. */
+        gen_ir_void_call_args(&saved_args[pf->vararg_idx], 1, tok_alloc_const("puts"));
+        vpushi(0);
+        vtop[-1] = vtop[0];
+        --vtop;
+      }
+      optimized = 1;
     }
   }
-  else
-  {
-    ret_nregs = 1;
-    ret.type = s->type;
-  }
+  return optimized;
+}
 
-  if (ret_nregs > 0)
-  {
-    /* return in register */
-    ret.c.i = 0;
-    PUT_R_RET(&ret, ret.type.t);
-  }
-
-  /* Storage for arguments in case we need to constant-fold.
-   * Heap-allocated to reduce unary()'s stack frame.
-   * Size based on parameter count so we can inline functions with >8 params. */
-  int saved_args_cap = 8;
-  if (call_func_sym && call_func_sym->type.ref)
-  {
-    int pc = auto_inline_param_count(call_func_sym);
-    if (pc > saved_args_cap)
-      saved_args_cap = pc;
-  }
-  FuncallScratch *saved_scratch = tcc_mallocz(sizeof(*saved_scratch));
-  saved_scratch->saved_args = tcc_mallocz(saved_args_cap * sizeof(SValue));
-  saved_scratch->saved_args_cid = tcc_mallocz(saved_args_cap * sizeof(unsigned char *));
-  saved_scratch->saved_args_cid_size = tcc_mallocz(saved_args_cap * sizeof(int));
-  saved_scratch->next = funcall_scratch_stack;
-  funcall_scratch_stack = saved_scratch;
-  SValue *saved_args = saved_scratch->saved_args;
-  unsigned char **saved_args_cid = saved_scratch->saved_args_cid;
-  int *saved_args_cid_size = saved_scratch->saved_args_cid_size;
-  int saved_arg_count = 0;
-  int can_try_fold = 0;
-  int can_inline_builtin = 0;
-  int can_inline_eval = 0;
-  int can_optimize_string_builtin = 0;
-  int can_optimize_fputs_family = 0;
-  /* Folding/rewriting a call by its NAME is only valid when the callee is the
-   * library function: not a static function of this TU that reuses the name,
-   * and not under plain -fno-builtin.  The __builtin_ spellings always fold. */
-  int libcall_by_name_ok = 1;
-  const char *func_name = NULL;
-  /* The callee's name, as far as any library name it is screened against
-   * reaches (the longest is 26 bytes): a longer one is cut, which keeps every
-   * comparison's answer, and a spilled name is not read back for good. */
-  char func_name_buf[48];
-  int inl_first_obj = 0; /* frame objects of an inline expansion start here (tcc_ir_frame_scope_end) */
-
-  /* Check if we have a named function that might be foldable */
-  if (call_func_sym && call_func_sym->v >= TOK_IDENT)
-  {
-    pstrcpy(func_name_buf, sizeof func_name_buf, tok_name_tmp(call_func_sym->v));
-    func_name = func_name_buf;
-    if (func_name && strncmp(func_name, "__builtin_", 10) != 0 &&
-        ((call_func_sym->type.t & VT_STATIC) || (tcc_state->no_builtin_funcs & NO_BUILTIN_ALL)))
-      libcall_by_name_ok = 0;
-
-    /* Calling alloca() (library version) modifies SP; the caller
-     * needs a frame pointer so the epilogue can restore SP. */
-    if (func_name && strcmp(func_name, "alloca") == 0 && tcc_state->ir)
-      tcc_state->force_frame_pointer = 1;
-
-    /* Quick check if this could be a foldable math function */
-    if (func_name && (func_name[0] == 's' || func_name[0] == 'c' || func_name[0] == 't' || func_name[0] == 'a' ||
-                      func_name[0] == 'e' || func_name[0] == 'l' || func_name[0] == 'p' || func_name[0] == 'f' ||
-                      func_name[0] == 'r' || func_name[0] == 't'))
-    {
-      can_try_fold = 1;
-    }
-
-    {
-      int is_unsigned;
-      can_inline_builtin =
-          (get_builtin_abs_info(func_name, &is_unsigned) && builtin_abs_decl_matches(call_func_sym, func_name)) ||
-          !strcmp(func_name, "__multi3"); /* try_inline_multi3 */
-    }
-
-    can_optimize_string_builtin = resolve_str_builtin_id(call_func_sym->v, func_name) != STRBI_UNKNOWN;
-
-    /* The fputs lowering below needs the arguments saved.  can_try_fold's
-     * first-letter screen passes fputs and fputs_unlocked but not
-     * __builtin_fputs_unlocked, which is a lazily declared prototype that
-     * keeps its own name -- so that one was never lowered, and with a
-     * user-supplied fputs that aborts inside main (gcc_execute
-     * builtins/fputs) the call reached it. */
-    can_optimize_fputs_family = func_name && (strcmp(func_name, "fputs") == 0 || strcmp(func_name, "fputs_unlocked") == 0 ||
-                                              strcmp(func_name, "__builtin_fputs_unlocked") == 0);
-  }
-
-  /* Check if the callee is a small inline function we might evaluate.
-   * Also enter this path for non-static auto-inline candidates: they don't
-   * have VT_INLINE (needed for correct ELF linkage) but should still be
-   * inlined at call sites within this translation unit. */
-  if (call_func_sym && TCC_OPT(tcc_state, optimize) &&
-      ((call_func_sym->type.t & VT_INLINE) || call_func_sym->a.guard_head ||
-       (call_func_sym->type.ref &&
-        (call_func_sym->type.ref->f.func_auto_inline || call_func_sym->type.ref->f.func_eval_only_inline))))
-    can_inline_eval = 1;
-
-  /* ---- One level of direct self-recursion ----
-   * A recursive callee cannot be inlined away, but expanding its body ONCE
-   * into itself halves the dynamic call count: every second level of the
-   * recursion tree is then handled inline, and each removed call is a
-   * PUSH/POP/BL/return the M-profile core no longer executes.  (gcc does the
-   * same thing at -O2, several levels deep -- it is the whole of its 2x lead
-   * on recursive fib.)
-   *
-   * Exactly one level, and only from the standalone body: inside the
-   * expansion `in_inline_expansion` is set, so the inner self-calls fail this
-   * test and are emitted as ordinary calls.  That refusal happens at the gate
-   * below, before any of the callee's IR is emitted -- the partial-expansion
-   * leftover the old unconditional refusal was written against. */
-  int self_inline_ok = 0;
-  if (can_inline_eval && call_func_sym == tcc_state->cur_func_sym &&
-      !tcc_state->in_inline_expansion && TCC_OPT(tcc_state, opt_inline_functions) &&
-      call_func_sym->type.ref && call_func_sym->type.ref->f.func_auto_inline &&
-      !call_func_sym->a.nested_func)
-  {
-    int rbt = call_func_sym->type.ref->type.t & VT_BTYPE;
-    /* Struct and floating returns go through the sret/multi-register paths
-     * the expansion does not model for a self-call. */
-    if (rbt == VT_VOID || rbt == VT_BOOL || rbt == VT_BYTE || rbt == VT_SHORT ||
-        rbt == VT_INT || rbt == VT_LLONG || rbt == VT_PTR)
-      self_inline_ok = 1;
-  }
-
-  /* Detect printf-family functions that can be optimized.
-   * We recognize standard (printf, fprintf), unlocked stdio variants,
-   * v-variants (vprintf, vfprintf), and fortified (_chk) variants.
-   * For each, we track the index of key arguments in saved_args[].
-   * For v-variants, varargs are in a va_list (opaque), so pf_vararg_idx is
-   * set past the arg count to prevent %s/%c optimization — only constant
-   * format strings without specifiers can be optimized. */
-  int can_optimize_printf_family = 0;
-  int pf_fmt_idx = -1;    /* index of the format string in saved_args[] */
-  int pf_file_idx = -1;   /* index of FILE* arg, or -1 for stdout */
-  int pf_vararg_idx = -1; /* index of first vararg in saved_args[], or high value for va_list fns */
-  int pf_min_args = 0;    /* minimum number of args for a valid call */
-  if (func_name && TCC_OPT(tcc_state, optimize) > 0)
-  {
-    /* --- printf family (stdout, variadic) --- */
-    if (strcmp(func_name, "printf") == 0 || strcmp(func_name, "printf_unlocked") == 0 ||
-        strcmp(func_name, "__builtin_printf") == 0 || strcmp(func_name, "__builtin_printf_unlocked") == 0)
-    {
-      can_optimize_printf_family = 1;
-      pf_fmt_idx = 0;
-      pf_vararg_idx = 1;
-      pf_min_args = 1;
-    }
-    else if (strcmp(func_name, "__printf_chk") == 0)
-    {
-      can_optimize_printf_family = 1;
-      pf_fmt_idx = 1; /* [0]=flag */
-      pf_vararg_idx = 2;
-      pf_min_args = 2;
-    }
-    /* --- fprintf family (FILE*, variadic) --- */
-    else if (strcmp(func_name, "fprintf") == 0 || strcmp(func_name, "fprintf_unlocked") == 0 ||
-             strcmp(func_name, "__builtin_fprintf_unlocked") == 0)
-    {
-      can_optimize_printf_family = 1;
-      pf_file_idx = 0;
-      pf_fmt_idx = 1;
-      pf_vararg_idx = 2;
-      pf_min_args = 2;
-    }
-    else if (strcmp(func_name, "__fprintf_chk") == 0)
-    {
-      can_optimize_printf_family = 1;
-      pf_file_idx = 0;
-      pf_fmt_idx = 2; /* [1]=flag */
-      pf_vararg_idx = 3;
-      pf_min_args = 3;
-    }
-    /* --- vprintf family (stdout, va_list — no vararg access) --- */
-    else if (strcmp(func_name, "vprintf") == 0)
-    {
-      can_optimize_printf_family = 1;
-      pf_fmt_idx = 0;
-      pf_vararg_idx = 99; /* va_list: varargs inaccessible */
-      pf_min_args = 2;    /* fmt + va_list */
-    }
-    else if (strcmp(func_name, "__vprintf_chk") == 0)
-    {
-      can_optimize_printf_family = 1;
-      pf_fmt_idx = 1; /* [0]=flag */
-      pf_vararg_idx = 99;
-      pf_min_args = 3; /* flag + fmt + va_list */
-    }
-    /* --- vfprintf family (FILE*, va_list — no vararg access) --- */
-    else if (strcmp(func_name, "vfprintf") == 0)
-    {
-      can_optimize_printf_family = 1;
-      pf_file_idx = 0;
-      pf_fmt_idx = 1;
-      pf_vararg_idx = 99;
-      pf_min_args = 3; /* file + fmt + va_list */
-    }
-    else if (strcmp(func_name, "__vfprintf_chk") == 0)
-    {
-      can_optimize_printf_family = 1;
-      pf_file_idx = 0;
-      pf_fmt_idx = 2; /* [1]=flag */
-      pf_vararg_idx = 99;
-      pf_min_args = 4; /* file + flag + fmt + va_list */
-    }
-  }
-
-  /* Save IR instruction index before argument emission.
-   * If constant folding succeeds we roll back to discard orphaned
-   * FUNCPARAMVAL ops that were already emitted for the arguments. */
-  int ir_idx_before_args = tcc_ir_count(tcc_state->ir);
-  /* Tracks IR position just before the first FUNCPARAMVAL emission.
-   * Used by try_inline_builtin_call to roll back only FUNCPARAMVAL ops
-   * while preserving argument evaluation IR. */
-  int ir_idx_before_first_param = -1;
-
-  /* __builtin_va_arg_pack() expansion: if the callee is an always_inline
-   * function that uses __builtin_va_arg_pack(), we must create a specialized
-   * clone for this call site with the variadic args baked in.
-   *
-   * Strategy:
-   * 1. Save all argument tokens from the call site
-   * 2. Count named (fixed) parameters of the callee
-   * 3. Split into fixed arg tokens and variadic arg tokens
-   * 4. Parse the variadic args once for their types only
-   * 5. Create a clone of the inline function's token stream with
-   *    __builtin_va_arg_pack() replaced by extra parameters, one per
-   *    variadic arg, so the args are evaluated at the call in the caller's
-   *    scope (pasting their tokens re-resolved names in the callee's)
-   * 6. Register the clone as a new inline function
-   * 7. Change the call target to the clone
-   * 8. Replay all the arg tokens for normal call parsing
-   * Without code (sizeof, dead code) nothing is emitted: no clone needed.
-   */
-  if (call_func_sym && call_func_sym->type.ref && call_func_sym->type.ref->f.func_va_arg_pack &&
-      (call_func_sym->type.t & VT_INLINE) && !tcc_state->check_only && !nocode_wanted)
+/* A call of a variadic inline function using __builtin_va_arg_pack(): its
+   clone with the variadic arguments as parameters becomes the callee (the
+   steps are at the call, in unary_funcall_body).  Out of line: the clone's
+   bookkeeping is cold, and unary_funcall_body is on the parser's recursive
+   path (arguments that are calls, inline expansions). */
+static __attribute__((noinline)) void funcall_va_pack_clone(Sym **pcall_func_sym, Sym **ps, Sym **psa)
+{
+  Sym *call_func_sym = *pcall_func_sym, *s = *ps, *sa = *psa;
   {
     /* Find the InlineFunc for this symbol */
     struct InlineFunc *orig_fn = NULL;
@@ -1264,9 +1233,508 @@ static void unary_funcall_body(void)
       tok_str_free(va_args);
     }
   }
+  *pcall_func_sym = call_func_sym;
+  *ps = s;
+  *psa = sa;
+}
 
+/* The argument checks of a call (-Wformat, -Wsizeof-pointer-memaccess): on
+   the heap and only for a callee they apply to.  unary_funcall_body's frame
+   is on the parser's recursive path twice -- arguments that are calls, and
+   inline expansions, which replay a body inside it -- and the two states
+   (168 bytes on the device) were live across both. */
+typedef struct CallArgChecks
+{
+  FmtCheck fc;
+  FeMemAccess ma;
+} CallArgChecks;
+
+static __attribute__((noinline)) CallArgChecks *call_arg_checks_begin(Sym *fsym, Sym *memsym)
+{
+  CallArgChecks ck, *p;
+  attr_format_begin(&ck.fc, fsym);
+  fe_memaccess_begin(&ck.ma, memsym);
+  if (!(ck.fc.state | ck.fc.fa_idx | ck.fc.kind) && !ck.ma.fn)
+    return NULL;
+  p = tcc_malloc(sizeof *p);
+  *p = ck;
+  return p;
+}
+
+/* argument NB_ARGS of a call whose sizeof-memaccess check is on */
+static __attribute__((noinline)) void call_arg_memaccess(CallArgChecks *ck, int nb_args)
+{
+  const int started_sizeof = tok == TOK_SIZEOF, seq0 = fe_sizeof_seq;
+  FeSpan arg_span = {0, 0};
+  if (fe_tokfp_on)
+    fe_span_begin(&arg_span);
+  expr_eq();
+  if (fe_tokfp_on)
+    fe_span_end(&arg_span);
+  fe_memaccess_arg(&ck->ma, nb_args, started_sizeof, seq0, &arg_span);
+}
+
+static __attribute__((noinline)) void call_arg_checks_end(CallArgChecks *ck, int nb_args)
+{
+  if (ck->fc.kind | ck->fc.fa_idx)
+    attr_format_end(&ck->fc, nb_args);
+  if (ck->ma.fn)
+    fe_memaccess_end(&ck->ma);
+  tcc_free(ck);
+}
+
+static void unary_funcall_body(void)
+{
+  int n, t, r, size, align;
+  Sym *s;
+  /* yasc `obj.method(...)`: the object is the first argument, kept aside in
+     funcall_self_arg (decl/method.c) */
+  int self_pending = funcall_self_pending;
+  funcall_self_pending = 0;
+  /* builtin/objsize.c: the call unary_funcall began for this body */
+  ObjCall *oc = objsize_cur_call;
+  objsize_cur_call = NULL;
+
+  SValue ret;
+  Sym *sa;
+  int nb_args, ret_nregs, ret_align, regsize, variadic;
+  TokenString *p, *p2;
+
+  /* function call  */
+  if ((vtop->type.t & VT_BTYPE) != VT_FUNC)
+  {
+    /* pointer test (no array accepted) */
+    if ((vtop->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR)
+    {
+      /* a byte-reversed pointer member (big-endian scalar_storage_order) is
+         loaded and swapped while it is still typed as a pointer */
+      if ((vtop->r & VT_LVAL) && vtop->sso_reversed)
+        gv(RC_INT);
+      vtop->type = *pointed_type(&vtop->type);
+      if ((vtop->type.t & VT_BTYPE) != VT_FUNC)
+        goto error_func;
+    }
+    else
+    {
+    error_func:
+      expect("function pointer");
+    }
+  }
+  else
+  {
+    vtop->r &= ~VT_LVAL; /* no lvalue */
+  }
+  /* get return type */
+  /* Save function symbol before switching to type ref - needed for nested_func check */
+  Sym *call_func_sym = vtop->sym;
+  s = vtop->type.ref;
+  if (self_pending && (tcc_state->reverse_funcargs || (call_func_sym && call_func_sym->type.ref &&
+                                                       call_func_sym->type.ref->f.func_va_arg_pack)))
+    tcc_error("a method call cannot use this calling convention");
+  /* A direct call (BL to the function itself) of an internal function takes
+   * its 8-byte aggregate in r0/r1 (gfunc_regpair_ret); through a pointer, the
+   * address is the AAPCS adapter's. */
+  Sym *regpair_callee =
+      (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM) && vtop->c.i == 0 && call_func_sym &&
+              (call_func_sym->type.t & VT_BTYPE) == VT_FUNC && call_func_sym->type.ref == s
+          ? call_func_sym
+          : NULL;
+  next();
+
+  /* A call of a nested function passes its static chain, the frame of the
+   * function that defines the callee (nested_chain_level).  SET_CHAIN is
+   * emitted right before the FUNCCALL and takes effect at the branch, so the
+   * argument code still sees our own chain.  Level 1 (a sibling, our own
+   * incoming chain) is already in R10. */
+  int set_chain_level = -1;
+  /* The nested function this call targets, if any.  Its nb_real_calls counts
+   * the call sites that actually emitted a call: incremented here, decremented
+   * again below wherever the body is inlined instead.  gen_function needs the
+   * exact count — "the callee is marked auto_inline" is not the same thing as
+   * "every call site inlined it", and clearing a capture's addrtaken on that
+   * guess leaves the surviving call reading chain offset 0. */
+  NestedFunc *call_nf = NULL;
+  if (tcc_state->ir && call_func_sym && call_func_sym->a.nested_func)
+  {
+    for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++)
+    {
+      if (tcc_state->nested_funcs[ni]->sym == call_func_sym)
+      {
+        call_nf = tcc_state->nested_funcs[ni];
+        break;
+      }
+    }
+    if (call_nf)
+      call_nf->nb_real_calls++;
+    set_chain_level = nested_chain_level(call_nf);
+    if (set_chain_level == 1)
+      set_chain_level = -1;
+  }
+
+  /* Each IR-level call gets a unique call_id so FUNCPARAM* can be bound
+   * without fragile nested-depth scanning.
+   */
+  int call_id = 0;
+  /* If we claim an NRVO target as the sret buffer, remember its vreg so
+   * the post-call result push can use the same vreg as the destination —
+   * lets the IR see the call's effect and the later use as a single
+   * variable (otherwise DCE may misanalyse the dependency). */
+  int nrvo_call_vreg = -1;
+  /* When NRVO claims a register-deref destination, this holds the address
+     vreg so the post-call result is pushed as a deref through it. */
+  int nrvo_call_ptr_vreg = -1;
+  if (!NOEVAL_WANTED && tcc_state->ir)
+  {
+    call_id = tcc_state->ir->next_call_id++;
+    /* -Wlifetime: which arguments move into the callee */
+    if (tcc_state->ir->lt_on)
+      tcc_ir_lt_note_call(tcc_state->ir, call_id, s, regpair_callee);
+    /* -Wtainted-format: the sources and the format arguments */
+    if (tcc_state->ir->taint_on)
+      tcc_ir_taint_note_call(tcc_state->ir, call_id, call_func_sym && call_func_sym->type.ref == s ? call_func_sym : NULL);
+    /* -fcallgraph-info: the type an indirect call is resolved by */
+    if (tcc_state->callgraph_info)
+      tcc_stack_usage_note_call(tcc_state, call_id, s);
+  }
+
+  /* An NRVO hint (expr_eq, a declaration's initializer) is for the first call
+   * of the right-hand side, the outermost one: taken now, so that no call
+   * among the arguments -- whose result is not the value assigned -- can
+   * claim the destination as its buffer. */
+  const int nrvo_hint = tcc_state->nrvo_target_active;
+  tcc_state->nrvo_target_active = 0;
+
+  sa = sym_first(s); /* first parameter */
+  nb_args = regsize = 0;
+  int nb_implicit_args = 0; /* sret pointer counted in nb_args but not saved_arg_count */
+  int sret_param_idx = -1;  /* IR index of the sret pointer's FUNCPARAMVAL */
+  /* Hard-float result in s0..s(n-1) (gfunc_sret_vfp_words): the buffer gets
+   * no hidden argument; the registers are stored into it after the call. */
+  int vfp_ret_words = 0;
+  SValue vfp_ret_ptr;
+  /* compute first implicit argument if a composite type is returned */
+  if ((s->type.t & VT_BTYPE) == VT_STRUCT || (s->type.t & VT_COMPLEX))
+  {
+    variadic = (s->f.func_type == FUNC_ELLIPSIS);
+    ret_nregs = gfunc_sret_fn(regpair_callee, &s->type, variadic, &ret.type, &ret_align, &regsize);
+    if (!gfunc_regpair_ret(regpair_callee))
+      regpair_callee = NULL;
+    if (ret_nregs == 0)
+      vfp_ret_words = gfunc_sret_vfp_words(&s->type, variadic);
+    if (ret_nregs <= 0)
+    {
+      /* get some space for the returned structure */
+      size = type_size(&s->type, &align);
+#ifdef TCC_TARGET_ARM64
+      /* On arm64, a small struct is return in registers.
+         It is much easier to write it to memory if we know
+         that we are allowed to write some extra bytes, so
+         round the allocated space up to a power of 2: */
+      if (size < 16)
+        while (size & (size - 1))
+          size = (size | (size - 1)) + 1;
+#endif
+      /* NRVO: if the caller has hinted a destination slot for this
+       * call's return, use it as the sret buffer.  Saves the temp +
+       * the temp→dst copy in the caller.  Conditions: size and
+       * alignment must match exactly so we don't write past the dst.
+       *
+       * Important: do NOT mutate `loc` here.  The destination slot was
+       * already allocated by the surrounding declaration, and `loc`
+       * already points past it.  Overwriting `loc` would let later
+       * allocations in this function overlap the destination.
+       *
+       * Skip NRVO for nested-function callees: the callee accesses outer
+       * locals via static link, and an existing IR-fold can collapse a
+       * `LEA(local_a) + 4` into a `StackLoc[N]` reference whose pool
+       * entry was originally tagged as a static-link access — emitting
+       * the wrong base register at codegen.  Triggers when the callee's
+       * local struct field offset coincides with the caller's other
+       * locals (much more likely once NRVO eliminates the temp). */
+      int nrvo_claimed = 0;
+      int nrvo_ptr_claimed = 0;
+      int nrvo_vreg = -1;
+      int nrvo_ptr_vreg = -1;
+      int sret_loc = 0;
+      int callee_is_nested = (call_func_sym && call_func_sym->a.nested_func);
+      if (ret_nregs == 0 && nrvo_hint &&
+          tcc_state->nrvo_target_size == size &&
+          tcc_state->nrvo_target_align == align &&
+          !callee_is_nested)
+      {
+        if (tcc_state->nrvo_target_ptr_vreg >= 0)
+        {
+          /* Register-deref destination: write the sret directly through the
+           * destination's address vreg. */
+          nrvo_ptr_vreg = tcc_state->nrvo_target_ptr_vreg;
+          nrvo_ptr_claimed = 1;
+        }
+        else
+        {
+          sret_loc = tcc_state->nrvo_target_loc;
+          nrvo_vreg = tcc_state->nrvo_target_vreg;
+        }
+        nrvo_claimed = 1;
+      }
+      else
+      {
+        /* At least word-aligned: tcc_ir_sret_dealias keeps a buffer only at
+         * a word-aligned address (an optimized callee may LDM/LDRD through
+         * it), so a char-array struct's temporary would get a second one --
+         * 256 KB more frame for tests2/119's big_struct. */
+        loc = tcc_ir_frame_alloc_ret_temp(loc, size, -(align < 4 ? 4 : align));
+        tcc_ir_frame_note_type(loc, &s->type);
+        sret_loc = loc;
+      }
+      ret.type = s->type;
+      if (nrvo_ptr_claimed)
+      {
+        /* Push the destination address (held in nrvo_ptr_vreg) as the sret
+         * pointer param.  The post-call result is a deref through it. */
+        SValue ptr;
+        svalue_init(&ptr);
+        ptr.type.t = VT_PTR;
+        ptr.type.ref = s->type.ref;
+        ptr.r = 0; /* value in vreg */
+        ptr.vr = nrvo_ptr_vreg;
+        vpushv(&ptr);
+        ret.r = VT_LVAL; /* register-deref lvalue (valmask 0) */
+        nrvo_call_ptr_vreg = nrvo_ptr_vreg;
+      }
+      else
+      {
+        ret.r = VT_LOCAL | VT_LVAL;
+        /* pass it as 'int' to avoid structure arg passing
+           problems */
+        vseti(VT_LOCAL, sret_loc);
+        if (nrvo_claimed)
+        {
+          vtop->vr = nrvo_vreg;
+          nrvo_call_vreg = nrvo_vreg;
+        }
+      }
+#ifdef CONFIG_TCC_BCHECK
+      /* Skip bcheck padding when NRVO reused a caller-owned slot — that
+       * slot already has whatever bcheck guards the caller installed. */
+      if (tcc_state->do_bounds_check && !nrvo_claimed)
+        --loc;
+#endif
+      ret.c = vtop->c;
+      if (ret_nregs < 0)
+      {
+        vtop--;
+        print_vstack("unary, function call");
+      }
+      else if (vfp_ret_words)
+      {
+        vfp_ret_ptr = *vtop;
+        pin_call_arg_temp_slot(vtop);
+        vtop--;
+      }
+      else
+      {
+        /* ret_nregs == 0: struct is returned via an implicit first argument
+         * (sret pointer). In IR mode we must actually emit the parameter and
+         * pop it, otherwise it stays on the value stack and triggers
+         * check_vstack() failures (vstack leak).
+         *
+         * Keep parameter indices 0-based: this implicit argument is param #0.
+         */
+        if (!NOEVAL_WANTED)
+        {
+          SValue num;
+          svalue_init(&num);
+          num.vr = -1;
+          num.r = VT_CONST;
+          num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
+          LOG_CODEGEN("FUNCPARAMVAL push: site=sret_param0 call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
+                      TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), vtop->r, vtop->vr);
+          sret_param_idx = tcc_ir_count(tcc_state->ir);
+          tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+          pin_call_arg_temp_slot(vtop);
+          tcc_ir_frame_note_sret_call(call_id, size);
+        }
+        vtop--;
+        nb_args++;
+        nb_implicit_args++;
+        if (!NOEVAL_WANTED && tcc_state->ir && tcc_state->ir->lt_on)
+          tcc_ir_lt_note_implicit(tcc_state->ir, call_id);
+      }
+    }
+  }
+  else
+  {
+    ret_nregs = 1;
+    ret.type = s->type;
+  }
+
+  if (ret_nregs > 0)
+  {
+    /* return in register */
+    ret.c.i = 0;
+    PUT_R_RET(&ret, ret.type.t);
+  }
+
+  /* Storage for arguments in case we need to constant-fold.
+   * Heap-allocated to reduce unary()'s stack frame.
+   * Size based on parameter count so we can inline functions with >8 params. */
+  int saved_args_cap = 8;
+  if (call_func_sym && call_func_sym->type.ref)
+  {
+    int pc = auto_inline_param_count(call_func_sym);
+    if (pc > saved_args_cap)
+      saved_args_cap = pc;
+  }
+  FuncallScratch *saved_scratch = tcc_mallocz(sizeof(*saved_scratch));
+  saved_scratch->saved_args = tcc_mallocz(saved_args_cap * sizeof(SValue));
+  saved_scratch->saved_args_cid = tcc_mallocz(saved_args_cap * sizeof(unsigned char *));
+  saved_scratch->saved_args_cid_size = tcc_mallocz(saved_args_cap * sizeof(int));
+  saved_scratch->next = funcall_scratch_stack;
+  funcall_scratch_stack = saved_scratch;
+  SValue *saved_args = saved_scratch->saved_args;
+  unsigned char **saved_args_cid = saved_scratch->saved_args_cid;
+  int *saved_args_cid_size = saved_scratch->saved_args_cid_size;
+  int saved_arg_count = 0;
+  int can_try_fold = 0;
+  int can_inline_builtin = 0;
+  int can_inline_eval = 0;
+  int can_optimize_string_builtin = 0;
+  int can_optimize_fputs_family = 0;
+  /* Folding/rewriting a call by its NAME is only valid when the callee is the
+   * library function: not a static function of this TU that reuses the name,
+   * and not under plain -fno-builtin.  The __builtin_ spellings always fold. */
+  int libcall_by_name_ok = 1;
+  const char *func_name = NULL;
+  /* The callee's name, as far as any library name it is screened against
+   * reaches (the longest is 26 bytes): a longer one is cut, which keeps every
+   * comparison's answer, and a spilled name is not read back for good. */
+  char func_name_buf[48];
+  int inl_first_obj = 0; /* frame objects of an inline expansion start here (tcc_ir_frame_scope_end) */
+
+  /* Check if we have a named function that might be foldable */
+  if (call_func_sym && call_func_sym->v >= TOK_IDENT)
+  {
+    pstrcpy(func_name_buf, sizeof func_name_buf, tok_name_tmp(call_func_sym->v));
+    func_name = func_name_buf;
+    if (func_name && strncmp(func_name, "__builtin_", 10) != 0 &&
+        ((call_func_sym->type.t & VT_STATIC) || (tcc_state->no_builtin_funcs & NO_BUILTIN_ALL)))
+      libcall_by_name_ok = 0;
+
+    /* Calling alloca() (library version) modifies SP; the caller
+     * needs a frame pointer so the epilogue can restore SP. */
+    if (func_name && strcmp(func_name, "alloca") == 0 && tcc_state->ir)
+      tcc_state->force_frame_pointer = 1;
+
+    /* Quick check if this could be a foldable math function */
+    if (func_name && (func_name[0] == 's' || func_name[0] == 'c' || func_name[0] == 't' || func_name[0] == 'a' ||
+                      func_name[0] == 'e' || func_name[0] == 'l' || func_name[0] == 'p' || func_name[0] == 'f' ||
+                      func_name[0] == 'r' || func_name[0] == 't'))
+    {
+      can_try_fold = 1;
+    }
+
+    {
+      int is_unsigned;
+      can_inline_builtin =
+          (get_builtin_abs_info(func_name, &is_unsigned) && builtin_abs_decl_matches(call_func_sym, func_name)) ||
+          !strcmp(func_name, "__multi3"); /* try_inline_multi3 */
+    }
+
+    can_optimize_string_builtin = resolve_str_builtin_id(call_func_sym->v, func_name) != STRBI_UNKNOWN;
+
+    /* The fputs lowering below needs the arguments saved.  can_try_fold's
+     * first-letter screen passes fputs and fputs_unlocked but not
+     * __builtin_fputs_unlocked, which is a lazily declared prototype that
+     * keeps its own name -- so that one was never lowered, and with a
+     * user-supplied fputs that aborts inside main (gcc_execute
+     * builtins/fputs) the call reached it. */
+    can_optimize_fputs_family = func_name && (strcmp(func_name, "fputs") == 0 || strcmp(func_name, "fputs_unlocked") == 0 ||
+                                              strcmp(func_name, "__builtin_fputs_unlocked") == 0);
+  }
+
+  /* Check if the callee is a small inline function we might evaluate.
+   * Also enter this path for non-static auto-inline candidates: they don't
+   * have VT_INLINE (needed for correct ELF linkage) but should still be
+   * inlined at call sites within this translation unit. */
+  if (call_func_sym && TCC_OPT(tcc_state, optimize) &&
+      ((call_func_sym->type.t & VT_INLINE) || call_func_sym->a.guard_head ||
+       (call_func_sym->type.ref &&
+        (call_func_sym->type.ref->f.func_auto_inline || call_func_sym->type.ref->f.func_eval_only_inline))))
+    can_inline_eval = 1;
+
+  /* ---- One level of direct self-recursion ----
+   * A recursive callee cannot be inlined away, but expanding its body ONCE
+   * into itself halves the dynamic call count: every second level of the
+   * recursion tree is then handled inline, and each removed call is a
+   * PUSH/POP/BL/return the M-profile core no longer executes.  (gcc does the
+   * same thing at -O2, several levels deep -- it is the whole of its 2x lead
+   * on recursive fib.)
+   *
+   * Exactly one level, and only from the standalone body: inside the
+   * expansion `in_inline_expansion` is set, so the inner self-calls fail this
+   * test and are emitted as ordinary calls.  That refusal happens at the gate
+   * below, before any of the callee's IR is emitted -- the partial-expansion
+   * leftover the old unconditional refusal was written against. */
+  int self_inline_ok = 0;
+  if (can_inline_eval && call_func_sym == tcc_state->cur_func_sym &&
+      !tcc_state->in_inline_expansion && TCC_OPT(tcc_state, opt_inline_functions) &&
+      call_func_sym->type.ref && call_func_sym->type.ref->f.func_auto_inline &&
+      !call_func_sym->a.nested_func)
+  {
+    int rbt = call_func_sym->type.ref->type.t & VT_BTYPE;
+    /* Struct and floating returns go through the sret/multi-register paths
+     * the expansion does not model for a self-call. */
+    if (rbt == VT_VOID || rbt == VT_BOOL || rbt == VT_BYTE || rbt == VT_SHORT ||
+        rbt == VT_INT || rbt == VT_LLONG || rbt == VT_PTR)
+      self_inline_ok = 1;
+  }
+
+  /* Detect printf-family functions that can be optimized.
+   * We recognize standard (printf, fprintf), unlocked stdio variants,
+   * v-variants (vprintf, vfprintf), and fortified (_chk) variants.
+   * For each, we track the index of key arguments in saved_args[].
+   * For v-variants, varargs are in a va_list (opaque), so its vararg_idx is
+   * set past the arg count to prevent %s/%c optimization — only constant
+   * format strings without specifiers can be optimized. */
+  const PrintfFamily *pf = func_name && TCC_OPT(tcc_state, optimize) > 0 ? printf_family_lookup(func_name) : NULL;
+
+  /* Save IR instruction index before argument emission.
+   * If constant folding succeeds we roll back to discard orphaned
+   * FUNCPARAMVAL ops that were already emitted for the arguments. */
+  int ir_idx_before_args = tcc_ir_count(tcc_state->ir);
+  /* Tracks IR position just before the first FUNCPARAMVAL emission.
+   * Used by try_inline_builtin_call to roll back only FUNCPARAMVAL ops
+   * while preserving argument evaluation IR. */
+  int ir_idx_before_first_param = -1;
+
+  /* __builtin_va_arg_pack() expansion: if the callee is an always_inline
+   * function that uses __builtin_va_arg_pack(), we must create a specialized
+   * clone for this call site with the variadic args baked in.
+   *
+   * Strategy:
+   * 1. Save all argument tokens from the call site
+   * 2. Count named (fixed) parameters of the callee
+   * 3. Split into fixed arg tokens and variadic arg tokens
+   * 4. Parse the variadic args once for their types only
+   * 5. Create a clone of the inline function's token stream with
+   *    __builtin_va_arg_pack() replaced by extra parameters, one per
+   *    variadic arg, so the args are evaluated at the call in the caller's
+   *    scope (pasting their tokens re-resolved names in the callee's)
+   * 6. Register the clone as a new inline function
+   * 7. Change the call target to the clone
+   * 8. Replay all the arg tokens for normal call parsing
+   * Without code (sizeof, dead code) nothing is emitted: no clone needed.
+   */
+  if (call_func_sym && call_func_sym->type.ref && call_func_sym->type.ref->f.func_va_arg_pack &&
+      (call_func_sym->type.t & VT_INLINE) && !tcc_state->check_only && !nocode_wanted)
+    funcall_va_pack_clone(&call_func_sym, &s, &sa);
+
+  /* -Wformat: format(printf|scanf) checks the arguments as they come */
   p = NULL;
-  if (tok != ')')
+  CallArgChecks *ck = call_arg_checks_begin(
+      call_func_sym,
+      call_func_sym && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM) ? call_func_sym : NULL);
+  if (tok != ')' || self_pending)
   {
     r = tcc_state->reverse_funcargs;
     SValue num;
@@ -1283,7 +1751,22 @@ static void unary_funcall_body(void)
       {
         /* IR expects 0-based parameter indices.
          * Keep FUNCPARAMVAL numbering consistent across all call sites. */
-        expr_eq();
+        if (ck && (ck->fc.state | ck->fc.fa_idx))
+          attr_format_before(&ck->fc, nb_args);
+        if (oc)
+          objsize_call_arg_before(oc, nb_args);
+        if (self_pending)
+          vpushv(&funcall_self_arg);
+        else if (ck && ck->ma.fn)
+          call_arg_memaccess(ck, nb_args);
+        else
+          expr_eq();
+        if (yasc_pp_live)
+          yasc_pp_arg(vtop, call_func_sym, sa, nb_args); /* plain_param.c */
+        if (oc)
+          objsize_call_arg(oc, nb_args);
+        if (ck && (ck->fc.state | ck->fc.fa_idx))
+          attr_format_arg(&ck->fc, nb_args);
         /* Materialize comparisons before applying the parameter conversion. */
         if (!NOEVAL_WANTED)
           tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
@@ -1295,7 +1778,7 @@ static void unary_funcall_body(void)
         /* Save argument for potential constant folding or inline evaluation.
          * This must happen BEFORE the double-complex materialization below,
          * which converts VT_CONST to VT_LOCAL. */
-        if ((can_try_fold || can_inline_builtin || can_inline_eval || can_optimize_printf_family ||
+        if ((can_try_fold || can_inline_builtin || can_inline_eval || pf ||
              can_optimize_string_builtin || can_optimize_fputs_family) &&
             saved_arg_count < saved_args_cap && !NOEVAL_WANTED)
         {
@@ -1387,6 +1870,13 @@ static void unary_funcall_body(void)
       nb_args++;
       if (sa)
         sa = sa->next;
+      if (self_pending)
+      {
+        self_pending = 0;
+        if (tok == ')')
+          break;
+        continue;
+      }
       if (tok == ')')
         break;
       skip(',');
@@ -1394,6 +1884,10 @@ static void unary_funcall_body(void)
   }
   if (sa && s->f.func_type != FUNC_OLD)
     tcc_error("too few arguments to function");
+  if (ck)
+    call_arg_checks_end(ck, nb_args);
+  if (oc)
+    objsize_call_args_end(oc);
 
   if (p)
   { /* with reverse_funcargs */
@@ -1413,7 +1907,7 @@ static void unary_funcall_body(void)
 
       /* Save argument for potential constant folding or inline evaluation (in reverse order for reverse_funcargs)
        */
-      if ((can_try_fold || can_inline_builtin || can_inline_eval || can_optimize_printf_family ||
+      if ((can_try_fold || can_inline_builtin || can_inline_eval || pf ||
            can_optimize_string_builtin) && n < saved_args_cap &&
           (nb_args - 1 - n) < saved_args_cap && !NOEVAL_WANTED)
       {
@@ -1601,263 +2095,10 @@ static void unary_funcall_body(void)
    * Also handles __printf_chk/__fprintf_chk (extra flag argument).
    * Only optimize when the call is a whole expression statement. */
   int printf_family_optimized = 0;
-  if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && can_optimize_printf_family &&
-      saved_arg_count == nb_real_args && nb_args >= pf_min_args && !nocode_wanted && call_result_discarded())
-  {
-    int fmt_len = 0;
-    const char *fmt = try_get_constant_string(&saved_args[pf_fmt_idx], &fmt_len);
-    if (fmt)
-    {
-      int has_file = (pf_file_idx >= 0); /* fprintf-family vs printf-family */
-      int has_varargs = (nb_args > pf_vararg_idx);
-
-      /* Classify the format pattern:
-       *  PF_OPT_NOP           = empty output
-       *  PF_OPT_PUTCHAR_CONST = putchar/fputc with a constant char
-       *  PF_OPT_FWRITE        = fwrite (fprintf-family) or puts (printf-family, trailing \n)
-       *  PF_OPT_PUTCHAR_ARG   = putchar/fputc from %c vararg
-       *  PF_OPT_FPUTS_ARG     = fputs from %s vararg
-       *  PF_OPT_PUTS_ARG      = puts from %s\n vararg */
-      enum
-      {
-        PF_OPT_NONE = 0,
-        PF_OPT_NOP,
-        PF_OPT_PUTCHAR_CONST,
-        PF_OPT_FWRITE,
-        PF_OPT_PUTS_CHOPPED,
-        PF_OPT_PUTCHAR_ARG,
-        PF_OPT_FPUTS_ARG,
-        PF_OPT_PUTS_ARG
-      };
-      int opt_kind = PF_OPT_NONE;
-      int putchar_val = 0;
-      /* For fwrite: which SValue to write and its known length */
-      SValue *write_str_sv = NULL;
-      int write_len = 0;
-      /* For puts with trailing-\n chopped: the string to analyze */
-      const char *puts_src = NULL;
-      int puts_src_len = 0;
-
-      if (strchr(fmt, '%') == NULL)
-      {
-        /* No format specifiers — output is the format string itself */
-        if (fmt_len == 0)
-        {
-          opt_kind = PF_OPT_NOP;
-        }
-        else if (has_file)
-        {
-          opt_kind = PF_OPT_FWRITE;
-          write_str_sv = &saved_args[pf_fmt_idx];
-          write_len = fmt_len;
-        }
-        else if (fmt_len == 1)
-        {
-          opt_kind = PF_OPT_PUTCHAR_CONST;
-          putchar_val = (unsigned char)fmt[0];
-        }
-        else if (fmt[fmt_len - 1] == '\n')
-        {
-          opt_kind = PF_OPT_PUTS_CHOPPED;
-          puts_src = fmt;
-          puts_src_len = fmt_len;
-        }
-        /* else: multi-char without trailing \n to stdout → not optimized */
-      }
-      else if (strcmp(fmt, "%s") == 0 && has_varargs)
-      {
-        int slen = 0;
-        const char *sval = try_get_constant_string(&saved_args[pf_vararg_idx], &slen);
-        if (sval)
-        {
-          if (slen == 0)
-          {
-            opt_kind = PF_OPT_NOP;
-          }
-          else if (has_file)
-          {
-            opt_kind = PF_OPT_FWRITE;
-            write_str_sv = &saved_args[pf_vararg_idx];
-            write_len = slen;
-          }
-          else if (slen == 1)
-          {
-            opt_kind = PF_OPT_PUTCHAR_CONST;
-            putchar_val = (unsigned char)sval[0];
-          }
-          else if (sval[slen - 1] == '\n')
-          {
-            opt_kind = PF_OPT_PUTS_CHOPPED;
-            puts_src = sval;
-            puts_src_len = slen;
-          }
-        }
-        else if (has_file)
-        {
-          opt_kind = PF_OPT_FPUTS_ARG;
-        }
-        /* non-constant string to stdout → skip */
-      }
-      else if (strcmp(fmt, "%c") == 0 && has_varargs)
-      {
-        opt_kind = PF_OPT_PUTCHAR_ARG;
-      }
-      else if (!has_file && strcmp(fmt, "%s\n") == 0 && has_varargs)
-      {
-        opt_kind = PF_OPT_PUTS_ARG; /* puts appends \n automatically */
-      }
-
-      if (opt_kind != PF_OPT_NONE)
-      {
-        /* Remove FUNCPARAMVAL ops while preserving argument-evaluation IR.
-         * With forward args, arg-evaluation IR for args 1+ is interleaved
-         * with FUNCPARAMVALs.  A blanket rollback of next_instruction_index
-         * would also erase those definitions (e.g. LEA for &a[1]), leaving
-         * dangling vreg references.  Instead, NOP out only the FUNCPARAMVAL
-         * instructions for the original call. */
-        if (ir_idx_before_first_param >= 0)
-        {
-          int current_end = tcc_state->ir->next_instruction_index;
-          for (int i = ir_idx_before_first_param; i < current_end; i++)
-          {
-            if (tcc_state->ir->compact_instructions[i].op == TCCIR_OP_FUNCPARAMVAL)
-            {
-              /* Only NOP FUNCPARAMVALs belonging to the original call_id,
-               * not those from nested calls (e.g., memcmp inside printf). */
-              IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
-              int encoded_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2));
-              if (encoded_call_id == call_id)
-                tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
-            }
-          }
-        }
-        else
-        {
-          tcc_state->ir->next_instruction_index = ir_idx_before_args;
-        }
-
-        if (opt_kind == PF_OPT_NOP)
-        {
-          /* Empty output — no call needed, result is 0 chars written. */
-          vpushi(0);
-          vtop[-1] = vtop[0];
-          --vtop;
-        }
-        else if (opt_kind == PF_OPT_PUTCHAR_CONST)
-        {
-          /* putchar(constant_char) or fputc(constant_char, f) */
-          SValue ch_sv;
-          svalue_init(&ch_sv);
-          ch_sv.r = VT_CONST;
-          ch_sv.c.i = putchar_val;
-          ch_sv.type.t = VT_INT;
-          ch_sv.vr = -1;
-
-          if (has_file)
-          {
-            SValue pf_args[2];
-            pf_args[0] = ch_sv;
-            pf_args[1] = saved_args[pf_file_idx];
-            gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputc"));
-          }
-          else
-          {
-            gen_ir_void_call_args(&ch_sv, 1, tok_alloc_const("putchar"));
-          }
-          vpushi(1);
-          vtop[-1] = vtop[0];
-          --vtop;
-        }
-        else if (opt_kind == PF_OPT_FWRITE)
-        {
-          /* fwrite(str, 1, len, f) — always goes to a FILE* */
-          SValue fw_args[4];
-          fw_args[0] = *write_str_sv;
-          svalue_init(&fw_args[1]);
-          fw_args[1].r = VT_CONST;
-          fw_args[1].c.i = 1;
-          fw_args[1].type.t = VT_INT;
-          fw_args[1].vr = -1;
-          svalue_init(&fw_args[2]);
-          fw_args[2].r = VT_CONST;
-          fw_args[2].c.i = write_len;
-          fw_args[2].type.t = VT_INT;
-          fw_args[2].vr = -1;
-          fw_args[3] = saved_args[pf_file_idx];
-          gen_ir_void_call_args(fw_args, 4, tok_alloc_const("fwrite"));
-          vpushi(write_len);
-          vtop[-1] = vtop[0];
-          --vtop;
-        }
-        else if (opt_kind == PF_OPT_PUTS_CHOPPED)
-        {
-          /* puts(string_without_trailing_newline)
-           * Create a new string constant in rodata with the trailing \n removed.
-           * Copy puts_src first because it may point into rodata_section->data
-           * and section_ptr_add can reallocate that buffer. */
-          int new_len = puts_src_len - 1;
-          char *puts_copy = tcc_malloc(new_len);
-          memcpy(puts_copy, puts_src, new_len);
-          addr_t new_off = rodata_section->data_offset;
-          char *new_ptr = section_ptr_add(rodata_section, new_len + 1);
-          memcpy(new_ptr, puts_copy, new_len);
-          tcc_free(puts_copy);
-          new_ptr[new_len] = '\0';
-
-          SValue new_str_sv;
-          svalue_init(&new_str_sv);
-          new_str_sv.type = char_pointer_type;
-          new_str_sv.r = VT_CONST | VT_SYM;
-          new_str_sv.sym = get_sym_ref(&char_type, rodata_section, new_off, new_len + 1);
-          new_str_sv.c.i = 0;
-          new_str_sv.vr = -1;
-
-          gen_ir_void_call_args(&new_str_sv, 1, tok_alloc_const("puts"));
-          vpushi(puts_src_len);
-          vtop[-1] = vtop[0];
-          --vtop;
-        }
-        else if (opt_kind == PF_OPT_PUTCHAR_ARG)
-        {
-          /* putchar(arg) or fputc(arg, f) — for "%c" format */
-          if (has_file)
-          {
-            SValue pf_args[2];
-            pf_args[0] = saved_args[pf_vararg_idx];
-            pf_args[1] = saved_args[pf_file_idx];
-            gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputc"));
-          }
-          else
-          {
-            gen_ir_void_call_args(&saved_args[pf_vararg_idx], 1, tok_alloc_const("putchar"));
-          }
-          vpushi(1);
-          vtop[-1] = vtop[0];
-          --vtop;
-        }
-        else if (opt_kind == PF_OPT_FPUTS_ARG)
-        {
-          /* fputs(arg, f) — for fprintf-family "%s" format. */
-          SValue pf_args[2];
-          pf_args[0] = saved_args[pf_vararg_idx];
-          pf_args[1] = saved_args[pf_file_idx];
-          gen_ir_void_call_args(pf_args, 2, tok_alloc_const("fputs"));
-          vpushi(0);
-          vtop[-1] = vtop[0];
-          --vtop;
-        }
-        else if (opt_kind == PF_OPT_PUTS_ARG)
-        {
-          /* puts(arg) — for "%s\n" format. puts() appends \n automatically. */
-          gen_ir_void_call_args(&saved_args[pf_vararg_idx], 1, tok_alloc_const("puts"));
-          vpushi(0);
-          vtop[-1] = vtop[0];
-          --vtop;
-        }
-        printf_family_optimized = 1;
-      }
-    }
-  }
+  if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && pf && saved_arg_count == nb_real_args &&
+      nb_args >= pf->min_args && !nocode_wanted && call_result_discarded())
+    printf_family_optimized =
+        funcall_printf_family(pf, saved_args, nb_args, call_id, ir_idx_before_first_param, ir_idx_before_args);
 
   /* Optimize fputs-family calls in void context.
    * When the result is unused, lowering to strlen+fwrite preserves side
@@ -2390,6 +2631,14 @@ static void unary_funcall_body(void)
         if (pv == 0)
           pv = anon_sym++;
         Sym *psym = sym_push(pv, &param_sym->type, VT_LOCAL | VT_LVAL, loc);
+        psym->a.param_array = param_sym->a.param_array; /* -Wsizeof-array-argument */
+        /* -Wlifetime: the callee's parameter, its compile reports what the
+           body does with it; binding the argument is the call's */
+        if (tcc_state->ir->lt_on)
+          tcc_ir_lt_inline_param(tcc_state->ir, psym->vreg, call_func_sym, pi);
+        /* -Wtainted-format: the expansion is a call for the summaries */
+        if (tcc_state->ir->taint_on && !tcc_state->in_inline_expansion)
+          tcc_ir_taint_inline_param(tcc_state->ir, pi, psym);
         SValue arg_val = saved_args[pi];
         inline_eval_cast_arg_to_param(&arg_val, &param_sym->type);
         /* A K&R definition's caller passes the promoted argument and the
@@ -2490,6 +2739,15 @@ static void unary_funcall_body(void)
        * body's `return` then emits a real RETURNVALUE instead of the
        * store-to-inline_return_loc + jump-to-rsym pattern. */
       uint8_t saved_in_inline_expansion = tcc_state->in_inline_expansion;
+      /* the body is parsed in its own file's dialect, not the caller's */
+      uint8_t saved_yasc = tcc_state->yasc;
+      tcc_state->yasc = tcc_state->nb_yasc_files && inline_fn->filename && tcc_yasc_file(tcc_state, inline_fn->filename);
+      /* its diagnostics name its own file, and are quiet when that is a
+         system header */
+      const char *saved_diag_replay_file = tcc_state->diag_replay_file;
+      if (inline_fn->filename)
+        tcc_state->diag_replay_file = inline_fn->filename;
+      const unsigned saved_diag_parse = tcc_diag_parse_enter(tcc_state);
       int saved_inline_return_loc = tcc_state->inline_return_loc;
       int saved_inline_return_vr = tcc_state->inline_return_vr;
       uint8_t saved_inline_return_redirected = tcc_state->inline_return_redirected;
@@ -2573,6 +2831,11 @@ static void unary_funcall_body(void)
        * suppress next() ONLY for the outermost function-body '}' of the inline
        * expansion and NOT for nested '{...}' blocks inside the inline body. */
       tcc_state->in_inline_expansion = local_scope;
+      if (!saved_in_inline_expansion && tcc_state->ir && (tcc_state->ir->lt_on || tcc_state->ir->ab_on))
+        tcc_ir_lt_inline_mark(tcc_state->ir, 1);
+      if (!saved_in_inline_expansion && tcc_state->ir && tcc_state->ir->taint_on)
+        tcc_ir_taint_inline_mark(tcc_state->ir, 1, call_func_sym, -1);
+      inline_fn->expanded = 1;
       tcc_state->inline_return_loc = inline_ret_loc;
       tcc_state->inline_return_vr = inline_ret_vr;
       tcc_state->inline_return_redirected = 0;
@@ -2594,12 +2857,10 @@ static void unary_funcall_body(void)
       inline_ts->data.str = tok_str_buf(inline_fn->func_str);
       inline_ts->allocated_len = 1;
       inline_ts->len = inline_fn->func_str->len;
+      inline_ts->src = inline_fn->func_str; /* its warnings' quiet ranges */
       int saved_pack[PACK_STACK_SIZE + 1];
       pp_pack_enter(tcc_state, inline_fn->pack, saved_pack);
-      begin_macro(inline_ts, 2);
-      next();
-      block(0);
-      end_macro();
+      replay_body_recovering(inline_ts, call_func_sym); /* begin_macro, block(0), end_macro */
       pp_pack_leave(tcc_state, saved_pack);
       inline_restore_label_bindings(inline_label_tokens, saved_inline_labels, nb_inline_label_tokens);
 
@@ -2608,6 +2869,11 @@ static void unary_funcall_body(void)
 
       /* --- 5. Backpatch return jumps --- */
       tcc_ir_backpatch_to_here(tcc_state->ir, rsym);
+      /* -Wlifetime: the result is as maybe as the call's type says */
+      if (!saved_in_inline_expansion && inline_ret_vr >= 0 && tcc_state->ir && tcc_state->ir->lt_on)
+        tcc_ir_lt_inline_result(tcc_state->ir, inline_ret_vr, s);
+      if (!saved_in_inline_expansion && tcc_state->ir && tcc_state->ir->taint_on)
+        tcc_ir_taint_inline_mark(tcc_state->ir, 0, NULL, inline_ret_vr);
 
       /* --- 6. Restore state --- */
       /* Read back inline_return_loc: the struct return handler may have
@@ -2618,7 +2884,12 @@ static void unary_funcall_body(void)
       if (tcc_state->ir)
         tcc_ir_frame_scope_end(tcc_state->ir, inl_first_obj, tcc_state->ir->next_instruction_index,
                                tcc_state->inline_return_redirected ? inline_ret_loc : 1);
+      if (!saved_in_inline_expansion && tcc_state->in_inline_expansion && tcc_state->ir && (tcc_state->ir->lt_on || tcc_state->ir->ab_on))
+        tcc_ir_lt_inline_mark(tcc_state->ir, 0);
       tcc_state->in_inline_expansion = saved_in_inline_expansion;
+      tcc_state->yasc = saved_yasc;
+      tcc_state->diag_replay_file = saved_diag_replay_file;
+      tcc_diag_parse_leave(tcc_state, saved_diag_parse);
       tcc_state->inline_return_loc = saved_inline_return_loc;
       tcc_state->inline_return_vr = saved_inline_return_vr;
       tcc_state->inline_return_redirected = saved_inline_return_redirected;
@@ -2885,6 +3156,34 @@ static void unary_funcall_body(void)
 void unary_funcall(void)
 {
   unsigned saved_pending = pending_call_temp_slots;
+  /* a direct call: the callee's name (a borrowing struct result's binding) */
+  int callee = (vtop->type.t & VT_BTYPE) == VT_FUNC && vtop->sym ? vtop->sym->v : 0;
+  Sym *fsym = vtop->sym; /* the function, or the pointer variable called through */
+  /* object sizes: allocations, and the checks at memcpy, free, ... */
+  ObjCall *oc = (vtop->type.t & VT_BTYPE) == VT_FUNC &&
+                        (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM)
+                    ? objsize_call_begin(fsym)
+                    : NULL;
+  if (!oc)
+    attr_dep_call_flush(); /* a deprecated sprintf called through a cast */
+  /* -Wconversion: the declared return type (a narrow one is promoted below) */
+  const CType *callee_ft = (vtop->type.t & VT_BTYPE) == VT_PTR ? pointed_type(&vtop->type) : &vtop->type;
+  const int ret_t = (callee_ft->t & VT_BTYPE) == VT_FUNC && callee_ft->ref ? callee_ft->ref->type.t : VT_VOID;
+  objsize_cur_call = oc;
   unary_funcall_body();
+  if (oc) /* the result is the statement's, dropped at the ';' */
+    objsize_call_end(oc, tok == ';' && discarded_call_vtop != NULL && vtop - 1 == discarded_call_vtop);
+  if (tcc_state->warn_conversion || tcc_state->warn_sign_conversion)
+    fe_narrow_note_type(ret_t);
+  /* yasc: a borrowing struct result bound to static storage, for vstore */
+  if (tcc_state->yasc && callee && yasc_borrowing_struct(&vtop->type) &&
+      yasc_struct_result_code(callee) == YASC_BORROWS_STATIC)
+    vtop->sym = &yasc_static_bound;
   pending_call_temp_slots = saved_pending;
+  /* yasc: a call's owned result is a temporary until something takes it;
+     what stores it gets the declared type, an assignment the target's */
+  if (tcc_state->yasc && (type_yasc(&vtop->type) & YASC_OWNED))
+    yasc_requalify(&vtop->type, vtop->type.ref->yasc | YASC_FRESH);
+  /* -Wunused-result: this value, if the statement drops it */
+  attr_call_result(fsym);
 }

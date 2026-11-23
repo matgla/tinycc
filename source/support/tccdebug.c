@@ -212,11 +212,13 @@ static void tcc_debug_print_symattr(FILE *f, const struct SymAttr *a)
     fprintf(f, "%sdllimport", first ? "" : "|");
     first = 0;
   }
+#ifdef TCC_TARGET_PE
   if (a->nodecorate)
   {
     fprintf(f, "%snodecorate", first ? "" : "|");
     first = 0;
   }
+#endif
   if (a->addrtaken)
   {
     fprintf(f, "%saddrtaken", first ? "" : "|");

@@ -424,6 +424,7 @@ int inline_body_has_side_effects(TokenString *func_str)
       case TOK_STATIC:
       case TOK_EXTERN:
       case TOK_AUTO:
+      case TOK_AUTO_TYPE:
       case TOK_REGISTER:
       case TOK_TYPEDEF:
         in_decl = 1;
@@ -754,7 +755,7 @@ static int inline_body_scan_names(TokenString *func_str, Sym *callee, const int 
         if (tv == TOK_TYPEDEF)
           is_td = 1;
         else if (!inline_tok_is_declarator_qual(tv) && tv != TOK_EXTERN && tv != TOK_STATIC && tv != TOK_AUTO &&
-                 tv != TOK_REGISTER && !(tv >= TOK_INLINE1 && tv <= TOK_INLINE3) && tv != TOK_THREAD_LOCAL)
+                 tv != TOK_AUTO_TYPE && tv != TOK_REGISTER && !(tv >= TOK_INLINE1 && tv <= TOK_INLINE3) && tv != TOK_THREAD_LOCAL)
           type_seen = 1;
       }
       else if (!(mode == M_DECLR && inline_tok_is_declarator_qual(tv)) && mode != M_AFTER)
@@ -1602,13 +1603,14 @@ typedef struct HiddenLabelFrame
 {
   int *tokens;
   Sym **saved_labels;
+  int count;
 } HiddenLabelFrame;
 
 static HiddenLabelFrame *hidden_label_frames;
 static int nb_hidden_label_frames;
 static int hidden_label_frames_capacity;
 
-static void inline_push_hidden_label_frame(int *tokens, Sym **saved_labels)
+static void inline_push_hidden_label_frame(int *tokens, Sym **saved_labels, int count)
 {
   if (nb_hidden_label_frames >= hidden_label_frames_capacity)
   {
@@ -1618,6 +1620,7 @@ static void inline_push_hidden_label_frame(int *tokens, Sym **saved_labels)
   }
   hidden_label_frames[nb_hidden_label_frames].tokens = tokens;
   hidden_label_frames[nb_hidden_label_frames].saved_labels = saved_labels;
+  hidden_label_frames[nb_hidden_label_frames].count = count;
   nb_hidden_label_frames++;
 }
 
@@ -1645,6 +1648,27 @@ void inline_release_hidden_label_bindings(void)
   while (nb_hidden_label_frames > 0)
   {
     HiddenLabelFrame *f = &hidden_label_frames[--nb_hidden_label_frames];
+    tcc_free(f->saved_labels);
+    tcc_free(f->tokens);
+    f->saved_labels = NULL;
+    f->tokens = NULL;
+  }
+}
+
+/* Error recovery (core/recover.c): how many expansions hide labels now, and
+ * put back what the expansions above TO hid -- an error left them. */
+int inline_hidden_label_depth(void)
+{
+  return nb_hidden_label_frames;
+}
+
+void inline_unwind_hidden_labels(int to)
+{
+  while (nb_hidden_label_frames > to)
+  {
+    HiddenLabelFrame *f = &hidden_label_frames[--nb_hidden_label_frames];
+    for (int i = f->count - 1; i >= 0; --i)
+      sym_set_label_head(f->tokens[i], f->saved_labels[i]);
     tcc_free(f->saved_labels);
     tcc_free(f->tokens);
     f->saved_labels = NULL;
@@ -1716,7 +1740,7 @@ Sym **inline_hide_label_bindings(TokenString *func_str, int **tokens_out, int *c
 
   *tokens_out = tokens;
   *count_out = count;
-  inline_push_hidden_label_frame(tokens, saved_labels);
+  inline_push_hidden_label_frame(tokens, saved_labels, count);
   return saved_labels;
 }
 
@@ -1977,7 +2001,7 @@ static TokenString *guard_head_scan(TokenString *func_str, Sym *sym, GuardTok *t
     tok_get(&t, &p, &cv);
     if (t == TOK_EOF || t == 0)
       break;
-    if (t == TOK_LINENUM)
+    if (t == TOK_LINENUM || (t == TOK_PACK_REPLAY && (cv.i >> 16) == TCC_PCH_REPLAY_YASC))
       continue;
     if (t == TOK_PACK_REPLAY || t == self || n >= GUARD_HEAD_MAX_TOKENS)
       return NULL;

@@ -44,10 +44,19 @@ void parse_btype_qualify(CType *type, int qualifiers)
   type->t |= qualifiers;
 }
 
+/* Where a type is read but no initializer follows -- a parameter, a member,
+   a type name -- an `auto` that would take the initializer's type is an
+   error. */
+void btype_no_auto(AttributeDef *ad)
+{
+  if (ad->auto_tok)
+    tcc_error("'%s' takes the type of an initializer: it cannot be used here", get_tok_str(ad->auto_tok, NULL));
+}
+
 /* return 0 if no type declaration. otherwise, return the basic type
    and skip it.
  */
-int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
+static int parse_btype_body(CType *type, AttributeDef *ad, int ignore_label)
 {
   int t, u, bt, st, type_found, typespec_found, g, n;
   Sym *s;
@@ -196,7 +205,18 @@ int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
       type->ref = type1.ref;
       goto basic_type1;
     case TOK_STRUCT:
+      yasc_sbind_pending = 0;
       struct_decl(&type1, VT_STRUCT);
+      if (yasc_sbind_pending)
+      {
+        if (!yasc_struct_params(type1.ref))
+          tcc_error("borrows(...): 'struct %s' does not borrow", get_tok_str(type1.ref->v & ~SYM_STRUCT, NULL));
+        ad->sbind_set = 1;
+        ad->sbind_static = yasc_sbind_static;
+        ad->sbind_nb = yasc_sbind_nb;
+        memcpy(ad->sbind_names, yasc_sbind_names, yasc_sbind_nb * sizeof(int));
+        yasc_sbind_pending = 0;
+      }
       goto basic_type2;
     case TOK_UNION:
       struct_decl(&type1, VT_UNION);
@@ -246,8 +266,18 @@ int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
     case TOK_RODATA_REL:
       tcc_error("'__rodata_relative' qualifies a pointer: write it after the '*'");
       break;
-    case TOK_REGISTER:
     case TOK_AUTO:
+      /* C23: with no type specifier, the type of the initializer; with one
+         (and before C23) the storage class, which changes nothing */
+      if (tcc_state->cversion > 201710 || tcc_state->yasc)
+        ad->auto_tok = TOK_AUTO;
+      next();
+      break;
+    case TOK_AUTO_TYPE:
+      ad->auto_tok = TOK_AUTO_TYPE;
+      next();
+      break;
+    case TOK_REGISTER:
     case TOK_RESTRICT1:
     case TOK_RESTRICT2:
     case TOK_RESTRICT3:
@@ -324,8 +354,95 @@ int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
         break;
       }
 
+      if (tcc_state->yasc && tok >= TOK_owned && tok <= TOK_drop)
+      {
+        n = tok;
+        /* `int owned(close) maybe fd`, `int view fd`: an int handle */
+        if ((tok == TOK_owned || tok == TOK_maybe || tok == TOK_view) && typespec_found &&
+            (t & VT_BTYPE) == VT_INT && !IS_ENUM(t))
+        {
+          next();
+          /* `f(int owned)`, `f(int view, ...)`: a handle parameter with no name */
+          if (YASC_NAME_FOLLOWS(tok) && !(func_param_decl_depth > 0 && (tok == ')' || tok == ',')))
+            yasc_keyword_as_name(n);
+          ad->yhandle |= n == TOK_owned ? YASC_OWNED : n == TOK_view ? YASC_VIEW : YASC_MAYBE;
+          if ((ad->yhandle & (YASC_OWNED | YASC_VIEW)) == (YASC_OWNED | YASC_VIEW))
+            tcc_error("a handle is owned or a view, not both");
+          if (n == TOK_owned && tok == '(')
+          {
+            next();
+            if (tok < TOK_UIDENT)
+              expect("the deallocator's name");
+            ad->yhandle_dealloc = tok;
+            next();
+            skip(')');
+          }
+          break;
+        }
+        /* `regex_t owned(regfree) re`: the object is owned as a whole */
+        if (tok == TOK_owned && typespec_found && (t & VT_BTYPE) == VT_STRUCT && !(t & VT_ARRAY))
+        {
+          next();
+          if (tok != '(')
+            tcc_error("an owned object names its deallocator: owned(release)");
+          next();
+          if (tok < TOK_UIDENT)
+            expect("the deallocator's name");
+          ad->yobj_dealloc = tok;
+          next();
+          skip(')');
+          break;
+        }
+        if (tok == TOK_owned || tok == TOK_maybe || tok == TOK_view)
+        {
+          next();
+          if (typespec_found && YASC_NAME_FOLLOWS(tok))
+            yasc_keyword_as_name(n);
+          tcc_error("'%s' qualifies a pointer: write it after the '*'", get_tok_str(n, NULL));
+        }
+        ad->yasc |= tok == TOK_out ? YASC_OUT : YASC_DROP;
+        next();
+        if (typespec_found && YASC_NAME_FOLLOWS(tok))
+          yasc_keyword_as_name(n);
+        break;
+      }
+
       if (typespec_found)
         goto the_end;
+
+      /* yasc: `error ...` (an error set, or any error), unless a variable
+       * or function named error is in scope, and not `error.NAME` */
+      if (tcc_state->yasc && tok == TOK_ERROR && !sym_find(TOK_ERROR))
+      {
+        next();
+        if (tok == '.')
+        {
+          unget_tok(TOK_ERROR);
+          goto the_end;
+        }
+        yasc_error_type(&type1);
+        goto basic_type2;
+      }
+      /* yasc: `!T`, an error union; the declarator wraps it (type_decl) */
+      if (tcc_state->yasc && tok == '!')
+      {
+        AttributeDef ad1;
+        next();
+        if (!parse_btype(&type1, &ad1, 0))
+        {
+          unget_tok('!');
+          goto the_end;
+        }
+        if (type1.t & VT_STORAGE)
+          tcc_error("a storage class after '!'");
+        ad->yasc |= YASC_ERRUNION;
+        type->t = type1.t;
+        type->ref = type1.ref;
+        t = type->t;
+        typespec_found = 1;
+        st = bt = -2;
+        break;
+      }
 
       if (tcc_state->cversion > 201710 && tok_is_ident(tok, "bool", 4))
       {
@@ -346,6 +463,14 @@ int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
         unget_tok(n);
         goto the_end;
       }
+      /* yasc: `T.method(...)`, a struct's method through its typedef
+         (decl/method.c), starts an expression */
+      if (tok == '.' && tcc_state->yasc && (s->type.t & VT_BTYPE) == VT_STRUCT &&
+          (s->type.ref->ymod & YASC_HAS_METHODS))
+      {
+        unget_tok(n);
+        goto the_end;
+      }
 
       t &= ~(VT_BTYPE | VT_LONG);
       u = t & ~(VT_CONSTANT | VT_VOLATILE), t ^= u;
@@ -356,6 +481,9 @@ int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
       t = type->t;
       /* get attributes from typedef */
       sym_to_attr(ad, s);
+      if (s->a.attr_facts)
+        attr_deprecated_use(s);
+      s->ymod |= SYM_UNUSED_REF | SYM_UNUSED_READ; /* -Wunused-local-typedefs */
       if (s->a.transparent_union && type->ref)
         type->ref->a.transparent_union = 1;
       typespec_found = 1;
@@ -365,6 +493,12 @@ int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
     type_found = 1;
   }
 the_end:
+  if (ad->auto_tok && typespec_found)
+  {
+    if (ad->auto_tok == TOK_AUTO_TYPE)
+      tcc_error("'__auto_type' with a type: the type comes from the initializer");
+    ad->auto_tok = 0; /* `auto int x`: the storage class */
+  }
   if (tcc_state->char_is_unsigned)
   {
     if ((t & (VT_DEFSIGN | VT_BTYPE)) == VT_BYTE)
@@ -379,6 +513,12 @@ the_end:
     t = (t & ~(VT_BTYPE | VT_LONG)) | (VT_DOUBLE | VT_LONG);
 #endif
   type->t = t;
+  if (ad->yhandle)
+  {
+    if (!(ad->yhandle & (YASC_OWNED | YASC_VIEW)))
+      tcc_error("a handle says owned or view");
+    type->ref = sym_handle_node(ad->yhandle | (ad->yasc & (YASC_OUT | YASC_DROP)), ad->yhandle_dealloc);
+  }
 
   /* Apply __attribute__((vector_size(N))) if present.
    * Wrap the just-parsed base type into a vector type.
@@ -394,4 +534,14 @@ the_end:
   }
 
   return type_found;
+}
+
+/* The deprecated typedefs and tags the specifiers name are reported at their
+ * end, unless the specifiers say deprecated too (attr_btype_end) */
+int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
+{
+  int mark = attr_btype_begin();
+  int found = parse_btype_body(type, ad, ignore_label);
+  attr_btype_end(mark, ad);
+  return found;
 }

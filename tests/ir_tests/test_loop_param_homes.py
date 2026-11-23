@@ -21,7 +21,7 @@ def test_parameter_homes_not_reloaded_in_loop(tmp_path, opt, flags, disabled):
     env.pop("TCC_DISABLE_PASS", None)
     if disabled:
         env["TCC_DISABLE_PASS"] = disabled
-    subprocess.run([str(ROOT / "armv8m-tcc"), *INCLUDE_FLAGS, opt, "-fno-pic", "-fno-module-local-calls", *flags, "-c", str(SOURCE),
+    subprocess.run([str(ROOT / "armv8m-tcc"), "-ccompat", *INCLUDE_FLAGS, opt, "-fno-pic", "-fno-module-local-calls", *flags, "-c", str(SOURCE),
                     "-o", str(obj)], env=env, check=True, capture_output=True, text=True)
     asm = subprocess.run(
         ["arm-none-eabi-objdump", "-d", "--no-show-raw-insn",
@@ -47,7 +47,7 @@ def test_parameter_homes_not_reloaded_in_loop(tmp_path, opt, flags, disabled):
 
 def test_crowded_loop_keeps_parameter_homes(tmp_path):
     result = subprocess.run(
-        [str(ROOT / "armv8m-tcc"), *INCLUDE_FLAGS, "-O2", "-dump-ir-passes=param_home_fwd", "-c",
+        [str(ROOT / "armv8m-tcc"), "-ccompat", *INCLUDE_FLAGS, "-O2", "-dump-ir-passes=param_home_fwd", "-c",
          str(SOURCE), "-o", str(tmp_path / "pressure.o")],
         env=dict(os.environ, TCC_DUMP_FUNC="pressured_home"),
         check=True, capture_output=True, text=True,
@@ -71,7 +71,7 @@ def test_narrow_stack_param_needle_not_reloaded(tmp_path, opt, disabled):
     env.pop("TCC_DISABLE_PASS", None)
     if disabled:
         env["TCC_DISABLE_PASS"] = disabled
-    subprocess.run([str(ROOT / "armv8m-tcc"), *INCLUDE_FLAGS, opt, "-fno-pic", "-c", str(NEEDLE_SOURCE),
+    subprocess.run([str(ROOT / "armv8m-tcc"), "-ccompat", *INCLUDE_FLAGS, opt, "-fno-pic", "-c", str(NEEDLE_SOURCE),
                     "-o", str(obj)], env=env, check=True, capture_output=True, text=True)
     asm = subprocess.run(
         ["arm-none-eabi-objdump", "-d", "--no-show-raw-insn",

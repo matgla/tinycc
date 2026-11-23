@@ -5,7 +5,6 @@
 #undef INLINE_GIANT_CALLER_TOKENS
 #undef INLINE_WRAPPER_PER_CALLER
 #include "../frontend/gen/builtin/chk.c"
-#undef FIND_LOCAL_OBJSIZE
 #include "../frontend/gen/builtin/fp.c"
 #include "../frontend/gen/builtin/fp2.c"
 #include "../frontend/gen/builtin/misc.c"
@@ -19,6 +18,9 @@
 #undef GCC_TYPE_CLASS_UNION
 #undef GCC_TYPE_CLASS_VECTOR
 #undef GCC_TYPE_CLASS_VOID
+#include "../frontend/gen/builtin/objsize.c"
+#undef DEALLOC_FREE
+#undef OC_MAXARGS
 #include "../frontend/gen/builtin/overflow.c"
 #include "../frontend/gen/builtin/simd.c"
 #include "../frontend/gen/builtin/string.c"

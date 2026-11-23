@@ -43,6 +43,40 @@ ST_DATA int parse_flags;
 ST_DATA struct BufferedFile *file;
 ST_DATA int tok;
 ST_DATA CValue tokc;
+/* -Wtautological-compare: a running hash of the tokens next() hands the
+   parser, and its value before the current token -- two operands that read
+   the same tokens are the same expression (fe_tokfp_*) */
+ST_DATA unsigned char fe_tokfp_on;
+ST_DATA uint64_t fe_tokfp_h, fe_tokfp_prev;
+ST_DATA unsigned fe_tokfp_n;
+
+static void tokfp_add(void)
+{
+  uint64_t v = (unsigned)tok + 1;
+  if (TOK_HAS_VALUE(tok))
+  {
+    if (tok <= TOK_CULONG)
+      v ^= tokc.i * 0x9E3779B97F4A7C15ull;
+    else if (tok == TOK_CFLOAT)
+    {
+      uint32_t b;
+      memcpy(&b, &tokc.f, 4);
+      v ^= (uint64_t)b * 0x9E3779B97F4A7C15ull;
+    }
+    else if (tok == TOK_CDOUBLE || tok == TOK_CLDOUBLE)
+    {
+      uint64_t b;
+      memcpy(&b, &tokc.d, 8);
+      v ^= b * 0x9E3779B97F4A7C15ull;
+    }
+    else if (tok == TOK_STR || tok == TOK_LSTR)
+      for (int i = 0; i < tokc.str.size; i++)
+        v = (v ^ (unsigned char)tokc.str.data[i]) * 0x100000001B3ull;
+  }
+  fe_tokfp_prev = fe_tokfp_h;
+  fe_tokfp_h = fe_tokfp_h * 0x100000001B3ull + v;
+  fe_tokfp_n++;
+}
 ST_DATA const int *macro_ptr;
 ST_DATA CString tokcstr; /* current parsed string, if any */
 ST_DATA TokenString *pp_pragma_capture; /* see tcc.h */
@@ -85,6 +119,226 @@ static void tcc_predef_try_materialize(TokenSym *ts, const char *str, int len);
 static void parse_string(const char *p, int len);
 
 static TokenString *macro_stack;
+/* error recovery (recover.c): begin_macro numbers the replays; and > 0 while
+   a macro is being substituted -- an error there leaves stack-held strings on
+   the macro stack, so it cannot be recovered from */
+ST_DATA unsigned tok_macro_serial;
+ST_DATA int pp_subst_depth;
+
+ST_FUNC TokenString *tok_macro_stack(void)
+{
+  return macro_stack;
+}
+
+/* An error the lexer cannot read past (an unterminated comment or string):
+   the compile ends there, at every -O -- a body being saved as tokens says
+   it where its parse reaches it (decl.c save_body_cut). */
+static void lex_error_stuck(const char *fmt, int c)
+{
+  tcc_state->error_fatal = 1;
+  tcc_error(fmt, c);
+}
+
+/* Back to a macro stack read before an error left the lexer in the middle
+   of something (decl.c save_function_body); what it held above is dropped. */
+ST_FUNC void tok_macro_restore(TokenString *stack, const int *ptr)
+{
+  macro_stack = stack;
+  macro_ptr = ptr;
+}
+
+/* ---- tokens from a system header's macro ------------------------------
+ *
+ * gcc keeps quiet about what a macro defined in a system header expands to
+ * (an assert, a FD_SET, a NULL), unless -Wsystem-headers.  A macro defined
+ * in one is MACRO_SYS; next() marks its live expansion (TokenString.sys) --
+ * the parse is in it while that string is on the macro stack.
+ *
+ * A body saved as tokens (-O1+ saves nearly every one, -O0 a nested
+ * function's, an initializer) holds the expansion's tokens but not where
+ * they came from, and must not: a mark in the tokens would lengthen the body,
+ * which the inliner sizes by tokens, and change the objects.  So the saved
+ * string's ranges of such tokens are kept beside it, here, by the string's
+ * address (moved by tok_str_keep, dropped by tok_str_free, copied with it),
+ * and only looked at when a warning is about to be given: a replay of the
+ * string (tok_str_borrow: its src) is in one of them when the token it read
+ * last is.  Bounds are word offsets, [start, end) in pairs; an odd count
+ * leaves the last range open. */
+
+typedef struct SysRanges
+{
+  TokenString *s;
+  int n, cap;
+  int *b;
+} SysRanges;
+
+static SysRanges **sys_tab; /* open addressing by the string's address */
+static unsigned sys_tab_mask;
+ST_DATA int tok_sys_ranges; /* entries in sys_tab */
+
+static unsigned sys_hash(const TokenString *s)
+{
+  return (unsigned)(((uintptr_t)s >> 3) * 2654435761u);
+}
+
+static SysRanges **sys_slot(const TokenString *s)
+{
+  unsigned i = sys_hash(s) & sys_tab_mask;
+  while (sys_tab[i] && sys_tab[i]->s != s)
+    i = (i + 1) & sys_tab_mask;
+  return &sys_tab[i];
+}
+
+static SysRanges *sys_ranges_find(const TokenString *s)
+{
+  return tok_sys_ranges ? *sys_slot(s) : NULL;
+}
+
+static void sys_tab_put(SysRanges *r)
+{
+  *sys_slot(r->s) = r;
+}
+
+static SysRanges *sys_ranges_get(TokenString *s)
+{
+  SysRanges *r = sys_ranges_find(s);
+  if (r)
+    return r;
+  if (2 * (tok_sys_ranges + 1) > (int)sys_tab_mask)
+  {
+    SysRanges **old = sys_tab;
+    unsigned n = old ? sys_tab_mask + 1 : 0, m = n ? 2 * n : 64;
+    sys_tab = tcc_mallocz(m * sizeof *sys_tab);
+    sys_tab_mask = m - 1;
+    for (unsigned i = 0; i < n; i++)
+      if (old[i])
+        sys_tab_put(old[i]);
+    tcc_free(old);
+  }
+  r = tcc_mallocz(sizeof *r);
+  r->s = s;
+  sys_tab_put(r);
+  tok_sys_ranges++;
+  return r;
+}
+
+/* S's entry goes (the slots after it in its run move up) */
+static void sys_ranges_remove(SysRanges **slot)
+{
+  unsigned i = slot - sys_tab, j = i;
+  tcc_free((*slot)->b);
+  tcc_free(*slot);
+  sys_tab[i] = NULL;
+  tok_sys_ranges--;
+  for (;;)
+  {
+    j = (j + 1) & sys_tab_mask;
+    if (!sys_tab[j])
+      break;
+    SysRanges *r = sys_tab[j];
+    sys_tab[j] = NULL;
+    sys_tab_put(r);
+  }
+}
+
+static void sys_ranges_drop(TokenString *s)
+{
+  SysRanges **slot = sys_slot(s);
+  if (*slot)
+    sys_ranges_remove(slot);
+}
+
+static void sys_ranges_rekey(TokenString *from, TokenString *to)
+{
+  SysRanges **slot = sys_slot(from), *r = *slot;
+  if (!r || from == to)
+    return;
+  *slot = NULL; /* re-placed below, with its run */
+  tok_sys_ranges--;
+  {
+    unsigned j = slot - sys_tab;
+    for (;;)
+    {
+      j = (j + 1) & sys_tab_mask;
+      if (!sys_tab[j])
+        break;
+      SysRanges *q = sys_tab[j];
+      sys_tab[j] = NULL;
+      sys_tab_put(q);
+    }
+  }
+  r->s = to;
+  sys_tab_put(r);
+  tok_sys_ranges++;
+}
+
+static void sys_ranges_add(SysRanges *r, int at)
+{
+  if (r->n == r->cap)
+  {
+    r->cap = r->cap ? 2 * r->cap : 4;
+    r->b = tcc_realloc(r->b, r->cap * sizeof *r->b);
+  }
+  r->b[r->n++] = at;
+}
+
+/* the last token read before offset POS of R's string was in a range */
+static int sys_ranges_at(const SysRanges *r, int pos)
+{
+  for (int i = 0; i < r->n; i += 2)
+    if (pos > r->b[i] && (i + 1 == r->n || pos <= r->b[i + 1]))
+      return 1;
+  return 0;
+}
+
+ST_FUNC int tcc_sys_macro_here(void)
+{
+  const int *pos = macro_ptr;
+  for (TokenString *m = macro_stack; m; pos = m->prev_ptr, m = m->prev)
+  {
+    if (m->sys)
+      return 1;
+    if (m->alloc >= 2)
+    {
+      /* a replay decides by its string's ranges */
+      const SysRanges *r = m->src ? sys_ranges_find(m->src) : NULL;
+      return r && pos && sys_ranges_at(r, (int)(pos - tok_str_buf(m)));
+    }
+  }
+  return 0;
+}
+
+/* A saved string TO is about to get the token just read: SYS says whether
+   the one before it was from a system header's macro; the new state is
+   returned.  TO's ranges follow. */
+ST_FUNC int tok_str_sys_save(TokenString *to, int sys)
+{
+  const int now = macro_stack ? tcc_sys_macro_here() : 0;
+  if (now != sys)
+  {
+    SysRanges *r = now ? sys_ranges_get(to) : sys_ranges_find(to);
+    if (r)
+    {
+      if (r->n && r->b[r->n - 1] == to->len)
+        r->n--; /* an empty range, or two that touch: one */
+      else
+        sys_ranges_add(r, to->len);
+    }
+  }
+  return now;
+}
+
+/* TO is a copy of FROM's tokens (FROM's offsets are TO's) */
+ST_FUNC void tok_str_sys_copy(TokenString *from, TokenString *to)
+{
+  const SysRanges *r = sys_ranges_find(from);
+  if (!r || !r->n)
+    return;
+  SysRanges *t = sys_ranges_get(to);
+  t->n = 0;
+  for (int i = 0; i < r->n; i++)
+    sys_ranges_add(t, r->b[i]);
+}
 
 static void token_lookup_cache_clear(void)
 {
@@ -467,6 +721,10 @@ static void *toksym_bump(TokSymArena *a, unsigned size)
       }
       return c + 1;
     }
+    /* the free tail of the chunk it retires: the names' go to the spill file
+       whole (tok_names_spill), so not left uninitialised */
+    if (a->p)
+      memset(a->p, 0, a->end - a->p);
     c = tcc_malloc(sizeof *c + TOKSYM_CHUNK_SIZE);
     c->size = TOKSYM_CHUNK_SIZE;
     c->prev = a->chunks;
@@ -497,6 +755,8 @@ static char *toksym_name_copy(const char *str, int len)
   char *name = toksym_bump(&toksym_names, (len + 2) & ~1u);
   memcpy(name, str, len);
   name[len] = '\0';
+  if (!(len & 1))
+    name[len + 1] = '\0'; /* the padding to 2: spilled with the chunk */
   return name;
 }
 
@@ -600,6 +860,8 @@ ST_FUNC const char *tok_name_load(TokenSym *ts)
 {
   char *name = toksym_bump(&toksym_names, (ts->len + 2) & ~1u);
   tcc_spill_read((long)((uintptr_t)ts->str >> 1), name, ts->len + 1);
+  if (!(ts->len & 1))
+    name[ts->len + 1] = '\0'; /* the padding, as toksym_name_copy */
   ts->str = name;
   return name;
 }
@@ -1144,6 +1406,19 @@ ST_FUNC const char *get_tok_str(int v, CValue *cv)
 
 /* return the current character, handling end of block if necessary
    (but not stray) */
+/* -Wimplicit-fallthrough: the end of the buffer before the last refill, for a
+   comment read across it (ft_comment_across) */
+#define FT_CARRY 256
+static uint8_t ft_carry[FT_CARRY];
+static int ft_carry_len;
+static const uint8_t *ft_carry_end; /* where the old buffer ended */
+static unsigned ft_refills;
+/* a fall-through comment's blanks reached the end of the buffer: the label
+   may be at the start of the next one */
+static unsigned char ft_pending, ft_partial_len;
+static uint8_t ft_partial[8]; /* the start of `case` / `default` it ended in */
+static int ft_label_after(const uint8_t *q, const uint8_t *e, int *lines);
+
 static int handle_eob(void)
 {
   BufferedFile *bf = file;
@@ -1154,6 +1429,24 @@ static int handle_eob(void)
   {
     if (bf->fd >= 0)
     {
+      if (tcc_state->warn_implicit_fallthrough | tcc_state->nb_diag_snaps)
+      {
+        int n = bf->buf_end - bf->buffer;
+        if (n > FT_CARRY)
+          n = FT_CARRY;
+        memcpy(ft_carry, bf->buf_end - n, n);
+        ft_carry_len = n;
+        ft_carry_end = bf->buf_end;
+        ft_refills++;
+      }
+      /* -fstack-usage names a definition by its column (tcc_stack_usage_name_column) */
+      if (TCC_SU_WANTED(tcc_state))
+      {
+        const uint8_t *p = bf->buf_end;
+        while (p > bf->buffer && p[-1] != '\n')
+          p--;
+        bf->col_base = (int)(bf->buf_end - p) + (p == bf->buffer ? bf->col_base : 0);
+      }
 #if defined(PARSE_DEBUG)
       len = 1;
 #else
@@ -1171,6 +1464,26 @@ static int handle_eob(void)
     bf->buf_ptr = bf->buffer;
     bf->buf_end = bf->buffer + len;
     *bf->buf_end = CH_EOB;
+    if (ft_pending)
+    {
+      /* the label after a fall-through comment the last buffer ended in */
+      int lines = 0;
+      ft_pending = 0;
+      if (ft_partial_len)
+      {
+        /* `ca` + `se ...`: the word across the two buffers */
+        uint8_t w[24];
+        int n = len < 16 ? len : 16;
+        memcpy(w, ft_partial, ft_partial_len);
+        memcpy(w + ft_partial_len, bf->buffer, n);
+        w[ft_partial_len + n] = ' ';
+        if (ft_label_after(w, w + ft_partial_len + n + 1, &lines) > 0)
+          tcc_diag_first(tcc_state, bf->line_num, DIAG_KEY_FALLTHROUGH_COMMENT);
+        ft_partial_len = 0;
+      }
+      else if (ft_label_after(bf->buffer, bf->buf_end, &lines) > 0)
+        tcc_diag_first(tcc_state, bf->line_num + lines, DIAG_KEY_FALLTHROUGH_COMMENT);
+    }
   }
   if (bf->buf_ptr < bf->buf_end)
   {
@@ -1340,7 +1653,7 @@ static uint8_t *parse_comment(uint8_t *p)
     {
       c = handle_bs(&p);
       if (c == CH_EOF)
-        tcc_error("unexpected end of file in comment");
+        lex_error_stuck("unexpected end of file in comment", 0);
       if (c == '\n')
       {
         file->line_num++;
@@ -1362,7 +1675,7 @@ static uint8_t *parse_comment(uint8_t *p)
       if (c == '/')
         break;
       if (c == CH_EOF)
-        tcc_error("unexpected end of file in comment");
+        lex_error_stuck("unexpected end of file in comment", 0);
       if (c == '\n')
       {
         file->line_num++;
@@ -1374,6 +1687,155 @@ static uint8_t *parse_comment(uint8_t *p)
     }
   }
   return p + 1;
+}
+
+/* -Wimplicit-fallthrough: gcc's (=3) fall-through comments.  The whole
+ * comment is `-fallthrough`, `@fallthrough@`, `lint -fallthrough`, or
+ * [ELSE,? |INTENTIONAL(LY)? ]FALL(S | |-)?THR(OUGH|U) -- in capitals, in
+ * lower case, or capitalised (Fall through, Falls Through, Fallthrough) --
+ * with [ \t.!] around it and an optional `- reason` after. */
+static int ft_lit(const uint8_t **pp, const uint8_t *e, const char *w)
+{
+  size_t n = strlen(w);
+  if ((size_t)(e - *pp) < n || memcmp(*pp, w, n))
+    return 0;
+  *pp += n;
+  return 1;
+}
+
+static int ft_tail(const uint8_t *q, const uint8_t *e)
+{
+  while (q < e && (*q == ' ' || *q == '\t' || *q == '.' || *q == '!'))
+    q++;
+  return q == e || *q == '-';
+}
+
+static int fallthrough_comment_text(const uint8_t *p, const uint8_t *e)
+{
+  /* per casing: prefixes (NULL-ended), "fall", what may follow it, "thr" */
+  static const char *const prefix[3][9] = {
+      {"ELSE, ", "ELSE ", "INTENTIONALLY ", "INTENTIONAL ", NULL},
+      {"Else, ", "Else ", "Intentionally ", "Intentional ", NULL},
+      {"else, ", "else ", "Else, ", "Else ", "intentionally ", "intentional ", "Intentionally ", "Intentional ",
+       NULL}};
+  static const char *const fall[3] = {"FALL", "Fall", "fall"};
+  static const char *const mid[3][8] = {{"S THR", " THR", "-THR", "THR", NULL},
+                                        {"s Thr", "s thr", " Thr", " thr", "-Thr", "-thr", "thr", NULL},
+                                        {"s thr", " thr", "-thr", "thr", NULL}};
+  static const char *const end[3][2] = {{"OUGH", "U"}, {"ough", "u"}, {"ough", "u"}};
+  while (p < e && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n'))
+    p++;
+  while (e > p && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n'))
+    e--;
+  {
+    const uint8_t *q = p;
+    if ((ft_lit(&q, e, "-fallthrough") || ft_lit(&q, e, "@fallthrough@")) && q == e)
+      return 1;
+    q = p;
+    if (ft_lit(&q, e, "lint -fallthrough"))
+    {
+      while (q < e && (*q == ' ' || *q == '\t'))
+        q++;
+      if (q == e)
+        return 1;
+    }
+  }
+  while (p < e && (*p == ' ' || *p == '\t' || *p == '.' || *p == '!'))
+    p++;
+  for (int c = 0; c < 3; c++)
+    for (int i = -1; i < 0 || prefix[c][i]; i++)
+    {
+      const uint8_t *q = p;
+      if (i >= 0 && !ft_lit(&q, e, prefix[c][i]))
+        continue;
+      if (!ft_lit(&q, e, fall[c]))
+        continue;
+      for (int m = 0; mid[c][m]; m++)
+      {
+        const uint8_t *r = q;
+        if (!ft_lit(&r, e, mid[c][m]))
+          continue;
+        for (int k = 0; k < 2; k++)
+        {
+          const uint8_t *t = r;
+          if (ft_lit(&t, e, end[c][k]) && ft_tail(t, e))
+            return 1;
+        }
+      }
+    }
+  return 0;
+}
+
+/* After a fall-through comment, from Q to E: blanks and other comments (as
+ * gcc), then `case` or `default`?  1 yes (*LINES newlines before it), 0 no,
+ * -1 the buffer ended first */
+static int ft_label_after(const uint8_t *q, const uint8_t *e, int *lines)
+{
+  for (; q < e; q++)
+  {
+    if (*q == '\n')
+      ++*lines;
+    else if (*q == '/' && q + 1 < e && q[1] == '*')
+    {
+      for (q += 2; q + 1 < e && !(q[0] == '*' && q[1] == '/'); q++)
+        *lines += *q == '\n';
+      if (q + 1 >= e)
+        return 0;
+      q++;
+    }
+    else if (*q == '/' && q + 1 < e && q[1] == '/')
+    {
+      while (q < e && *q != '\n')
+        q++;
+      q--;
+    }
+    else if (!(*q == ' ' || *q == '\t' || *q == '\r' || *q == '\f' || *q == '\v'))
+      break;
+  }
+  if (q >= e)
+    return -1;
+  if (e - q < 7 && (!memcmp(q, "case", e - q < 4 ? e - q : 4) || !memcmp(q, "default", e - q)) &&
+      (e - q < 4 || memcmp(q, "case", 4)))
+  {
+    /* the buffer ends inside the word */
+    memcpy(ft_partial, q, e - q);
+    ft_partial_len = e - q;
+    return -1;
+  }
+  return (ft_lit(&q, e, "case") || ft_lit(&q, e, "default")) && !(isidnum_table[*q - CH_EOF] & (IS_ID | IS_NUM));
+}
+
+/* A recognised fall-through comment ending at Q (in the I/O buffer) that only
+ * blanks and other comments separate from a `case` or `default`: mark that
+ * label's line.  The parser asks for the mark (tcc_diag_marked) when the case
+ * is reached by falling through, and a body the inliner replays later still
+ * finds it. */
+static void fallthrough_comment(const uint8_t *text, const uint8_t *text_end, const uint8_t *q)
+{
+  int lines = 0, r;
+  if (!fallthrough_comment_text(text, text_end))
+    return;
+  ft_partial_len = 0;
+  r = ft_label_after(q, file->buf_end, &lines);
+  if (r > 0)
+    tcc_diag_first(tcc_state, file->line_num + lines, DIAG_KEY_FALLTHROUGH_COMMENT);
+  else if (r < 0 && file->fd >= 0)
+    ft_pending = 1;
+}
+
+/* A comment from START (in the buffer before one refill) to END (in the new
+   one), followed by Q: its text from the carried tail and the new buffer */
+static void ft_comment_across(const uint8_t *start, const uint8_t *end, const uint8_t *q)
+{
+  uint8_t text[2 * FT_CARRY];
+  long from = ft_carry_end - start, head = from, tail = end - file->buffer;
+  if (tail < 0) /* the comment's end (`*` `/`) across the two */
+    head += tail, tail = 0;
+  if (head < 0 || from > ft_carry_len || head + tail > (long)sizeof text)
+    return;
+  memcpy(text, ft_carry + ft_carry_len - from, head);
+  memcpy(text + head, file->buffer, tail);
+  fallthrough_comment(text, text + head + tail, q);
 }
 
 /* parse a string without interpreting escapes */
@@ -1396,7 +1858,7 @@ static uint8_t *parse_pp_string(uint8_t *p, int sep, CString *str)
       unterminated_string:
         /* XXX: indicate line number of start of string */
         tok_flags &= ~TOK_FLAG_BOL;
-        tcc_error("missing terminating %c character", sep);
+        lex_error_stuck("missing terminating %c character", sep);
       }
       else if (c == '\\')
       {
@@ -1601,6 +2063,8 @@ ST_INLN void tok_str_new(TokenString *s)
   s->last_line_num = 0; /* 0 means no line recorded yet */
   s->spill_pos = 0;
   s->owner = NULL;
+  s->src = NULL;
+  s->sys = 0;
 }
 
 ST_FUNC TokenString *tok_str_alloc(void)
@@ -1618,8 +2082,13 @@ ST_FUNC void tok_str_free_str(int *str)
 
 static void tok_str_spill_forget(TokenString *s);
 
+static void sys_ranges_drop(TokenString *s);
+static void sys_ranges_rekey(TokenString *from, TokenString *to);
+
 ST_FUNC void tok_str_free(TokenString *str)
 {
+  if (tok_sys_ranges)
+    sys_ranges_drop(str);
   tok_str_spill_forget(str);
   if (str->allocated_len > 0)
     tok_str_free_str(str->data.str);
@@ -1724,6 +2193,8 @@ ST_FUNC TokenString *tok_str_keep(TokenString *s)
   TokenString *k = tcc_malloc(sizeof *k);
   *k = *s;
   tal_free(tokstr_alloc, s);
+  if (tok_sys_ranges)
+    sys_ranges_rekey(s, k);
   return k;
 #else
   /* Saved bodies run to thousands; their 96-byte headers were 64 bytes of
@@ -1738,7 +2209,10 @@ ST_FUNC TokenString *tok_str_keep(TokenString *s)
     s->data.str = buf;
     s->allocated_len = n;
   }
-  return tcc_realloc(s, TOKSTR_KEPT_SIZE);
+  TokenString *k = tcc_realloc(s, TOKSTR_KEPT_SIZE);
+  if (tok_sys_ranges)
+    sys_ranges_rekey(s, k);
+  return k;
 #endif
 }
 
@@ -2162,7 +2636,14 @@ ST_FUNC TokenString *tok_str_borrow(TokenString *str, int len)
     b->allocated_len = len;
     b->len = len;
   }
+  b->src = str;
   return b;
+}
+
+ST_FUNC int pp_in_c(void)
+{
+  TCCState *s1 = tcc_state;
+  return !s1->yasc && tcc_yasc_unit(s1);
 }
 
 ST_FUNC void begin_macro(TokenString *str, int alloc)
@@ -2171,6 +2652,8 @@ ST_FUNC void begin_macro(TokenString *str, int alloc)
   str->prev = macro_stack;
   str->prev_ptr = macro_ptr;
   str->save_line_num = file->line_num;
+  str->save_tok = tok;
+  str->serial = ++tok_macro_serial;
   macro_ptr = tok_str_buf(str);
   macro_stack = str;
 }
@@ -2316,6 +2799,10 @@ ST_FUNC void tok_str_add2(TokenString *s, int t, CValue *cv)
     /* Insert the string into the int array. */
     size_t str_words = 1 + (cv->str.size + sizeof(int) - 1) / sizeof(int);
     str[len] = cv->str.size;
+    /* The last word's tail is padding: zero it, so equal strings compare
+     * equal word by word (save_function_body) and the spill file is the
+     * same from run to run. */
+    str[len + str_words - 1] = 0;
     memcpy(&str[len + 1], cv->str.data, cv->str.size);
     len += str_words;
   }
@@ -2523,6 +3010,12 @@ ST_FUNC void pp_apply_pack_replay(TCCState *s1, int code)
       tcc_error("out of pack stack");
     s1->pack_stack_ptr--;
     break;
+  case TCC_PCH_REPLAY_YASC:
+    s1->yasc = value;
+    break;
+  case TCC_PCH_REPLAY_ERROR:
+    save_body_raise(s1);
+    break;
   }
 }
 
@@ -2535,7 +3028,7 @@ ST_FUNC void pp_apply_pack_replays(TCCState *s1, const int *p, const int *end)
     int t;
     CValue cv;
     tok_get(&t, &p, &cv);
-    if (t == TOK_PACK_REPLAY)
+    if (t == TOK_PACK_REPLAY && (cv.i >> 16) != TCC_PCH_REPLAY_ERROR)
       pp_apply_pack_replay(s1, cv.i);
   }
 }
@@ -2680,6 +3173,15 @@ ST_INLN void define_push(int v, int macro_type, int *str, Sym *first_arg)
   Sym *s, *o;
 
   o = define_find(v);
+  if (tcc_state->yasc)
+    macro_type |= MACRO_YASC;
+  {
+    BufferedFile *f = file;
+    while (f && f->filename[0] == ':' && f->prev)
+      f = f->prev;
+    if (f && f->sys)
+      macro_type |= MACRO_SYS;
+  }
   s = sym_push2_short(&define_stack, v, macro_type, 0);
   s->d = str;
   s->next = first_arg;
@@ -2864,11 +3366,13 @@ static int inc_dir_may_hold(TCCState *s1, const char *dir, const char *name)
 #define inc_dir_may_hold(s1, dir, name) 1
 #endif
 
-static int parse_include(TCCState *s1, int do_next, int test)
+/* The header name of #include, #embed, __has_include or __has_embed: "name",
+ * <name>, or tokens that expand to one.  Returns the opening delimiter, with
+ * tok the token after the name. */
+static int pp_header_name(char *name, int size, const char *directive)
 {
   int c, i;
-  char name[1024], buf[1024], *p;
-  CachedInclude *e;
+  char *p;
 
   c = skip_spaces();
   if (c == '<' || c == '\"')
@@ -2876,13 +3380,16 @@ static int parse_include(TCCState *s1, int do_next, int test)
     cstr_reset(&tokcstr);
     file->buf_ptr = parse_pp_string(file->buf_ptr, c == '<' ? '>' : c, &tokcstr);
     i = tokcstr.size;
-    pstrncpy(name, tokcstr.data, i >= sizeof name ? sizeof name - 1 : i);
+    pstrncpy(name, tokcstr.data, i >= size ? size - 1 : i);
     next_nomacro();
   }
   else
   {
     /* computed #include : concatenate tokens until result is one of
-       the two accepted forms.  Don't convert pp-tokens to tokens here. */
+       the two accepted forms.  Don't convert pp-tokens to tokens here,
+       but do again after the name: `__has_include(H) && 1` and #embed
+       limit(2) read numbers. */
+    int saved_parse_flags = parse_flags;
     parse_flags = PARSE_FLAG_PREPROCESS | PARSE_FLAG_LINEFEED | (parse_flags & PARSE_FLAG_ASM_FILE);
     name[0] = 0;
     for (;;)
@@ -2892,13 +3399,58 @@ static int parse_include(TCCState *s1, int do_next, int test)
       if (i > 0 && ((p[0] == '"' && p[i] == '"') || (p[0] == '<' && p[i] == '>')))
         break;
       if (tok == TOK_LINEFEED)
-        tcc_error("'#include' expects \"FILENAME\" or <FILENAME>");
-      pstrcat(name, sizeof name, get_tok_str(tok, &tokc));
+        tcc_error("'#%s' expects \"FILENAME\" or <FILENAME>", directive);
+      pstrcat(name, size, get_tok_str(tok, &tokc));
     }
     c = p[0];
     /* remove '<>|""' */
     memmove(p, p + 1, i - 1), p[i - 1] = 0;
+    parse_flags = saved_parse_flags;
   }
+  return c;
+}
+
+/* yasc: a module's interface names the headers its main file included, for
+   importers to include before its declarations (decl/module.c).  <h> as
+   written, so an importer searches its own paths; "h" as the file found. */
+static void pp_note_main_include(TCCState *s1, int c, const char *name, const char *path)
+{
+  char *note;
+  if (c == '<')
+  {
+    note = tcc_malloc(strlen(name) + 3);
+    sprintf(note, "<%s>", name);
+  }
+  else
+  {
+    char *real = realpath(path, NULL);
+    note = tcc_strdup(real ? real : path);
+    if (real)
+      libc_free(real);
+  }
+  dynarray_add(&s1->yasc_includes, &s1->nb_yasc_includes, note);
+}
+
+static void pp_yasc_file(TCCState *s1);
+
+/* BF was found in an -iyasc directory, or next to a header that was */
+static int pp_in_yasc_dir(TCCState *s1, BufferedFile *bf)
+{
+  int i = 0;
+  while (bf && (i = bf->include_next_index) == 1)
+    bf = bf->prev;
+  return bf && i >= 2 && i - 2 < s1->nb_include_paths && tcc_yasc_include_dir(s1, s1->include_paths[i - 2]);
+}
+
+static int parse_include(TCCState *s1, int do_next, int test)
+{
+  int c, i;
+  char name[1024], buf[1024], *p;
+  CachedInclude *e;
+  int note_main;
+
+  c = pp_header_name(name, sizeof name, "include");
+  note_main = !test && s1->yasc && s1->include_stack_ptr == s1->include_stack;
 
   if (!test)
     skip_to_eol(1);
@@ -2960,11 +3512,15 @@ static int parse_include(TCCState *s1, int do_next, int test)
 #ifdef INC_DEBUG
       printf("%s: skipping cached %s\n", file->filename, buf);
 #endif
+      if (note_main)
+        pp_note_main_include(s1, c, name, buf);
       return 1;
     }
     if (tcc_open(s1, buf) >= 0)
       break;
   }
+  if (note_main)
+    pp_note_main_include(s1, c, name, buf);
 
   if (test)
   {
@@ -2977,6 +3533,16 @@ static int parse_include(TCCState *s1, int do_next, int test)
     /* push previous file on stack */
     *s1->include_stack_ptr++ = file->prev;
     file->include_next_index = i;
+    /* a system header: from a system include path, or "next to" one */
+    file->sys = i == 1 ? file->prev->sys : i >= 2 && i - 2 >= s1->nb_include_paths;
+    if (file->sys)
+      tcc_sys_mark_file(s1, file->filename, 0);
+    /* a yasc header: from an -iyasc directory, or "next to" one */
+    if (s1->nb_yasc_include_paths && pp_in_yasc_dir(s1, file))
+    {
+      file->yasc_dir = 1; /* tcc -E writes the #pragma yasc it stands for */
+      pp_yasc_file(s1);
+    }
 #ifdef INC_DEBUG
     printf("%s: including %s\n", file->prev->filename, file->filename);
 #endif
@@ -2994,6 +3560,248 @@ static int parse_include(TCCState *s1, int do_next, int test)
     tcc_debug_bincl(s1);
   }
   return 1;
+}
+
+/* C23 #embed: the resource's bytes as a comma-separated list of int
+ * constants.  The list is pushed as a token string; preprocess() runs inside
+ * the file lexer, which then returns TOK_EMBED_RESUME so next() reads it. */
+static int pp_embed_pending;
+
+static int64_t expr_preprocess(TCCState *s1, int close_paren);
+
+typedef struct EmbedParams
+{
+  int64_t limit; /* -1: the whole resource */
+  TokenString *prefix, *suffix, *if_empty;
+  int unsupported; /* a parameter __has_embed answers 0 for */
+} EmbedParams;
+
+/* limit / prefix / suffix / if_empty, each also as __name__.  Their
+ * names are not macro-expanded, their arguments are. */
+static TokenString **embed_param_slot(EmbedParams *ep, const char *name, int *is_limit)
+{
+  char bare[32];
+  int len = strlen(name);
+
+  if (len > 4 && len - 4 < (int)sizeof bare && !strncmp(name, "__", 2) && !strcmp(name + len - 2, "__"))
+  {
+    memcpy(bare, name + 2, len - 4);
+    bare[len - 4] = 0;
+    name = bare;
+  }
+  *is_limit = !strcmp(name, "limit");
+  if (!strcmp(name, "prefix"))
+    return &ep->prefix;
+  if (!strcmp(name, "suffix"))
+    return &ep->suffix;
+  if (!strcmp(name, "if_empty"))
+    return &ep->if_empty;
+  return NULL;
+}
+
+/* The parameters up to END: TOK_LINEFEED for #embed, ')' for __has_embed. */
+static void embed_params(TCCState *s1, EmbedParams *ep, int end)
+{
+  memset(ep, 0, sizeof *ep);
+  ep->limit = -1;
+  while (tok != end)
+  {
+    char name[64];
+    int is_limit = 0, vendor = 0;
+    TokenString **slot;
+
+    if (tok == TOK_LINEFEED || tok == TOK_EOF)
+      tcc_error("missing ')' after __has_embed");
+    if (tok < TOK_IDENT)
+      tcc_error("#embed parameter expected, got '%s'", get_tok_str(tok, &tokc));
+    pstrcpy(name, sizeof name, get_tok_str(tok, NULL));
+    next_nomacro();
+    if (tok == ':')
+    {
+      /* vendor::name: none is supported */
+      next_nomacro();
+      if (tok != ':')
+        expect("'::' in #embed parameter");
+      next_nomacro();
+      if (tok < TOK_IDENT)
+        expect("#embed parameter name");
+      pstrcat(name, sizeof name, "::");
+      pstrcat(name, sizeof name, get_tok_str(tok, NULL));
+      next_nomacro();
+      vendor = 1;
+    }
+    slot = vendor ? NULL : embed_param_slot(ep, name, &is_limit);
+    if (!slot && !is_limit)
+    {
+      if (end == TOK_LINEFEED)
+        tcc_error("unsupported #embed parameter '%s'", name);
+      ep->unsupported = 1;
+    }
+    if (tok != '(')
+    {
+      if (slot || is_limit)
+        tcc_error("'(' expected after #embed parameter '%s'", name);
+      continue;
+    }
+    if (is_limit)
+    {
+      ep->limit = expr_preprocess(s1, 1);
+      if (ep->limit < 0)
+        tcc_error("negative #embed limit");
+      next_nomacro();
+      continue;
+    }
+    /* a balanced token sequence, kept for prefix / suffix / if_empty */
+    TokenString *str = slot ? tok_str_alloc() : NULL;
+    int depth = 0;
+    for (;;)
+    {
+      next();
+      if (tok == TOK_LINEFEED || tok == TOK_EOF)
+        tcc_error("missing ')' in #embed parameter '%s'", name);
+      if (tok == '(')
+        depth++;
+      else if (tok == ')' && depth-- == 0)
+        break;
+      if (str)
+        tok_str_add2(str, tok, &tokc);
+    }
+    if (slot)
+    {
+      if (*slot)
+        tok_str_free(*slot);
+      *slot = str;
+    }
+    next_nomacro();
+  }
+}
+
+static void embed_params_free(EmbedParams *ep)
+{
+  if (ep->prefix)
+    tok_str_free(ep->prefix);
+  if (ep->suffix)
+    tok_str_free(ep->suffix);
+  if (ep->if_empty)
+    tok_str_free(ep->if_empty);
+}
+
+/* Found as #include finds a header: an absolute name as given, "name" beside
+ * the including file, then the -I and system directories. */
+static int embed_open(TCCState *s1, const char *name, int delim, char *path, int size)
+{
+  for (int i = 0;; i++)
+  {
+    if (i == 0)
+    {
+      if (!IS_ABSPATH(name))
+        continue;
+      path[0] = 0;
+    }
+    else if (IS_ABSPATH(name))
+    {
+      return -1;
+    }
+    else if (i == 1)
+    {
+      if (delim != '\"')
+        continue;
+      const char *p = file->true_filename;
+      pstrncpy(path, p, tcc_basename(p) - p);
+    }
+    else
+    {
+      int j = i - 2, k = j - s1->nb_include_paths;
+      if (k < 0)
+        pstrcpy(path, size, s1->include_paths[j]);
+      else if (k < s1->nb_sysinclude_paths)
+        pstrcpy(path, size, s1->sysinclude_paths[k]);
+      else
+        return -1;
+      pstrcat(path, size, "/");
+    }
+    pstrcat(path, size, name);
+    int fd = open(path, O_RDONLY | O_BINARY);
+    if (fd >= 0)
+      return fd;
+  }
+}
+
+static void embed_add_tokens(TokenString *str, TokenString *src)
+{
+  if (src)
+    tok_str_add_words(str, tok_str_buf(src), src->len);
+}
+
+static void parse_embed(TCCState *s1)
+{
+  char name[1024], path[1024];
+  unsigned char buf[512];
+  EmbedParams ep;
+  CValue cv;
+  int delim, fd, n, count = 0;
+
+  delim = pp_header_name(name, sizeof name, "embed");
+  embed_params(s1, &ep, TOK_LINEFEED);
+  fd = embed_open(s1, name, delim, path, sizeof path);
+  if (fd < 0)
+    tcc_error("embed file '%s' not found", name);
+  if (s1->gen_deps)
+    dynarray_add(&s1->target_deps, &s1->nb_target_deps, tcc_strdup(path));
+
+  TokenString *str = tok_str_alloc();
+  int64_t left = ep.limit;
+  memset(&cv, 0, sizeof cv);
+  while (left != 0)
+  {
+    int want = left > 0 && left < (int64_t)sizeof buf ? (int)left : (int)sizeof buf;
+    n = read(fd, buf, want);
+    if (n < 0)
+    {
+      close(fd);
+      tcc_error("cannot read embed file '%s'", path);
+    }
+    if (n == 0)
+      break;
+    if (left > 0)
+      left -= n;
+    for (int i = 0; i < n; i++, count++)
+    {
+      if (count == 0)
+        embed_add_tokens(str, ep.prefix);
+      else
+        tok_str_add(str, ',');
+      cv.i = buf[i];
+      tok_str_add2(str, TOK_CINT, &cv);
+    }
+  }
+  close(fd);
+  embed_add_tokens(str, count ? ep.suffix : ep.if_empty);
+  embed_params_free(&ep);
+  tok_str_add(str, 0);
+  begin_macro(str, 1);
+  pp_embed_pending = 1;
+}
+
+/* __has_embed( header-name params ): tok is '(' on entry, ')' on return. */
+static int has_embed(TCCState *s1)
+{
+  char name[1024], path[1024];
+  unsigned char byte;
+  EmbedParams ep;
+  int delim, fd, n;
+
+  delim = pp_header_name(name, sizeof name, "__has_embed");
+  embed_params(s1, &ep, ')');
+  embed_params_free(&ep);
+  if (ep.unsupported)
+    return 0;
+  fd = embed_open(s1, name, delim, path, sizeof path);
+  if (fd < 0)
+    return 0;
+  n = ep.limit == 0 ? 0 : read(fd, &byte, 1);
+  close(fd);
+  return n > 0 ? 1 : 2;
 }
 
 static int pp_assertion_macro_defined(const char *name)
@@ -3076,12 +3884,16 @@ static void pp_next_nosubst(void)
     next_nomacro();
 }
 
-/* eval an expression for #if/#elif */
-static int expr_preprocess(TCCState *s1)
+/* eval an expression for #if/#elif (its truth), or with CLOSE_PAREN the
+   value of #embed limit( ... ) up to its ')' */
+static int64_t expr_preprocess(TCCState *s1, int close_paren)
 {
   int t;
   int64_t c;
-  int t0 = tok;
+  int t0 = close_paren ? TOK_EMBED : tok;
+  /* only a limit() inside an #if's __has_embed restores the outer pp_expr;
+     an #if ends with it clear, as an error leaves it set */
+  int depth = 0, saved_pp_expr = close_paren ? pp_expr : 0;
   TokenString *str;
 
   str = tok_str_alloc();
@@ -3097,6 +3909,14 @@ static int expr_preprocess(TCCState *s1)
     else if (tok < TOK_IDENT)
     {
       if (tok == TOK_LINEFEED || tok == TOK_EOF)
+      {
+        if (close_paren)
+          tcc_error("missing ')' in #embed limit");
+        break;
+      }
+      if (close_paren && tok == '(')
+        depth++;
+      else if (close_paren && tok == ')' && depth-- == 0)
         break;
       if (tok >= TOK_STR && tok <= TOK_CLDOUBLE)
         tcc_error("invalid constant in preprocessor expression");
@@ -3112,7 +3932,7 @@ static int expr_preprocess(TCCState *s1)
       if (s1->run_test)
         maybe_run_test(s1);
       c = 0;
-      if (define_find(tok) || tok == TOK___HAS_INCLUDE || tok == TOK___HAS_INCLUDE_NEXT ||
+      if (define_find(tok) || tok == TOK___HAS_INCLUDE || tok == TOK___HAS_INCLUDE_NEXT || tok == TOK___HAS_EMBED ||
           tok == TOK___HAS_ATTRIBUTE)
         c = 1;
       if (t == '(')
@@ -3155,6 +3975,15 @@ static int expr_preprocess(TCCState *s1)
       tok = TOK_CINT;
       tokc.i = c;
     }
+    else if (tok == TOK___HAS_EMBED)
+    {
+      next();
+      if (tok != '(')
+        expect("'('");
+      c = has_embed(s1);
+      tok = TOK_CINT;
+      tokc.i = c;
+    }
     else
     {
       /* if undefined macro, replace with zero */
@@ -3164,7 +3993,7 @@ static int expr_preprocess(TCCState *s1)
     tok_str_add_tok(str);
   }
   if (0 == str->len)
-    tcc_error("#%s with no expression", get_tok_str(t0, 0));
+    tcc_error(close_paren ? "#embed limit with no expression" : "#%s with no expression", get_tok_str(t0, 0));
   tok_str_add(str, TOK_EOF); /* simulate end of file */
   pp_expr = t0;              /* redirect pre-processor expression error messages */
   t = tok;
@@ -3174,10 +4003,10 @@ static int expr_preprocess(TCCState *s1)
   c = expr_const64();
   if (tok != TOK_EOF)
     tcc_error("...");
-  pp_expr = 0;
+  pp_expr = saved_pp_expr;
   end_macro();
-  tok = t; /* restore LF or EOF */
-  return c != 0;
+  tok = t; /* restore LF, EOF or the limit's ')' */
+  return close_paren ? c : c != 0;
 }
 
 /* __has_builtin: builtins parse_builtin and friends implement.  A "no" sends a
@@ -3199,6 +4028,7 @@ static const char *TCC_RODATA_REL const tcc_builtins_supported[] = {
     "__builtin_memcpy", "__builtin_memmove", "__builtin_memset", "__builtin_memcmp", "__builtin_strlen",
     "__builtin_abs", "__builtin_labs", "__builtin_llabs", "__builtin_alloca", "__builtin_offsetof",
     "__builtin_va_start", "__builtin_va_end", "__builtin_va_arg", "__builtin_va_copy",
+    "__builtin_object_size", "__builtin_dynamic_object_size",
     NULL};
 
 ST_FUNC int tcc_builtin_supported(int t)
@@ -3366,6 +4196,99 @@ static CachedInclude *search_cached_include(TCCState *s1, const char *filename, 
   return e;
 }
 
+/* #pragma ... diagnostic, after the word `diagnostic` */
+static void pragma_diagnostic(TCCState *s1)
+{
+  static const char *const actions[] = {"push", "pop", "ignored", "warning", "error"};
+  BufferedFile *f = file;
+  const char *name, *option = NULL;
+  int action = -1;
+  /* a _Pragma's text is read from a ":pragma:" buffer: its place is the file's */
+  while (f && f->filename[0] == ':' && f->prev)
+    f = f->prev;
+  next();
+  name = get_tok_str(tok, &tokc);
+  for (int i = 0; i < 5; i++)
+    if (!strcmp(name, actions[i]))
+      action = i;
+  if (action < 0)
+  {
+    tcc_warning_c(warn_unsupported)("#pragma diagnostic %s ignored", name);
+    return;
+  }
+  if (action >= DIAG_PRAGMA_IGNORED)
+  {
+    next();
+    if (tok != TOK_STR)
+    {
+      tcc_warning_c(warn_unsupported)("#pragma diagnostic %s: a \"-W...\" string expected", name);
+      return;
+    }
+    option = tokc.str.data;
+  }
+  tcc_pragma_diagnostic(s1, action, option, f->filename, f->line_num);
+}
+
+/* #pragma yasc, or a header found through -iyasc: this file is yasc from
+   here on (and in every replay of a body saved from it); the files it
+   includes stay what they are */
+static void pp_yasc_file(TCCState *s1)
+{
+  if (!file->yasc)
+  {
+    file->yasc = 1;
+    tcc_yasc_mark_file(s1, file->filename);
+  }
+  s1->yasc = 1;
+  if (!define_find(tok_alloc("__YASC__", 8)->tok))
+  {
+    TokenString str;
+    CValue cv;
+    tok_str_new(&str);
+    memset(&cv, 0, sizeof cv);
+    cv.i = 1;
+    tok_str_add2(&str, TOK_CINT, &cv);
+    tok_str_add(&str, 0);
+    tok_str_fit(&str);
+    define_push(tok_alloc("__YASC__", 8)->tok, MACRO_OBJ, tok_str_ensure_heap(&str), NULL);
+  }
+}
+
+/* #pragma GCC system_header: the rest of this file is a system header, as if
+   found on a system include path: its warnings are not given, and the "..."
+   includes next to it are system headers too */
+static void pp_system_header(TCCState *s1)
+{
+  BufferedFile *f = file;
+  while (f->filename[0] == ':' && f->prev) /* _Pragma */
+    f = f->prev;
+  if (s1->include_stack_ptr == s1->include_stack)
+    tcc_warning_c(warn_all)("#pragma GCC system_header ignored outside include file");
+  else
+  {
+    f->sys = 1;
+    tcc_sys_mark_file(s1, f->filename, f->line_num);
+  }
+}
+
+/* tcc -E, the pragma's first word read: #pragma GCC system_header is done
+   here (the other pragmas are kept for the compile of the output).  Else the
+   tokens are as they were. */
+static int pp_system_header_pp(TCCState *s1)
+{
+  int t = tok;
+  if (t < TOK_IDENT || strcmp(get_tok_str(t, NULL), "GCC"))
+    return 0;
+  next_nomacro();
+  if (tok >= TOK_IDENT && !strcmp(get_tok_str(tok, NULL), "system_header"))
+  {
+    pp_system_header(s1);
+    return 1;
+  }
+  unget_tok(t);
+  return 0;
+}
+
 static int pragma_parse(TCCState *s1)
 {
   next_nomacro();
@@ -3406,9 +4329,28 @@ static int pragma_parse(TCCState *s1)
     }
     pp_debug_tok = t, pp_debug_symv = v;
   }
+  else if (tok == TOK_yasc)
+  {
+    pp_yasc_file(s1);
+    if (s1->output_type == TCC_OUTPUT_PREPROCESS)
+    {
+      /* tcc -E: keep it for the compile of the output */
+      unget_tok(' ');
+      unget_tok(TOK_PRAGMA);
+      unget_tok('#');
+      unget_tok(TOK_LINEFEED);
+    }
+    else
+      next_nomacro();
+    return 1;
+  }
   else if (tok == TOK_once)
   {
     search_cached_include(s1, file->true_filename, 1)->once = 1;
+  }
+  else if (s1->output_type == TCC_OUTPUT_PREPROCESS && pp_system_header_pp(s1))
+  {
+    return 0; /* tcc -E: the line goes, as with gcc; the line markers say it (flag 3) */
   }
   else if (s1->output_type == TCC_OUTPUT_PREPROCESS)
   {
@@ -3523,13 +4465,31 @@ static int pragma_parse(TCCState *s1)
       tcc_free(p);
     }
   }
-  else if (tok >= TOK_IDENT && !strcmp(get_tok_str(tok, NULL), "GCC"))
+  else if (tok >= TOK_IDENT && (!strcmp(get_tok_str(tok, NULL), "GCC") || !strcmp(get_tok_str(tok, NULL), "tcc") ||
+                                 !strcmp(get_tok_str(tok, NULL), "clang")))
   {
     /* #pragma GCC visibility push(default|hidden|internal|protected) / pop:
-       the visibility of the declarations in between (see decl()).  The
-       other GCC pragmas stay ignored. */
+       the visibility of the declarations in between (see decl()).
+       #pragma GCC|tcc|clang diagnostic push / pop / ignored / warning /
+       error "-Wname" (pragma_diagnostic).  The other GCC pragmas stay
+       ignored. */
+    int gcc = !strcmp(get_tok_str(tok, NULL), "GCC");
     next();
-    if (tok != TOK_VISIBILITY1)
+    if (tok >= TOK_IDENT && !strcmp(get_tok_str(tok, NULL), "diagnostic"))
+    {
+      pragma_diagnostic(s1);
+      if (s1->output_type == TCC_OUTPUT_PREPROCESS)
+        return 0; /* tcc -E: keep the line for the compile of the output */
+      next();
+      return 1;
+    }
+    if (gcc && tok >= TOK_IDENT && !strcmp(get_tok_str(tok, NULL), "system_header"))
+    {
+      pp_system_header(s1);
+      next();
+      return 1;
+    }
+    if (!gcc || tok != TOK_VISIBILITY1)
     {
       tcc_warning_c(warn_all)("#pragma GCC %s ignored", get_tok_str(tok, &tokc));
       return 0;
@@ -3592,6 +4552,18 @@ ST_FUNC void tccpp_setfile(const char *filename)
   tcc_debug_newfile(tcc_state);
 }
 
+/* A saved body replayed under the name of the file it came from: in that
+   file's dialect too (not for #line, which only renames). */
+ST_FUNC void tccpp_setfile_replay(const char *filename)
+{
+  tccpp_setfile(filename);
+  file->yasc = tcc_state->nb_yasc_files && tcc_yasc_file(tcc_state, filename);
+  tcc_state->yasc = file->yasc;
+  /* a whole system header; one from its #pragma GCC system_header on is
+     line by line (tcc_in_sys_header) */
+  file->sys = tcc_sys_file(tcc_state, filename, 0);
+}
+
 /* put alternative filename (#line, .file): relative to the real file */
 ST_FUNC void tccpp_putfile(const char *filename)
 {
@@ -3611,10 +4583,50 @@ ST_FUNC void tccpp_putfile(const char *filename)
 }
 
 /* is_bof is true if first non space token at beginning of file */
+/* gcc's line marker `# N "file" flags`, which tcc -E writes: 1 enters a
+ * header, 2 returns to the file that included it, 3 the text is a system
+ * header's.  Compiling the output, the header is a system header again from
+ * line N, and a file is in the dialect it had when a marker returns to it (a
+ * header starts as regular C, its #pragma yasc is in the output).  Reads the
+ * flags after the file name, up to the line feed. */
+static void pp_line_marker(TCCState *s1, int line)
+{
+  int flags = 0;
+  for (;;)
+  {
+    next_nomacro();
+    if (tok != TOK_PPNUM || tokc.str.data[0] < '1' || tokc.str.data[0] > '4' || tokc.str.data[1])
+      break;
+    flags |= 1 << (tokc.str.data[0] - '0');
+  }
+  file->sys = !!(flags & 8);
+  if (file->sys)
+    tcc_sys_mark_file(s1, file->filename, line);
+  if (flags & 2)
+  {
+    if (s1->pp_marker_depth < 32)
+      s1->pp_marker_yasc = (s1->pp_marker_yasc << 1) | file->yasc;
+    s1->pp_marker_depth++;
+    file->yasc = 0;
+  }
+  else if ((flags & 4) && s1->pp_marker_depth > 0)
+  {
+    if (--s1->pp_marker_depth < 32)
+    {
+      file->yasc = s1->pp_marker_yasc & 1;
+      s1->pp_marker_yasc >>= 1;
+    }
+  }
+  s1->yasc = file->yasc;
+  /* a body replayed under this name later is in this dialect too */
+  if (file->yasc)
+    tcc_yasc_mark_file(s1, file->filename);
+}
+
 ST_FUNC void preprocess(int is_bof)
 {
   TCCState *s1 = tcc_state;
-  int c, n, saved_parse_flags;
+  int c, n, saved_parse_flags, linemarker = 0;
   char buf[1024], *q;
   Sym *s;
 
@@ -3646,11 +4658,14 @@ redo:
   case TOK_INCLUDE_NEXT:
     parse_include(s1, tok - TOK_INCLUDE, 0);
     goto the_end;
+  case TOK_EMBED:
+    parse_embed(s1);
+    goto the_end;
   case TOK_IFNDEF:
     c = 1;
     goto do_ifdef;
   case TOK_IF:
-    c = expr_preprocess(s1);
+    c = expr_preprocess(s1, 0);
     goto do_if;
   case TOK_IFDEF:
     c = 0;
@@ -3668,7 +4683,7 @@ redo:
         file->ifndef_macro = tok;
       }
     }
-    if (define_find(tok) || tok == TOK___HAS_INCLUDE || tok == TOK___HAS_INCLUDE_NEXT ||
+    if (define_find(tok) || tok == TOK___HAS_INCLUDE || tok == TOK___HAS_INCLUDE_NEXT || tok == TOK___HAS_EMBED ||
         tok == TOK___HAS_ATTRIBUTE)
       c ^= 1;
     next_nomacro();
@@ -3699,7 +4714,7 @@ redo:
     }
     else
     {
-      c = expr_preprocess(s1);
+      c = expr_preprocess(s1, 0);
       s1->ifdef_stack_ptr[-1] = c;
     }
   test_else:
@@ -3744,6 +4759,7 @@ redo:
   case TOK_PPNUM:
     if (parse_flags & PARSE_FLAG_ASM_FILE)
       goto ignore;
+    linemarker = 1; /* `# N "file" flags`, not #line */
   _line_num:
     for (n = 0, q = tokc.str.data; *q; ++q)
     {
@@ -3758,7 +4774,10 @@ redo:
     {
       tokc.str.data[tokc.str.size - 2] = 0;
       tccpp_putfile(tokc.str.data + 1);
-      n--;
+      if (linemarker)
+        pp_line_marker(s1, n);
+      if (tok != TOK_LINEFEED)
+        n--; /* the line feed ending the directive is still to come */
       if (macro_ptr && *macro_ptr == 0)
         macro_stack->save_line_num = n;
     }
@@ -3783,9 +4802,12 @@ redo:
     }
     *q = '\0';
     if (tok == TOK_ERROR)
-      tcc_error("#error %s", buf);
+      tcc_error_noabort("#error %s", buf); /* an error, and the compile goes on (gcc) */
     else
+    {
+      s1->diag_any_header = 1; /* given in a system header too, as gcc */
       tcc_warning("#warning %s", buf);
+    }
     next_nomacro();
     break;
   }
@@ -4751,6 +5773,18 @@ redo_no_start:
       file->buf_ptr = p;
       preprocess(tok_flags & TOK_FLAG_BOF);
       p = file->buf_ptr;
+      if (pp_embed_pending)
+      {
+        /* #embed pushed its list: next() reads it (after the directive's
+           linefeed when linefeeds are tokens, as with -E) */
+        pp_embed_pending = 0;
+        if (!(parse_flags & PARSE_FLAG_LINEFEED))
+        {
+          tok_flags |= TOK_FLAG_BOL;
+          tok = TOK_EMBED_RESUME;
+          goto keep_tok_flags;
+        }
+      }
       goto maybe_newline;
     }
     else
@@ -5136,14 +6170,31 @@ redo_no_start:
     PEEKC(c, p);
     if (c == '*')
     {
+      uint8_t *start = p + 1;
+      unsigned int read_before = total_bytes, refills = ft_refills;
       p = parse_comment(p);
+      /* a comment that crossed one buffer refill: the old buffer's tail was kept */
+      if ((tcc_state->warn_implicit_fallthrough | tcc_state->nb_diag_snaps) && read_before == total_bytes &&
+          p - 2 >= start)
+        fallthrough_comment(start, p - 2, p);
+      else if ((tcc_state->warn_implicit_fallthrough | tcc_state->nb_diag_snaps) && ft_refills == refills + 1 &&
+               p > file->buffer)
+        ft_comment_across(start, p - 2, p);
       /* comments replaced by a blank */
       tok = ' ';
       goto maybe_space;
     }
     else if (c == '/')
     {
+      uint8_t *start = p + 1;
+      unsigned int read_before = total_bytes, refills = ft_refills;
       p = parse_line_comment(p);
+      if ((tcc_state->warn_implicit_fallthrough | tcc_state->nb_diag_snaps) && read_before == total_bytes &&
+          p >= start)
+        fallthrough_comment(start, p, p);
+      else if ((tcc_state->warn_implicit_fallthrough | tcc_state->nb_diag_snaps) && ft_refills == refills + 1 &&
+               p >= file->buffer)
+        ft_comment_across(start, p, p);
       tok = ' ';
       goto maybe_space;
     }
@@ -5538,6 +6589,8 @@ static int next_argstream(Sym **nested_list, TokenString *ws_str)
   else
   {
     next_nomacro();
+    if (tok == TOK_EMBED_RESUME)
+      tcc_error("#embed inside macro arguments is not supported");
     if (tok == '\t' || tok == TOK_LINEFEED)
       tok = ' ';
     return tok;
@@ -5545,11 +6598,70 @@ static int next_argstream(Sym **nested_list, TokenString *ws_str)
   return 0; /* unreachable */
 }
 
+static int macro_subst_tok_1(TokenString *tok_str, Sym **nested_list, Sym *s);
+
+/* Expanding regular-C macros inside yasc code (depth, outermost first) */
+static int pp_c_macro_depth;
+
+static int yasc_tok_matters(int t)
+{
+  /* owned .. error_name: the qualifiers and statements, consecutive in tcctok.h */
+  return t == '*' || (t >= TOK_owned && t <= TOK_error_name);
+}
+
 /* do macro substitution of current token with macro 's' and add
    result to (tok_str,tok_len). 'nested_list' is the list of all
    macros we got inside to avoid recursing. Return non zero if no
-   substitution needs to be done */
+   substitution needs to be done.
+
+   A macro defined in regular C (a system header's NULL, `(T *)0` casts, a
+   parameter named `view`) expanded in yasc code reads as regular C: the
+   expansion goes between two TOK_PACK_REPLAY "yasc off" / "yasc on" markers,
+   which next() applies and saved bodies keep.  Only when it holds a token the
+   dialect reads differently ('*' or a yasc keyword): the markers lengthen
+   saved bodies, which the inliner sizes by tokens. */
 static int macro_subst_tok(TokenString *tok_str, Sym **nested_list, Sym *s)
+{
+  int c_macro = tcc_state->yasc && !(s->type.t & MACRO_YASC) && !(parse_flags & PARSE_FLAG_ASM_FILE);
+  int outer = c_macro && !pp_c_macro_depth, start = tok_str->len, ret;
+  pp_c_macro_depth += c_macro;
+  pp_subst_depth++;
+  ret = macro_subst_tok_1(tok_str, nested_list, s);
+  pp_subst_depth--;
+  pp_c_macro_depth -= c_macro;
+  if (outer && tok_str->len > start)
+  {
+    const int *p = tok_str_buf(tok_str) + start, *end = tok_str_buf(tok_str) + tok_str->len;
+    int matters = 0;
+    while (p < end && !matters)
+    {
+      int t;
+      CValue cv;
+      tok_get(&t, &p, &cv);
+      matters = yasc_tok_matters(t & ~SYM_FIELD);
+    }
+    if (matters)
+    {
+      /* move the expansion up one marker: [off] expansion [on] */
+      TokenString body;
+      CValue cv;
+      int n = tok_str->len - start;
+      tok_str_new(&body);
+      tok_str_add_words(&body, tok_str_buf(tok_str) + start, n);
+      tok_str->len = start;
+      cv.i = (TCC_PCH_REPLAY_YASC << 16) | 0;
+      tok_str_add2(tok_str, TOK_PACK_REPLAY, &cv);
+      tok_str_add_words(tok_str, tok_str_buf(&body), n);
+      cv.i = (TCC_PCH_REPLAY_YASC << 16) | 1;
+      tok_str_add2(tok_str, TOK_PACK_REPLAY, &cv);
+      if (body.allocated_len > 0)
+        tok_str_free_str(body.data.str);
+    }
+  }
+  return ret;
+}
+
+static int macro_subst_tok_1(TokenString *tok_str, Sym **nested_list, Sym *s)
 {
   int t;
   int v = s->v;
@@ -5970,7 +7082,9 @@ restart:
         if (pp_pragma_capture)
         {
           tok_str_add2(pp_pragma_capture, TOK_PACK_REPLAY, &tokc);
-          pp_pack_captures++;
+          /* the yasc dialect is no pack state the definition must apply */
+          if ((tokc.i >> 16) < TCC_PCH_REPLAY_YASC)
+            pp_pack_captures++;
         }
         else
           pp_apply_pack_replay(s1, tokc.i);
@@ -6014,6 +7128,8 @@ restart:
       macro_subst_tok(&tokstr_buf, &nested_list, s);
       tok_str_add(&tokstr_buf, 0);
       begin_macro(&tokstr_buf, 0);
+      /* a system header's macro: warnings in what it expands to are quiet */
+      tokstr_buf.sys = (s->type.t & MACRO_SYS) != 0;
       goto redo;
     }
     goto check_pragma;
@@ -6028,6 +7144,8 @@ check_pragma:
     handle_pragma_operator(s1);
     goto restart; /* fetch the token after the (now-processed) _Pragma */
   }
+  if (fe_tokfp_on)
+    tokfp_add();
   return;
 
 convert:
@@ -6041,6 +7159,98 @@ convert:
   {
     if (parse_flags & PARSE_FLAG_TOK_STR)
       parse_string(tokc.str.data, tokc.str.size - 1);
+  }
+  else if (t == TOK_EMBED_RESUME)
+  {
+    goto restart; /* the #embed list is on the macro stack */
+  }
+  if (fe_tokfp_on)
+    tokfp_add();
+}
+
+/* The number object-like macro S stands for when its body is one number,
+   maybe in parentheses (an errno macro), else -1.  tok and tokc survive. */
+static long long macro_number(Sym *s)
+{
+  const int saved_tok = tok;
+  const CValue saved_tokc = tokc;
+  const int *p;
+  int t, depth = 0, numbers = 0, other = 0;
+  long long value = -1;
+  CValue cv;
+
+  if (!s || (s->type.t & MACRO_FUNC) || !s->d) /* MACRO_YASC may be set */
+    return -1;
+  for (p = s->d; *p;)
+  {
+    tok_get(&t, &p, &cv);
+    if (t == '(')
+      depth++;
+    else if (t == ')')
+      depth--;
+    else if (t == TOK_PPNUM)
+    {
+      parse_number(cv.str.data);
+      if (tok == TOK_CINT || tok == TOK_CUINT || tok == TOK_CLONG || tok == TOK_CULONG)
+        value = tokc.i, numbers++;
+      else
+        other = 1;
+    }
+    else if (t != TOK_LINENUM && t != ' ')
+      other = 1;
+  }
+  tok = saved_tok;
+  tokc = saved_tokc;
+  return other || numbers != 1 || depth ? -1 : value;
+}
+
+/* yasc `error.NAME`, tok is the '.': read NAME without expanding it, so an
+   errno name stays a name.  Returns the number NAME stands for when it is an
+   object-like macro of one number (an errno macro), else -1; a number token
+   (a saved body expanded it already) gives its value.  tok is NAME
+   afterwards, unexpanded. */
+ST_FUNC long long pp_error_name(void)
+{
+  const int saved_flags = parse_flags;
+
+  parse_flags &= ~PARSE_FLAG_PREPROCESS;
+  next();
+  parse_flags = saved_flags;
+  if (tok == TOK_CINT || tok == TOK_CUINT || tok == TOK_CLONG || tok == TOK_CULONG || tok == TOK_CLLONG ||
+      tok == TOK_CULLONG)
+    return tokc.i;
+  if (tok >= TOK_IDENT)
+    return macro_number(define_find(tok));
+  return -1;
+}
+
+/* yasc error_name(): call CB for every errno macro defined now -- an
+   E[A-Z0-9]+ object-like macro of one number in 1..255. */
+ST_FUNC void pp_errno_macros(void (*cb)(int tok, int value))
+{
+  for (Sym *s = define_stack; s; s = s->prev)
+  {
+    const int v = s->v;
+    long long n;
+    const char *name;
+    if ((v & SYM_FIELD) || v < TOK_IDENT || define_find(v) != s)
+      continue;
+    n = macro_number(s);
+    if (n < 1 || n > 255)
+      continue;
+    name = get_tok_str(v, NULL);
+    if (name[0] != 'E' || !name[1])
+      continue;
+    for (const char *c = name + 1;; c++)
+    {
+      if (!*c)
+      {
+        cb(v, (int)n);
+        break;
+      }
+      if (!((*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9')))
+        break;
+    }
   }
 }
 
@@ -6412,6 +7622,12 @@ static void tcc_predefs_base(TCCState *s1, CString *cs, int is_asm, int include_
 #endif
   if (s1->char_is_unsigned)
     putdef(cs, "__CHAR_UNSIGNED__");
+  /* gcc's: -fstack-protector, -all, -strong, -explicit */
+  if (s1->stack_protector)
+    putdef(cs, s1->stack_protector == SSP_ALL      ? "__SSP_ALL__ 2"
+               : s1->stack_protector == SSP_STRONG ? "__SSP_STRONG__ 3"
+               : s1->stack_protector == SSP_EXPLICIT ? "__SSP_EXPLICIT__ 4"
+                                                     : "__SSP__ 1");
   if (TCC_OPT(s1, optimize) > 0)
     putdef(cs, "__OPTIMIZE__");
   if (TCC_OPT(s1, optimize_size))
@@ -6433,6 +7649,8 @@ static void tcc_predefs_base(TCCState *s1, CString *cs, int is_asm, int include_
   {
     putdef(cs, "__STDC__");
     cstr_printf(cs, "#define __STDC_VERSION__ %dL\n", s1->cversion);
+    if (s1->yasc_std)
+      putdef(cs, "__YASC__");
     /* TCC_SKIP_PREDEF_MACROS drops the 7.2 KB tccdefs block from the
        <command line> buffer.  It is a MEASUREMENT knob, not a supported mode:
        a compile that references __SIZE_TYPE__, the va_arg machinery or any
@@ -6525,7 +7743,16 @@ ST_FUNC void preprocess_start(TCCState *s1, int filetype)
   s1->include_stack_ptr = s1->include_stack;
   s1->ifdef_stack_ptr = s1->ifdef_stack;
   file->ifdef_stack_ptr = s1->ifdef_stack_ptr;
+  s1->yasc = file->yasc; /* tcc_open_bf: the main file is yasc under -std=yasc */
+  s1->pp_marker_yasc = 0;
+  s1->pp_marker_depth = 0;
+  s1->warned_attributes = 0;
+  dynarray_reset(&s1->yasc_includes, &s1->nb_yasc_includes);
+  /* -Wtautological-compare's operand hash: only while it can be wanted */
+  fe_tokfp_on = ((s1->warn_tautological_compare | s1->warn_sizeof_pointer_memaccess) & WARN_ON) &&
+                !(filetype & (AFF_TYPE_ASM | AFF_TYPE_ASMPP));
   pp_expr = 0;
+  pp_subst_depth = 0;
   pp_counter = 0;
   pp_debug_tok = pp_debug_symv = 0;
   s1->pack_stack[0] = 0;
@@ -6557,9 +7784,11 @@ ST_FUNC void preprocess_start(TCCState *s1, int filetype)
 /* cleanup from error/setjmp */
 ST_FUNC void preprocess_end(TCCState *s1)
 {
+  tcc_diag_reset(s1); /* the next unit starts from the command line's options */
   while (macro_stack)
     end_macro();
   macro_ptr = NULL;
+  pp_embed_pending = 0;
   while (file)
     tcc_close();
 #ifdef CONFIG_TCC_ASM
@@ -6665,6 +7894,17 @@ ST_FUNC void tccpp_delete(TCCState *s)
   cstr_free(&cstr_buf);
   if (tokstr_buf.allocated_len > 0)
     tok_str_free_str(tokstr_buf.data.str);
+  /* the ranges of strings an error left unfreed */
+  for (unsigned i = 0; sys_tab && i <= sys_tab_mask; i++)
+    if (sys_tab[i])
+    {
+      tcc_free(sys_tab[i]->b);
+      tcc_free(sys_tab[i]);
+    }
+  tcc_free(sys_tab);
+  sys_tab = NULL;
+  sys_tab_mask = 0;
+  tok_sys_ranges = 0;
   if (unget_buf.allocated_len > 0)
     tok_str_free_str(unget_buf.data.str);
 
@@ -6723,7 +7963,7 @@ static void pp_line(TCCState *s1, BufferedFile *f, int level)
   {
     ;
   }
-  else if (level == 0 && f->line_ref && d < 8)
+  else if (level == 0 && f->line_ref && d < 8 && (f->pp_sys == f->sys || s1->Pflag == LINE_MACRO_OUTPUT_FORMAT_STD))
   {
     while (d > 0)
       fputs("\n", s1->ppfp), --d;
@@ -6734,9 +7974,11 @@ static void pp_line(TCCState *s1, BufferedFile *f, int level)
   }
   else
   {
-    fprintf(s1->ppfp, "# %d \"%s\"%s\n", f->line_num, f->filename, level > 0 ? " 1" : level < 0 ? " 2" : "");
+    fprintf(s1->ppfp, "# %d \"%s\"%s%s\n", f->line_num, f->filename, level > 0 ? " 1" : level < 0 ? " 2" : "",
+            f->sys ? " 3" : "");
   }
   f->line_ref = f->line_num;
+  f->pp_sys = f->sys;
 }
 
 static void define_print(TCCState *s1, int v)
@@ -6888,6 +8130,17 @@ ST_FUNC int tcc_preprocess(TCCState *s1)
       pp_debug_defines(s1);
       if (s1->dflag & 4)
         continue;
+    }
+    if (file->yasc_dir == 1 && tok != TOK_LINEFEED && !is_space(tok))
+    {
+      /* a header from an -iyasc directory: what its compile needs to know,
+         before its first text (the line marker after it keeps the lines) */
+      file->yasc_dir = 2;
+      if (token_seen != TOK_LINEFEED)
+        fputs("\n", s1->ppfp);
+      fputs("#pragma yasc\n", s1->ppfp);
+      file->line_ref = 0;
+      token_seen = TOK_LINEFEED, spcs = 0;
     }
 
     if (is_space(tok))

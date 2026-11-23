@@ -89,6 +89,7 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
   int saved_nb_errors;
   int saved_pack[PACK_STACK_SIZE + 1];
   void (*saved_error_func)(void *opaque, const char *msg);
+  unsigned char saved_fe_speculative, saved_spec_dropped;
   void *saved_error_opaque;
   int saved_overlay_n;
 
@@ -392,6 +393,10 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
   memcpy(saved_jmp_buf, tcc_state->error_jmp_buf, sizeof(jmp_buf));
   tcc_state->error_func = inline_eval_suppress_error;
   tcc_state->error_opaque = NULL;
+  saved_fe_speculative = tcc_state->fe_speculative;
+  tcc_state->fe_speculative = 1;
+  saved_spec_dropped = tcc_state->diag_spec_dropped;
+  tcc_state->diag_spec_dropped = 0;
 
   if (setjmp(tcc_state->error_jmp_buf) != 0)
   {
@@ -498,8 +503,9 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
       if (!parse_btype(&btype, &ad, 0))
         break; /* not a declaration — let the return check handle it */
 
-      /* Storage classes inside a speculative body are not supported. */
-      if (btype.t & (VT_EXTERN | VT_STATIC | VT_TYPEDEF))
+      /* Storage classes inside a speculative body are not supported, nor is
+         a type taken from the initializer (`auto x = 2.5`). */
+      if ((btype.t & (VT_EXTERN | VT_STATIC | VT_TYPEDEF)) || ad.auto_tok)
       {
         success = 0;
         goto cleanup;
@@ -585,6 +591,7 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
         if ((result.type.t & VT_STRUCT_MASK) == VT_ENUM_VAL)
           result.type.t &= ~VT_STRUCT_MASK;
         success = 1;
+        fn->folded = 1; /* its checks: check_uncompiled_inline_functions */
       }
       else if (TCC_LOG_INLINE_STRUCT)
       {
@@ -600,7 +607,17 @@ cleanup:
   memcpy(tcc_state->error_jmp_buf, saved_jmp_buf, sizeof(jmp_buf));
   tcc_state->error_func = saved_error_func;
   tcc_state->error_opaque = saved_error_opaque;
+  tcc_state->fe_speculative = saved_fe_speculative;
   tcc_state->nb_errors = saved_nb_errors;
+  /* a warning the speculation could not say, and the call folds: the body
+     may never be parsed again -- its check-only parse says it
+     (check_uncompiled_inline_functions) */
+  if (success && tcc_state->diag_spec_dropped)
+  {
+    fn->expanded = 1;
+    tcc_state->diag_spec_recheck = 1;
+  }
+  tcc_state->diag_spec_dropped |= saved_spec_dropped;
 
   /* Restore inline-eval overlay count (supports nested inline-eval). */
   tcc_state->inline_eval_overlay_n = saved_overlay_n;

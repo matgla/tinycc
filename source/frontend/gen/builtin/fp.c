@@ -26,7 +26,8 @@
 /* Extracted from unary() to reduce stack frame size. */
 void __attribute__((noinline)) unary_builtin_alloca(void)
 {
-  CType type;
+  /* ref read by mk_pointer's pointer-type cache */
+  CType type = {0};
   switch (tok)
   {
 /* TOK_alloca is an enum constant (tcctok.h), so it can't be tested with
@@ -43,6 +44,10 @@ void __attribute__((noinline)) unary_builtin_alloca(void)
     /* __builtin_alloca(size) — allocate memory on the stack.
      * The allocation persists until function return (epilogue restores SP
      * from the frame pointer). */
+    if (tcc_state->stack_protector)
+      ssp_note_frame_use(1);
+    if ((tcc_state->warn_alloca & WARN_ON) && diag_stack_site())
+      tcc_warning_c(warn_alloca)("%i:use of '%s'", file->line_num, get_tok_str(tok, NULL));
     parse_builtin_params(0, "e"); /* size argument on vtop */
     if (tcc_state->ir)
     {
@@ -63,6 +68,7 @@ void __attribute__((noinline)) unary_builtin_alloca(void)
       mk_pointer(&type);
       vset(&type, VT_LOCAL | VT_LVAL, alloca_slot);
       vtop->vr = -1;
+      objsize_alloca_result(&size_sv); /* its size (builtin/objsize.c) */
     }
     break;
   }
@@ -161,7 +167,7 @@ void __attribute__((noinline)) unary_builtin_alloca(void)
       vtop->type.t = VT_INT;
       mk_pointer(&vtop->type);
       indir();
-      tcc_ir_gen_return_value(tcc_state->ir, vtop);
+      gen_return_value_now();
       vpop();
     }
     type.t = VT_VOID;

@@ -1,0 +1,7 @@
+area 12
+lo 1 -2 hi 4 2
+manhattan 3
+size 8
+dirs 1 2 4
+moves 2 calls 3
+cells 48

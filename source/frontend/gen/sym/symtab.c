@@ -23,6 +23,9 @@
 
 #include "gen_priv.h"
 
+/* SymAttr stays one word: every Sym carries it */
+_Static_assert(sizeof(struct SymAttr) == 4, "SymAttr must stay 32 bits");
+
 /* ------------------------------------------------------------------------- */
 /* symbol allocator */
 #ifndef SYM_DEBUG /* SYM_DEBUG: every Sym its own block */
@@ -377,7 +380,11 @@ ST_FUNC void sym_params_track(Sym *ref, Sym *stack_before)
   if (local_stack || !ref->next || !tcc_spill_active())
     return;
   for (p = ref->next; p; p = p->next)
+  {
+    if (p->a.attr_facts) /* a deprecated member: its facts are keyed by the Sym */
+      return;
     n++;
+  }
   par = n <= 16 ? small : tcc_malloc(n * sizeof *par);
   k = 0;
   for (p = ref->next; p; p = p->next)
@@ -671,26 +678,38 @@ ST_FUNC void sym_set_label_head(int v, Sym *s)
 static Sym **ptr_nodes; /* open-addressed, at most half full */
 static int ptr_nodes_nb, ptr_nodes_mask;
 
-static unsigned ptr_node_hash(int t, const Sym *ref)
+static unsigned ptr_node_hash(int t, const Sym *ref, int yasc)
 {
-  return ((unsigned)t ^ (unsigned)((uintptr_t)ref >> 2) * 2654435761u) * 2654435761u;
+  return ((unsigned)t ^ (unsigned)((uintptr_t)ref >> 2) * 2654435761u ^ (unsigned)yasc) * 2654435761u;
 }
 
-static Sym **ptr_node_slot(int t, const Sym *ref)
+/* yasc: a pointer's qualifiers (YASC_*) and borrows(...) (in vreg, -1 for
+   none) are part of its node */
+static Sym **ptr_node_slot(int t, const Sym *ref, int yasc, int borrows)
 {
   unsigned h;
   Sym **e;
-  for (h = ptr_node_hash(t, ref);; h++)
+  for (h = ptr_node_hash(t, ref, yasc) + (unsigned)borrows * 2654435761u;; h++)
   {
     e = &ptr_nodes[h & ptr_nodes_mask];
-    if (!*e || ((*e)->type.t == t && (*e)->type.ref == ref))
+    if (!*e || ((*e)->type.t == t && (*e)->type.ref == ref && (*e)->yasc == yasc && (*e)->vreg == borrows))
       return e;
   }
 }
 
 ST_FUNC Sym *sym_pointer_node(CType *type)
 {
-  Sym *s, **e = ptr_nodes ? ptr_node_slot(type->t, type->ref) : NULL;
+  return sym_pointer_node_q(type, 0);
+}
+
+ST_FUNC Sym *sym_pointer_node_q(CType *type, int yasc)
+{
+  return sym_pointer_node_b(type, yasc, -1);
+}
+
+ST_FUNC Sym *sym_pointer_node_b(CType *type, int yasc, int borrows)
+{
+  Sym *s, **e = ptr_nodes ? ptr_node_slot(type->t, type->ref, yasc, borrows) : NULL;
 
   if (e && *e)
     return *e;
@@ -702,9 +721,9 @@ ST_FUNC Sym *sym_pointer_node(CType *type)
     ptr_nodes = tcc_mallocz((ptr_nodes_mask + 1) * sizeof *ptr_nodes);
     for (i = 0; i < n; i++)
       if (old[i])
-        *ptr_node_slot(old[i]->type.t, old[i]->type.ref) = old[i];
+        *ptr_node_slot(old[i]->type.t, old[i]->type.ref, old[i]->yasc, old[i]->vreg) = old[i];
     tcc_free(old);
-    e = ptr_node_slot(type->t, type->ref);
+    e = ptr_node_slot(type->t, type->ref, yasc, borrows);
   }
   /* what sym_push(SYM_FIELD, type, 0, -1) makes, without the stack */
   s = sym_malloc();
@@ -712,15 +731,43 @@ ST_FUNC Sym *sym_pointer_node(CType *type)
   s->v = SYM_FIELD;
   s->type = *type;
   s->c = -1;
-  s->vreg = -1;
+  s->vreg = borrows;
+  s->yasc = yasc;
   *e = s;
   ptr_nodes_nb++;
+  return s;
+}
+
+/* yasc int handles: one node per (qualifiers, deallocator) */
+static Sym **handle_nodes;
+static int handle_nodes_nb;
+
+ST_FUNC Sym *sym_handle_node(int yasc, int dealloc)
+{
+  Sym *s;
+  for (int i = 0; i < handle_nodes_nb; i++)
+    if (handle_nodes[i]->yasc == yasc && handle_nodes[i]->vreg == (dealloc ? dealloc : -1))
+      return handle_nodes[i];
+  s = sym_malloc();
+  memset(s, 0, sizeof *s);
+  s->v = SYM_HANDLE;
+  s->type.t = VT_INT;
+  s->c = -1;
+  s->vreg = dealloc ? dealloc : -1;
+  s->yasc = yasc;
+  handle_nodes = tcc_realloc(handle_nodes, (handle_nodes_nb + 1) * sizeof *handle_nodes);
+  handle_nodes[handle_nodes_nb++] = s;
   return s;
 }
 
 /* End of TU, before the Sym pools go. */
 ST_FUNC void sym_pointer_nodes_free(void)
 {
+  for (int i = 0; i < handle_nodes_nb; i++)
+    sym_free(handle_nodes[i]);
+  tcc_free(handle_nodes);
+  handle_nodes = NULL;
+  handle_nodes_nb = 0;
   int i, n = ptr_nodes ? ptr_nodes_mask + 1 : 0;
   for (i = 0; i < n; i++)
     if (ptr_nodes[i])
@@ -732,7 +779,7 @@ ST_FUNC void sym_pointer_nodes_free(void)
 
 static int sym_is_pointer_node(Sym *s)
 {
-  return s->v == SYM_FIELD && ptr_nodes && *ptr_node_slot(s->type.t, s->type.ref) == s;
+  return s->v == SYM_FIELD && ptr_nodes && *ptr_node_slot(s->type.t, s->type.ref, s->yasc, s->vreg) == s;
 }
 
 /* Parked prototypes.  System headers declare far more functions than a TU
@@ -788,7 +835,7 @@ static int park_attr_zero(struct SymAttr a, int param)
 {
   static const struct SymAttr zero;
   if (param)
-    a.param_volatile = 0;
+    a.param_volatile = a.param_array = 0; /* (param_array only feeds a warning in a body) */
   return !memcmp(&a, &zero, sizeof a);
 }
 
@@ -843,7 +890,7 @@ ST_FUNC void sym_park_proto(Sym *s, Sym *stack_before)
   ts = table_ident[s->v - TOK_IDENT];
   if (!ts || ts->sym_identifier != s || s->prev_tok || (s->type.t & VT_BTYPE) != VT_FUNC ||
       (s->type.t & (VT_STATIC | VT_INLINE | VT_TYPEDEF)) || s->r != (VT_CONST | VT_SYM) || s->c || s->sym_scope ||
-      s->vreg || s->asm_label)
+      s->vreg || s->asm_label || s->a.attr_facts)
     return;
   if (f->v != SYM_FIELD || f->r || f->c || f->vreg != -1 || f->prev_tok || !park_type_ok(&f->type))
     return;
@@ -1084,7 +1131,9 @@ ST_INLN Sym *sym_find(int v)
 int sym_scope(Sym *s)
 {
   int scope;
-  if (IS_ENUM_VAL(s->type.t))
+  /* VT_ASM_FUNC has the enum constant's bits, without a ref (an assembler
+     symbol or a helper the compiler calls: global) */
+  if (IS_ENUM_VAL(s->type.t) && s->type.ref)
     scope = s->type.ref->sym_scope;
   else
     scope = s->sym_scope;
@@ -1121,6 +1170,173 @@ int token_stream_references_local_object(const int *p)
 }
 
 /* push a given symbol on the symbol stack */
+/* -Wshadow.  Where each declaration was, for the "shadowed declaration is
+ * here" note: a side table by Sym, filled only while -Wshadow is on (a Sym
+ * popped and reused gets its new place; the token is checked too). */
+struct shadow_place
+{
+  Sym *s;
+  int v, line;
+  const char *file;
+};
+static struct shadow_place *shadow_places;
+static int shadow_places_n, shadow_places_mask;
+/* the parameters of the function being compiled: local_stack down to here */
+static Sym *shadow_params_top, *shadow_params_bottom;
+
+static unsigned shadow_hash(const Sym *s)
+{
+  return ((unsigned)((uintptr_t)s >> 3) * 2654435761u) & shadow_places_mask;
+}
+
+static void shadow_record(Sym *s)
+{
+  unsigned h;
+  BufferedFile *f = file;
+  if ((s->v & SYM_FIELD) || (s->v & ~SYM_STRUCT) >= SYM_FIRST_ANOM || (s->v & SYM_STRUCT) || !f)
+    return;
+  while (f->filename[0] == ':' && f->prev)
+    f = f->prev;
+  if (2 * (shadow_places_n + 1) > shadow_places_mask)
+  {
+    struct shadow_place *old = shadow_places;
+    int n = old ? shadow_places_mask + 1 : 0, m = n ? 2 * n : 256;
+    shadow_places = tcc_mallocz(m * sizeof *old);
+    shadow_places_mask = m - 1;
+    shadow_places_n = 0;
+    for (int i = 0; i < n; i++)
+      if (old[i].s)
+      {
+        for (h = shadow_hash(old[i].s); shadow_places[h].s; h = (h + 1) & shadow_places_mask)
+          ;
+        shadow_places[h] = old[i];
+        shadow_places_n++;
+      }
+    tcc_free(old);
+  }
+  for (h = shadow_hash(s); shadow_places[h].s && shadow_places[h].s != s; h = (h + 1) & shadow_places_mask)
+    ;
+  if (!shadow_places[h].s)
+    shadow_places_n++;
+  shadow_places[h].s = s;
+  shadow_places[h].v = s->v;
+  shadow_places[h].line = f->line_num;
+  shadow_places[h].file = tcc_filename_intern(f->filename);
+}
+
+static const struct shadow_place *shadow_place_of(Sym *s)
+{
+  if (!shadow_places)
+    return NULL;
+  for (unsigned h = shadow_hash(s); shadow_places[h].s; h = (h + 1) & shadow_places_mask)
+    if (shadow_places[h].s == s)
+      return shadow_places[h].v == s->v ? &shadow_places[h] : NULL;
+  return NULL;
+}
+
+void shadow_free(void)
+{
+  tcc_free(shadow_places);
+  shadow_places = NULL;
+  shadow_places_n = shadow_places_mask = 0;
+  shadow_params_top = shadow_params_bottom = NULL;
+}
+
+static int shadow_is_param(Sym *p)
+{
+  for (Sym *q = shadow_params_top; q && q != shadow_params_bottom; q = q->prev)
+    if (q == p)
+      return 1;
+  return 0;
+}
+
+/* -Wshadow: the local or parameter S, just declared, hides another local, a
+ * parameter, or a file-scope object (not a function or a type, as gcc). */
+static void check_shadow_at(Sym *s, int line);
+
+void check_shadow(Sym *s)
+{
+  check_shadow_at(s, 0);
+}
+
+/* the declarator's name decl() read last came from a system header's macro
+   (type_decl, while -Wshadow is on) */
+int shadow_name_sys;
+
+/* the same, S declared at LINE (0: here) */
+static void check_shadow_at(Sym *s, int line)
+{
+  Sym *p;
+  const char *what;
+  const struct shadow_place *where;
+  if (!line)
+  {
+    /* a declaration a system header's macro expands to is quiet (gcc) */
+    if (shadow_name_sys && !tcc_state->warn_system_headers)
+      return;
+    line = file ? file->line_num : 0;
+  }
+  if ((s->v & SYM_FIELD) || (s->v & ~SYM_STRUCT) >= SYM_FIRST_ANOM || (s->v & SYM_STRUCT) ||
+      (s->type.t & VT_TYPEDEF) || (s->type.t & VT_BTYPE) == VT_FUNC || !fe_check_on(tcc_state->warn_shadow))
+    return;
+  p = s->prev_tok;
+  if (!p || SYM_IS_PARKED(p))
+    return;
+  if (sym_scope(p))
+    what = shadow_is_param(p) ? "a parameter" : "a previous local";
+  else if ((p->type.t & VT_TYPEDEF) || (p->type.t & VT_BTYPE) == VT_FUNC)
+    return;
+  else
+    what = "a global declaration";
+  if (!tcc_diag_first(tcc_state, line, DIAG_KEY(DIAG_KEY_SHADOW, (unsigned)s->v)))
+    return;
+  tcc_warning_c(warn_shadow)("%i:declaration of '%s' shadows %s", line, get_tok_str(s->v, NULL), what);
+  where = shadow_place_of(p);
+  if (where)
+  {
+    /* the note names its own file when it is not this one */
+    BufferedFile *f = file;
+    while (f && f->filename[0] == ':' && f->prev)
+      f = f->prev;
+    if (f && where->file == tcc_filename_intern(f->filename))
+      tcc_note("%i:shadowed declaration is here", where->line);
+    else
+      tcc_note("shadowed declaration is at %s:%d", where->file, where->line);
+  }
+}
+
+/* -Wshadow for the parameters gen_function just bound (local_stack down to
+ * the marker it pushed): a parameter can only hide a file-scope name */
+void check_shadow_params(Sym *func)
+{
+  Sym *q;
+  shadow_params_top = local_stack;
+  for (q = local_stack; q && q->v != SYM_FIELD; q = q->prev)
+    ;
+  shadow_params_bottom = q;
+  if (!(tcc_state->warn_shadow & WARN_ON) && !tcc_state->nb_diag_snaps)
+    return;
+  /* in the order they were written, each at its own line */
+  Sym *small[16], **ps = small;
+  int n = 0, i;
+  for (q = local_stack; q && q != shadow_params_bottom; q = q->prev)
+    n++;
+  if (n > 16)
+    ps = tcc_malloc(n * sizeof *ps);
+  for (i = n, q = local_stack; q && q != shadow_params_bottom; q = q->prev)
+    ps[--i] = q;
+  for (i = 0; i < n; i++)
+  {
+    int line = func ? unused_param_decl_line(func, ps[i]->v) : 0;
+    struct shadow_place *where = (struct shadow_place *)shadow_place_of(ps[i]);
+    if (where && line)
+      where->line = line; /* a local hiding it names this line too */
+    check_shadow_at(ps[i], line);
+  }
+  if (ps != small)
+    tcc_free(ps);
+}
+
 ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
 {
   Sym *s, **ps;
@@ -1212,6 +1428,19 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
   s->type.ref = type->ref;
   s->r = r;
   s->vreg = vreg;
+  /* -Wlifetime follows pointer locals and parameters through the raw IR,
+     and the maybe members of local structs and arrays of them (no vreg) */
+  if ((vreg >= 0 || (type->t & (VT_BTYPE | VT_ARRAY)) == VT_STRUCT ||
+       ((type->t & VT_ARRAY) && type->ref && (type->ref->type.t & (VT_BTYPE | VT_ARRAY)) == VT_STRUCT)) &&
+      tcc_state->ir && tcc_state->ir->lt_on)
+    tcc_ir_lt_add_var(tcc_state->ir, vreg, s);
+  /* -Wtainted-format: the frame's objects (arrays, structs, locals whose
+     address is taken), each its own memory */
+  if (vreg < 0 && local_stack && (r & VT_VALMASK) == VT_LOCAL && tcc_state->ir && tcc_state->ir->taint_on)
+    tcc_ir_taint_add_local(tcc_state->ir, s);
+  /* -Wdangling-pointer names the pointer variables it follows */
+  if (vreg >= 0 && (type->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && tcc_state->ir && tcc_ir_dp_wanted())
+    tcc_ir_dp_add_name(tcc_state->ir, vreg, s);
   /* don't record fields or anonymous symbols */
   /* XXX: simplify */
   if (!(v & SYM_FIELD) && (v & ~SYM_STRUCT) < SYM_FIRST_ANOM)
@@ -1235,6 +1464,8 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
     s->sym_scope = local_scope;
     if (s->prev_tok && sym_scope(s->prev_tok) == s->sym_scope)
       tcc_error("redeclaration of '%s'", get_tok_str(v & ~SYM_STRUCT, NULL));
+    if (tcc_state->warn_shadow & WARN_ON)
+      shadow_record(s);
   }
   return s;
 }
@@ -1259,6 +1490,8 @@ ST_FUNC Sym *global_identifier_push(int v, int t, int c)
       ps = &(*ps)->prev_tok;
     s->prev_tok = *ps;
     *ps = s;
+    if (tcc_state->warn_shadow & WARN_ON)
+      shadow_record(s);
   }
   return s;
 }
@@ -1275,6 +1508,9 @@ ST_FUNC void sym_pop(Sym **ptop, Sym *b, int keep)
   {
     ss = s->prev;
     v = s->v;
+    /* -Wunused-*: a local or parameter whose scope ends here */
+    if (!keep && ptop == &local_stack && (s->ymod & SYM_UNUSED_TRACK))
+      unused_sym_popped(s);
     /* remove symbol in token array */
     /* XXX: simplify */
     if (!(v & SYM_FIELD) && (v & ~SYM_STRUCT) < SYM_FIRST_ANOM)
@@ -1358,11 +1594,13 @@ ST_FUNC void label_pop(Sym **ptop, Sym *slast, int keep)
   for (s = *ptop; s != slast; s = s1)
   {
     s1 = s->prev;
+    if (s->ymod & SYM_UNUSED_TRACK)
+      unused_label_popped(s);
     int addr_taken =
         (s->c == -3 || s->c > 0 || s->a.addrtaken); /* Remember if address was taken before modifying s->c */
     if (s->r == LABEL_DECLARED)
     {
-      tcc_warning_c(warn_all)("label '%s' declared but not used", get_tok_str(s->v, NULL));
+      tcc_warning_once(warn_all, "label '%s' declared but not used", get_tok_str(s->v, NULL));
     }
     else if (s->r == LABEL_FORWARD)
     {

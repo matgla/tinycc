@@ -81,7 +81,7 @@ def _defined_symbols(tmp_path, *flags):
     src = tmp_path / "statics.c"
     src.write_text(SOURCE)
     obj = tmp_path / "statics.o"
-    proc = subprocess.run([str(TCC), "-c", *flags, "-o", str(obj), str(src)], capture_output=True, text=True)
+    proc = subprocess.run([str(TCC), "-ccompat", "-c", *flags, "-o", str(obj), str(src)], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = subprocess.run([READELF, "-sW", str(obj)], capture_output=True, text=True, check=True).stdout
     names = set()
@@ -115,7 +115,7 @@ def _compile(tmp_path, source, *flags):
     src = tmp_path / "check.c"
     src.write_text(source)
     obj = tmp_path / "check.o"
-    proc = subprocess.run([str(TCC), "-c", "-O1", *flags, "-o", str(obj), str(src)], capture_output=True, text=True)
+    proc = subprocess.run([str(TCC), "-ccompat", "-c", "-O1", *flags, "-o", str(obj), str(src)], capture_output=True, text=True)
     return proc, obj
 
 
@@ -217,6 +217,6 @@ def test_replayed_body_keeps_a_relative_file_name(tmp_path, opt):
         "int g(int x) { return t(x); }\n"
         "int h(int x) { if (x) return 1; }\n"
     )
-    proc = subprocess.run([str(TCC), "-c", opt, "-o", "a.o", "./sub/a.c"], capture_output=True, text=True, cwd=tmp_path)
+    proc = subprocess.run([str(TCC), "-ccompat", "-c", opt, "-o", "a.o", "./sub/a.c"], capture_output=True, text=True, cwd=tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert "./sub/a.c:6: warning: function might return no value: 'h'" in proc.stderr.splitlines(), proc.stderr

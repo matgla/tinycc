@@ -66,6 +66,11 @@ UNITY_MEMBERS_arm_thumb_s1 = \
 	source/backend/arch/arm/thumb/thop_tbb.c \
 	source/backend/arch/arm/thumb/thop_vfp.c
 
+UNITY_GROUPS_generators = backend_generators
+UNITY_MEMBERS_backend_generators = \
+	source/backend/generators/function.c \
+	source/backend/generators/stack_usage.c
+
 UNITY_GROUPS_frontend = frontend_gen_builtin frontend_gen_core frontend_gen_decl frontend_gen_expr frontend_gen_inline frontend_gen_op frontend_gen_stmt frontend_gen_store frontend_gen_sym frontend_gen_type frontend_gen_value
 UNITY_MEMBERS_frontend_gen_builtin = \
 	source/frontend/gen/builtin/call.c \
@@ -73,40 +78,52 @@ UNITY_MEMBERS_frontend_gen_builtin = \
 	source/frontend/gen/builtin/fp.c \
 	source/frontend/gen/builtin/fp2.c \
 	source/frontend/gen/builtin/misc.c \
+	source/frontend/gen/builtin/objsize.c \
 	source/frontend/gen/builtin/overflow.c \
 	source/frontend/gen/builtin/simd.c \
 	source/frontend/gen/builtin/string.c
 UNITY_MEMBERS_frontend_gen_core = \
 	source/frontend/gen/core/predicates.c \
+	source/frontend/gen/core/recover.c \
 	source/frontend/gen/core/state.c \
-	source/frontend/gen/core/suppress.c
+	source/frontend/gen/core/suppress.c \
+	source/frontend/gen/core/unused.c
 UNITY_MEMBERS_frontend_gen_decl = \
 	source/frontend/gen/decl/attribute.c \
 	source/frontend/gen/decl/btype.c \
 	source/frontend/gen/decl/declarator.c \
+	source/frontend/gen/decl/method.c \
+	source/frontend/gen/decl/module.c \
+	source/frontend/gen/decl/plain_param.c \
 	source/frontend/gen/decl/predef_protos.c \
-	source/frontend/gen/decl/struct.c
+	source/frontend/gen/decl/struct.c \
+	source/frontend/gen/decl/typesig.c
 UNITY_MEMBERS_frontend_gen_expr = \
 	source/frontend/gen/expr/atomic.c \
+	source/frontend/gen/expr/attr_checks.c \
 	source/frontend/gen/expr/cond.c \
 	source/frontend/gen/expr/indir.c \
 	source/frontend/gen/expr/infix.c \
 	source/frontend/gen/expr/primary.c \
-	source/frontend/gen/expr/unary.c
+	source/frontend/gen/expr/unary.c \
+	source/frontend/gen/expr/yasc_errors.c
 UNITY_MEMBERS_frontend_gen_inline = \
 	source/frontend/gen/inline/analysis.c \
 	source/frontend/gen/inline/const_eval.c \
 	source/frontend/gen/inline/emit.c
 UNITY_MEMBERS_frontend_gen_op = \
+	source/frontend/gen/op/bcheck.c \
 	source/frontend/gen/op/complex.c \
 	source/frontend/gen/op/float.c \
 	source/frontend/gen/op/fold_math.c \
 	source/frontend/gen/op/int.c \
 	source/frontend/gen/op/op.c \
+	source/frontend/gen/op/ubsan.c \
 	source/frontend/gen/op/vector.c
 UNITY_MEMBERS_frontend_gen_stmt = \
 	source/frontend/gen/stmt/block.c \
 	source/frontend/gen/stmt/cleanup.c \
+	source/frontend/gen/stmt/defer.c \
 	source/frontend/gen/stmt/ret.c \
 	source/frontend/gen/stmt/switch.c
 UNITY_MEMBERS_frontend_gen_store = \
@@ -129,15 +146,18 @@ UNITY_MEMBERS_frontend_gen_value = \
 
 UNITY_GROUPS_ir = ir ir_frame ir_gen ir_regalloc ir_regalloc_ssa
 UNITY_MEMBERS_ir = \
+	source/ir/bounds.c \
 	source/ir/cfg.c \
 	source/ir/dead_def.c \
 	source/ir/dump.c \
 	source/ir/known_ext.c \
+	source/ir/lifetime.c \
 	source/ir/machine_op.c \
 	source/ir/op_props.c \
 	source/ir/pool.c \
 	source/ir/self_store.c \
 	source/ir/ssa.c \
+	source/ir/taint.c \
 	source/ir/type.c \
 	source/ir/vreg.c
 UNITY_MEMBERS_ir_frame = \

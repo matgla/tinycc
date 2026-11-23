@@ -70,7 +70,7 @@ def _compile(name, extra_cflags=(), src_dir=None):
         "-fno-module-local-calls",
         "-c",
     ]
-    cmd = [str(TCC), *INCLUDE_FLAGS] + cflags + list(extra_cflags) + [str(src), "-o", str(obj)]
+    cmd = [str(TCC), "-ccompat", *INCLUDE_FLAGS] + cflags + list(extra_cflags) + [str(src), "-o", str(obj)]
     result = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -260,7 +260,7 @@ def _funcs_with_env(case, env_extra):
     tag = hashlib.sha1(f"{case}|{sorted(env_extra.items())}".encode()).hexdigest()[:8]
     obj = BUILD_DIR / f"{case}.env.{tag}.o"
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [str(TCC), *INCLUDE_FLAGS, "-O2", "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb",
+    cmd = [str(TCC), "-ccompat", *INCLUDE_FLAGS, "-O2", "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb",
            "-mfloat-abi=soft", "-ffunction-sections", "-c", str(ASM_DIR / f"{case}.c"), "-o", str(obj)]
     env = dict(os.environ)
     env.pop("TCC_DISABLE_PASS", None)
@@ -1606,7 +1606,7 @@ def _compile_struct_arg(opt, disable=None):
     tag = hashlib.sha1(f"{opt}|{disable}".encode()).hexdigest()[:8]
     obj = BUILD_DIR / f"struct_arg_split.{tag}.o"
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [str(TCC), *INCLUDE_FLAGS, opt, "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb",
+    cmd = [str(TCC), "-ccompat", *INCLUDE_FLAGS, opt, "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb",
            "-ffunction-sections", "-c", *STRUCT_ARG_HARD, str(ASM_DIR / "struct_arg_split.c"), "-o", str(obj)]
     env = dict(os.environ)
     if disable:
@@ -1753,7 +1753,7 @@ def _sp_loads_in(opt, name, disable=None):
     tag = hashlib.sha1(f"{opt}|{disable}".encode()).hexdigest()[:8]
     obj = BUILD_DIR / f"ra_caller_save.{tag}.o"
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [str(TCC), *INCLUDE_FLAGS, opt, "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft",
+    cmd = [str(TCC), "-ccompat", *INCLUDE_FLAGS, opt, "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft",
            "-ffunction-sections", "-fno-pic", "-mno-sb-relative-got",
            "-c", str(ASM_DIR / "ra_caller_save.c"), "-o", str(obj)]
     env = dict(os.environ)
@@ -1848,7 +1848,7 @@ def test_o1_hoists_loop_invariants():
     # A plain -O1: `_compile`'s -O2 would leave the -O2 tier's flags set.
     obj = BUILD_DIR / "o1_licm.O1.o"
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [str(TCC), *INCLUDE_FLAGS, "-O1", "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb",
+    cmd = [str(TCC), "-ccompat", *INCLUDE_FLAGS, "-O1", "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb",
            "-mfloat-abi=soft", "-ffunction-sections", "-c", str(ASM_DIR / "o1_licm.c"), "-o", str(obj)]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
     assert result.returncode == 0, f"compile failed: {cmd}\n{result.stderr}"
@@ -1891,7 +1891,7 @@ def _call_targets(opt_flags, disable=None, case="inline_accessor_classes", src_d
     tag = hashlib.sha1(f"{case}|{opt_flags}|{disable}".encode()).hexdigest()[:8]
     obj = BUILD_DIR / f"{case}.{tag}.o"
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [str(TCC), *INCLUDE_FLAGS, *opt_flags.split(), "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb",
+    cmd = [str(TCC), "-ccompat", *INCLUDE_FLAGS, *opt_flags.split(), "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb",
            "-mfloat-abi=soft", "-ffunction-sections", "-c", str((src_dir or ASM_DIR) / f"{case}.c"), "-o", str(obj)]
     env = dict(os.environ)
     env.pop("TCC_DISABLE_PASS", None)
@@ -2197,7 +2197,7 @@ def test_bump_sink_off_keeps_copy():
     tag = "nosink"
     obj = BUILD_DIR / f"bump_sink_walk.{tag}.o"
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [str(TCC), *INCLUDE_FLAGS, "-O2", "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft",
+    cmd = [str(TCC), "-ccompat", *INCLUDE_FLAGS, "-O2", "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft",
            "-ffunction-sections", "-c", str(ASM_DIR / "bump_sink_walk.c"), "-o", str(obj)]
     env = dict(os.environ)
     env["TCC_DISABLE_PASS"] = "ra:bump_sink"
@@ -2312,7 +2312,7 @@ def test_bug_u64_divmod_layer_cake(opt):
     """
     obj = BUILD_DIR / f"armeabi.{opt}.o"
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [str(TCC), *INCLUDE_FLAGS, opt, "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33",
+    cmd = [str(TCC), "-ccompat", *INCLUDE_FLAGS, opt, "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33",
            "-mthumb", "-mfloat-abi=soft", "-ffunction-sections", "-fno-pic",
            "-mno-sb-relative-got", "-c", str(ROOT / "lib" / "armeabi.c"),
            "-o", str(obj)]
@@ -2824,7 +2824,7 @@ def _compile_regpair(opt="-O2", disable=None, extra=()):
     tag = hashlib.sha1(f"{opt}|{disable}|{extra}".encode()).hexdigest()[:8]
     obj = BUILD_DIR / f"regpair_static_return.{tag}.o"
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [str(TCC), *INCLUDE_FLAGS, opt, "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft",
+    cmd = [str(TCC), "-ccompat", *INCLUDE_FLAGS, opt, "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft",
            "-ffunction-sections", "-fno-pic", "-mno-sb-relative-got", "-fno-module-local-calls", *extra,
            "-c", str(ASM_DIR / "regpair_static_return.c"), "-o", str(obj)]
     env = dict(os.environ)
@@ -2904,7 +2904,7 @@ def _compile_regpair_src(src, opt, disable=None):
     c = BUILD_DIR / f"regpair_src.{tag}.c"
     obj = BUILD_DIR / f"regpair_src.{tag}.o"
     c.write_text(src)
-    cmd = [str(TCC), *INCLUDE_FLAGS, opt, "-nostdlib", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft", "-c", str(c), "-o", str(obj)]
+    cmd = [str(TCC), "-ccompat", *INCLUDE_FLAGS, opt, "-nostdlib", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft", "-c", str(c), "-o", str(obj)]
     env = dict(os.environ)
     env.pop("TCC_DISABLE_PASS", None)
     if disable:
@@ -3007,7 +3007,7 @@ def _guarded_calls(opt_flags, disable=None, case="bug_guard_head_partial_inline"
     tag = hashlib.sha1(f"guard|{case}|{opt_flags}|{disable}".encode()).hexdigest()[:8]
     obj = BUILD_DIR / f"{case}.{tag}.o"
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [str(TCC), *INCLUDE_FLAGS, *opt_flags.split(), "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb",
+    cmd = [str(TCC), "-ccompat", *INCLUDE_FLAGS, *opt_flags.split(), "-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb",
            "-mfloat-abi=soft", "-ffunction-sections", "-fno-pic", "-mno-sb-relative-got", "-fno-module-local-calls",
            "-c", str(ASM_DIR.parent / f"{case}.c"), "-o", str(obj)]
     env = dict(os.environ)

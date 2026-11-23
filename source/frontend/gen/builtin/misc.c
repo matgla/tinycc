@@ -157,8 +157,9 @@ void gen_builtin_libcall(int func_tok, int argc, int ret_type)
 
 /* Emit an IR function call with arguments from an SValue array (not from vstack).
  * args[0..argc-1] are the arguments.
- * Pushes the result onto the vstack with the given return type. */
-void gen_ir_call_args(SValue *args, int argc, int func_tok, CType *ret_ctype)
+ * Pushes the result onto the vstack with the given return type; returns the
+ * call's id. */
+int gen_ir_call_args(SValue *args, int argc, int func_tok, CType *ret_ctype)
 {
   const int new_call_id = tcc_state->ir->next_call_id++;
   SValue param_num;
@@ -187,4 +188,5 @@ void gen_ir_call_args(SValue *args, int argc, int func_tok, CType *ret_ctype)
   vtop->type = dest.type;
   vtop->vr = dest.vr;
   vtop->r = TREG_R0;
+  return new_call_id;
 }

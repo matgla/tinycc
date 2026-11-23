@@ -1180,6 +1180,64 @@ static int coalesce_split_sections(TCCState *s1)
   return ret;
 }
 
+#ifdef TCC_TARGET_YAFF
+/* yasc error names (frontend/gen/expr/yasc_errors.c): the records every yasc
+ * file puts in their own section, which libtcc1's __yasc_error_name scans
+ * from __start_yasc_errname to __stop_yasc_errname.  A YAFF module has no
+ * place for another section, so the records move to the end of .rodata and
+ * the two symbols are defined there -- LOCAL, as __yaff_initfini, so their
+ * GOT entries take the R_RELATIVE path.  The records carry no relocations.
+ * The section keeps its bytes for the linker's check of the names
+ * (tcc_yasc_check_error_names) but leaves the layout. */
+static void yaff_merge_yasc_errname(TCCState *s1)
+{
+  Section *sec = have_section(s1, YASC_ERRNAME_SECTION);
+  size_t start, size;
+  int i, nb_syms, found_start = 0, found_stop = 0;
+
+  if (!sec || !(sec->sh_flags & SHF_ALLOC))
+    return;
+  section_materialize(s1, sec);
+  size = sec->data_offset;
+  if (size)
+  {
+    section_materialize(s1, rodata_section);
+    start = section_add(rodata_section, size, sec->sh_addralign > 4 ? sec->sh_addralign : 4);
+    memcpy(rodata_section->data + start - rodata_section->data_base, sec->data, size);
+  }
+  else
+    start = rodata_section->data_offset;
+
+  nb_syms = s1->symtab->data_offset / sizeof(ElfW(Sym));
+  for (i = 1; i < nb_syms; ++i)
+  {
+    ElfW(Sym) *sym = &((ElfW(Sym) *)s1->symtab->data)[i];
+    const char *sname = (char *)s1->symtab->link->data + sym->st_name;
+    const int is_start = !strcmp(sname, "__start_" YASC_ERRNAME_SECTION);
+    if (!is_start && strcmp(sname, "__stop_" YASC_ERRNAME_SECTION))
+      continue;
+    sym->st_info = ELFW(ST_INFO)(STB_LOCAL, STT_NOTYPE);
+    sym->st_value = is_start ? start : start + size;
+    sym->st_size = 0;
+    sym->st_shndx = rodata_section->sh_num;
+    if (is_start)
+      found_start = 1;
+    else
+      found_stop = 1;
+  }
+  if (!found_start)
+    put_elf_sym(s1->symtab, start, 0, ELFW(ST_INFO)(STB_LOCAL, STT_NOTYPE), 0, rodata_section->sh_num,
+                "__start_" YASC_ERRNAME_SECTION);
+  if (!found_stop)
+    put_elf_sym(s1->symtab, start + size, 0, ELFW(ST_INFO)(STB_LOCAL, STT_NOTYPE), 0, rodata_section->sh_num,
+                "__stop_" YASC_ERRNAME_SECTION);
+
+  /* out of the layout, of the writer's check and of tcc_add_linker_symbols'
+     __start_/__stop_ definitions */
+  sec->sh_flags &= ~SHF_ALLOC;
+}
+#endif
+
 /* Output an elf, coff or binary file */
 /* XXX: suppress unneeded sections */
 static int elf_output_file(TCCState *s1, const char *filename)
@@ -1248,7 +1306,10 @@ static int elf_output_file(TCCState *s1, const char *filename)
      R_RELATIVE (local) GOT path, and relocations pointing into the
      merged data are resolved naturally by relocate_sections(). */
   if (s1->output_format == TCC_OUTPUT_FORMAT_YAFF)
+  {
     tcc_yaff_prepare_init_fini(s1);
+    yaff_merge_yasc_errname(s1);
+  }
 #endif
 
   /* Phase 2: Garbage Collection During Loading - mark and load referenced sections */
@@ -1899,6 +1960,14 @@ LIBTCCAPI int tcc_output_file(TCCState *s, const char *filename)
 
   if (s->test_coverage)
     tcc_tcov_add_file(s, filename);
+  /* -Wcross-tu: every unit is in: compare their globals' types */
+  if (s->output_type != TCC_OUTPUT_OBJ && s->nb_typesigs)
+  {
+    int errors = s->nb_errors;
+    tcc_typesig_check(s);
+    if (s->nb_errors != errors)
+      return -1;
+  }
   if (s->output_type == TCC_OUTPUT_OBJ)
     ret = elf_output_obj(s, filename);
 #ifdef TCC_TARGET_PE

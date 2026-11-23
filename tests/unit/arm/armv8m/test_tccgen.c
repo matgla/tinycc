@@ -27,6 +27,7 @@
 #include "source/frontend/gen/core/state.c"
 #include "source/frontend/gen/op/fold_math.c"
 #include "source/frontend/gen/core/suppress.c"
+#include "source/frontend/gen/core/unused.c"
 #include "source/frontend/gen/core/predicates.c"
 #include "source/frontend/gen/sym/elfsym.c"
 #include "source/frontend/gen/sym/symtab.c"
@@ -34,6 +35,7 @@
 #include "source/frontend/gen/value/strlit_pool.c"
 #include "source/frontend/gen/sym/attr_merge.c"
 #include "source/frontend/gen/value/load.c"
+#include "source/frontend/gen/op/bcheck.c" /* gbound, gen_bounded_ptr_add: were in load.c */
 #include "source/frontend/gen/value/longlong.c"
 #include "source/frontend/gen/value/rodata_rel.c"
 #include "source/frontend/gen/op/int.c"
@@ -57,6 +59,7 @@
 #include "source/frontend/gen/decl/declarator.c"
 #include "source/frontend/gen/expr/indir.c"
 #include "source/frontend/gen/expr/atomic.c"
+#include "source/frontend/gen/expr/attr_checks.c"
 #include "source/frontend/gen/builtin/misc.c"
 #include "source/frontend/gen/builtin/call.c"
 #include "source/frontend/gen/builtin/fp.c"
@@ -71,6 +74,8 @@
 #include "source/frontend/gen/stmt/ret.c"
 #include "source/frontend/gen/stmt/switch.c"
 #include "source/frontend/gen/stmt/cleanup.c"
+#include "source/frontend/gen/stmt/defer.c"
+#include "source/frontend/gen/expr/yasc_errors.c"
 #include "source/frontend/gen/stmt/block.c"
 #include "source/frontend/gen/init/initializer.c"
 #include "source/frontend/gen/init/alloc.c"
@@ -83,7 +88,10 @@
    definitions satisfy the linker.  The tests are written so the error/IR
    paths are never actually executed. */
 
-struct TCCState *tcc_state = NULL;
+/* "no state": a zeroed one, since the frontend checks read their options
+   from it (ut_null_state; ut_dummy_state is the same for the older tests) */
+static struct TCCState ut_null_state;
+struct TCCState *tcc_state = &ut_null_state;
 
 NORETURN void expect(const char *msg)
 {
@@ -140,6 +148,45 @@ int tcc_ir_get_vreg_var(TCCIRState *ir)
 {
   (void)ir;
   return -1;
+}
+
+/* -Wlifetime records (lifetime.c): sym_push registers owned locals */
+int tcc_ir_lt_active(void)
+{
+  return 0;
+}
+
+void tcc_ir_lt_add_var(TCCIRState *ir, int32_t vreg, Sym *sym)
+{
+  (void)ir;
+  (void)vreg;
+  (void)sym;
+}
+
+/* vstore notes a store into an owned pointer */
+void tcc_ir_lt_note_owned_store(TCCIRState *ir, int from, int to)
+{
+  (void)ir;
+  (void)from;
+  (void)to;
+}
+
+int tcc_ir_dp_wanted(void)
+{
+  return 0;
+}
+
+void tcc_ir_dp_add_name(TCCIRState *ir, int32_t vreg, Sym *sym)
+{
+  (void)ir;
+  (void)vreg;
+  (void)sym;
+}
+
+void tcc_ir_taint_add_local(TCCIRState *ir, Sym *sym)
+{
+  (void)ir;
+  (void)sym;
 }
 
 IRLiveInterval *tcc_ir_vreg_live_interval(TCCIRState *ir, int vreg)
@@ -301,6 +348,121 @@ void _tcc_warning(const char *fmt, ...)
   (void)fmt;
 }
 
+/* the frontend checks (core/suppress.c, sym/symtab.c -Wshadow): no input file
+   and no diagnostics place table here */
+struct BufferedFile *file;
+
+const char *tcc_filename_intern(const char *name)
+{
+  return name;
+}
+
+/* the other frontend checks' reporting (libtcc.c), the preprocessor's #if
+   flag (tccpp.c) and the -Wlifetime field hook (ir/lifetime.c) */
+int pp_expr;
+unsigned tok_macro_serial; /* tccpp.c: begin_macro's count (error recovery) */
+
+void _tcc_warning_once(int woff, int line, const char *fmt, ...)
+{
+  (void)woff;
+  (void)line;
+  (void)fmt;
+}
+
+int tcc_fixit(int line, const char *word, int where, const char *text)
+{
+  (void)line;
+  (void)word;
+  (void)where;
+  (void)text;
+  return 0;
+}
+
+int tcc_fixit_call(int line, const char *name, int arg, char *buf, int bufsz)
+{
+  (void)line;
+  (void)name;
+  (void)arg;
+  (void)buf;
+  (void)bufsz;
+  return 0;
+}
+
+void tcc_fixit_call_emit(const char *rename, const char *append)
+{
+  (void)rename;
+  (void)append;
+}
+
+/* decl/plain_param.c: no plain pointer parameter waits here */
+int yasc_pp_live;
+void yasc_pp_compare(void)
+{
+}
+void yasc_pp_store(const SValue *dst, const SValue *val)
+{
+  (void)dst;
+  (void)val;
+}
+
+void tcc_fixit_next_alt(const char *word, int where, const char *text)
+{
+  (void)word;
+  (void)where;
+  (void)text;
+}
+
+void tcc_fixit_next(int line, const char *word, int where, const char *text, const char *note)
+{
+  (void)line;
+  (void)word;
+  (void)where;
+  (void)text;
+  (void)note;
+}
+
+void tcc_fe_warning(int warn_offset, const char *fmt, ...)
+{
+  (void)warn_offset;
+  (void)fmt;
+}
+
+void tcc_vwarning_once(int woff, int line, const char *fmt, va_list ap)
+{
+  (void)woff;
+  (void)line;
+  (void)fmt;
+  (void)ap;
+}
+
+int tcc_diag_once(TCCState *s1, int ns, unsigned key, const char *file, int line, const char *text, int insert)
+{
+  (void)s1;
+  (void)ns;
+  (void)key;
+  (void)file;
+  (void)line;
+  (void)text;
+  (void)insert;
+  return 1;
+}
+
+void tcc_ir_lt_note_field_store(TCCIRState *ir, int from, int to, int entry)
+{
+  (void)ir;
+  (void)from;
+  (void)to;
+  (void)entry;
+}
+
+int tcc_diag_first(TCCState *s1, int line, int key)
+{
+  (void)s1;
+  (void)line;
+  (void)key;
+  return 1;
+}
+
 /* Minimal tok_get: the real one (tccpp.c) isn't linked here.  The
    inline_body_has_* scanners only feed it single-int (value-less) tokens, so
    advancing one int per call is a faithful stand-in for those tests. */
@@ -438,6 +600,30 @@ int gfunc_regpair_ret(Sym *fsym)
  * below are enough to exercise the symbol-stack, vstack and type helpers
  * without dragging in the full compiler.
  * --------------------------------------------------------------------------- */
+
+/* builtin/objsize.c: gen_op and vstore call into it */
+int objsize_ctx, objsize_ab_watch;
+int objsize_op_begin(ObjOpHook *h, int op)
+{
+  (void)h, (void)op;
+  return 0;
+}
+void objsize_op_end(ObjOpHook *h)
+{
+  (void)h;
+}
+void objsize_ab_op(int op, int after)
+{
+  (void)op, (void)after;
+}
+void objsize_store(SValue *dst, SValue *src)
+{
+  (void)dst, (void)src;
+}
+void objsize_ab_store(SValue *dst, SValue *src)
+{
+  (void)dst, (void)src;
+}
 
 /* Bump allocator used by the symbol allocator in tccgen.c.  We avoid the
    libc malloc/free names because tcc.h redefines them to use_tcc_*. */
@@ -902,7 +1088,7 @@ UT_TEST(test_vpop_with_cmp_backpatch)
   vtop->jfalse = 1;
   vpop();
   UT_ASSERT(vtop == _vstack);
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -935,7 +1121,7 @@ UT_TEST(test_vsetc_triggers_vcheck_cmp_when_code_on)
   UT_ASSERT_EQ(vtop->c.i, 55);
 
   nocode_wanted = 0x40000000;
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -968,11 +1154,13 @@ UT_TEST(test_sym_push_and_sym_find)
 {
   CType t = simple_type(VT_INT);
   reset_token_table();
+  tcc_state = &ut_dummy_state; /* sym_push reads the -Wshadow option */
   Sym *s = sym_push(TOK_IDENT + 1, &t, VT_CONST, 123);
   UT_ASSERT(s != NULL);
   UT_ASSERT_EQ(sym_find(TOK_IDENT + 1), s);
   UT_ASSERT_EQ(s->r, VT_CONST);
   sym_pop(&global_stack, NULL, 0);
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -995,7 +1183,7 @@ UT_TEST(test_sym_pop_defers_free_inside_gen_function)
   UT_ASSERT_EQ(s->type.t, VT_INT | VT_VOLATILE);
   gen_function_depth--;
   sym_free_outlived_locals(mark); /* with the function's other outlived Syms */
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -1094,7 +1282,7 @@ UT_TEST(test_update_storage_with_esym)
   update_storage(&s);
   UT_ASSERT_EQ(ELFW(ST_BIND)(ut_symtab_data[2].st_info), STB_WEAK);
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -1116,7 +1304,7 @@ UT_TEST(test_put_extern_sym2_skips_invalid_v)
   put_extern_sym2(&s, SHN_UNDEF, 0, 4, 1);
   UT_ASSERT_EQ(s.c, 0);
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -1131,7 +1319,7 @@ UT_TEST(test_put_extern_sym2_creates_object_symbol)
   tcc_state = &ut_dummy_state;
   put_extern_sym2(&s, SHN_UNDEF, 0x100, 4, 1);
   UT_ASSERT_EQ(s.c, 0); /* stub put_elf_sym() always returns 0 */
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   global_stack = NULL;
   return 0;
 }
@@ -1154,7 +1342,7 @@ UT_TEST(test_put_extern_sym2_func_and_asm_types)
   put_extern_sym2(&s, SHN_UNDEF, 0, 1, 1);
   UT_ASSERT_EQ(s.c, 0);
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   global_stack = NULL;
   return 0;
 }
@@ -1172,7 +1360,7 @@ UT_TEST(test_put_extern_sym_respects_nocode_wanted)
   put_extern_sym(&s, NULL, 0, 4);
   UT_ASSERT_EQ(s.c, 0);
   nocode_wanted = 0x40000000;
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -1187,7 +1375,7 @@ UT_TEST(test_get_sym_ref)
   sym = get_sym_ref(&t, NULL, 0x20, 4);
   UT_ASSERT(sym != NULL);
   UT_ASSERT(sym->type.t & VT_STATIC);
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   global_stack = NULL;
   return 0;
 }
@@ -1204,7 +1392,7 @@ UT_TEST(test_external_global_sym_new)
   UT_ASSERT_EQ(sym_find(TOK_IDENT + 1), s);
   tcc_state = &ut_dummy_state;
   sym_pop(&global_stack, NULL, 0);
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -1220,7 +1408,7 @@ UT_TEST(test_external_global_sym_reuses_existing)
   UT_ASSERT_EQ(s1, s2);
   tcc_state = &ut_dummy_state;
   sym_pop(&global_stack, NULL, 0);
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -1234,7 +1422,7 @@ UT_TEST(test_external_helper_sym)
   UT_ASSERT_EQ(s->type.t, (VT_ASM_FUNC | VT_EXTERN));
   tcc_state = &ut_dummy_state;
   sym_pop(&global_stack, NULL, 0);
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -1250,7 +1438,7 @@ UT_TEST(test_vpush_helper_func)
   vpop();
   tcc_state = &ut_dummy_state;
   sym_pop(&global_stack, NULL, 0);
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -1284,7 +1472,7 @@ UT_TEST(test_greloca_and_greloc)
   nocode_wanted = 0;
   greloca(&s, &sym, 0x10, 0, 0);
   greloc(&s, &sym, 0x14, 0);
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -1302,7 +1490,7 @@ UT_TEST(test_greloca_skips_under_nocode_wanted)
   greloca(&s, &sym, 0, 0, 0);
   nocode_wanted = 0x40000000;
   cur_text_section = NULL;
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -1326,7 +1514,7 @@ UT_TEST(test_put_extern_sym2_updates_existing_esym)
   UT_ASSERT_EQ(ut_symtab_data[1].st_shndx, 5);
 
   symtab_section = NULL;
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -1356,7 +1544,7 @@ UT_TEST(test_put_extern_sym2_name_variants)
   UT_ASSERT_EQ(s.c, 0);
   s1->leading_underscore = 0;
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   global_stack = NULL;
   return 0;
 }
@@ -1374,7 +1562,7 @@ UT_TEST(test_put_extern_sym2_debug_mode)
   put_extern_sym2(&s, SHN_UNDEF, 0, 4, 1);
   UT_ASSERT_EQ(s.c, 0);
   debug_modes = 0;
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   global_stack = NULL;
   return 0;
 }
@@ -1391,7 +1579,7 @@ UT_TEST(test_external_global_sym_asm_existing)
   UT_ASSERT_EQ(s->type.t, (VT_INT | VT_EXTERN));
   tcc_state = &ut_dummy_state;
   sym_pop(&global_stack, NULL, 0);
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -1403,7 +1591,7 @@ UT_TEST(test_greloca_null_symbol)
   tcc_state = &ut_dummy_state;
   nocode_wanted = 0;
   greloca(&s, NULL, 0x20, 0, 0);
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -1425,7 +1613,7 @@ UT_TEST(test_put_extern_sym_with_cur_text_section_nocode)
   UT_ASSERT_EQ(sym.c, 0);
   nocode_wanted = 0x40000000;
   cur_text_section = NULL;
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -1435,7 +1623,7 @@ UT_TEST(test_gen_negf)
   vtop->type.t = VT_FLOAT;
   tcc_state = &ut_dummy_state;
   gen_negf(TOK_NEG);
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -1984,7 +2172,7 @@ UT_TEST(test_vpush_ref)
   UT_ASSERT(vtop->sym != NULL);
   UT_ASSERT_EQ(vtop->r & VT_VALMASK, VT_CONST);
   UT_ASSERT(vtop->r & VT_SYM);
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   global_stack = NULL;
   return 0;
 }
@@ -2092,7 +2280,7 @@ UT_TEST(test_switch_can_use_jump_table)
   c3.v1 = c3.v2 = 100;
   UT_ASSERT(!switch_can_use_jump_table(&sw));
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -2461,7 +2649,7 @@ UT_TEST(test_is_const_for_folding)
   sv.type.t = VT_STRUCT;
   UT_ASSERT(!is_const_for_folding(&sv));
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -2595,7 +2783,7 @@ UT_TEST(test_find_nested_func_by_sym)
 
   ut_dummy_state.nested_funcs = NULL;
   ut_dummy_state.nb_nested_funcs = 0;
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -2700,7 +2888,7 @@ UT_TEST(test_gind)
   UT_ASSERT_EQ(t, 7);                          /* returns the current IR index */
   UT_ASSERT_EQ(nocode_wanted & CODE_OFF_BIT, 0); /* CODE_ON() cleared the bit */
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   nocode_wanted = 0x40000000;
   return 0;
 }
@@ -2723,7 +2911,7 @@ UT_TEST(test_gjmp_acs)
   UT_ASSERT_EQ(ut_last_ir_dest.r, VT_CONST);
   UT_ASSERT(nocode_wanted & CODE_OFF_BIT);      /* code suppressed after jump */
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   nocode_wanted = 0x40000000;
   return 0;
 }
@@ -2753,7 +2941,7 @@ UT_TEST(test_vset_VT_JMP)
   UT_ASSERT_EQ(vtop->r & VT_VALMASK, VT_JMP & VT_VALMASK);
   UT_ASSERT_EQ(vtop->c.i, 55);
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -3071,7 +3259,7 @@ UT_TEST(test_try_get_constant_string_function_and_bounds)
   ut_dummy_state.sections = NULL;
   ut_dummy_state.nb_sections = 0;
   symtab_section = NULL;
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -3160,7 +3348,7 @@ UT_TEST(test_gen_op_const_fold_int)
   gen_op('+');
   UT_ASSERT_EQ(vtop, _vstack + 1);
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -3259,7 +3447,7 @@ UT_TEST(test_gen_cast_const)
   UT_ASSERT_EQ(vtop->type.t & VT_BTYPE, VT_INT);
   UT_ASSERT_EQ((int)vtop->c.i, -3);
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -3304,7 +3492,7 @@ UT_TEST(test_gen_cast_more)
   UT_ASSERT_EQ(vtop->type.t & VT_BTYPE, VT_DOUBLE);
   UT_ASSERT(vtop->c.d == 1.5);
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -3355,7 +3543,7 @@ UT_TEST(test_gen_op_fp_compare)
   gen_op('+');
   UT_ASSERT(vtop->c.f == 4.0f);
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -3425,7 +3613,7 @@ UT_TEST(test_try_fold_math_call)
   args[0].r = VT_LOCAL;
   UT_ASSERT_EQ(try_fold_math_call("sqrt", args, 1), 0);
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -3486,7 +3674,7 @@ UT_TEST(test_condition_3way)
   vtop->r = VT_LOCAL;
   UT_ASSERT_EQ(condition_3way(), -1);
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -3618,7 +3806,7 @@ UT_TEST(test_force_charshort_cast)
   UT_ASSERT_EQ(vtop->type.t & VT_BTYPE, VT_SHORT);
   UT_ASSERT_EQ((int)(short)vtop->c.i, -1);
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -3729,7 +3917,7 @@ UT_TEST(test_svalue_get_conservative_max_u64)
   SymLocalFacts lf = {0};
   unsigned long long m;
 
-  tcc_state = NULL; /* keep the vreg-fact fallback inert */
+  tcc_state = &ut_null_state; /* keep the vreg-fact fallback inert */
 
   /* a plain non-negative int constant is its own max */
   memset(&sv, 0, sizeof(sv));
@@ -3791,7 +3979,7 @@ UT_TEST(test_svalue_get_conservative_string_bytes_u64)
   SymLocalFacts lf = {0};
   unsigned long long m;
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
 
   /* a local scalar with a recorded strlen fact reports (len) directly */
   reset_symbol_state();
@@ -4031,7 +4219,7 @@ UT_TEST(test_inline_body_shadowed_ident)
   ut_dummy_state.in_inline_expansion = 1;
   UT_ASSERT(!inline_body_has_unsafe_shadowed_ident(&ts, NULL));
   ut_dummy_state.in_inline_expansion = 0;
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
 
   ut_tok_a.sym_identifier = NULL;
   return 0;
@@ -4097,7 +4285,7 @@ UT_TEST(test_patch_storage)
   UT_ASSERT_EQ(sym.asm_label, TOK_IDENT + 2);
 
   symtab_section = NULL;
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   global_stack = NULL;
   return 0;
 }
@@ -4141,7 +4329,7 @@ UT_TEST(test_gen_test_zero)
   gen_test_zero(TOK_EQ);
   UT_ASSERT_EQ((int)vtop->c.i, 1); /* 0 == 0 -> true */
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -4291,7 +4479,7 @@ UT_TEST(test_alias_resolution)
 
   ut_tok_b.sym_identifier = NULL;
   symtab_section = NULL;
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   global_stack = NULL;
   return 0;
 }
@@ -4341,7 +4529,7 @@ UT_TEST(test_try_inline_builtin_call)
   UT_ASSERT_EQ((long long)vtop->c.i, 10);
   UT_ASSERT(vtop->type.t & VT_UNSIGNED);
 
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -4414,7 +4602,7 @@ UT_TEST(test_vla_restore_and_leave)
   UT_ASSERT_EQ((int)ut_last_ir_op, -1);
 
   cur_scope = NULL;
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -4528,7 +4716,7 @@ UT_TEST(test_nested_callee_has_genuine_capture)
 
   ut_dummy_state.nested_funcs = NULL;
   ut_dummy_state.nb_nested_funcs = 0;
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }
 
@@ -4569,6 +4757,6 @@ UT_TEST(test_nested_callee_captures_reachable)
 
   ut_dummy_state.nested_funcs = NULL;
   ut_dummy_state.nb_nested_funcs = 0;
-  tcc_state = NULL;
+  tcc_state = &ut_null_state;
   return 0;
 }

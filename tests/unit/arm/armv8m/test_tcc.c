@@ -140,6 +140,13 @@ int tcc_add_include_path(TCCState *s, const char *path)
   return 0;
 }
 
+int tcc_add_yasc_include_path(TCCState *s, const char *path)
+{
+  (void)s;
+  (void)path;
+  return 0;
+}
+
 int tcc_add_library_path(TCCState *s, const char *path)
 {
   (void)s;

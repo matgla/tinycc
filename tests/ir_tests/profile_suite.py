@@ -153,7 +153,7 @@ def ensure_profile_auto_pch(compiler: Path) -> None:
         probe_path = probe_dir / f"{header}.c"
         probe_path.write_text(f'#include <{header}>\nint main(void) {{ return 0; }}\n')
 
-        generate_cmd = [str(compiler), f"-B{REPO_ROOT}", *common_flags]
+        generate_cmd = [str(compiler), "-ccompat", f"-B{REPO_ROOT}", *common_flags]
         for include_dir in include_dirs:
             generate_cmd.extend(["-I", str(include_dir)])
         generate_cmd.extend(["-generate-pch", str(header_path), "-o", str(pch_path)])
@@ -166,7 +166,7 @@ def ensure_profile_auto_pch(compiler: Path) -> None:
         candidate_lines = [*filtered_index_lines, *generated_lines, f"{header_path}\t{pch_name}"]
         index_path.write_text("\n".join(candidate_lines) + "\n")
 
-        validate_cmd = [str(compiler), f"-B{REPO_ROOT}", *common_flags]
+        validate_cmd = [str(compiler), "-ccompat", f"-B{REPO_ROOT}", *common_flags]
         for include_dir in include_dirs:
             validate_cmd.extend(["-I", str(include_dir)])
         validate_cmd.extend(["-c", str(probe_path), "-o", str(probe_dir / f"{header}.o")])

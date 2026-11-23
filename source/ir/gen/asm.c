@@ -132,7 +132,7 @@ int tcc_ir_asm_goto_target(TCCIRState *ir, const IRQuadCompact *q, int label)
 void tcc_ir_asm_label_note(TCCIRState *ir, int sym, int jind)
 {
 #ifdef CONFIG_TCC_ASM
-  for (int a = 0; ir && sym > 0 && a < ir->inline_asm_count; a++) {
+  for (int a = 0; ir && ASM_LABEL_ID_VALID(sym) && a < ir->inline_asm_count; a++) {
     TCCIRInlineAsm *ia = &ir->inline_asms[a];
     for (int k = ia->nb_operands; k < ia->nb_operands + ia->nb_labels; k++)
       if (ia->operands[k].label_sym == sym)

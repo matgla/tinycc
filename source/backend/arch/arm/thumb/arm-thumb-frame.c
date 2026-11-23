@@ -239,6 +239,65 @@ ST_FUNC void tcc_gen_machine_outline_emit_raw(uint16_t hw)
   o(hw);
 }
 
+/* -fstack-protector (ir->ssp, set by the frontend: frontend/gen/op/ubsan.c).
+ * The canary is the word right below the pushed registers, above every local
+ * and spill slot (the SUB SP region grows by 8 for it, or takes the 4-byte
+ * alignment pad when there is one), so a buffer overrun reaches it before the
+ * saved registers and the return address.  The prologue copies
+ * __stack_chk_guard there; the epilogue compares it with the guard again and
+ * calls __stack_chk_fail (noreturn) on a mismatch.  Both run off SP at the
+ * bottom of the frame, before the body and after it has restored SP.  Off
+ * (ssp_canary_off < 0) nothing is emitted: the frame is the one without it. */
+static int ssp_canary_off = -1;
+
+static Sym *ssp_sym(const char *name, int func)
+{
+  CType ct;
+  ct.t = func ? VT_ASM_FUNC : VT_INT;
+  ct.ref = NULL;
+  return external_global_sym(tok_alloc_const(name), &ct);
+}
+
+/* REG <- __stack_chk_guard (its value) */
+static void ssp_load_guard(int reg)
+{
+  load_immediate(reg, 0, ssp_sym("__stack_chk_guard", 0), 0);
+  ot_check(th_ldr_imm(reg, reg, 0, 6, ENFORCE_ENCODING_NONE));
+}
+
+static void ssp_prologue(void)
+{
+  /* the incoming arguments, the GOT base and the static chain are live */
+  const uint32_t live = 0xfu | (1u << ARM_R9) | (1u << architecture_config.static_chain_reg) | (1u << R_IP);
+  ssp_load_guard(R_IP);
+  tcc_gen_machine_store_to_sp_ex(R_IP, ssp_canary_off, live);
+}
+
+/* SP is the bottom of the frame; r3 and IP are free (the return value is in
+ * r0/r1 or a VFP register). */
+static void ssp_epilogue(void)
+{
+  ssp_load_guard(R_IP);
+  if (ssp_canary_off < 4096)
+    ot_check(th_ldr_imm(R3, R_SP, ssp_canary_off, 6, ENFORCE_ENCODING_NONE));
+  else
+  {
+    load_immediate(R3, ssp_canary_off, NULL, 0);
+    ot_check(th_ldr_reg(R3, R_SP, R3, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+  }
+  /* no literal pool between the branch and the call it skips */
+  th_literal_pool_reserve_upcoming_bytes(8);
+  ot_check(th_cmp_reg(0, R3, R_IP, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+  ot_check(th_b_t1(0 /* EQ */, 1)); /* over the 4-byte BL */
+  MachineOperand target = {0};
+  target.kind = MACH_OP_SYMBOL;
+  target.u.sym.sym = ssp_sym("__stack_chk_fail", 1);
+  const int saved_tail = tail_call_pending;
+  tail_call_pending = 0;
+  gcall_or_jump_mop(0, target);
+  tail_call_pending = saved_tail;
+}
+
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_size, uint32_t extra_prologue_regs)
 {
   thumb_gen_state.function_argument_count = 0;
@@ -337,9 +396,10 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
    * register (R3) — avoids SUB SP + ADD SP, saving 2 insns.  When locals
    * exist, absorb the gap into SUB SP instead, keeping PUSH in 16-bit
    * encoding (no high regs like R12). */
+  const int ssp = ir && ir->ssp && !ir->naked;
   if (registers_count % 2 != 0)
   {
-    if (stack_size == 0)
+    if (stack_size == 0 && !ssp)
     {
       registers_to_push |= (1 << R3);
       registers_count++;
@@ -389,12 +449,18 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   /* total_stack_dealloc is the full amount to restore in the epilogue,
    * including the alignment pad that sits below addressable locals. */
   int total_stack_dealloc = stack_size + push_align_pad;
+  /* -fstack-protector: the canary takes the pad, or 8 more bytes */
+  if (ssp && !push_align_pad)
+    total_stack_dealloc += 8;
+  ssp_canary_off = ssp ? total_stack_dealloc - 4 : -1;
   epilogue_stack_dealloc = total_stack_dealloc;
   stack_size = total_stack_dealloc;
   if (stack_size > 0)
   {
     gadd_sp(-stack_size);
   }
+  if (ssp)
+    ssp_prologue();
 
   /* The frame pointer is the SP left here, the bottom of the frame: locals
    * and incoming parameters sit at the same positive offsets from it as from
@@ -416,6 +482,8 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
    * the top of the SUB SP region, right below the pushed registers, so
    * locals occupy base+0 .. base+allocated_stack_size-1. */
   offset_to_args += epilogue_stack_dealloc;
+  /* -fstack-usage and the frame warnings: the drop below the caller's SP. */
+  th_stack_prolog_done(vararg_push_size + registers_count * 4 + epilogue_stack_dealloc);
 
   /* Everything from here to the parameter shuffle below runs before a single
    * incoming value has been moved to its allocated home, so these registers
@@ -915,6 +983,8 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
     ot_check_mov_reg(R_SP, R_FP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
     tcc_debug_cfi_frame_pointer(tcc_state, R_SP);
   }
+  if (ssp_canary_off >= 0)
+    ssp_epilogue();
   if (epilogue_stack_dealloc > 0)
     gadd_sp_ex(epilogue_stack_dealloc, R3);
   if (vararg_push_size > 0 && lr_saved)
@@ -949,6 +1019,7 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
   }
 
   thumb_gen_state.generating_function = 0;
+  ssp_canary_off = -1;
   /* The anchor register holds this function's .rodata base and the epilogue
    * has just restored the caller's value in it. */
   rodata_anchor_reg = -1;
@@ -959,6 +1030,7 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
 ST_FUNC void tcc_gen_machine_finish_noreturn(void)
 {
   thumb_gen_state.generating_function = 0;
+  ssp_canary_off = -1;
   rodata_anchor_reg = -1;
   th_literal_pool_generate();
   thumb_free_call_sites();
@@ -1245,6 +1317,7 @@ void gcall_or_jump_mop(int is_jmp, MachineOperand target)
   const uint32_t arg_regs = (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3);
   MachineCodegenContext mctx = {0};
 
+  tcc_gen_machine_stack_indirect(is_jmp);
   if (is_jmp)
   {
     int r = mach_ensure_in_reg(&mctx, &adjusted, arg_regs);

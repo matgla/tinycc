@@ -440,6 +440,13 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
         src.is_lval = 1;
         src.btype = IROP_BTYPE_INT32; /* pointers are 32-bit on ARMv8-M */
       }
+      else if (op->is_memory)
+      {
+        /* `[rN]` moved off a clobbered rN: the address itself */
+        src = asm_operand_irop(op->vt);
+        src.is_lval = 0;
+        src.btype = IROP_BTYPE_INT32;
+      }
       else if (i >= nb_outputs || op->is_rw)
       { // not write-only
         src = asm_operand_irop(op->vt);
@@ -572,13 +579,28 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
             tcc_gen_mach_store_from_reg(op->reg, &store_mop);
           }
         }
+        else if (op->is_memory)
+        {
+          /* the asm wrote the memory itself, through op->reg */
+        }
         else
         {
           IROperand ir_op = asm_operand_irop(op->vt);
           MachineOperand mop = machine_op_from_ir(tcc_state->ir, &ir_op);
-          tcc_gen_mach_store_from_reg(op->reg, &mop);
           if (op->is_llong)
             tcc_error("long long not implemented");
+          if (mop.kind == MACH_OP_REG && !mop.needs_deref && mop.u.reg.r1 < 0 && mop.u.reg.r0 >= 0 &&
+              mop.u.reg.r0 < 16 && (saved_regset & (1u << mop.u.reg.r0)))
+          {
+            /* The home is a register the asm saved: the restore below would
+               throw the value away, so it goes into the save slot, which
+               the restore then loads.  STR.W op->reg, [sp, #slot] */
+            const int slot = 4 * __builtin_popcount(saved_regset & ((1u << mop.u.reg.r0) - 1));
+            gen_le16(0xf8cd);
+            gen_le16((uint16_t)((op->reg << 12) | slot));
+          }
+          else
+            tcc_gen_mach_store_from_reg(op->reg, &mop);
         }
       }
     }
@@ -873,6 +895,19 @@ instruction
          later */
       if (j < nb_outputs || c == 'm')
       {
+        /* `[rN]` where the asm clobbers rN: the body would overwrite the
+           address before using it.  The address goes to a free register,
+           loaded with the inputs, like a pointer held in memory below. */
+        const int base = op->vt->r & VT_VALMASK;
+        if ((op->vt->r & VT_LVAL) && base < NB_ASM_REGS && clobber_regs[base])
+        {
+          for (reg = 0; reg <= 8; reg++)
+          {
+            if (!(regs_allocated[reg] & REG_IN_MASK))
+              goto reg_found1;
+          }
+          tcc_error("asm memory operand %d: no register for its address outside the clobbers", j);
+        }
         if ((op->vt->r & VT_VALMASK) == VT_LLOCAL)
         {
           /* any general register */

@@ -559,21 +559,344 @@ void struct_layout(CType *type, AttributeDef *ad)
 }
 
 /* enum/struct/union declaration. u is VT_ENUM/VT_STRUCT/VT_UNION */
+/* yasc borrows(...) on members: what the table says of each such member */
+static YascFieldBorrows *field_borrows;
+static int nb_field_borrows;
+
+ST_FUNC YascFieldBorrows *yasc_field_borrows(int i)
+{
+  return i >= 0 && i < nb_field_borrows ? &field_borrows[i] : NULL;
+}
+
+/* borrowing structs: the tag and its borrows(...) names */
+static struct
+{
+  Sym *s;
+  int nb, names[4];
+} *struct_params;
+static int nb_struct_params;
+/* the struct, union and enum bodies being parsed (error recovery: a ';' in
+   one ends a member, not the declaration) */
+int struct_body_depth;
+int yasc_sbind_pending, yasc_sbind_static, yasc_sbind_nb, yasc_sbind_names[4];
+Sym yasc_static_bound;
+
+ST_FUNC int yasc_struct_params(Sym *s)
+{
+  for (int i = 0; i < nb_struct_params; i++)
+    if (struct_params[i].s == s)
+      return struct_params[i].nb;
+  return 0;
+}
+
+ST_FUNC int yasc_struct_param(Sym *s, int tok)
+{
+  for (int i = 0; i < nb_struct_params; i++)
+    if (struct_params[i].s == s)
+      for (int k = 0; k < struct_params[i].nb; k++)
+        if (struct_params[i].names[k] == tok)
+          return k;
+  return -1;
+}
+
+ST_FUNC int yasc_borrowing_struct(CType *type)
+{
+  return (type->t & (VT_BTYPE | VT_ARRAY)) == VT_STRUCT && type->ref && yasc_struct_params(type->ref) > 0;
+}
+
+/* functions (by name: a parked prototype's type Sym is made again when it
+   is named) whose result is a borrowing struct: what it borrows */
+static struct
+{
+  int name, code;
+} *result_binds;
+static int nb_result_binds;
+
+ST_FUNC void yasc_struct_result_bind(int name, int code)
+{
+  for (int i = 0; i < nb_result_binds; i++)
+    if (result_binds[i].name == name)
+    {
+      result_binds[i].code = code;
+      return;
+    }
+  result_binds = tcc_realloc(result_binds, (nb_result_binds + 1) * sizeof *result_binds);
+  result_binds[nb_result_binds].name = name;
+  result_binds[nb_result_binds++].code = code;
+}
+
+ST_FUNC int yasc_struct_result_code(int name)
+{
+  for (int i = 0; i < nb_result_binds; i++)
+    if (result_binds[i].name == name)
+      return result_binds[i].code;
+  return -1;
+}
+
+typedef struct PendingFieldBorrows
+{
+  Sym *member;
+  int nb, st;
+  int names[28];
+} PendingFieldBorrows;
+
+/* the members of struct REF that borrow from other members: their names
+   resolved to offsets, the member's pointer node pointing at its entry */
+static void yasc_resolve_field_borrows(Sym *ref, PendingFieldBorrows *fb, int nfb)
+{
+  for (int i = 0; i < nfb; i++)
+  {
+    Sym *m = fb[i].member, *f;
+    YascFieldBorrows e;
+    memset(&e, 0, sizeof e);
+    e.self_tok = m->v & ~SYM_FIELD;
+    e.self_off = m->c;
+    e.is_static = fb[i].st != 0;
+    for (int k = 0; k < fb[i].nb; k++)
+    {
+      int name = fb[i].names[k];
+      for (f = sym_first(ref); f && (f->v & ~SYM_FIELD) != name; f = f->next)
+        ;
+      /* one of the struct's own borrows(...) names: a view of what the
+         value borrows, not of a member */
+      if (!f && yasc_struct_param(ref, name) >= 0)
+        continue;
+      if (!f)
+        tcc_error("borrows(%s): no member is called '%s'", get_tok_str(name, NULL), get_tok_str(name, NULL));
+      if (f == m)
+        tcc_error("borrows(%s): a member cannot borrow from itself", get_tok_str(name, NULL));
+      if ((f->type.t & (VT_BTYPE | VT_ARRAY)) != VT_PTR && !(f->type.t & VT_ARRAY))
+        tcc_error("borrows(%s): '%s' is neither a pointer nor an array", get_tok_str(name, NULL),
+                  get_tok_str(name, NULL));
+      if (e.nsrc == YASC_FIELD_SRC_MAX)
+        tcc_error("borrows(...) on a member names at most %d members", YASC_FIELD_SRC_MAX);
+      e.src_tok[e.nsrc] = name;
+      {
+        int al;
+        e.src_size[e.nsrc] = type_size(&f->type, &al);
+      }
+      /* an array member is the memory itself; a pointer member's target is
+         what was loaded from it */
+      e.src_off[e.nsrc++] = (f->type.t & VT_ARRAY) ? ~f->c : f->c;
+    }
+    if (!e.nsrc && !e.is_static)
+      continue; /* only the struct's own names: a plain view member */
+    field_borrows = tcc_realloc(field_borrows, (nb_field_borrows + 1) * sizeof *field_borrows);
+    field_borrows[nb_field_borrows] = e;
+    m->type.ref = sym_pointer_node_b(&m->type.ref->type, m->type.ref->yasc, -2 - nb_field_borrows);
+    nb_field_borrows++;
+  }
+}
+
+/* A struct or union body being parsed: what its members add to. */
+typedef struct StructBody
+{
+  Sym *s, **ps;
+  AttributeDef *ad;
+  PendingFieldBorrows *fb;
+  int u, c, nfb, with_methods;
+  int flexible; /* the flexible array member's name: no member after it */
+} StructBody;
+
+/* One member declaration of a struct or union body (error recovery goes on
+   with the next one: core/recover.c struct_body_recovering). */
+static void struct_member(void *arg)
+{
+  StructBody *sb = arg;
+  int v, size, align, bit_size, bsize, bt;
+  Sym *ss;
+  AttributeDef ad1;
+  CType type1, btype;
+
+  /* yasc: a function member is a method (decl/method.c) */
+  if (sb->with_methods && yasc_method_member(sb->s))
+    return;
+  if (!parse_btype(&btype, &ad1, 0))
+  {
+    if (tok_is_static_assert())
+    {
+      do_Static_assert();
+      return;
+    }
+    skip(';');
+    return;
+  }
+  btype_no_auto(&ad1);
+  /* `deprecated` in the specifiers is every declarator's, after a
+     declarator only its own */
+  const unsigned char dep_spec = ad1.attr_deprecated;
+  const int dep_spec_msg = ad1.attr_deprecated_msg;
+  while (1)
+  {
+    ad1.attr_deprecated = dep_spec;
+    ad1.attr_deprecated_msg = dep_spec_msg;
+    if (sb->flexible)
+      tcc_error("flexible array member '%s' not at the end of struct", get_tok_str(sb->flexible, NULL));
+    bit_size = -1;
+    v = 0;
+    type1 = btype;
+    if (tok != ':')
+    {
+      if (tok != ';')
+      {
+        int saved_ok = yasc_borrows_field_ok;
+        yasc_borrows_field_ok = 1;
+        yasc_field_bnb = 0;
+        type_decl(&type1, &ad1, &v, TYPE_DIRECT);
+        yasc_borrows_field_ok = saved_ok;
+      }
+      if (v == 0)
+      {
+        if ((type1.t & VT_BTYPE) != VT_STRUCT)
+          expect("identifier");
+        else
+        {
+          int v = btype.ref->v;
+          if (!(v & SYM_FIELD) && (v & ~SYM_STRUCT) < SYM_FIRST_ANOM)
+          {
+            if (tcc_state->ms_extensions == 0)
+              expect("identifier");
+          }
+        }
+      }
+      if (type_size(&type1, &align) < 0)
+      {
+        if ((sb->u == VT_STRUCT) && (type1.t & VT_ARRAY) && sb->c)
+          sb->flexible = v ? v : 1;
+        else
+          tcc_error("field '%s' has incomplete type", get_tok_str(v, NULL));
+      }
+      if ((type1.t & VT_BTYPE) == VT_FUNC || (type1.t & VT_BTYPE) == VT_VOID || (type1.t & VT_STORAGE))
+        tcc_error("invalid type for '%s'", get_tok_str(v, NULL));
+    }
+    if (tok == ':')
+    {
+      next();
+      bit_size = expr_const();
+      /* XXX: handle v = 0 case for messages */
+      if (bit_size < 0)
+        tcc_error("negative width in bit-field '%s'", get_tok_str(v, NULL));
+      if (v && bit_size == 0)
+        tcc_error("zero width for bit-field '%s'", get_tok_str(v, NULL));
+      parse_attribute(&ad1);
+    }
+    size = type_size(&type1, &align);
+    if (bit_size >= 0)
+    {
+      bt = type1.t & VT_BTYPE;
+      if (bt != VT_INT && bt != VT_BYTE && bt != VT_SHORT && bt != VT_BOOL && bt != VT_LLONG)
+        tcc_error("bitfields must have scalar type");
+      bsize = size * 8;
+      if (bit_size > bsize)
+      {
+        tcc_error("width of '%s' exceeds its type", get_tok_str(v, NULL));
+      }
+      else if (bit_size == bsize && !sb->ad->a.packed && !ad1.a.packed)
+      {
+        /* no need for bit fields */
+        ;
+      }
+      else if (bit_size == 64)
+      {
+        tcc_error("field width 64 not implemented");
+      }
+      else
+      {
+        type1.t = (type1.t & ~VT_STRUCT_MASK) | VT_BITFIELD | ((unsigned)bit_size << (VT_STRUCT_SHIFT + 6));
+      }
+    }
+    if (v != 0 || (type1.t & VT_BTYPE) == VT_STRUCT)
+    {
+      /* Remember we've seen a real field to check
+         for placement of flexible array member. */
+      sb->c = 1;
+    }
+    /* If member is a struct or bit-field, enforce
+       placing into the struct (as anonymous).  */
+    if (v == 0 && ((type1.t & VT_BTYPE) == VT_STRUCT || bit_size >= 0))
+    {
+      v = anon_sym++;
+    }
+    if (v)
+    {
+      ss = sym_push(v | SYM_FIELD, &type1, 0, 0);
+      ss->a = ad1.a;
+      if (ad1.attr_deprecated) /* -Wdeprecated-declarations at each use */
+        attr_apply_decl_facts(ss, &ad1);
+      *sb->ps = ss;
+      sb->ps = &ss->next;
+      if (yasc_field_bnb > 0)
+      {
+        /* resolved after the layout: the names may come later */
+        sb->fb = tcc_realloc(sb->fb, (sb->nfb + 1) * sizeof *sb->fb);
+        sb->fb[sb->nfb].member = ss;
+        sb->fb[sb->nfb].nb = yasc_field_bnb;
+        sb->fb[sb->nfb].st = yasc_field_bstatic;
+        memcpy(sb->fb[sb->nfb].names, yasc_field_bnames, yasc_field_bnb * sizeof(int));
+        sb->nfb++;
+        yasc_field_bnb = 0;
+      }
+    }
+    if (tok == ';' || tok == '}' || tok == TOK_EOF)
+      break;
+    skip(',');
+  }
+  if (tok == ';')
+    next();
+  else if (tok != '}')
+    skip(';');
+}
+
 void struct_decl(CType *type, int u)
 {
-  int v, c, size, align, flexible;
-  int bit_size, bsize, bt, ut;
+  int v, bt, ut;
   Sym *s, *ss, **ps;
   AttributeDef ad, ad1;
   CType type1, btype;
+  PendingFieldBorrows *fb = NULL;
+  int nfb = 0;
 
   memset(&ad, 0, sizeof ad);
   next();
-  parse_attribute(&ad);
+  parse_decl_attributes(&ad);
+  const int tag_line = file ? file->line_num : 0; /* "declared here" for a deprecated tag */
 
   v = 0;
   if (tok >= TOK_IDENT) /* struct/enum tag */
     v = tok, next();
+  /* yasc `struct T borrows(text) { ... }` (the names it borrows from) or,
+     where the type is used, `struct T borrows(src)` (what this one does) */
+  int bnames[4], bnb = 0, bstatic = 0, bwritten = 0;
+  if (tcc_state->yasc && u != VT_ENUM && tok == TOK_borrows)
+  {
+    bwritten = 1;
+    next();
+    skip('(');
+    for (;;)
+    {
+      if (tok == TOK_STATIC)
+        bstatic = 1;
+      else if (tok >= TOK_UIDENT && bnb < 4)
+        bnames[bnb++] = tok;
+      else
+        expect("a name or 'static'");
+      next();
+      if (tok != ',')
+        break;
+      next();
+    }
+    skip(')');
+    if (tok != '{')
+    {
+      yasc_sbind_pending = 1;
+      yasc_sbind_static = bstatic;
+      yasc_sbind_nb = bnb;
+      memcpy(yasc_sbind_names, bnames, bnb * sizeof(int));
+      bwritten = 0;
+    }
+    else if (bstatic || !bnb)
+      tcc_error("a struct borrows from names it is given: borrows(text)");
+  }
 
   bt = ut = 0;
   if (u == VT_ENUM)
@@ -616,14 +939,33 @@ void struct_decl(CType *type, int u)
 do_decl:
   type->t = s->type.t;
   type->ref = s;
+  if (s->a.attr_facts && tok != '{' && tok != ';')
+    attr_deprecated_use(s); /* `struct S` names a deprecated tag */
   merge_symattr(&s->a, &ad.a);
+  if (bwritten && tok == '{')
+  {
+    struct_params = tcc_realloc(struct_params, (nb_struct_params + 1) * sizeof *struct_params);
+    struct_params[nb_struct_params].s = s;
+    struct_params[nb_struct_params].nb = bnb;
+    memcpy(struct_params[nb_struct_params].names, bnames, bnb * sizeof(int));
+    nb_struct_params++;
+  }
 
   if (tok == '{')
   {
+    if ((tcc_state->warn_cross_tu & WARN_ON) && !local_stack && u != VT_ENUM)
+      tcc_typesig_note(s->v, tag_line, 1); /* -Wcross-tu: where its layout is */
     next();
+    struct_body_depth++;
     if (s->c != -1 && !(u == VT_ENUM && s->c == 0)) /* not yet defined typed enum */
       tcc_error("struct/union/enum already defined");
     s->c = -2;
+    if (tcc_state->yasc_module && yasc_in_main_file())
+    {
+      s->ymod |= YASC_MODULE_OWN;
+      if (yasc_exporting)
+        yasc_export_tag(s);
+    }
     /* cannot be empty */
     /* non empty enums are not allowed */
     ps = &s->next;
@@ -646,12 +988,22 @@ do_decl:
         if (ss && !local_stack)
           tcc_error("redefinition of enumerator '%s'", get_tok_str(v, NULL));
         next();
+        /* `A __attribute__((deprecated)) = 1`, `A [[deprecated]]` */
+        AttributeDef ead;
+        int ead_set = tok == TOK_ATTRIBUTE1 || tok == TOK_ATTRIBUTE2 || tok == '[';
+        if (ead_set)
+        {
+          memset(&ead, 0, sizeof ead);
+          parse_decl_attributes(&ead);
+        }
         if (tok == '=')
         {
           next();
           ll = expr_const64();
         }
         ss = sym_push(v, &t, VT_CONST, 0);
+        if (ead_set)
+          attr_apply_decl_facts(ss, &ead);
         sym_set_enum_val(ss, ll);
         *ps = ss, ps = &ss->next;
         if (ll < nl)
@@ -666,6 +1018,7 @@ do_decl:
         if (tok == '}')
           break;
       }
+      struct_body_depth--;
       skip('}');
 
       if (bt)
@@ -706,119 +1059,25 @@ do_decl:
     }
     else
     {
-      c = 0;
-      flexible = 0;
-      while (tok != '}')
-      {
-        if (!parse_btype(&btype, &ad1, 0))
-        {
-          if (tok_is_static_assert())
-          {
-            do_Static_assert();
-            continue;
-          }
-          skip(';');
-          continue;
-        }
-        while (1)
-        {
-          if (flexible)
-            tcc_error("flexible array member '%s' not at the end of struct", get_tok_str(v, NULL));
-          bit_size = -1;
-          v = 0;
-          type1 = btype;
-          if (tok != ':')
-          {
-            if (tok != ';')
-              type_decl(&type1, &ad1, &v, TYPE_DIRECT);
-            if (v == 0)
-            {
-              if ((type1.t & VT_BTYPE) != VT_STRUCT)
-                expect("identifier");
-              else
-              {
-                int v = btype.ref->v;
-                if (!(v & SYM_FIELD) && (v & ~SYM_STRUCT) < SYM_FIRST_ANOM)
-                {
-                  if (tcc_state->ms_extensions == 0)
-                    expect("identifier");
-                }
-              }
-            }
-            if (type_size(&type1, &align) < 0)
-            {
-              if ((u == VT_STRUCT) && (type1.t & VT_ARRAY) && c)
-                flexible = 1;
-              else
-                tcc_error("field '%s' has incomplete type", get_tok_str(v, NULL));
-            }
-            if ((type1.t & VT_BTYPE) == VT_FUNC || (type1.t & VT_BTYPE) == VT_VOID || (type1.t & VT_STORAGE))
-              tcc_error("invalid type for '%s'", get_tok_str(v, NULL));
-          }
-          if (tok == ':')
-          {
-            next();
-            bit_size = expr_const();
-            /* XXX: handle v = 0 case for messages */
-            if (bit_size < 0)
-              tcc_error("negative width in bit-field '%s'", get_tok_str(v, NULL));
-            if (v && bit_size == 0)
-              tcc_error("zero width for bit-field '%s'", get_tok_str(v, NULL));
-            parse_attribute(&ad1);
-          }
-          size = type_size(&type1, &align);
-          if (bit_size >= 0)
-          {
-            bt = type1.t & VT_BTYPE;
-            if (bt != VT_INT && bt != VT_BYTE && bt != VT_SHORT && bt != VT_BOOL && bt != VT_LLONG)
-              tcc_error("bitfields must have scalar type");
-            bsize = size * 8;
-            if (bit_size > bsize)
-            {
-              tcc_error("width of '%s' exceeds its type", get_tok_str(v, NULL));
-            }
-            else if (bit_size == bsize && !ad.a.packed && !ad1.a.packed)
-            {
-              /* no need for bit fields */
-              ;
-            }
-            else if (bit_size == 64)
-            {
-              tcc_error("field width 64 not implemented");
-            }
-            else
-            {
-              type1.t = (type1.t & ~VT_STRUCT_MASK) | VT_BITFIELD | ((unsigned)bit_size << (VT_STRUCT_SHIFT + 6));
-            }
-          }
-          if (v != 0 || (type1.t & VT_BTYPE) == VT_STRUCT)
-          {
-            /* Remember we've seen a real field to check
-               for placement of flexible array member. */
-            c = 1;
-          }
-          /* If member is a struct or bit-field, enforce
-             placing into the struct (as anonymous).  */
-          if (v == 0 && ((type1.t & VT_BTYPE) == VT_STRUCT || bit_size >= 0))
-          {
-            v = anon_sym++;
-          }
-          if (v)
-          {
-            ss = sym_push(v | SYM_FIELD, &type1, 0, 0);
-            ss->a = ad1.a;
-            *ps = ss;
-            ps = &ss->next;
-          }
-          if (tok == ';' || tok == '}' || tok == TOK_EOF)
-            break;
-          skip(',');
-        }
-        if (tok == ';')
-          next();
-        else if (tok != '}')
-          skip(';');
-      }
+      const int with_methods = tcc_state->yasc;
+      if (with_methods)
+        yasc_struct_body_begin();
+      StructBody sb;
+      sb.s = s;
+      sb.ps = ps;
+      sb.ad = &ad;
+      sb.fb = NULL;
+      sb.u = u;
+      sb.c = 0;
+      sb.flexible = 0;
+      sb.nfb = 0;
+      sb.with_methods = with_methods;
+      struct_body_recovering(struct_member, &sb);
+      fb = sb.fb;
+      nfb = sb.nfb;
+      if (with_methods)
+        yasc_struct_body_end();
+      struct_body_depth--;
       skip('}');
       parse_attribute(&ad);
       if (ad.cleanup_func)
@@ -829,10 +1088,20 @@ do_decl:
       check_fields(type, 0);
       merge_symattr(&type->ref->a, &ad.a);
       struct_layout(type, &ad);
+      if (nfb)
+        yasc_resolve_field_borrows(type->ref, fb, nfb);
+      tcc_free(fb);
+      fb = NULL;
+      nfb = 0;
+      yasc_methods_struct_done(s);
+      if (s->ymod & YASC_EXPORT)
+        yasc_check_export_members(s);
       if (debug_modes)
         tcc_debug_fix_anon(tcc_state, type);
       else
         sym_params_track(s, members_after); /* a file-scope struct's members spill like parameters */
     }
   }
+  /* deprecated on the tag: after its body, which may name it */
+  attr_apply_decl_facts_at(s, &ad, tag_line);
 }

@@ -208,9 +208,15 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   nb_pending_aliases = 0;
   gfunc_regpair_reset(s1);
   s1->tu_parsed = 0; /* a previous TU's */
+  tcc_free(s1->yasc_module);
+  s1->yasc_module = NULL;
+  s1->yasc_main_decl_seen = 0;
+  yasc_module_reset();
+  yasc_methods_reset();
   s1->tu_first_sym = symtab_section ? symtab_section->data_offset / sizeof(ElfW(Sym)) : 1;
   nocode_wanted = DATA_ONLY_WANTED; /* no code outside of functions */
   discarded_call_vtop = NULL;
+  attr_checks_reset(); /* -Wformat, -Wunused-result, -Wdeprecated-declarations */
   /* an error may have left them set mid-'&' */
   unary_addr_operand = 0;
   indir_keep_lvalue = 0;
@@ -241,9 +247,13 @@ ST_FUNC int tccgen_compile(TCCState *s1)
 #ifdef INC_DEBUG
   printf("%s: **** new file\n", file->filename);
 #endif
+  unused_unit_begin(s1);
   parse_flags = PARSE_FLAG_PREPROCESS | PARSE_FLAG_TOK_NUM | PARSE_FLAG_TOK_STR;
   next();
-  decl(VT_CONST);
+  tccgen_decls_recovering(s1); /* decl(VT_CONST), going on after errors */
+  /* yasc modules: check the exports again and write the interface */
+  if (s1->yasc_module)
+    yasc_module_finish(s1);
   /* Drop the statics nothing live refers to, and define the objects whose
    * initializers were saved (-fdrop-unused-statics). */
   prune_unused_statics(s1);
@@ -263,7 +273,10 @@ ST_FUNC int tccgen_compile(TCCState *s1)
    * static globals with no reachable readers.  Must run before
    * gen_late_reopt_functions so newly-flagged writer functions get picked
    * up by the existing late_reopt loop. */
-  if (TCC_OPT(s1, opt_dead_store))
+  /* After an error the unit is only checked (recover.c): what follows only
+   * recompiles bodies to optimize them, which would check them twice. */
+  const int recompile = !s1->recover_flipped;
+  if (TCC_OPT(s1, opt_dead_store) && recompile)
     tcc_ir_tu_analyze_dead_statics();
   /* Propagate noreturn from callees to callers: for any function whose
    * tokens were preserved by the gen_function noreturn-trigger AND whose
@@ -273,9 +286,10 @@ ST_FUNC int tccgen_compile(TCCState *s1)
    * Static inline callees are emitted by gen_inline_functions(), after the
    * first end-of-TU propagation point.  Speculatively kept callers are
    * therefore cleaned up after a second propagation/reopt pass below. */
-  if (TCC_OPT(s1, opt_dce) && TCC_OPT(s1, optimize) >= 2)
+  if (TCC_OPT(s1, opt_dce) && TCC_OPT(s1, optimize) >= 2 && recompile)
     tcc_ir_tu_propagate_noreturn_to_callers();
-  gen_late_reopt_functions(s1);
+  if (recompile)
+    gen_late_reopt_functions(s1);
   /* tu_static_writer functions were kept in inline_fns (gen_function's auto-
    * inline path) so the end-of-TU dead-static analysis could re-compile them
    * via late_reopt to drop dead static stores.  Those whose static turned out
@@ -306,7 +320,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
     ifn->sym = NULL;
   }
   gen_inline_functions(s1);
-  if (TCC_OPT(s1, opt_dce) && TCC_OPT(s1, optimize) >= 2)
+  if (TCC_OPT(s1, opt_dce) && TCC_OPT(s1, optimize) >= 2 && !s1->recover_flipped)
   {
     tcc_ir_tu_propagate_noreturn_to_callers();
     gen_late_reopt_functions(s1);
@@ -332,12 +346,24 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   }
   /* The statics dropped as unused are still checked for errors. */
   check_dropped_statics(s1);
+  /* and the inlined ones never generated on their own, by the flow checks */
+  check_uncompiled_inline_functions(s1);
+  /* -Wtainted-format: the summaries across the unit's functions, the reports */
+  tcc_ir_taint_unit_end();
+  /* a plain pointer parameter whose body was never parsed (decl/plain_param.c) */
+  yasc_pp_finish();
+  /* -Wunused-*: the file-scope statics nothing named */
+  unused_unit_end(s1);
   /* The AAPCS entries of the r0/r1 functions whose address is taken. */
   regpair_adapt_pending_aliases();
   gfunc_regpair_emit_adapters(s1);
   /* What the optimizer left unreferenced goes too. */
   gc_unreferenced_statics(s1);
   resolve_pending_aliases();
+  yasc_errors_emit(s1); /* the error names this file used */
+  /* -Wcross-tu: the global symbols' types, for the link */
+  if (s1->warn_cross_tu & WARN_ON)
+    tcc_typesig_unit(s1, s1->current_filename ? s1->current_filename : file ? file->filename : "");
   check_vstack();
   /* end of translation unit info */
 #if TCC_EH_FRAME
@@ -367,6 +393,19 @@ ST_FUNC void tccgen_finish(TCCState *s1)
      would have freed. */
   inline_release_hidden_label_bindings();
   free_deferred_functions(s1);
+  /* a body save an error cut (decl.c save_body_cut): its entry and message;
+     the tokens went with the macro stack */
+  if (s1->save_body_deferred)
+  {
+    tcc_free(s1->save_body_deferred->pack);
+    tcc_free(s1->save_body_deferred);
+    s1->save_body_deferred = NULL;
+  }
+  tcc_free(s1->save_body_msg);
+  s1->save_body_msg = NULL;
+  vla_param_exprs_free(s1); /* a declarator's, its function never parsed */
+  unused_unit_free(s1);
+  tcc_ir_taint_unit_free();
   free_dropped_statics(s1);
   gfunc_regpair_reset(s1);
   free_tentative_definitions(s1);
@@ -374,6 +413,7 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   tcc_gen_machine_outline_reset();
 
   str_lit_pool_free();
+  attr_checks_reset();
   gen_op_vector_reset(); /* frees the last function's vector recipes */
 
   /* Release per-TU function write summaries (Sym* keys are about to become
@@ -443,6 +483,11 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   nested_names_reset(); /* an error may leave a nested function's name bound */
   sym_params_spill_close(); /* the parameter lists still in memory, while their types live */
   funcname_copies_free(); /* an error out of a body skips its gen_function end */
+  yasc_errors_reset();
+  /* an error out of a scope leaves its defer bodies */
+  for (Sym *cls = all_cleanups; cls; cls = cls->prev)
+    if (cls->type.t && cls->defer_str)
+      tok_str_free(cls->defer_str), cls->defer_str = NULL;
   sym_pop(&global_stack, NULL, 0);
   sym_pop(&local_stack, NULL, 0);
   sym_parked_free_all();
@@ -468,6 +513,7 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   dynarray_reset(&sym_pools, &nb_sym_pools);
   sym_heads_free();
   sym_facts_free_all();
+  shadow_free();
   cstr_free(&initstr);
   dynarray_reset(&stk_data, &nb_stk_data);
   while (cur_switch)

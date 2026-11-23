@@ -1070,6 +1070,12 @@ int g_debug_current_op = -1;
  * machinery is exercised, so this minimal fake stack (one push depth is all
  * either function ever needs) is sufficient. See codegen_mop_stubs.h for the
  * cgstub_vtop_push()/cgstub_vtop_get() test-facing API. */
+/* -Wconversion's note that a materialized comparison is 0 or 1
+ * (frontend/gen/op/op.c, not linked here) */
+void fe_narrow_note_bool(void)
+{
+}
+
 SValue _vstack[VSTACK_SIZE];
 SValue *vtop = _vstack; /* empty: vtop == _vstack, matching codegen.c's
                           * `vtop < _vstack + 1` empty-stack guard */

@@ -346,6 +346,7 @@ void gen_late_reopt_functions(TCCState *s)
       compile_ts->allocated_len = body_len;
       compile_ts->len = body_len;
     }
+    tok_str_sys_copy(fn->func_str, compile_ts);
 
     int saved_outer_tok = tok;
     CValue saved_outer_tokc = tokc;
@@ -354,7 +355,7 @@ void gen_late_reopt_functions(TCCState *s)
 
     int saved_pack[PACK_STACK_SIZE + 1];
     int saved_budget = called_once_budget_begin(body_len);
-    tccpp_setfile(fn->filename);
+    tccpp_setfile_replay(fn->filename);
     pp_pack_enter(s, fn->pack, saved_pack);
     begin_macro_kept(compile_ts);
     next();
@@ -494,7 +495,7 @@ static void emit_inline_functions(TCCState *s, int owed_only)
         fn->sym = NULL;
         int saved_pack[PACK_STACK_SIZE + 1];
         int saved_budget = called_once_budget_begin(fn->func_str->len);
-        tccpp_setfile(fn->filename);
+        tccpp_setfile_replay(fn->filename);
         pp_pack_enter(s, fn->pack, saved_pack);
         begin_macro_kept(fn->func_str);
         next();
@@ -923,7 +924,7 @@ static void tombstone_unused_static(Sym *sym)
 
 /* A scratch section for what a check-only parse lays out (check_only in
  * tcc.h): never registered with the TU, so nothing in it is output. */
-static void check_scratch_begin(TCCState *s)
+void tcc_check_scratch_begin(TCCState *s)
 {
   if (s->check_scratch)
     return;
@@ -1039,8 +1040,26 @@ void prune_unused_statics(TCCState *s)
     if (node_sym[i]->a.used)
       root[i] = 1;
 
+  /* yasc methods by member name: `.NAME` / `->NAME` may call any of them */
+  int *mhead = NULL, *mnext = NULL;
+  for (int i = 0; i < n; i++)
+  {
+    int mk = yasc_method_name_of(node_sym[i]->v & ~SYM_FIELD) - TOK_IDENT;
+    if (mk < 0 || mk >= ntok)
+      continue;
+    if (!mhead)
+    {
+      mhead = deferred_alloc(sizeof(int) * ntok);
+      mnext = deferred_alloc(sizeof(int) * n);
+      for (int k = 0; k < ntok; k++)
+        mhead[k] = -1;
+    }
+    mnext[i] = mhead[mk];
+    mhead[mk] = i;
+  }
+
   /* Mentions, breadth first from the roots.  A name after '.' or '->' is a
-   * member, not a reference. */
+   * member, not a reference -- or a yasc method call. */
   int *work = deferred_alloc(sizeof(int) * (n ? n : 1)), nw = 0;
   for (int i = 0; i < n; i++)
     if (root[i])
@@ -1060,6 +1079,10 @@ void prune_unused_statics(TCCState *s)
       tok_get(&t, &p, &cv);
       if (t >= TOK_IDENT && t - TOK_IDENT < ntok && prev != '.' && prev != TOK_ARROW)
         for (int j = head[t - TOK_IDENT]; j >= 0; j = next_same[j])
+          if (!live[j])
+            live[j] = 1, work[nw++] = j;
+      if (mhead && t >= TOK_IDENT && t - TOK_IDENT < ntok && (prev == '.' || prev == TOK_ARROW))
+        for (int j = mhead[t - TOK_IDENT]; j >= 0; j = mnext[j])
           if (!live[j])
             live[j] = 1, work[nw++] = j;
       if (t != TOK_LINENUM)
@@ -1118,6 +1141,11 @@ void prune_unused_statics(TCCState *s)
   deferred_release(live);
   deferred_release(head);
   deferred_release(next_same);
+  if (mhead)
+  {
+    deferred_release(mhead);
+    deferred_release(mnext);
+  }
   deferred_release(by_elf);
   deferred_release(work);
 
@@ -1132,7 +1160,7 @@ define_all:
       DeferredData *d = s->deferred_data[i];
       if (check_every_static())
       {
-        check_scratch_begin(s);
+        tcc_check_scratch_begin(s);
         check_dropped_deferred_data(d, tok_str_clone(d->init));
       }
       define_deferred_data(d);
@@ -1402,6 +1430,62 @@ void gc_unreferenced_statics(TCCState *s)
   tcc_free(nodes);
 }
 
+/* The flow checks of a static function nothing generated on its own: at -O1+
+ * a body every call inlined (and one of the main file nobody calls) would
+ * otherwise go unchecked, where -O0 compiles and checks it.  A check-only
+ * parse after everything live has been generated; the expansions already
+ * reported its frontend warnings, so only the flow checks speak -- and the
+ * frontend checks that stay quiet in expansions (fe_check_on). */
+void check_uncompiled_inline_functions(TCCState *s)
+{
+  int opened = 0;
+  /* -Wvla / -Walloca speak here too: the expansions keep quiet (diag_stack_site);
+     -Wunused-* reports locals, parameters and labels at their scope's end */
+  /* after an error (recover.c) the unit was only checked from there on: a
+     body whose calls generated nothing was never parsed, and may hold an
+     error too */
+  if (!tcc_ir_flow_checks_wanted() && !fe_checks_wanted() && !unused_locals_wanted() &&
+      (s->warn_none || !((s->warn_vla | s->warn_alloca) & WARN_ON)) && !s->diag_spec_recheck && !s->recover_flipped)
+    return;
+  for (int i = 0; i < s->nb_inline_fns; i++)
+  {
+    InlineFunc *fn = s->inline_fns[i];
+    Sym *sym = fn->sym;
+    TokenString *body = fn->func_str;
+    int saved_pack[PACK_STACK_SIZE + 1];
+    if (!sym || !body || !sym->type.ref || sym->type.ref->f.func_compiled || sym->a.nested_func ||
+        sym->type.ref->f.func_va_arg_pack)
+      continue;
+    /* a body only folded at compile time was never parsed with its
+       diagnostics on: it gets all of them here (a call nothing generated) */
+    if (!fn->expanded && !fn->folded && (!fn->filename || fn->filename != s->main_file))
+      continue;
+    if (!opened)
+    {
+      tcc_check_scratch_begin(s);
+      tcc_open_bf(s, ":inline-check:", 0);
+      opened = 1;
+    }
+    const char saved_debug_modes = debug_modes;
+    debug_modes = 0;
+    /* -fsyntax-only expands nothing: this parse is the body's only one */
+    s->diag_flow_only = !s->syntax_only && (fn->expanded || !fn->folded);
+    fn->func_str = NULL;
+    fn->sym = NULL;
+    tccpp_setfile_replay(fn->filename);
+    pp_pack_enter(s, fn->pack, saved_pack);
+    begin_macro_kept(body);
+    next();
+    gen_function_check_only(sym);
+    end_macro();
+    pp_pack_leave(s, saved_pack);
+    s->diag_flow_only = 0;
+    debug_modes = saved_debug_modes;
+  }
+  if (opened)
+    tcc_close();
+}
+
 /* Parse the statics prune_unused_statics dropped, for their diagnostics
  * only, after everything live has been generated -- so what the parse
  * records on symbols (possibly_written, addrtaken) cannot pessimize code.
@@ -1410,7 +1494,7 @@ void check_dropped_statics(TCCState *s)
 {
   if (!s->nb_dropped_fns && !s->nb_dropped_data)
     return;
-  check_scratch_begin(s);
+  tcc_check_scratch_begin(s);
   const char saved_debug_modes = debug_modes;
   debug_modes = 0;
   tcc_open_bf(s, ":dropped:", 0);
@@ -1471,6 +1555,23 @@ void gen_deferred_function_bodies(TCCState *s)
     if (k >= 0 && k < ntok)
       by_tok[k] = i;
   }
+  /* yasc methods by member name (see the scan below) */
+  int *mhead = NULL, *mnext = NULL;
+  for (int i = 0; i < n; i++)
+  {
+    int mk = yasc_method_name_of(s->deferred_fns[i]->sym->v & ~SYM_FIELD) - TOK_IDENT;
+    if (mk < 0 || mk >= ntok)
+      continue;
+    if (!mhead)
+    {
+      mhead = deferred_alloc(sizeof(int) * ntok);
+      mnext = deferred_alloc(sizeof(int) * n);
+      for (int k2 = 0; k2 < ntok; k2++)
+        mhead[k2] = -1;
+    }
+    mnext[i] = mhead[mk];
+    mhead[mk] = i;
+  }
 
   /* References to deferred functions from the saved bodies: a name followed
    * by '(' is a call; anything else (address taken, sizeof, a same-named
@@ -1490,7 +1591,7 @@ void gen_deferred_function_bodies(TCCState *s)
     edge_start[i] = nedges;
     const int reload = s->deferred_fns[i]->body->allocated_len < 0; /* spilled: see tok_str_release */
     const int *p = tok_str_buf(s->deferred_fns[i]->body);
-    int t;
+    int t, prev = 0;
     CValue cv;
     tok_get(&t, &p, &cv);
     while (t != TOK_EOF && t != 0)
@@ -1498,6 +1599,13 @@ void gen_deferred_function_bodies(TCCState *s)
       int next_t;
       CValue ncv;
       tok_get(&next_t, &p, &ncv);
+      /* a yasc method call, `.NAME(` or `->NAME(`: a mention of every
+         method of that name (decl/method.c) */
+      if (mhead && t >= TOK_IDENT && t - TOK_IDENT < ntok && (prev == '.' || prev == TOK_ARROW))
+        for (int j = mhead[t - TOK_IDENT]; j >= 0; j = mnext[j])
+          mentions[j]++;
+      if (t != TOK_LINENUM)
+        prev = t;
       if (t >= TOK_IDENT && t - TOK_IDENT < ntok && by_tok[t - TOK_IDENT] >= 0)
       {
         int j = by_tok[t - TOK_IDENT];
@@ -1601,6 +1709,11 @@ void gen_deferred_function_bodies(TCCState *s)
     dynarray_add(&s->inline_fns, &s->nb_inline_fns, fn);
   }
   /* Only the call graph and `once` are read from here on. */
+  if (mhead)
+  {
+    deferred_release(mhead);
+    deferred_release(mnext);
+  }
   deferred_release(by_tok);
   deferred_release(calls);
   deferred_release(mentions);
@@ -1673,7 +1786,7 @@ void gen_deferred_function_bodies(TCCState *s)
       {
         if (check_every_static())
         {
-          check_scratch_begin(s);
+          tcc_check_scratch_begin(s);
           check_dropped_function(s->deferred_fns[i], tok_str_clone(s->deferred_fns[i]->body));
         }
         define_deferred_function(s->deferred_fns[i]);

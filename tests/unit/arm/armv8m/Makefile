@@ -205,6 +205,9 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/analysis/memref.c \
 	$(TOP)/source/opt/analysis/mem_ssa.c \
 	$(TOP)/source/ir/cfg.c \
+	$(TOP)/source/ir/lifetime.c \
+	$(TOP)/source/ir/bounds.c \
+	$(TOP)/source/ir/taint.c \
 	$(TOP)/source/opt/flat/loop/loop_ir_mutate.c \
 	$(TOP)/source/opt/flat/loop/iv_analysis.c \
 	$(TOP)/source/opt/flat/loop/iv_strength_reduction.c \
@@ -399,20 +402,27 @@ UT_COVERAGE_ONLY_SRCS := \
 	$(TOP)/source/frontend/gen/builtin/simd.c \
 	$(TOP)/source/frontend/gen/builtin/string.c \
 	$(TOP)/source/frontend/gen/core/predicates.c \
+	$(TOP)/source/frontend/gen/core/recover.c \
 	$(TOP)/source/frontend/gen/core/state.c \
 	$(TOP)/source/frontend/gen/core/suppress.c \
+	$(TOP)/source/frontend/gen/core/unused.c \
 	$(TOP)/source/frontend/gen/decl/attribute.c \
 	$(TOP)/source/frontend/gen/decl/btype.c \
 	$(TOP)/source/frontend/gen/decl/decl.c \
 	$(TOP)/source/frontend/gen/decl/declarator.c \
+	$(TOP)/source/frontend/gen/decl/method.c \
+	$(TOP)/source/frontend/gen/decl/module.c \
+	$(TOP)/source/frontend/gen/decl/plain_param.c \
 	$(TOP)/source/frontend/gen/decl/predef_protos.c \
 	$(TOP)/source/frontend/gen/decl/struct.c \
 	$(TOP)/source/frontend/gen/expr/atomic.c \
+	$(TOP)/source/frontend/gen/expr/attr_checks.c \
 	$(TOP)/source/frontend/gen/expr/cond.c \
 	$(TOP)/source/frontend/gen/expr/indir.c \
 	$(TOP)/source/frontend/gen/expr/infix.c \
 	$(TOP)/source/frontend/gen/expr/primary.c \
 	$(TOP)/source/frontend/gen/expr/unary.c \
+	$(TOP)/source/frontend/gen/expr/yasc_errors.c \
 	$(TOP)/source/frontend/gen/init/alloc.c \
 	$(TOP)/source/frontend/gen/init/initializer.c \
 	$(TOP)/source/frontend/gen/inline/analysis.c \
@@ -427,6 +437,7 @@ UT_COVERAGE_ONLY_SRCS := \
 	$(TOP)/source/frontend/gen/op/vector.c \
 	$(TOP)/source/frontend/gen/stmt/block.c \
 	$(TOP)/source/frontend/gen/stmt/cleanup.c \
+	$(TOP)/source/frontend/gen/stmt/defer.c \
 	$(TOP)/source/frontend/gen/stmt/ret.c \
 	$(TOP)/source/frontend/gen/stmt/switch.c \
 	$(TOP)/source/frontend/gen/store/struct_copy.c \
@@ -1220,8 +1231,9 @@ $(TOP)/tccdefs_.h: $(TOP)/include/tccdefs.h
 # builds for one set of target defines.  The top-level copy is for the cross
 # compiler's defines, not these (tccpp.c's _Static_assert rejects a mismatch),
 # so this suite generates its own and puts it first on the include path.
+# A new token in tcctok.h changes the index: regenerate it then too.
 UT7_GEN := $(BUILD_DIR7)/gen
-$(UT7_GEN)/tcckw_index_.h: $(TOP)/gen_kw_index.c Makefile
+$(UT7_GEN)/tcckw_index_.h: $(TOP)/gen_kw_index.c $(TOP)/source/frontend/tcctok.h Makefile
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(filter-out $(UT_COV_CFLAGS),$(UT_CFLAGS)) -o $(UT7_GEN)/gen_kw_index $<
 	./$(UT7_GEN)/gen_kw_index $@

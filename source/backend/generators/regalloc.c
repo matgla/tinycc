@@ -174,7 +174,7 @@ void tcc_ir_backend_fold_pure_forward(TCCIRState *ir, Sym *sym)
   if (!ir || !sym || !sym->type.ref || TCC_OPT(tcc_state, optimize) <= 0 || tcc_ir_opt_pass_disabled("pure_forward"))
     return;
   Sym *fref = sym->type.ref;
-  if (fref->f.func_type != FUNC_NEW || ir->has_static_chain || ir->captured_count > 0 || ir->naked ||
+  if (fref->f.func_type != FUNC_NEW || ir->has_static_chain || ir->captured_count > 0 || ir->naked || ir->ssp ||
       tcc_state->do_debug || tcc_bounds_checking(tcc_state) || tcc_state->instrument_functions)
     return;
   if ((fref->type.t & VT_BTYPE) == VT_STRUCT || (fref->type.t & VT_COMPLEX))
@@ -420,6 +420,11 @@ void tcc_ir_backend_analyze_leaf_and_tail_calls(TCCIRState *ir, int func_var)
     ir->leaffunc = 0;
     call_count = 99;
   }
+
+  /* -fstack-protector: the epilogue checks the canary, so the function has
+     one and calls nothing as its last act */
+  if (ir->ssp)
+    return;
 
   if (ir->pure_forward && call_count == 1)
   {
@@ -1332,7 +1337,7 @@ static void run_post_alloc_passes(TCCIRState *ir, Sym *sym,
    * f2d/d2f conversion calls around a math libcall — which the early
    * analysis could not yet see.  The frame/stack guards in codegen still
    * veto ineligible functions afterwards. */
-  if (!ir->tail_call_only && !ir->has_static_chain && !ir->push_arg_regs && !ir_asm_clobbers_lr(ir) &&
+  if (!ir->tail_call_only && !ir->ssp && !ir->has_static_chain && !ir->push_arg_regs && !ir_asm_clobbers_lr(ir) &&
       sym && sym->type.ref &&
       sym->type.ref->f.func_type != FUNC_ELLIPSIS)
   {

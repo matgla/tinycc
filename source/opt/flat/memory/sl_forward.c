@@ -223,6 +223,41 @@ static int sl_fwd_value_within_bits(TCCIRState *ir, IROperand op, int bits)
   return 0;
 }
 
+/* Does a `bits`-wide read (signed unless `is_unsigned`) of a store of `op`
+ * give back `op` itself?  Its bits from the read's sign bit up are zero, or
+ * it is a load at most as wide whose extension the read repeats (unsigned
+ * into a wider or unsigned read, signed into a signed one). */
+static int sl_fwd_narrow_read_keeps(TCCIRState *ir, IROperand op, int bits, int is_unsigned)
+{
+  if (sl_fwd_value_within_bits(ir, op, bits - !is_unsigned))
+    return 1;
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0 || op.is_lval || irop_is_64bit(op))
+    return 0;
+  IRQuadCompact *def = NULL;
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    if (tcc_ir_op_dest_is_lval(ir, q) || tcc_ir_op_dest_vreg(ir, q) != vr)
+      continue;
+    if (def)
+      return 0; /* more than one definition */
+    def = q;
+  }
+  if (!def || (def->op != TCCIR_OP_LOAD && def->op != TCCIR_OP_LOAD_INDEXED))
+    return 0;
+  /* a LOAD_INDEXED carries its access width on the dest */
+  IROperand a = def->op == TCCIR_OP_LOAD_INDEXED ? tcc_ir_op_get_dest(ir, def) : tcc_ir_op_get_src1(ir, def);
+  int ab = irop_get_btype(a) == IROP_BTYPE_INT8 ? 8 : irop_get_btype(a) == IROP_BTYPE_INT16 ? 16 : 0;
+  if (!ab)
+    return 0;
+  if (a.is_unsigned)
+    return ab < bits || (ab == bits && is_unsigned);
+  return !is_unsigned && ab <= bits;
+}
+
 /* Returns 1 iff EVERY read of value_vr anywhere in the function is "self-narrowing":
  * an AND with an immediate mask that fits in load_bits, or a 32-bit SHL by at least
  * (32 - load_bits).  Both produce a result that does not depend on value_vr's bits at
@@ -2147,9 +2182,50 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
             }
             if (li_tag == IROP_TAG_STACKOFF && lie->stored_value.is_lval)
               continue;
+            /* A narrow read gives back the stored value only when the store's
+             * truncation and the read's extension leave it as it is; a struct
+             * copy moves an i16 field as a u16.  Otherwise forward what the
+             * read makes of it, as the LOAD path does: a constant narrowed, a
+             * value as `dest <- value AND #mask` / `SBFX #0,#bits`. */
+            IROperand li_val = lie->stored_value;
+            if (li_access_btype == IROP_BTYPE_INT8 || li_access_btype == IROP_BTYPE_INT16)
+            {
+              const int li_bits = li_access_btype == IROP_BTYPE_INT8 ? 8 : 16;
+              IROperand li_dest = tcc_ir_op_get_dest(ir, q);
+              if (li_tag == IROP_TAG_STACKOFF || li_tag == IROP_TAG_I64)
+                continue;
+              if (li_tag == IROP_TAG_IMM32)
+              {
+                const int32_t full = (int32_t)irop_get_imm64_ex(ir, li_val);
+                int32_t narrow = (int32_t)((uint32_t)full & ((1u << li_bits) - 1));
+                if (!li_dest.is_unsigned)
+                  narrow = (int32_t)((uint32_t)narrow << (32 - li_bits)) >> (32 - li_bits);
+                if (full != narrow)
+                  li_val = irop_make_imm32(-1, narrow, li_access_btype);
+              }
+              else if (!sl_fwd_narrow_read_keeps(ir, li_val, li_bits, li_dest.is_unsigned))
+              {
+                if (irop_get_vreg(li_val) < 0 || irop_op_is_lval(li_val) || irop_get_vreg(li_dest) < 0)
+                  continue;
+                LOG_SL_FWD("LOAD_INDEXED@i=%d FORWARD-EXT: eff_off=%lld from store@i=%d bits=%d", i,
+                           (long long)eff_off, lie->instruction_idx, li_bits);
+                const int is_u = li_dest.is_unsigned;
+                li_dest.btype = IROP_BTYPE_INT32;
+                tcc_ir_pool_ensure(ir, 3);
+                int base = ir->iroperand_pool_count;
+                tcc_ir_pool_add(ir, li_dest);
+                tcc_ir_pool_add(ir, li_val);
+                tcc_ir_pool_add(ir, irop_make_imm32(-1, is_u ? (int32_t)((1u << li_bits) - 1) : li_bits << 5,
+                                                    IROP_BTYPE_INT32));
+                q->op = is_u ? TCCIR_OP_AND : TCCIR_OP_SBFX;
+                q->operand_base = base;
+                changes++;
+                break;
+              }
+            }
             q->op = TCCIR_OP_ASSIGN;
             int li_pool = q->operand_base + irop_config[TCCIR_OP_ASSIGN].has_dest;
-            ir->iroperand_pool[li_pool] = lie->stored_value;
+            ir->iroperand_pool[li_pool] = li_val;
             tcc_ir_set_src2_none(ir, i);
             LOG_SL_FWD("LOAD_INDEXED@i=%d FORWARD: eff_off=%lld from store@i=%d", i, (long long)eff_off,
                        lie->instruction_idx);
@@ -2160,7 +2236,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
                 int fp = TCCIR_DECODE_VREG_POSITION(fwd_vr);
                 if (fp <= max_tmp)
                 {
-                  fwd_tmp_val[fp] = lie->stored_value;
+                  fwd_tmp_val[fp] = li_val;
                   fwd_tmp_valid[fp] = 1;
                   if (li_tag == IROP_TAG_STACKOFF)
                   {

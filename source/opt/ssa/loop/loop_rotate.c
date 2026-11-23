@@ -71,6 +71,8 @@ int ssa_opt_loop_rotate(TCCIRState *ir)
           continue;
         if (!tcc_ir_cfg_dominates(cfg, h, b))
           continue; /* not a back-edge */
+        if (tcc_ir_cfg_loop_has_label_block(cfg, h, b))
+          continue; /* a computed goto enters it in the middle */
         IRLoop *lp = &cands[ncands++];
         lp->header_idx = cfg->blocks[h].start_idx;
         lp->start_idx = cfg->blocks[h].start_idx;

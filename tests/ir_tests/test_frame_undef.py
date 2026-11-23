@@ -88,7 +88,7 @@ def _disasm(tmp_path, opt):
     src = tmp_path / "u.c"
     obj = tmp_path / "u.o"
     src.write_text(SOURCE)
-    subprocess.run([str(TCC), opt, "-mfloat-abi=hard", "-fno-pic", "-mno-sb-relative-got",
+    subprocess.run([str(TCC), "-ccompat", opt, "-mfloat-abi=hard", "-fno-pic", "-mno-sb-relative-got",
                     "-fno-module-local-calls", "-c", str(src), "-o", str(obj)], check=True)
     return subprocess.run([OBJDUMP, "-d", str(obj)], capture_output=True, text=True, check=False).stdout
 

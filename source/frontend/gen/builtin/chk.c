@@ -23,30 +23,10 @@
 
 #include "gen_priv.h"
 
-/* Whether an object of type T holds a pointer at byte offset OFF. */
-static int objsize_ptr_slot_at(CType *t, int off)
+/* "__tcc_strcpy" is strcpy to whoever reads a warning */
+static const char *chk_base_name(const char *n)
 {
-  if (t->t & VT_ARRAY)
-  {
-    int align, esz = type_size(&t->ref->type, &align);
-    return esz > 0 && objsize_ptr_slot_at(&t->ref->type, off % esz);
-  }
-  if ((t->t & VT_BTYPE) == VT_PTR)
-    return off == 0;
-  if ((t->t & VT_BTYPE) == VT_STRUCT)
-  {
-    Sym *f;
-    for (f = sym_first(t->ref); f; f = f->next)
-    {
-      int align, fsz;
-      if (f->type.t & VT_BITFIELD)
-        continue;
-      fsz = type_size(&f->type, &align);
-      if (off >= (int)f->c && off < (int)f->c + fsz && objsize_ptr_slot_at(&f->type, off - (int)f->c))
-        return 1;
-    }
-  }
-  return 0;
+  return strncmp(n, "__tcc_", 6) ? n : n + 6;
 }
 
 /* Extracted from unary() to reduce stack frame size. */
@@ -55,23 +35,27 @@ void __attribute__((noinline)) unary_builtin_chk(void)
   switch (tok)
   {
   case TOK_builtin_object_size:
+  case TOK_builtin_dynamic_object_size:
   {
-    int obj_type_val;
-    addr_t result = (addr_t)-1; /* default: unknown */
+    /* builtin/objsize.c: what the pointer points into, decided while the
+       argument is parsed (without code) -- the same at every -O */
+    const int dynamic = tok == TOK_builtin_dynamic_object_size;
+    int obj_type_val, effects;
+    ObjInfo oi;
+    ObjRec saved;
 
-    next(); /* consume __builtin_object_size token */
+    next();
     skip('(');
-
-    /* Evaluate ptr expression without generating IR so we can inspect
-     * the SValue for type/offset info. */
     nocode_wanted++;
+    objsize_enter(&saved);
+    effects = uv_effects;
     expr_eq();
-
-    /* Capture ptr SValue before any decay */
-    SValue ptr_sv = *vtop;
-    CType ptr_type = vtop->type;
-    int ptr_r = vtop->r;
-
+    objsize_info(vtop, &oi);
+    /* side effects in the argument (an assignment, ++, a call): unknown, as
+       gcc says -- they are not evaluated */
+    if (uv_effects != effects)
+      memset(&oi, 0, sizeof oi);
+    objsize_leave(&saved);
     vpop();
     nocode_wanted--;
 
@@ -81,7 +65,7 @@ void __attribute__((noinline)) unary_builtin_chk(void)
     nocode_wanted++;
     expr_eq();
     if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
-      obj_type_val = vtop->c.i;
+      obj_type_val = vtop->c.i & 3;
     else
       obj_type_val = 0;
     vpop();
@@ -89,128 +73,8 @@ void __attribute__((noinline)) unary_builtin_chk(void)
 
     skip(')');
 
-    /* --- Compute object size --- */
-    /* Modes 2/3 are the lower-bound twins of 0/1: same size when the object
-     * is known, but "unknown" is 0 there instead of (size_t)-1. */
-    int lower_bound = obj_type_val & 2;
-    obj_type_val &= 1;
-    {
-/* Helper: search local_stack for the outermost variable that
- * contains a given frame-pointer offset.  Returns remaining
- * bytes from that offset to end of the variable, or -1. */
-#define FIND_LOCAL_OBJSIZE(target_off, out_size)                                                                       \
-  do                                                                                                                   \
-  {                                                                                                                    \
-    Sym *_s;                                                                                                           \
-    (out_size) = (addr_t) - 1;                                                                                         \
-    for (_s = local_stack; _s; _s = _s->prev)                                                                          \
-    {                                                                                                                  \
-      if ((_s->r & VT_VALMASK) != VT_LOCAL)                                                                            \
-        continue;                                                                                                      \
-      /* Skip field/struct-tag namespace symbols */                                                                    \
-      if (_s->v & (SYM_FIELD | SYM_STRUCT))                                                                            \
-        continue;                                                                                                      \
-      /* Skip vreg-managed scalars: their sym->c is not a real                                                         \
-       * stack offset (register allocator assigns the actual                                                           \
-       * location). Only arrays, structs, VLAs keep permanent                                                          \
-       * frame offsets assigned by the front-end. */                                                                   \
-      if ((_s->r & VT_LVAL) && ((_s->type.t & VT_BTYPE) != VT_STRUCT) && !(_s->type.t & (VT_ARRAY | VT_VLA)))          \
-        continue;                                                                                                      \
-      int _align;                                                                                                      \
-      int _sz = type_size(&_s->type, &_align);                                                                         \
-      if (_sz <= 0)                                                                                                    \
-        continue;                                                                                                      \
-      /* Use int for signed frame-offset arithmetic (sym->c is                                                         \
-       * a signed FP-relative offset; addr_t is unsigned and                                                           \
-       * would break the range check on 64-bit hosts). */                                                              \
-      int _base = (int)_s->c;                                                                                          \
-      int _end = _base + _sz;                                                                                          \
-      int _tgt = (int)(target_off);                                                                                    \
-      if (_tgt >= _base && _tgt < _end)                                                                                \
-      {                                                                                                                \
-        (out_size) = (addr_t)(_end - _tgt);                                                                            \
-        os_sym = _s;                                                                                                   \
-        break;                                                                                                         \
-      }                                                                                                                \
-    }                                                                                                                  \
-  } while (0)
-
-      Sym *os_sym = NULL;
-
-      /* All VT_LOCAL cases (both lval and non-lval, with or without
-       * array type) use the same local variable search for mode 0. */
-      if ((ptr_r & VT_VALMASK) == VT_LOCAL)
-      {
-        int target_offset = (int)ptr_sv.c.i;
-
-        if ((ptr_type.t & VT_ARRAY) && ptr_type.ref && obj_type_val == 0)
-        {
-          /* Array type still present — might be a sub-array of a larger
-           * struct.  Search for the outermost enclosing variable. */
-          addr_t outer;
-          FIND_LOCAL_OBJSIZE(target_offset, outer);
-          if (outer != (addr_t)-1)
-            result = outer;
-          else
-          {
-            /* No enclosing variable found (shouldn't happen for locals),
-             * fall back to the array's own size. */
-            int align;
-            result = type_size(&ptr_type, &align);
-          }
-        }
-        else if ((ptr_type.t & VT_ARRAY) && ptr_type.ref && obj_type_val == 1)
-        {
-          /* Mode 1: innermost subobject = the array itself */
-          int align;
-          result = type_size(&ptr_type, &align);
-        }
-        else
-        {
-          /* Pointer, pointer-to-struct, or address-of result.
-           * Search for enclosing variable. */
-          FIND_LOCAL_OBJSIZE(target_offset, result);
-          /* A pointer value loaded from a pointer slot of the container
-           * (ptrs[1], s.p): the container is the pointer's storage, not the
-           * object it points to. */
-          if (result != (addr_t)-1 && os_sym && (ptr_r & VT_LVAL) && (ptr_type.t & VT_BTYPE) == VT_PTR &&
-              !(ptr_type.t & VT_ARRAY) && objsize_ptr_slot_at(&os_sym->type, target_offset - (int)os_sym->c))
-            result = (addr_t)-1;
-          if (result != (addr_t)-1 && obj_type_val == 1)
-          {
-            /* Mode 1: remaining in the innermost subobject.
-             * If the type is known, use that; otherwise keep outer. */
-            if (ptr_r & VT_LVAL)
-            {
-              int align;
-              int inner_sz = type_size(&ptr_type, &align);
-              if (inner_sz > 0)
-                result = inner_sz;
-            }
-          }
-        }
-      }
-      /* Global/static symbol with known section size.
-       * VT_LVAL means we'd need to load the value (i.e. a pointer variable),
-       * not an array whose address we already have. Pointer variables have
-       * st_size = sizeof(pointer) which is NOT the pointed-to object size. */
-      else if ((ptr_r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM) && !(ptr_r & VT_LVAL) && ptr_sv.sym)
-      {
-        ElfSym *esym = elfsym(ptr_sv.sym);
-        if (esym && esym->st_size > 0)
-        {
-          addr_t offset_in_sym = ptr_sv.c.i;
-          if (offset_in_sym >= 0 && (addr_t)offset_in_sym < esym->st_size)
-            result = esym->st_size - offset_in_sym;
-        }
-      }
-
-#undef FIND_LOCAL_OBJSIZE
-    }
-
-    if (lower_bound && result == (addr_t)-1)
-      result = 0;
-    vpushs(result);
+    if (!dynamic || (obj_type_val & 1 ? oi.known1 : oi.known0) || !objsize_push_dynamic(&oi, obj_type_val))
+      vpushs((addr_t)objsize_result(&oi, obj_type_val));
     break;
   }
 
@@ -551,7 +415,10 @@ void __attribute__((noinline)) unary_builtin_chk(void)
           if (n_val <= objsize)
             use_chk = 0; /* statically safe */
           else
+          {
             use_chk = 1; /* will overflow — call __*_chk for runtime abort */
+            objsize_chk_overflow(chk_base_name(desc->base_func), n_val, objsize);
+          }
         }
         else
         {
@@ -575,7 +442,12 @@ void __attribute__((noinline)) unary_builtin_chk(void)
               src_bytes <= (unsigned long long)objsize)
             use_chk = 0;
           else
+          {
+            int sl;
             use_chk = 1;
+            if (try_get_constant_string(&all_args[1], &sl))
+              objsize_chk_overflow(chk_base_name(desc->base_func), (unsigned long long)sl + 1, objsize);
+          }
           break;
 
         case TOK_builtin___strcat_chk:

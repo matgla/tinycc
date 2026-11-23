@@ -40,7 +40,9 @@ void merge_symattr(struct SymAttr *sa, struct SymAttr *sa1)
   }
   sa->vis_explicit |= sa1->vis_explicit;
   sa->dllexport |= sa1->dllexport;
+#ifdef TCC_TARGET_PE
   sa->nodecorate |= sa1->nodecorate;
+#endif
   sa->dllimport |= sa1->dllimport;
   sa->naked |= sa1->naked;
   sa->transparent_union |= sa1->transparent_union;
@@ -91,8 +93,44 @@ void merge_attr(AttributeDef *ad, AttributeDef *ad1)
     ad->asm_label = ad1->asm_label;
   if (ad1->attr_mode)
     ad->attr_mode = ad1->attr_mode;
+  ad->attr_unused |= ad1->attr_unused;
   if (ad1->vector_size)
     ad->vector_size = ad1->vector_size;
+}
+
+/* The function type a declaration's own declarator built (decl.c sets it
+ * around external_sym): no typedef or other declaration holds it. */
+Sym *patch_own_functype;
+
+/* Whether SRC marks a parameter nonnull that DST does not. */
+static int param_nonnull_missing(Sym *dst, Sym *src)
+{
+  Sym *d = sym_first(dst), *s = sym_first(src);
+  for (; d && s; d = d->next, s = s->next)
+    if (s->a.nonnull && !d->a.nonnull && (d->type.t & VT_BTYPE) == VT_PTR)
+      return 1;
+  return 0;
+}
+
+static void param_nonnull_or(Sym *dst, Sym *src)
+{
+  Sym *d = sym_first(dst), *s = sym_first(src);
+  for (; d && s; d = d->next, s = s->next)
+    if (s->a.nonnull && (d->type.t & VT_BTYPE) == VT_PTR)
+      d->a.nonnull = 1;
+}
+
+/* nonnull on any declaration counts, as with GCC: each function type only
+ * this function holds takes the other declaration's marks.  Before the
+ * types are patched: a definition's type replaces the prototype's. */
+static void param_nonnull_merge(Sym *old_ref, Sym *new_ref)
+{
+  if (!old_ref || !new_ref || old_ref == new_ref)
+    return;
+  if (new_ref == patch_own_functype && param_nonnull_missing(new_ref, old_ref))
+    param_nonnull_or(new_ref, old_ref);
+  if (old_ref->a.proto_own && param_nonnull_missing(old_ref, new_ref))
+    param_nonnull_or(old_ref, new_ref);
 }
 
 /* Merge some type attributes.  */
@@ -159,6 +197,7 @@ static void patch_type(Sym *sym, CType *type)
     }
 
     Sym *old_ref = sym->type.ref;
+    param_nonnull_merge(old_ref, type->ref);
     if (0 == (type->t & VT_EXTERN))
     {
       struct FuncAttr f = sym->type.ref->f;
@@ -171,6 +210,14 @@ static void patch_type(Sym *sym, CType *type)
     else
     {
       sym->type.t &= ~VT_INLINE | static_proto;
+      /* the prototype's type is a typedef's (shared): a nonnull this
+       * declaration adds needs the type its declarator built */
+      if (!old_ref->a.proto_own && type->ref == patch_own_functype && old_ref->f.func_type != FUNC_OLD &&
+          type->ref->f.func_type != FUNC_OLD && param_nonnull_missing(old_ref, type->ref))
+      {
+        merge_funcattr(&type->ref->f, &old_ref->f);
+        sym->type.ref = type->ref;
+      }
     }
 
     /* A definition replacing its own prototype's type: the prototype's type
@@ -426,6 +473,7 @@ void apply_alias_attribute(Sym *alias_sym, int target_tok)
     tcc_error("'%s' defined both normally and as 'alias' attribute", get_tok_str(alias_sym->v, NULL));
   if (alias_sym->a.regpair_ret == REGPAIR_RET_UNKNOWN)
     alias_sym->a.regpair_ret = REGPAIR_RET_NO;
+  unused_alias_target(target_tok); /* named: not unused */
   if (!resolve_alias_symbol(alias_sym, target_tok, 0))
     queue_alias_symbol(alias_sym, target_tok);
 }

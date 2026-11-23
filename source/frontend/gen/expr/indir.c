@@ -42,12 +42,18 @@ void indir(void)
       return;
     expect("pointer");
   }
+  const int os_rec = objsize_ctx && objsize_rec_is(vtop);
   /* A byte-reversed pointer member (big-endian scalar_storage_order) is
    * loaded and swapped; what it points to is in native order.  (A pointer
    * still marked after this is an array member's address: its elements are
    * reversed too.) */
   if ((vtop->r & VT_LVAL) && vtop->sso_reversed)
     gv(RC_INT);
+#ifdef CONFIG_TCC_BCHECK
+  /* -b: a pointer read through a pointer is checked first */
+  if (vtop->r & VT_MUSTBOUND)
+    gbound();
+#endif
   if (vtop->r & VT_LVAL)
   {
     SValue dest;
@@ -63,6 +69,8 @@ void indir(void)
     vtop->vr = dest.vr;
     vtop->r = 0;
   }
+  if (tcc_state->sanitize & (SAN_NULL | SAN_ALIGN))
+    ubsan_deref();
   vtop->type = *pointed_type(&vtop->type);
   /* After pointer dereference, the result represents the pointed-to object,
    * not the original parameter.  Clear VT_PARAM so that a subsequent
@@ -142,6 +150,8 @@ void indir(void)
       }
     }
   }
+  if (os_rec)
+    objsize_after_indir(); /* builtin/objsize.c */
 }
 
 /* pass a parameter to a function and do type checking and casting */
@@ -149,6 +159,16 @@ void gfunc_param_typed(Sym *func, Sym *arg)
 {
   int func_type;
   CType type;
+
+  /* -Wnonnull: a null constant for a parameter __attribute__((nonnull)) names */
+  if (arg && arg->a.nonnull && tcc_state->warn_nonnull && is_null_pointer(vtop))
+  {
+    Sym *p;
+    int n = 1;
+    for (p = sym_first(func); p && p != arg; p = p->next)
+      n++;
+    tcc_warning_once(warn_nonnull, "null passed as argument %d, which is declared nonnull", n);
+  }
 
   /* If &g is being bound to a non-const pointer param, the callee may write
    * through it — poison g so inline-eval won't fold `*&g` to its initializer. */
@@ -229,7 +249,9 @@ void gfunc_param_typed(Sym *func, Sym *arg)
      * lowering copies it into the argument registers and stack, so no
      * temporary copy is made here.  (A pointer to a copy for composites over
      * 16 bytes is the AArch64 rule.) */
+    yasc_argument = 1;
     gen_assign_cast(&type);
+    yasc_argument = 0;
   }
 }
 
@@ -255,6 +277,7 @@ void parse_expr_type(CType *type)
   skip('(');
   if (parse_btype(type, &ad, 0))
   {
+    btype_no_auto(&ad);
     type_decl(type, &ad, &n, TYPE_ABSTRACT);
   }
   else
@@ -273,6 +296,7 @@ void parse_type(CType *type)
   {
     expect("type");
   }
+  btype_no_auto(&ad);
   type_decl(type, &ad, &n, TYPE_ABSTRACT);
 }
 

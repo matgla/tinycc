@@ -55,6 +55,7 @@ def test_default_page_layout_links_and_matches_its_header(tmp_path, name):
     proc = subprocess.run(
         [
             str(TCC),
+            "-ccompat",
             f"-B{TCC_TOP}",
             f"-L{TCC_TOP}/lib",
             f"-L{TCC_TOP}/lib/fp",

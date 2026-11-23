@@ -241,7 +241,15 @@ static inline unsigned tcc_getclock_us(void)
 #define CONFIG_TCC_BACKTRACE 1 /* enable builtin stack backtraces */
 #endif
 
-#if defined CONFIG_TCC_BCHECK && CONFIG_TCC_BCHECK == 0
+/* `-b` on the armv8m cross, for QEMU runs: config.mak's CFLAGS say
+   -DCONFIG_TCC_BCHECK=0 for every stage (build_rootfs.sh), so the Makefile
+   adds -DCONFIG_TCC_BCHECK_CROSS=1 to the cross compiler alone (configure
+   --disable-bcheck-cross drops it).  The device compiler never has it: the
+   runtime's memory cost rules the board out. */
+#if defined CONFIG_TCC_BCHECK_CROSS && CONFIG_TCC_BCHECK_CROSS && !defined TCC_IS_NATIVE
+#undef CONFIG_TCC_BCHECK
+#define CONFIG_TCC_BCHECK 1
+#elif defined CONFIG_TCC_BCHECK && CONFIG_TCC_BCHECK == 0
 #undef CONFIG_TCC_BCHECK
 #else
 #define CONFIG_TCC_BCHECK 1 /* enable bound checking code */
@@ -624,11 +632,18 @@ typedef union CValue
 struct SymAttr
 {
   unsigned aligned : 5, /* alignment as log2+1 (0 == unspecified) */
-      packed : 1, weak : 1, visibility : 2, dllexport : 1, nodecorate : 1, dllimport : 1, addrtaken : 1, nodebug : 1,
+      packed : 1, weak : 1, visibility : 2, dllexport : 1,
+#ifdef TCC_TARGET_PE
+      nodecorate : 1, /* PE only: a bit of the 32 this target needs */
+#endif
+      dllimport : 1, addrtaken : 1, nodebug : 1,
       naked : 1, nested_func : 1, /* nested function flag */
       sso_be : 1,                 /* scalar_storage_order("big-endian") */
       transparent_union : 1,      /* __attribute__((transparent_union)) */
-      possibly_written : 1,       /* global may have been written after its
+      possibly_written : 1,       /* (a local pointer variable: stored with a
+                                     value that is not an allocation's result,
+                                     builtin/objsize.c)
+                                     global may have been written after its
                                      initializer (a store was emitted, or its
                                      address escaped to a non-const pointer).
                                      Used by inline-eval to decide whether
@@ -663,12 +678,31 @@ struct SymAttr
                                      typedef, typeof or other declaration holds
                                      it, so its definition's type is adopted into
                                      it (patch_type, sym_functype_adopt). */
-      pure_via_sret : 1;          /* inferred: the function's only observable
+      nonnull : 1,                /* a parameter that __attribute__((nonnull)) names:
+                                     a null argument is a -Wnonnull warning */
+      param_array : 1,            /* a parameter declared as an array, now a
+                                     pointer: sizeof of it (-Wsizeof-array-argument) */
+      pure_via_sret : 1,          /* inferred: the function's only observable
                                      effect is its aggregate result (*sret_arg
                                      writes, or r0/r1).  In SymAttr, not
                                      FuncAttr: a global Sym's f is its
                                      sym_scope word. */
+      attr_facts : 1;             /* the Sym has facts in its SymLocalFacts that
+                                     say something without a pass asking:
+                                     deprecated, format, warn_unused_result or
+                                     nodiscard (decl/attribute.c
+                                     attr_apply_decl_facts), the SYMF_* flags
+                                     (sym_flag_set).  Such a prototype is never
+                                     parked. */
 };
+/* SymAttr is full: its 32 bits are a _Static_assert in symtab.c, and Sym
+   (48 bytes on the device) must not grow.  A new per-symbol fact goes to
+   SymLocalFacts, the side table keyed by the Sym: a value as a field there,
+   a 1-bit attribute as a SYMF_* flag (sym_flag_set / sym_flag).  Testing a
+   flag costs one bit when the Sym has no facts (attr_facts).  The table is
+   keyed by the Sym's address: a copy of a Sym (an inline expansion's
+   parameters, the IR's) does not carry it -- copy the flag where the copy is
+   made, as the SymAttr bits are copied. */
 #define REGPAIR_RET_UNKNOWN 0
 #define REGPAIR_RET_NO 1
 #define REGPAIR_RET_YES 2
@@ -766,6 +800,7 @@ struct Sym
     int enum_val_w[2];
     int *d; /* define token stream */
     struct Sym *cleanup_func;
+    struct TokenString *defer_str; /* a yasc defer's body (CLEANUP_DEFER entries) */
   };
   union
   {
@@ -780,11 +815,164 @@ struct Sym
 #if !(defined __SIZEOF_POINTER__ && __SIZEOF_POINTER__ == 8)
   unsigned short r;
 #endif
+  unsigned char yasc; /* YASC_*: on a pointer node, that pointer's qualifiers;
+                         in the padding after r on 32-bit hosts */
+  unsigned char ymod; /* yasc modules: YASC_MODULE_OWN, YASC_EXPORT (padding too) */
   struct SymAttr a; /* symbol attributes */
   int vreg;
   struct Sym *prev_tok; /* previous symbol for this token */
 };
 #define SYM_SHORT_SIZE (offsetof(struct Sym, prev) + sizeof(struct Sym *))
+
+/* yasc ownership qualifiers.  Those of a pointer live in its pointer node
+ * (type.ref, interned per pointee type and qualifiers by sym_pointer_node_q),
+ * so they follow the type through typedefs, members, parameters and returns,
+ * and compare_types, which compares pointee types, ignores them. */
+#define YASC_OWNED 0x01 /* `T * owned p`: p owns its target, freed or handed on once */
+#define YASC_MAYBE 0x02 /* `T * maybe p`: p may be null */
+#define YASC_OUT 0x04   /* `out T *p`: the callee initialises *p */
+#define YASC_DROP 0x08  /* `drop T *p`: the callee consumes *p */
+#define YASC_VIEW 0x10  /* `T * view p`: p borrows its target, never frees it */
+#define YASC_FRESH 0x20 /* a call's owned result, not yet taken by anything */
+/* yasc errors (docs/plans/yasc_errors.md), on other Syms than pointer nodes: */
+#define YASC_ERRSET 0x40   /* an error set's tag Sym (enum-like); also `error` alone */
+#define YASC_ERRUNION 0x80 /* an error union's node: type is the payload; in an
+                              AttributeDef, a `!` before the type */
+/* On a pointer node (ERRSET's bit, which only goes on other Syms): the
+   pointer was written in regular C -- a header, or a macro defined in one --
+   in a unit that has yasc in it.  C says nothing about ownership, so such a
+   pointer converts to and from owned / view ones without a diagnostic:
+   checks start at the yasc variable it lands in (docs/yasc_modules.md,
+   "Legacy C"). */
+#define YASC_UNCHECKED 0x40
+/* On a parameter's pointer node (ERRUNION's bit, which only goes on other
+   Syms): the function's result takes it over -- `takes(p)` on the result */
+#define YASC_TAKEN 0x80
+/* yasc modules (decl/module.c), in Sym.ymod of a file-scope identifier Sym or
+   a struct/union/enum tag Sym: declared by the module itself, and exported */
+#define YASC_MODULE_OWN 0x01
+#define YASC_EXPORT 0x02
+#define YASC_HAS_METHODS 0x04 /* a struct tag with yasc methods (decl/method.c) */
+/* -Wunused-* (frontend/gen/core/unused.c), in Sym.ymod of a variable, a
+   parameter, a function or a label: set only while unused_on */
+#define SYM_UNUSED_TRACK 0x08 /* reported if still unused when its scope (or the unit) ends */
+#define SYM_UNUSED_REF 0x10   /* named somewhere: used, or at least assigned to */
+#define SYM_UNUSED_READ 0x20  /* its value is read (or its address taken) */
+#define SYM_UNUSED_OK 0x40    /* __attribute__((unused)) / [[maybe_unused]] */
+/* unused.c */
+ST_FUNC void unused_unit_begin(TCCState *s1);
+ST_FUNC void unused_unit_end(TCCState *s1);
+ST_FUNC void unused_unit_free(TCCState *s1);
+ST_FUNC void unused_options_changed(TCCState *s1);
+ST_FUNC int unused_locals_wanted(void);
+ST_FUNC void unused_mention(Sym *s);
+ST_FUNC void unused_scan_tokens(struct TokenString *str, Sym *self, int any);
+ST_FUNC void unused_declare_local(Sym *s, int line, int attr_unused);
+ST_FUNC void unused_declare_static(Sym *s, int line, int is_func);
+ST_FUNC void unused_params_begin(Sym *func, Sym *params_end);
+ST_FUNC void unused_param_line(int v, int line, int first);
+ST_FUNC void unused_params_bind(Sym *func);
+ST_FUNC int unused_param_decl_line(Sym *func, int v);
+ST_FUNC void unused_sym_popped(Sym *s);
+ST_FUNC void unused_label_defined(Sym *s, int line, int attr_unused);
+ST_FUNC void unused_alias_target(int tok_target);
+ST_FUNC Sym *unused_lhs(void);
+ST_FUNC void unused_stmt_expr_end(int effects_before, int line);
+ST_FUNC void unused_stmt_expr_drop(void);
+ST_FUNC void unused_declare_typedef(Sym *s, int line, int attr_unused);
+ST_FUNC Sym *unused_lhs_assign(void);
+ST_FUNC Sym *unused_part_begin(unsigned char *newly_read, int subscript);
+ST_FUNC void unused_part_end(Sym *s, unsigned char newly_read, int subscript);
+ST_FUNC void unused_assigned_to(Sym *lhs);
+ST_FUNC void unused_label_popped(Sym *s);
+/* -Wunused-value: what the expression parsed last did at its top */
+#define UV_VALUE 1  /* computed a value: an operator, a cast, a member */
+#define UV_EFFECT 2 /* a call, a statement expression, a builtin */
+#define UV_ASSIGN 3 /* an assignment or ++/-- */
+#define UV_COMMA 4  /* a comma operator (uv_comma_* tell about its right operand) */
+#define UV_INCDEC 5 /* ++ or -- */
+ST_DATA int uv_effects; /* side effects parsed so far: calls, stores, ++/--, ... */
+ST_DATA int uv_last;    /* UV_*: the operation the parser completed last */
+ST_DATA int uv_ident;   /* the name unary_primary() resolved last (not a builtin) */
+ST_FUNC void unused_assigned(void);
+ST_FUNC void unused_discard(int effects_before, int line, int comma_lhs);
+ST_FUNC void unused_void_cast(void);
+ST_FUNC void unused_comma_end(int effects_before_rhs, int rhs_last);
+/* A yasc keyword followed by one of these was meant as a name (`int out;`,
+   `f(char *view)`): say so instead of "identifier expected". */
+#define YASC_NAME_FOLLOWS(t) ((t) == ';' || (t) == ',' || (t) == '=' || (t) == ')' || (t) == '[' || (t) == ':')
+ST_FUNC void yasc_keyword_as_name(int kw);
+/* yasc error unions (frontend/gen/expr/yasc_errors.c) */
+ST_FUNC int type_is_errunion(CType *type);
+/* the section of the yasc error-name records, read by libtcc1's
+   __yasc_error_name and checked by the linker */
+#define YASC_ERRNAME_SECTION "yasc_errname"
+ST_FUNC void yasc_errunion_misuse(void);
+/* cheap pre-test for the checks on hot paths: an error union is an unsigned
+ * long long with a type.ref */
+#define MAYBE_ERRUNION(type) (((type)->t & VT_BTYPE) == VT_LLONG && (type)->ref)
+/* a macro: the VT_* flags are defined further down */
+/* yasc `int owned(close) maybe fd`: an int handle -- the int type's ref is a
+ * handle node (v == SYM_HANDLE, interned by sym_handle_node) with the
+ * qualifiers, and the deallocator in its vreg */
+#define SYM_HANDLE (SYM_FIELD | 1)
+#define type_is_handle(type)                                                                                           \
+  (((type)->t & (VT_BTYPE | VT_ARRAY)) == VT_INT && (type)->ref && (type)->ref->v == SYM_HANDLE)
+#define type_yasc(type)                                                                                                \
+  ((((type)->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && (type)->ref) ? (type)->ref->yasc                                \
+   : type_is_handle(type)                                         ? (type)->ref->yasc                                \
+                                                                  : 0)
+ST_FUNC Sym *sym_handle_node(int yasc, int dealloc);
+ST_FUNC void yasc_requalify(CType *type, int yasc);
+
+/* yasc `borrows(...)`: where a view points.  On a pointer node, in its vreg
+ * (-1 on every other one), part of the node's identity: the positions of a
+ * function's parameters its result points into, and static storage.  Only a
+ * function's result type is read this way (its own, or a callee's); a copy
+ * of the type elsewhere carries the bits along unread. */
+#define YASC_BORROWS_STATIC (1 << 28)
+#define YASC_BORROWS_ARGS ((1 << 28) - 1)
+#define YASC_BORROWS_MAX_PARAMS 28
+#define type_borrows(type)                                                                                             \
+  ((((type)->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && (type)->ref && (type)->ref->vreg > 0 &&                          \
+    (type)->ref->vreg < (1 << 29))                                                                                     \
+       ? (type)->ref->vreg                                                                                             \
+       : 0)
+ST_FUNC Sym *sym_pointer_node_b(CType *type, int yasc, int borrows);
+/* yasc `T * owned(fclose)`: the deallocator's name (token), in an owned
+ * pointer node's vreg; 0 for plain `owned` (not said) */
+#define type_dealloc(type) ((type_yasc(type) & YASC_OWNED) && (type)->ref->vreg > 0 && (type)->ref->vreg < (1 << 29) ? (type)->ref->vreg : 0)
+/* yasc `regex_t owned(regfree) * view preg`: a pointer to an object that is
+ * owned as a whole -- its node's vreg is (1 << 29) | the deallocator */
+#define YASC_OBJ_MARK (1 << 29)
+#define type_pointee_owned(type)                                                                                       \
+  ((((type)->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && (type)->ref && (type)->ref->vreg >= YASC_OBJ_MARK &&             \
+    (type)->ref->vreg < (YASC_OBJ_MARK << 1))                                                                          \
+       ? (type)->ref->vreg & (YASC_OBJ_MARK - 1)                                                                       \
+       : 0)
+/* yasc `T * borrows(buf) key` on a struct member: the member's pointer node
+ * has vreg -2 - i, an index into this table (struct.c) */
+#define YASC_FIELD_SRC_MAX 4
+typedef struct YascFieldBorrows
+{
+  int self_tok, self_off;
+  int nsrc;
+  int src_tok[YASC_FIELD_SRC_MAX], src_off[YASC_FIELD_SRC_MAX], src_size[YASC_FIELD_SRC_MAX];
+  int is_static;
+} YascFieldBorrows;
+#define type_borrows_field(type)                                                                                       \
+  ((((type)->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && (type)->ref && (type)->ref->vreg <= -2) ? -2 - (type)->ref->vreg \
+                                                                                              : -1)
+ST_FUNC YascFieldBorrows *yasc_field_borrows(int i);
+/* yasc `struct T borrows(text) { ... }`: a struct whose values borrow (struct.c) */
+ST_FUNC int yasc_struct_params(Sym *s);              /* how many borrows(...) names it takes, 0: none */
+ST_FUNC int yasc_struct_param(Sym *s, int tok);      /* the name's position, -1 */
+ST_FUNC int yasc_borrowing_struct(CType *type);      /* a value of TYPE borrows */
+ST_FUNC void yasc_struct_result_bind(int name, int code); /* function NAME's result: its sources (YASC_BORROWS_*) */
+ST_FUNC int yasc_struct_result_code(int name);         /* -1: none recorded */
+ST_DATA int yasc_sbind_pending, yasc_sbind_static, yasc_sbind_nb, yasc_sbind_names[4];
+ST_DATA Sym yasc_static_bound; /* SValue.sym of a call result bound to static storage */
+ST_DATA int yasc_borrows_field_ok, yasc_field_bnb, yasc_field_bstatic, yasc_field_bnames[28];
 
 /* Internal spill: the parameter list of a file-scope prototype goes to the spill
  * file between declarations and comes back when something reads it
@@ -840,11 +1028,58 @@ typedef struct SymLocalFacts
   int const_init_size;
   uint32_t param_nocapture; /* compiled static function: borrowed parameter bits */
   struct Sym *knr_proto;    /* old-style definition: the prototype its calls take */
+  /* The checked attributes (SymAttr.attr_facts): from the AttributeDef fields
+     of the same names, merged over every declaration of the Sym. */
+  int deprecated_msg;          /* a token, or 0 */
+  const char *deprecated_file; /* where `deprecated` was said, for the note (interned) */
+  int deprecated_line;
+  int nodiscard_msg;           /* a token, or 0 */
+  unsigned char deprecated;    /* -Wdeprecated-declarations at each use */
+  unsigned char unused_result; /* ATTR_WUR / ATTR_NODISCARD: -Wunused-result */
+  unsigned char fmt_kind, fmt_idx, fmt_first; /* format(): -Wformat */
+  unsigned char fmt_arg;                      /* format_arg(n): the result is argument n's format */
+  unsigned char tainted_result;                /* tainted_result: -Wtainted-format (ir/taint.c) */
+  uint32_t tainted_args;                       /* tainted_arg(n), bit n-1 */
   unsigned char objsize_max_valid;
   unsigned char objsize_strlen_valid;
   unsigned char const_init_valid;
   unsigned char const_init_in_progress;
+  /* A function's allocation attributes (builtin/objsize.c): alloc_size(a[, b])
+     (from 1), malloc, malloc(dealloc, i); and, for a deallocator some
+     malloc(dealloc, i) names, the argument it releases. */
+  int alloc_dealloc;              /* the deallocator's token, or 0 */
+  unsigned char alloc_size_a, alloc_size_b, alloc_dealloc_arg, alloc_malloc;
+  unsigned char dealloc_arg;
+  /* A local pointer variable's allocations (objsize.c): os_state 1 while
+     every store to it so far was an allocation's result (or null). */
+  unsigned char os_state;
+  unsigned char os_watch;         /* a variable an allocation's size came from: */
+  unsigned os_stores;             /* ... its stores, counted */
+  struct ObjHeap
+  {
+    unsigned lo, hi;              /* the sizes it may have (when known) */
+    int dealloc;                  /* the deallocator's token: 0 none yet, -1 several or unknown */
+    int alloc_tok, alloc_line;    /* the allocator (the last one), for the note */
+    struct Sym *nsym;             /* malloc(n): the variable n (the dynamic size) */
+    unsigned nstores;             /* ... its store count at the allocation */
+    unsigned factor;              /* calloc(n, k): k */
+    unsigned char known;          /* lo and hi hold */
+    unsigned char decl;           /* (also) a declared object's address: lo/hi its bytes from there */
+  } os_heap;
+  unsigned char flags; /* SYMF_*: 1-bit facts SymAttr has no room for (sym_flag_set) */
 } SymLocalFacts;
+typedef struct ObjHeap ObjHeap;
+/* SymLocalFacts.flags (SYMF_x (1u << n) as they come) */
+#define SYMF_STACK_PROTECT 1u    /* stack_protect: a canary under any -fstack-protector*, -explicit too */
+#define SYMF_NO_STACK_PROTECT 2u /* no_stack_protector: none, even under -fstack-protector-all */
+
+#define ATTR_WUR 1       /* warn_unused_result: (void) silences it, as with clang */
+#define ATTR_NODISCARD 2 /* C23 [[nodiscard]] */
+#define ATTR_FMT_PRINTF 1
+#define ATTR_FMT_SCANF 2
+#define ATTR_FMT_OTHER 3 /* an archetype tcc does not know: accepted, not checked */
+#define ATTR_FMT_STRFTIME 4 /* the conversions and their flags; no arguments */
+#define ATTR_FMT_STRFMON 5  /* %i / %n take a double (L: long double) */
 
 SymLocalFacts *sym_facts_peek(const struct Sym *s);
 const SymLocalFacts *sym_facts_get(const struct Sym *s);
@@ -852,6 +1087,16 @@ const SymLocalFacts *sym_facts_get(const struct Sym *s);
 SymLocalFacts *sym_facts(struct Sym *s);
 void sym_free_facts(struct Sym *s);
 void sym_facts_free_all(void);
+/* a 1-bit per-symbol fact (SYMF_*) in the side table: SymAttr is full */
+static inline void sym_flag_set(struct Sym *s, unsigned flag)
+{
+  sym_facts(s)->flags |= flag;
+  s->a.attr_facts = 1;
+}
+static inline int sym_flag(const struct Sym *s, unsigned flag)
+{
+  return s->a.attr_facts && (sym_facts_get(s)->flags & flag);
+}
 
 #include "source/ir/machine_op.h"
 #include "source/ir/tccir.h"
@@ -1066,6 +1311,8 @@ typedef struct YaffImportLib
 #define MACRO_OBJ 0  /* object like macro */
 #define MACRO_FUNC 1 /* function like macro */
 #define MACRO_JOIN 2 /* macro uses ## */
+#define MACRO_YASC 4 /* defined in yasc code: its expansion is yasc too */
+#define MACRO_SYS 8  /* defined in a system header: warnings in its expansion are quiet (gcc) */
 
 /* field 'Sym.r' for C labels */
 #define LABEL_DEFINED 0  /* label is defined */
@@ -1074,6 +1321,12 @@ typedef struct YaffImportLib
 #define LABEL_GONE                                                                                                     \
   3 /* label isn't in scope, but not yet popped                                                                        \
        from local_label_stack (stmt exprs) */
+
+/* Sym::c of a label an asm goto names in a check-only parse (tcc_state->
+   check_only), which may register no ELF symbol: an id below the -3 of
+   `&&label`, matched by tcc_ir_asm_label_note as an ELF index would be */
+#define ASM_CHECK_LABEL_ID(n) (-3 - (n))
+#define ASM_LABEL_ID_VALID(c) ((c) > 0 || (c) <= ASM_CHECK_LABEL_ID(1))
 
 /* type_decl() types */
 #define TYPE_ABSTRACT 1 /* type without variable */
@@ -1104,7 +1357,12 @@ typedef struct BufferedFile
   int prev_tok_flags;     /* saved tok_flags */
   char filename[1024];    /* filename */
   char *true_filename;    /* filename not modified by # line directive */
+  int col_base;           /* -fstack-usage: bytes of the current line before buffer[0] */
   unsigned char unget[4];
+  unsigned char yasc;      /* this file is yasc (see TCCState.yasc) */
+  unsigned char sys;       /* found on a system include path (or next to such a header) */
+  unsigned char pp_sys;    /* tcc -E: the sys of the last line marker written (flag 3) */
+  unsigned char yasc_dir;  /* found through -iyasc (1), its #pragma yasc written by tcc -E (2) */
   unsigned char buffer[1]; /* extra size for CH_EOB char */
 } BufferedFile;
 
@@ -1135,12 +1393,22 @@ typedef struct TokenString
   } data;
   char alloc;
   signed char need_spc; /* space insertion state: -1, 0, 1, 2, 3 */
+  unsigned char sys;    /* a live expansion of a system header's macro (next()) */
   int last_line_num;    /* last recorded line number (0 = none) */
   int save_line_num;    /* saved line number for macro */
   /* used to chain token-strings with begin/end_macro() */
   const int *prev_ptr;
   struct TokenString *prev;
   struct TokenString *owner; /* begin_macro_kept: the string this header replays, freed with it */
+  /* begin_macro: the token current when the replay began (what the parser
+   * would have gone back to) and the order of the replays, for error
+   * recovery (recover.c), which unwinds the replays an error left */
+  int save_tok;
+  unsigned serial;
+  /* a replay of a saved string (tok_str_borrow): that string, whose ranges
+   * of tokens from system-header macros (tok_str_sys_*) say where its
+   * warnings are quiet */
+  struct TokenString *src;
 } TokenString;
 
 /* The header of a kept string: everything up to and including data.str. */
@@ -1170,10 +1438,79 @@ typedef struct AttributeDef
   int alias_target; /* token */
   int asm_label;    /* associated asm label */
   char attr_mode;   /* __attribute__((__mode__(...))) */
+  unsigned char yasc; /* yasc qualifiers written before the type: out, drop, view */
+  unsigned char attr_unused; /* unused / maybe_unused: no -Wunused-* for it */
   int vector_size;  /* __attribute__((vector_size(N))) — total bytes, 0 if not a vector */
+  /* What GCC attributes say about pointers (applied by attr_apply_pointer_facts):
+     -Wnonnull reads nonnull, the yasc checks read all of them. */
+  unsigned char attr_malloc;          /* malloc: a fresh block, nothing else points to it */
+  unsigned char attr_returns_nonnull; /* returns_nonnull */
+  unsigned char attr_nonnull_all;     /* nonnull with no list: every pointer parameter */
+  uint32_t attr_nonnull;              /* nonnull(i, ...): bit i - 1 */
+  int attr_dealloc;                   /* malloc(dealloc, i): the deallocator's token */
+  int attr_dealloc_arg;               /* and its argument, from 1 */
+  unsigned char attr_alloc_a, attr_alloc_b; /* alloc_size(a[, b]), from 1 (builtin/objsize.c) */
+  /* Attributes the frontend checks at uses (decl/attribute.c, expr/attr_checks.c);
+     attr_apply_decl_facts moves them into the declared Sym's SymLocalFacts. */
+  unsigned char attr_deprecated;      /* deprecated; attr_deprecated_msg its text (a token), or 0 */
+  unsigned char attr_unused_result;   /* ATTR_WUR / ATTR_NODISCARD */
+  unsigned char attr_fmt_kind;        /* format(): ATTR_FMT_* */
+  unsigned char attr_fmt_idx;         /* format(kind, idx, first): the format's argument, from 1 */
+  unsigned char attr_fmt_first;       /* the first argument it formats, 0 for a va_list */
+  unsigned char attr_fmt_arg;         /* format_arg(n): n, from 1 */
+  unsigned char attr_tainted_result;  /* tainted_result: -Wtainted-format's source (ir/taint.c) */
+  uint32_t attr_tainted_args;         /* tainted_arg(n): what argument n points to, bit n-1 */
+  unsigned char attr_ssp;             /* stack_protect / no_stack_protector: SYMF_(NO_)STACK_PROTECT */
+  int attr_deprecated_msg;
+  int attr_nodiscard_msg;             /* [[nodiscard("why")]]: a token, or 0 */
+  /* C23 `auto` (C23 or yasc) or `__auto_type` with no type specifier: the
+     keyword; the declaration takes its type from the initializer (decl.c) */
+  int auto_tok;
+  /* `int owned(close) maybe`: an int handle's qualifiers and deallocator */
+  unsigned char yhandle;
+  int yhandle_dealloc;
+  /* `regex_t owned(regfree)`: an object owned as a whole, its deallocator */
+  int yobj_dealloc;
+  /* `struct T borrows(src)` where the type is used: what its values borrow */
+  unsigned char sbind_set, sbind_static, sbind_nb;
+  int sbind_names[4];
 } AttributeDef;
 
 /* inline functions */
+/* TCCState.sanitize: -fsanitize=<name> (gcc's names), -ftrapv */
+#define SAN_SIGNED_OVERFLOW 0x0001 /* signed-integer-overflow: + - * negation, MIN / -1 */
+#define SAN_SHIFT_BASE 0x0002      /* shift-base: a negative or overflowing signed << */
+#define SAN_SHIFT_EXP 0x0004       /* shift-exponent: a count < 0 or >= the width */
+#define SAN_DIV_ZERO 0x0008        /* integer-divide-by-zero */
+#define SAN_NULL 0x0010            /* null: a dereference of a null pointer */
+#define SAN_ALIGN 0x0020           /* alignment: of a misaligned pointer */
+#define SAN_VLA 0x0040             /* vla-bound: a VLA bound <= 0 */
+#define SAN_BOUNDS 0x0080          /* bounds: an index outside an array of known size */
+#define SAN_TRAPV 0x0100           /* -ftrapv: signed + - * and negation only */
+#define SAN_ARITH_ALL (SAN_SIGNED_OVERFLOW | SAN_SHIFT_BASE | SAN_SHIFT_EXP | SAN_DIV_ZERO)
+#define SAN_UNDEFINED (SAN_ARITH_ALL | SAN_NULL | SAN_ALIGN | SAN_VLA | SAN_BOUNDS)
+/* TCCState.stack_protector */
+#define SSP_PLAIN 1    /* -fstack-protector: char arrays of 8 bytes or more, alloca, VLAs */
+#define SSP_STRONG 2   /* -fstack-protector-strong: any array, any address-taken local */
+#define SSP_ALL 3      /* -fstack-protector-all: every function */
+#define SSP_EXPLICIT 4 /* -fstack-protector-explicit: only functions with stack_protect */
+/* frontend/gen/op/ubsan.c: ir->ssp / ir->ssp_off at a function's start */
+void ssp_begin_function(struct TCCIRState *ir, struct Sym *sym);
+#ifdef CONFIG_TCC_BCHECK
+void bcheck_func_exit(void); /* -b: the locals registered die (gen/op/bcheck.c) */
+void bcheck_ir_operand(struct SValue *sv); /* -b: an access reaching tcc_ir_put */
+void gbound(void);                         /* -b: vtop, an lvalue, checked */
+#endif
+
+/* the warning options (TCCState.warn_none up to warn_num) at a place */
+#define DIAG_SNAP_SIZE 96
+typedef struct DiagSnap
+{
+  const char *file; /* tcc_filename_intern; NULL: everywhere (the command line) */
+  int line;
+  unsigned char w[DIAG_SNAP_SIZE];
+} DiagSnap;
+
 typedef struct InlineFunc
 {
   TokenString *func_str;
@@ -1192,6 +1529,8 @@ typedef struct InlineFunc
   unsigned inline_count : 4; /* auto-inline expansions so far (call-heavy budget) */
   unsigned caller_count : 2; /* expansions into the function being compiled */
   unsigned leaf_bounded : 1;
+  unsigned expanded : 1; /* inlined at a call site at least once */
+  unsigned folded : 1;   /* a call evaluated at compile time (const_eval.c), which reports nothing */
 } InlineFunc; /* 4.9K in a Zig kernel compile: 44 -> 32 bytes */
 
 /* What few InlineFuncs carry, out of the one every function of a TU has
@@ -1341,6 +1680,10 @@ enum
   TCC_PCH_REPLAY_PACK_PUSH,
   TCC_PCH_REPLAY_PACK_POP,
   TCC_PCH_REPLAY_PACK_PUSH_DUP, /* bare push: duplicate the top at replay time */
+  TCC_PCH_REPLAY_YASC,          /* the yasc dialect off (0) / on (1): around a regular-C
+                                   macro's expansion in yasc code (macro_subst_tok) */
+  TCC_PCH_REPLAY_ERROR,         /* an error the lexer raised while a body was saved,
+                                   raised when the parse reaches it (save_body_cut) */
 };
 
 #ifdef CONFIG_TCC_ASM
@@ -1454,6 +1797,28 @@ struct TCCState
   unsigned char internal_spill;    /* -f[no-]internal-spill (on): saved bodies and prototype
                                       parameter lists go to <output>.<pid>.spill (tccpp.c) */
   unsigned int cversion;           /* supported C ISO version, 199901 (the default), 201112, ... */
+  unsigned char yasc_std;          /* -std=yasc: the yasc dialect from the start of each TU */
+  unsigned char yasc;              /* the yasc dialect is on here: in a yasc file (the main one with
+                                      -std=yasc, or one that said #pragma yasc), outside a regular-C
+                                      macro's expansion */
+  const char **yasc_files;         /* tcc_filename_intern'ed names of the yasc files */
+  int nb_yasc_files;
+  char **yasc_include_paths;       /* -iyasc DIR / YASC_INCLUDE_PATH: the include_paths entries
+                                      whose headers are yasc files */
+  int nb_yasc_include_paths;
+  uint32_t pp_marker_yasc;         /* compiling tcc -E output: the dialects line markers with
+                                      flag 1 left, one bit per level (pp_line_marker) */
+  int pp_marker_depth;
+  unsigned char ccompat;           /* -ccompat or -std=c../gnu..: regular C, no safe defaults */
+  unsigned char yasc_main_decl_seen; /* the main file has had a declaration: too late for `module` */
+  char *yasc_module;                /* `module NAME;` of this TU (decl/module.c), else NULL */
+  char **yasc_includes;             /* the main file's #includes, for the module interface */
+  int nb_yasc_includes;
+  char **module_dirs;               /* -fmodule-dir=: where interfaces are written (the first) and read */
+  unsigned char module_deps;        /* -fmodule-deps: print module/import lines, compile nothing */
+  char *module_header_dir;          /* -fmodule-header=DIR: also write a module's C header there */
+  int nb_module_dirs;
+  uint32_t warn_user[4];           /* options_W entries the command line set (by index) */
 
   /* C language options */
   unsigned char char_is_unsigned;
@@ -1493,13 +1858,144 @@ struct TCCState
   /* warning switches */
   unsigned char warn_none;
   unsigned char warn_all;
+  unsigned char warn_extra; /* -Wextra: the name of the WD_EXTRA group */
   unsigned char warn_error;
   unsigned char warn_write_strings;
   unsigned char warn_unsupported;
+  unsigned char warn_system_headers; /* -Wsystem-headers: warnings in system headers too (error1) */
   unsigned char warn_implicit_function_declaration;
   unsigned char warn_discarded_qualifiers;
+  unsigned char warn_lifetime; /* -Wlifetime: the flow checks on the raw IR (ir/lifetime.c) */
+  unsigned char warn_int_conversion;            /* pointer <-> integer without a cast */
+  unsigned char warn_incompatible_pointer_types; /* pointer to a different type */
+  unsigned char warn_return_type;               /* return with or without a value against the type */
+  unsigned char warn_implicit_int;              /* a declaration with no type */
+  unsigned char warn_uninitialized;             /* a local read where no path stored it */
+  unsigned char warn_maybe_uninitialized;       /* ... where some path did not */
+  unsigned char warn_return_local_addr;         /* return &local */
+  unsigned char warn_ignored_attributes;        /* an attribute promising a check tcc does not make */
+  unsigned char warn_nonnull;                   /* null passed to a nonnull parameter */
+  unsigned char warn_dangling_pointer;          /* a local's address stored where it outlives the function */
+  unsigned char warn_null_dereference;          /* a dereference the optimizer proved null */
+  unsigned char warn_implicit_move;             /* yasc: ownership leaves a variable without move() */
+  unsigned char warn_strict_prototypes;         /* a function declarator without parameter types */
+  unsigned char warn_missing_prototypes;        /* a global function defined with no prototype before it */
+  unsigned char warn_pointer_arith;             /* arithmetic on void * / function pointers, sizeof(void) */
+  unsigned char warn_cast_qual;                 /* a cast dropping const/volatile from the pointed-to type */
+  unsigned char warn_cast_align;                /* a cast raising the pointed-to alignment */
+  unsigned char warn_address_of_packed_member;  /* &packed->member converted to an over-aligned pointer */
+  unsigned char warn_frame_larger_than;         /* -Wframe-larger-than=N: a frame over N bytes (stack_usage.c) */
+  unsigned char warn_stack_usage;               /* -Wstack-usage=N: the same, and any dynamic frame */
+  unsigned char warn_vla;                       /* a variable-length array declared */
+  unsigned char warn_alloca;                    /* a call to alloca / __builtin_alloca */
+  unsigned char warn_format;                    /* a format(printf|scanf) call's literal against its arguments */
+  unsigned char warn_format_security;           /* a format that is not a literal, with no arguments */
+  unsigned char warn_format_n;                  /* %n in a printf format */
+  unsigned char warn_unused_result;             /* warn_unused_result / [[nodiscard]] result discarded */
+  unsigned char warn_deprecated_declarations;   /* a deprecated declaration used */
+  unsigned char warn_sign_compare;              /* signed and unsigned compared, the signed side converted */
+  unsigned char warn_conversion;                /* an implicit conversion that may change a value */
+  unsigned char warn_sign_conversion;           /* ... that may change its sign */
+  unsigned char warn_shift_count_overflow;      /* a constant shift count >= the width */
+  unsigned char warn_shift_count_negative;      /* a constant shift count < 0 */
+  unsigned char warn_shift_overflow;            /* 2 << 31: a constant shifted past the sign bit */
+  unsigned char warn_div_by_zero;               /* an integer division by the constant 0 */
+  unsigned char warn_overflow;                  /* a constant that does not fit, signed overflow folding */
+  unsigned char warn_tautological_compare;      /* x == x */
+  unsigned char warn_type_limits;               /* unsigned < 0, a char compared out of its range */
+  unsigned char warn_array_bounds;              /* a constant index outside a known-size array */
+  unsigned char warn_sizeof_pointer_memaccess;  /* memset(p, 0, sizeof p) */
+  unsigned char warn_sizeof_array_argument;     /* sizeof of an array parameter */
+  unsigned char warn_implicit_fallthrough;      /* a case reached from the one above it, unmarked */
+  unsigned char warn_parentheses;               /* `if (a = b)`, `a && b || c`, `a & b == c` */
+  unsigned char warn_logical_not_parentheses;   /* `!a == b` */
+  unsigned char warn_dangling_else;             /* `if (a) if (b) x; else y;` */
+  unsigned char warn_empty_body;                /* `if (x);`, `else;`, `do; while (x);` */
+  unsigned char warn_switch;                    /* an enum switch missing an enumerator, no default */
+  unsigned char warn_shadow;                    /* a local hiding a local, a parameter or a global */
+  unsigned char warn_cross_tu;                  /* a global's types differ between units (at the link) */
+  unsigned char warn_tainted_format;            /* a printf format from untrusted input (ir/taint.c) */
+  /* -Wunused-* (frontend/gen/core/unused.c) */
+  unsigned char warn_unused;                    /* -Wunused: the name of the group below */
+  unsigned char warn_unused_variable;           /* a local, or a file-scope static, never used */
+  unsigned char warn_unused_const_variable;     /* ... a const file-scope static of the main file */
+  unsigned char warn_unused_function;           /* a static function defined and never used */
+  unsigned char warn_unused_but_set_variable;   /* a local only ever assigned to */
+  unsigned char warn_unused_value;              /* a statement whose value goes nowhere */
+  unsigned char warn_unused_label;              /* a label nothing jumps to */
+  unsigned char warn_unused_local_typedefs;     /* a typedef in a block never used */
+  unsigned char warn_unused_parameter;          /* a parameter never used */
+  unsigned char warn_unused_but_set_parameter;  /* a parameter only ever assigned to */
+  /* object sizes (frontend/gen/builtin/objsize.c) */
+  unsigned char warn_stringop_overflow;         /* memcpy/strcpy/... writing past a known-size destination */
+  unsigned char warn_format_overflow;           /* sprintf output longer than its destination */
+  unsigned char warn_format_truncation;         /* snprintf output longer than its bound */
+  unsigned char warn_alloc_size_larger_than;    /* an allocation's constant size over the limit */
+  unsigned char warn_alloc_mul_overflow;        /* malloc(n * m) with no overflow check */
+  unsigned char warn_free_nonheap_object;       /* free of a local, a global or a literal */
+  unsigned char warn_mismatched_dealloc;        /* fclose(malloc(...)), free(fopen(...)) */
 #define WARN_ON 1         /* warning is on (-Woption) */
   unsigned char warn_num; /* temp var for tcc_warning_c() */
+  unsigned char diag_color;      /* -fdiagnostics-color= (DIAG_COLOR_*) */
+#define DIAG_COLOR_AUTO 0
+#define DIAG_COLOR_ALWAYS 1
+#define DIAG_COLOR_NEVER 2
+  unsigned char diag_last_shown; /* the last warning/error was printed: its notes are too */
+  unsigned char diag_any_header; /* the next warning is given in a system header too (#warning) */
+  unsigned char diag_noabort;    /* a warning made an error does not abort (a checker's report walk) */
+  unsigned char diag_flow_only;  /* only diagnostics that carry their line ("%i:", the flow checks):
+                                    the check-only parse of an inlined body the expansions already
+                                    reported on (check_uncompiled_inline_functions) */
+  const char *main_file;         /* tcc_filename_intern of the unit's main file */
+  unsigned char unused_on;       /* some -Wunused-* check was on in this unit: uses are recorded
+                                    (sticky: a #pragma turning it off must not lose a use) */
+  unsigned char syntax_only;     /* -fsyntax-only: parse and check, generate and write nothing */
+  /* stack use (backend/generators/stack_usage.c) */
+  unsigned long long frame_larger_than; /* -Wframe-larger-than=N (when frame_larger_than_set) */
+  unsigned long long stack_usage_limit; /* -Wstack-usage=N (when stack_usage_limit_set) */
+  unsigned char frame_larger_than_set, stack_usage_limit_set;
+  /* -Walloc-size-larger-than=N (default PTRDIFF_MAX), -Wstringop-overflow=N,
+     -Wformat-overflow=N, -Wformat-truncation=N (levels; 0: the default) */
+  unsigned long long alloc_size_limit;
+  unsigned char alloc_size_limit_set, stringop_level, format_overflow_level, format_truncation_level;
+  /* -Warray-bounds=N: 1 (also plain -Warray-bounds, -Wall) the frontend's
+     checks, 2 also the value ranges on the raw IR (ir/bounds.c); 0 unset */
+  unsigned char array_bounds_level;
+  unsigned char stack_usage;     /* -fstack-usage: write <object>.su */
+  unsigned char callgraph_info;  /* -fcallgraph-info[=su]: write <object>.ci */
+  struct StackUsage *su;         /* the unit's functions, written by tcc_stack_usage_write */
+  /* the last declarator's name (type_decl, only while TCC_SU_WANTED): a
+   * function definition's .su location, gcc's line and column of the name */
+  int su_name_tok, su_name_line, su_name_col;
+  unsigned warned_attributes;    /* -Wignored-attributes: the ones already reported in this unit */
+  /* #pragma GCC/tcc diagnostic: the warning options as each pragma left them,
+     by file and line, so a diagnostic reported later than its line was parsed
+     (the flow checks, at the end of a function) sees the state at its line;
+     entry 0 is the command line's.  And the push stack. */
+  struct DiagSnap *diag_snaps;
+  int nb_diag_snaps;
+  struct DiagSnap *diag_stack;
+  int nb_diag_stack;
+  /* the report-once set (tcc_diag_once): what was already reported in this
+     unit -- by option or kind, file, line and text -- as open-addressed
+     hashes (0 marks a free slot).  Every "once" of the frontend goes here:
+     tcc_warning_once, tcc_fe_warning, tcc_diag_first, the attribute and the
+     -Wunused checks. */
+  unsigned *diag_once;
+  int nb_diag_once, diag_once_cap;
+  /* the parse of a body being read (tcc_diag_parse_enter): a function's
+     compile, check-only parse, inline expansion or cleanup replay.  The k-th
+     warning of a line and text in one parse is the k-th in every other. */
+  unsigned diag_parse, diag_parse_next;
+  /* the system headers of this unit, from a line on (0: the whole file;
+     #pragma GCC system_header: its line), by tcc_filename_intern'ed name --
+     for a body replayed after its file was closed (tcc_in_sys_header) */
+  struct SysFile
+  {
+    const char *name;
+    int line;
+  } *sys_files;
+  int nb_sys_files;
 
   unsigned char option_r;         /* option -r */
   unsigned char do_bench;         /* option -bench */
@@ -1517,6 +2013,16 @@ struct TCCState
   unsigned char do_bounds_check;
 #endif
   unsigned char test_coverage; /* generate test coverage code */
+  /* -fsanitize=... (frontend/gen/op/ubsan.c) and -ftrapv: SAN_* bits, 0 =
+     off */
+  unsigned short sanitize;
+  /* the checks that call libc's __ubsan_handle_* instead of trapping:
+     asked for by -fno-sanitize-trap / -fsanitize-recover /
+     -fno-sanitize-recover, unless -fsanitize-trap names them; _abort
+     variants for -fno-sanitize-recover's (SAN_* bits) */
+  unsigned short sanitize_handler, sanitize_trap, sanitize_abort;
+  /* -fstack-protector[-strong|-all|-explicit]: SSP_* (0 = off) */
+  unsigned char stack_protector;
 
   /* IR optimization flags (-f options) */
   unsigned char opt_dce;              /* -fdce: dead code elimination */
@@ -1647,6 +2153,11 @@ struct TCCState
   char *ram_text_file;            /* --ram-text=FILE: functions the linker script runs from RAM */
   char **interned_files;          /* tcc_filename_intern: one copy of each source path */
   int nb_interned_files;
+  const char *diag_replay_file;   /* the file of the body an inline expansion (or a cleanup) replays:
+                                     its diagnostics name it, and its system-header state is that file's */
+  unsigned char fe_speculative;   /* const_eval.c's speculative parse: no frontend warnings */
+  unsigned char diag_spec_dropped; /* the speculative parse met a warning it could not say */
+  unsigned char diag_spec_recheck; /* ... and its call folded: the check-only parse runs */
   char **ram_text_names, **ram_text_section_names;
   int nb_ram_text_names, nb_ram_text_section_names;
   unsigned char ram_text_read;
@@ -1739,6 +2250,31 @@ struct TCCState
   int error_set_jmp_enabled;
   jmp_buf error_jmp_buf;
   int nb_errors;
+  /* Error recovery (frontend/gen/core/recover.c): an error goes on to the
+   * next external declaration, or the next statement of a function body,
+   * until max_errors (-fmax-errors=N, 0 = no limit) have been reported. */
+  int max_errors;
+  unsigned char max_errors_defer, max_errors_hit; /* tcc_max_errors_defer / _stop */
+  struct TCCRecover *recover;  /* the innermost armed recovery point, or NULL */
+  unsigned char error_fatal;   /* the error being raised leaves no state to go on from */
+  unsigned char recover_syntax_only; /* syntax_only before the first error turned it on */
+  unsigned char recover_flipped;     /* the unit went on as -fsyntax-only after an error */
+  unsigned *err_seen;          /* hashes of the errors printed in this unit: a replay says nothing twice */
+  int nb_err_seen, err_seen_mask;
+  int *undecl_toks;            /* the undeclared names reported in the current function */
+  int nb_undecl_toks, undecl_cap;
+  const void *undecl_func;     /* ... which is this one (its recovery point) */
+  /* a function body being saved as tokens (decl.c save_function_body): an
+     error the lexer raises, or the end of the input, cuts the body there and
+     the saved part is parsed at once -- the errors come where -O0 says them */
+  jmp_buf *save_body_jmp;
+  char *save_body_msg;         /* the lexer's error, said when the parse reaches it */
+  int save_body_line;
+  struct DeferredFunc *save_body_deferred; /* defer_function_body's entry while its body is
+                                              saved: an error there ends the compile, and
+                                              tccgen_finish frees it */
+  struct TypeSig *typesigs; /* -Wcross-tu: the link's type signatures (obj/tccelf_load.c) */
+  int nb_typesigs;
 
   /* output file for preprocessing (-E) */
   FILE *ppfp;
@@ -2376,6 +2912,7 @@ static inline SValue tcc_ir_svalue_call_id_argc(int call_id, int argc)
 #define TOK_PLCHLDR 0xa4                       /* placeholder token as defined in C99 */
 #define TOK_PPJOIN (TOK_TWOSHARPS | SYM_FIELD) /* A '##' in a macro to mean pasting */
 #define TOK_SOTYPE 0xa7                        /* alias of '(' for parsing sizeof (type) */
+#define TOK_EMBED_RESUME 0xa5                  /* #embed pushed its tokens: read them */
 
 /* assignment operators */
 #define TOK_A_ADD 0xb0
@@ -2627,6 +3164,36 @@ PUB_FUNC NORETURN void _tcc_error(const char *fmt, ...) PRINTF_LIKE(1, 2);
 PUB_FUNC NORETURN void _tcc_ice(const char *fmt, ...) PRINTF_LIKE(1, 2);
 PUB_FUNC NORETURN void _tcc_ice_stop(void);
 PUB_FUNC void _tcc_warning(const char *fmt, ...) PRINTF_LIKE(1, 2);
+PUB_FUNC void _tcc_warning_once(int woff, int line, const char *fmt, ...) PRINTF_LIKE(3, 4);
+ST_FUNC void tcc_vwarning_once(int woff, int line, const char *fmt, va_list ap);
+ST_FUNC int tcc_in_sys_header(void);
+ST_FUNC void tcc_sys_mark_file(TCCState *s1, const char *filename, int line);
+PUB_FUNC void _tcc_note(const char *fmt, ...) PRINTF_LIKE(1, 2);
+/* A fix-it for the diagnostic just shown (dropped with it): WORD, found once
+   on LINE (0: the diagnostic's) of its file, is replaced by TEXT, or TEXT goes
+   before or after it.  Shown as -fdiagnostics-parseable-fixits lines, or in
+   the JSON / SARIF output; nothing when the word is not there exactly once
+   (tcc keeps no columns).  Give the note saying it first. */
+#define FIXIT_REPLACE 0
+#define FIXIT_BEFORE 1
+#define FIXIT_AFTER 2
+PUB_FUNC int tcc_fixit(int line, const char *word, int where, const char *text);
+/* A call's fix-its, for the diagnostic just shown.  tcc_fixit_call() finds
+   the call `NAME(` once on LINE (0: the diagnostic's) of its file, with its
+   arguments up to ARG (from 0) on that line, and copies the first
+   argument's text into BUF (BUFSZ bytes): 0 when it is not all there.  Look before the note,
+   whose text may want the argument; then tcc_fixit_call_emit() after the
+   note: RENAME replaces the name, APPEND goes after argument ARG (each may be
+   NULL). */
+PUB_FUNC int tcc_fixit_call(int line, const char *name, int arg, char *buf, int bufsz);
+PUB_FUNC void tcc_fixit_call_emit(const char *rename, const char *append);
+/* the note NOTE and that fix-it, given right after the next diagnostic: for
+   an error, which aborts before its caller could add them.  Strings must live
+   on (literals, token names). */
+PUB_FUNC void tcc_fixit_next(int line, const char *word, int where, const char *text, const char *note);
+/* after tcc_fixit_next(): a fix-it to give instead when its word is not on
+   the line exactly once (WORD NULL: none); up to two, tried in turn */
+PUB_FUNC void tcc_fixit_next_alt(const char *word, int where, const char *text);
 #define tcc_internal_error(msg) tcc_error("internal compiler error in %s:%d: %s", __FUNCTION__, __LINE__, msg)
 
 /* other utilities */
@@ -2721,8 +3288,22 @@ ST_FUNC int normalized_PATHCMP(const char *f1, const char *f2);
 ST_DATA struct BufferedFile *file;
 ST_DATA int tok;
 ST_DATA CValue tokc;
+ST_DATA unsigned char fe_tokfp_on;
+ST_DATA uint64_t fe_tokfp_h, fe_tokfp_prev;
+ST_DATA unsigned fe_tokfp_n;
 ST_DATA const int *macro_ptr;
 ST_DATA int parse_flags;
+ST_DATA unsigned tok_macro_serial; /* begin_macro's count (error recovery) */
+ST_DATA int pp_subst_depth;        /* > 0 while a macro is substituted */
+ST_FUNC TokenString *tok_macro_stack(void);
+ST_FUNC void tok_macro_restore(TokenString *stack, const int *ptr);
+/* warnings in the expansion of a system header's macro are quiet (gcc): the
+   last token read came from one -- a live expansion, or a range of a saved
+   string being replayed */
+ST_FUNC int tcc_sys_macro_here(void);
+ST_FUNC int tok_str_sys_save(TokenString *to, int sys);   /* skip_or_save_block: per token */
+ST_FUNC void tok_str_sys_copy(TokenString *from, TokenString *to);
+ST_DATA int tok_sys_ranges;                               /* saved strings with such ranges */
 ST_DATA int tok_flags;
 ST_DATA CString tokcstr; /* current parsed string, if any */
 /* When non-NULL (set by skip_or_save_block while recording a function body for
@@ -2731,6 +3312,12 @@ ST_DATA CString tokcstr; /* current parsed string, if any */
    pack state is applied at the struct's position during replay, not eagerly
    during the recording scan. */
 ST_DATA TokenString *pp_pragma_capture;
+/* yasc: is the token just read regular C, in a unit that has yasc in it?
+   (TCCState.yasc follows the file and macro being read; tccpp.c) */
+ST_FUNC int pp_in_c(void);
+/* does the unit have yasc in it -- its main file, or any file from a #pragma
+   yasc, or an imported interface?  (TCCState.yasc is the file being read) */
+#define tcc_yasc_unit(s1) ((s1)->yasc_std || (s1)->nb_yasc_files)
 /* Count of #pragma pack actions ever added to a pp_pragma_capture stream: lets
    a caller of skip_or_save_block tell whether the saved tokens hold any. */
 ST_DATA int pp_pack_captures;
@@ -2829,10 +3416,65 @@ ST_FUNC int tcc_spill_active(void);
 ST_FUNC long tcc_spill_append(const void *p, size_t n);
 ST_FUNC void tcc_spill_read(long off, void *p, size_t n);
 ST_FUNC const char *tcc_filename_intern(const char *name);
+ST_FUNC int tcc_yasc_file(TCCState *s1, const char *filename);
+ST_FUNC int tcc_yasc_include_dir(TCCState *s1, const char *dir);
+/* tcc_warning_once for a warning that depends on constant values (-Woverflow,
+   -Warray-bounds, ...): also quiet in const_eval.c's speculative parse */
+ST_FUNC void tcc_fe_warning(int warn_offset, const char *fmt, ...) PRINTF_LIKE(2, 3);
+#define tcc_fe_warning_c(sw, ...) tcc_fe_warning(offsetof(TCCState, sw), __VA_ARGS__)
+enum
+{
+  DIAG_PRAGMA_PUSH,
+  DIAG_PRAGMA_POP,
+  DIAG_PRAGMA_IGNORED,
+  DIAG_PRAGMA_WARNING,
+  DIAG_PRAGMA_ERROR
+};
+ST_FUNC void tcc_pragma_diagnostic(TCCState *s1, int action, const char *option, const char *file, int line);
+ST_FUNC void tcc_diag_reset(TCCState *s1);
+ST_FUNC int tcc_diag_first(TCCState *s1, int line, int key);
+ST_FUNC int tcc_diag_marked(TCCState *s1, int line, int key);
+/* the report-once set itself: NS one of DIAG_ONCE_*, KEY and TEXT (may be
+   NULL) tell apart what is said at LINE of FILE (tcc_filename_intern'ed, or
+   NULL).  Returns 1 the first time (and records it when INSERT); 0 after. */
+enum
+{
+  DIAG_ONCE_WARN = 1, /* a warning: KEY its option's warn_ offset, TEXT its message */
+  DIAG_ONCE_PLACE,    /* tcc_diag_first: KEY a DIAG_KEY */
+  DIAG_ONCE_DECL      /* -Wunused: KEY mixes the kind and the declaration's token */
+};
+ST_FUNC int tcc_diag_once(TCCState *s1, int ns, unsigned key, const char *file, int line, const char *text,
+                          int insert);
+ST_FUNC const char *tcc_diag_file(BufferedFile **pf);
+/* a body's parse starts (returns what tcc_diag_parse_leave restores) */
+static inline unsigned tcc_diag_parse_enter(TCCState *s1)
+{
+  unsigned saved = s1->diag_parse;
+  s1->diag_parse = ++s1->diag_parse_next;
+  return saved;
+}
+#define tcc_diag_parse_leave(s1, saved) ((s1)->diag_parse = (saved))
+/* tcc_diag_first keys of the frontend checks */
+enum
+{
+  DIAG_KEY_FALLTHROUGH_COMMENT = 1, /* a fall-through comment right before this line's case label */
+  DIAG_KEY_FALLTHROUGH,
+  DIAG_KEY_PARENTHESES,
+  DIAG_KEY_DANGLING_ELSE,
+  DIAG_KEY_EMPTY_BODY,
+  DIAG_KEY_SWITCH,
+  DIAG_KEY_SHADOW
+};
+#define DIAG_KEY(kind, extra) ((int)((unsigned)(extra) << 4) | (kind))
+ST_FUNC void tccpp_setfile_replay(const char *filename);
+ST_FUNC void tcc_yasc_mark_file(TCCState *s1, const char *filename);
+ST_FUNC int tcc_sys_file(TCCState *s1, const char *filename, int line);
 ST_FUNC void tok_str_add(TokenString *s, int t);
 ST_FUNC void tok_str_add2(TokenString *s, int t, CValue *cv);
 ST_FUNC void tok_str_add_tok(TokenString *s);
 ST_FUNC void tok_get(int *t, const int **pp, CValue *cv);
+ST_FUNC long long pp_error_name(void);
+ST_FUNC void pp_errno_macros(void (*cb)(int tok, int value));
 ST_FUNC void pp_apply_pack_replay(TCCState *s1, int code);
 ST_FUNC void pp_apply_pack_replays(TCCState *s1, const int *p, const int *end);
 ST_FUNC int *pp_pack_snapshot(TCCState *s1);
@@ -2939,6 +3581,21 @@ ST_DATA const char *funcname;
 
 ST_FUNC void tccgen_init(TCCState *s1);
 ST_FUNC int tccgen_compile(TCCState *s1);
+/* error recovery (frontend/gen/core/recover.c) */
+ST_FUNC int tcc_error_seen(TCCState *s1, const char *msg, int len);
+ST_FUNC void tcc_recover_jump(TCCState *s1);
+ST_FUNC void tcc_recover_release(TCCState *s1);
+ST_FUNC void tcc_max_errors_defer(TCCState *s1);
+ST_FUNC void tcc_max_errors_stop(TCCState *s1);
+ST_FUNC void save_body_error(TCCState *s1, int line, const char *msg); /* longjmps */
+ST_FUNC void save_body_raise(TCCState *s1);
+ST_FUNC void tcc_undeclared(int t, const char *name);
+ST_FUNC int gen_body_recovering(void); /* block(0) of a body, going on after errors */
+/* a struct or union body's members, each by MEMBER(ARG), going on with the
+   next member after an error in one */
+ST_FUNC void struct_body_recovering(void (*member)(void *), void *arg);
+ST_FUNC int replay_recovering(void (*fn)(void *), void *arg); /* a replay: goes on after it */
+ST_FUNC void replay_body_recovering(TokenString *ts, Sym *callee); /* an inline expansion's or a defer's */
 /* The builtin alias prototypes are built lazily (predef_protos.c): armed at
    tccgen_compile start, a name is queued when first interned and its
    prototype materialised before the next identifier lookup or push. */
@@ -2992,6 +3649,46 @@ int tcc_icf_try_fold(TCCState *s1, Sym *sym, Section *sec, addr_t start, addr_t 
 void tcc_icf_reset(void);
 void tcc_icf_section_changed(Section *sec);
 #endif
+/* Stack use per function: -Wframe-larger-than=, -Wstack-usage=, -fstack-usage,
+ * -fcallgraph-info (backend/generators/stack_usage.c). */
+/* Indirect calls of one function type (-fcallgraph-info): SIG indexes the
+ * unit's signature table (tcc_stack_usage_sig), 0 when the type is not known. */
+#define TCC_SU_MAX_INDIRECT_SIGS 16
+typedef struct TCCStackIndirect
+{
+  int sig;
+  int calls, tail;
+} TCCStackIndirect;
+typedef struct TCCStackFrame
+{
+  int entry;          /* bytes SP drops in the prologue: pushes and the SUB SP */
+  int transient;      /* the most SP drops further in the body (scratch pushes, call windows) */
+  int dynamic;        /* SP moves by a run-time amount (VLA, alloca) */
+  int indirect_calls; /* BLX through a register */
+  int indirect_tail;  /* BX through a register (an indirect tail call) */
+  /* the indirect calls by function type; one with sig 0 holds those of no
+   * known type (and those past TCC_SU_MAX_INDIRECT_SIGS types) */
+  TCCStackIndirect by_sig[TCC_SU_MAX_INDIRECT_SIGS + 1];
+  int nb_sigs;
+} TCCStackFrame;
+/* any stack option on: the frontend's records for it are made only then */
+#define TCC_SU_WANTED(s1)                                                                                              \
+  ((s1)->stack_usage || (s1)->callgraph_info || (s1)->frame_larger_than_set || (s1)->stack_usage_limit_set)
+ST_FUNC int tcc_stack_usage_wanted(TCCState *s1);
+ST_FUNC void tcc_stack_usage_declarator(TCCState *s1, Sym *sym, int v, int line);
+ST_FUNC int tcc_stack_usage_name_column(int v);
+ST_FUNC int tcc_stack_usage_sig(TCCState *s1, Sym *ftype);
+ST_FUNC void tcc_stack_usage_note_call(TCCState *s1, int call_id, Sym *ftype);
+ST_FUNC int tcc_stack_usage_call_sig(TCCState *s1, int call_id);
+ST_FUNC void tcc_stack_usage_function(TCCState *s1, Sym *sym, int line, int end_line, Section *sec, addr_t start,
+                                      size_t reloc_mark, int naked);
+ST_FUNC void tcc_stack_usage_unit_end(TCCState *s1);
+ST_FUNC void tcc_stack_usage_write(TCCState *s1, const char *object);
+ST_FUNC void tcc_stack_usage_free(TCCState *s1);
+ST_FUNC void tcc_gen_machine_stack_begin(int naked);
+ST_FUNC void tcc_gen_machine_stack_end(TCCStackFrame *f);
+ST_FUNC void tcc_gen_machine_stack_indirect(int is_jmp);
+ST_FUNC void tcc_gen_machine_stack_call_sig(int sig);
 #if PTR_SIZE == 4
 ST_FUNC void greloc(Section *s, Sym *sym, unsigned long offset, int type);
 #endif
@@ -3007,6 +3704,8 @@ ST_FUNC Sym *label_find(int v);
 ST_FUNC Sym *label_push(Sym **ptop, int v, int flags);
 ST_FUNC void label_pop(Sym **ptop, Sym *slast, int keep);
 ST_INLN Sym *struct_find(int v);
+/* yasc modules (frontend/gen/decl/module.c): -fmodule-deps */
+ST_FUNC void yasc_module_scan(TCCState *s1);
 ST_FUNC Sym *sym_tag_head(int v);
 ST_FUNC void sym_set_tag_head(int v, Sym *s);
 ST_FUNC Sym *sym_label_head(int v);
@@ -3018,6 +3717,7 @@ ST_FUNC void sym_short_pools_free(void);
 ST_FUNC int sym_outlived_locals_mark(void);
 ST_FUNC void sym_free_outlived_locals(int mark);
 ST_FUNC Sym *sym_pointer_node(CType *type);
+ST_FUNC Sym *sym_pointer_node_q(CType *type, int yasc);
 ST_FUNC void sym_pointer_nodes_free(void);
 /* A parked prototype (sym_park_proto): its name's sym_identifier holds the
    record, tagged in bit 0, until sym_unpark builds the Syms back. */
@@ -3029,6 +3729,7 @@ ST_FUNC void sym_params_release(void);
 ST_FUNC void sym_params_spill_close(void);
 ST_FUNC int sym_functype_adopt(Sym *old_ref, Sym *new_ref);
 extern Sym *declarator_last_functype;
+extern Sym *patch_own_functype; /* attr_merge.c: set by decl around external_sym */
 ST_DATA int gen_function_depth;
 ST_FUNC void sym_parked_free_all(void);
 
@@ -3064,6 +3765,9 @@ ST_FUNC void gen_op(int op);
 ST_FUNC void gen_op_vector_reset(void);
 ST_FUNC int type_size(const CType *type, int *a);
 ST_FUNC void mk_pointer(CType *type);
+ST_FUNC void mk_pointer_yasc(CType *type, int yasc);
+ST_FUNC void type_yasc_strip(CType *type);
+ST_FUNC void yasc_verify_discard(void);
 ST_FUNC void mk_private_pointer(CType *type);
 ST_FUNC void vstore(void);
 ST_FUNC void inc(int post, int c);
@@ -3177,6 +3881,14 @@ ST_FUNC void relocate_sections(TCCState *s1);
 
 ST_FUNC ssize_t full_read(int fd, void *buf, size_t count);
 ST_FUNC void *load_data(int fd, unsigned long file_offset, unsigned long size);
+/* -Wcross-tu (frontend/gen/decl/typesig.c, obj/tccelf_load.c) */
+ST_FUNC void tcc_typesig_unit(TCCState *s1, const char *unit);
+ST_FUNC void tcc_typesig_note(int v, int line, int defined);
+ST_FUNC void tcc_typesig_reset(void);
+ST_FUNC void tcc_typesig_add(TCCState *s1, const char *name, const char *sig, int kind, const char *loc,
+                             const char *unit);
+ST_FUNC void tcc_typesig_check(TCCState *s1);
+ST_FUNC void tcc_typesig_free(TCCState *s1);
 ST_FUNC int tcc_object_type(int fd, ElfW(Ehdr) * h);
 ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset);
 ST_FUNC int tcc_load_object_file_lazy(TCCState *s1, int fd, unsigned long file_offset);
@@ -3937,6 +4649,7 @@ static inline void post_sem(TCCSem *p)
 #define tcc_ice(...) TCC_SET_STATE(_tcc_ice_stop)()
 #endif
 #define tcc_warning TCC_SET_STATE(_tcc_warning)
+#define tcc_note TCC_SET_STATE(_tcc_note)
 
 #define total_idents TCC_STATE_VAR(total_idents)
 #define total_lines TCC_STATE_VAR(total_lines)
@@ -3948,6 +4661,18 @@ PUB_FUNC void tcc_exit_state(TCCState *s1);
 /* conditional warning depending on switch */
 #define tcc_warning_c(sw)                                                                                              \
   TCC_SET_STATE((tcc_state->warn_num = offsetof(TCCState, sw) - offsetof(TCCState, warn_none), _tcc_warning))
+
+/* tcc_warning_c(sw), once per place (file, line, option, message) and never
+   in a system header: the frontend inliner replays a body at every call site
+   besides compiling it on its own.  For the frontend checks. */
+#define tcc_warning_once(sw, ...) _tcc_warning_once(offsetof(TCCState, sw), 0, __VA_ARGS__)
+/* ... at LINE of the current file */
+#define tcc_warning_once_at(sw, line, ...) _tcc_warning_once(offsetof(TCCState, sw), line, __VA_ARGS__)
+/* ... a warning no -W option controls (only -w silences it) */
+#define tcc_warning_once_always(...) _tcc_warning_once(offsetof(TCCState, warn_none), 0, __VA_ARGS__)
+/* the -W option can speak here: set, or a #pragma diagnostic in the unit may
+   turn it on (the check is skipped, at no cost, otherwise) */
+#define tcc_warn_wanted(sw) (tcc_state->sw || tcc_state->nb_diag_snaps)
 
 /********************************************************/
 #endif /* _TCC_H */

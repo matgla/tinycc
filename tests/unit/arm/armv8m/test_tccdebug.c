@@ -173,7 +173,6 @@ UT_TEST(test_sym_prints_token_r_type_and_attrs)
   s.a.weak = 1;
   s.a.visibility = 2;
   s.a.dllimport = 1;
-  s.a.nodecorate = 1;
   s.a.addrtaken = 1;
   s.a.nodebug = 1;
   s.a.naked = 1;
@@ -189,7 +188,7 @@ UT_TEST(test_sym_prints_token_r_type_and_attrs)
   UT_ASSERT(str_has(out, "r={loc=LOCAL(0x12), mods=LVAL|SYM} (0x00d2)"));
   UT_ASSERT(str_has(out, ", vreg=12"));
   UT_ASSERT(str_has(out, ", type=unsigned short[] const"));
-  UT_ASSERT(str_has(out, ", attr=aligned=4|packed|weak|vis=2|dllimport|nodecorate|addrtaken|nodebug|naked"));
+  UT_ASSERT(str_has(out, ", attr=aligned=4|packed|weak|vis=2|dllimport|addrtaken|nodebug|naked"));
   UT_ASSERT(str_has(out, ", next="));
   UT_ASSERT(str_has(out, ", prev="));
   UT_ASSERT(str_has(out, ", prev_tok="));

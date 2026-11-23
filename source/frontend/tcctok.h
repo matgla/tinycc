@@ -31,6 +31,7 @@ DEF(TOK_SIGNED1, "signed")
 DEF(TOK_SIGNED2, "__signed")   /* gcc keyword */
 DEF(TOK_SIGNED3, "__signed__") /* gcc keyword */
 DEF(TOK_AUTO, "auto")
+DEF(TOK_AUTO_TYPE, "__auto_type") /* GNU: the type from the initializer */
 DEF(TOK_INLINE1, "inline")
 DEF(TOK_INLINE2, "__inline")   /* gcc keyword */
 DEF(TOK_INLINE3, "__inline__") /* gcc keyword */
@@ -100,6 +101,7 @@ DEF(TOK_ERROR, "error")
 DEF(TOK_WARNING, "warning")
 DEF(TOK_LINE, "line")
 DEF(TOK_PRAGMA, "pragma")
+DEF(TOK_EMBED, "embed") /* C23 6.10.4 */
 DEF(TOK__Pragma, "_Pragma") /* C11 6.10.9 _Pragma operator */
 DEF(TOK___LINE__, "__LINE__")
 DEF(TOK___FILE__, "__FILE__")
@@ -111,6 +113,7 @@ DEF(TOK___COUNTER__, "__COUNTER__")
 DEF(TOK___HAS_INCLUDE, "__has_include")
 DEF(TOK___HAS_INCLUDE_NEXT, "__has_include_next")
 DEF(TOK___HAS_ATTRIBUTE, "__has_attribute")
+DEF(TOK___HAS_EMBED, "__has_embed")
 DEF(TOK___HAS_BUILTIN, "__has_builtin")
 
 /* special identifiers */
@@ -268,6 +271,7 @@ DEF(TOK_builtin___snprintf_chk, "__builtin___snprintf_chk")
 DEF(TOK_builtin___vsprintf_chk, "__builtin___vsprintf_chk")
 DEF(TOK_builtin___vsnprintf_chk, "__builtin___vsnprintf_chk")
 DEF(TOK_builtin_object_size, "__builtin_object_size")
+DEF(TOK_builtin_dynamic_object_size, "__builtin_dynamic_object_size")
 DEF(TOK_builtin_abort, "__builtin_abort")
 DEF(TOK_builtin_malloc, "__builtin_malloc")
 DEF(TOK_builtin_free, "__builtin_free")
@@ -437,7 +441,38 @@ DEF(TOK_lib, "lib")
 DEF(TOK_push_macro, "push_macro")
 DEF(TOK_pop_macro, "pop_macro")
 DEF(TOK_once, "once")
+/* the yasc dialect: #pragma yasc, and its keywords (identifiers outside it);
+   owned..drop stay consecutive: the parser tests the range */
+DEF(TOK_yasc, "yasc")
+DEF(TOK_owned, "owned")
+DEF(TOK_view, "view")
+DEF(TOK_maybe, "maybe")
+DEF(TOK_out, "out")
+DEF(TOK_drop, "drop")
 DEF(TOK_option, "option")
+/* yasc move(p) / borrow(p), unless a name of that spelling is in scope */
+DEF(TOK_move, "move")
+DEF(TOK_borrow, "borrow")
+/* yasc `T * borrows(x, ...)`: after a '*' in yasc */
+DEF(TOK_borrows, "borrows")
+/* yasc `T * owned takes(p)`: on a function's result */
+DEF(TOK_takes, "takes")
+/* yasc statements (identifiers outside the dialect) */
+DEF(TOK_defer, "defer")
+DEF(TOK_errdefer, "errdefer")
+DEF(TOK_try, "try")
+DEF(TOK_catch, "catch")
+DEF(TOK_error_from, "error_from")
+DEF(TOK_error_name, "error_name")
+DEF(TOK___yasc_error_name, "__yasc_error_name")
+/* yasc modules: keywords only where a file-scope declaration starts (decl/module.c) */
+DEF(TOK_module, "module")
+DEF(TOK_import, "import")
+DEF(TOK_export, "export")
+DEF(TOK___yasc_import_end, "__yasc_import_end") /* ends an import's headers */
+/* yasc methods: the replay of a struct's method (decl/method.c) */
+DEF(TOK___yasc_method, "__yasc_method")
+DEF(TOK___yasc_method_decl, "__yasc_method_decl")
 
 /* builtin functions or variables */
 #ifndef TCC_ARM_EABI
@@ -561,34 +596,10 @@ DEF(TOK___gttf2, "__gttf2")
 DEF(TOK___getf2, "__getf2")
 #endif
 
-/* bound checking symbols */
-#ifdef CONFIG_TCC_BCHECK
-DEF(TOK___bound_ptr_add, "__bound_ptr_add")
-DEF(TOK___bound_ptr_indir1, "__bound_ptr_indir1")
-DEF(TOK___bound_ptr_indir2, "__bound_ptr_indir2")
-DEF(TOK___bound_ptr_indir4, "__bound_ptr_indir4")
-DEF(TOK___bound_ptr_indir8, "__bound_ptr_indir8")
-DEF(TOK___bound_ptr_indir12, "__bound_ptr_indir12")
-DEF(TOK___bound_ptr_indir16, "__bound_ptr_indir16")
-DEF(TOK___bound_main_arg, "__bound_main_arg")
-DEF(TOK___bound_local_new, "__bound_local_new")
-DEF(TOK___bound_local_delete, "__bound_local_delete")
-DEF(TOK___bound_setjmp, "__bound_setjmp")
-DEF(TOK___bound_longjmp, "__bound_longjmp")
-DEF(TOK___bound_new_region, "__bound_new_region")
-#ifdef TCC_TARGET_PE
-#ifdef TCC_TARGET_X86_64
-DEF(TOK___bound_alloca_nr, "__bound_alloca_nr")
-#endif
-#else
-DEF(TOK_sigsetjmp, "sigsetjmp")
-DEF(TOK___sigsetjmp, "__sigsetjmp")
-DEF(TOK_siglongjmp, "siglongjmp")
-#endif
-DEF(TOK_setjmp, "setjmp")
-DEF(TOK__setjmp, "_setjmp")
-DEF(TOK_longjmp, "longjmp")
-#endif
+/* bound checking symbols: none.  -b's helpers are interned by name
+   (frontend/gen/op/bcheck.c), so the keyword table is the same with and
+   without CONFIG_TCC_BCHECK (the cross has it, the native does not, and
+   they share tcckw_index_.h) */
 
 /*********************************************************************/
 /* Tiny Assembler */

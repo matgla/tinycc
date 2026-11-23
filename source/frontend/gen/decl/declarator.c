@@ -65,7 +65,7 @@ int asm_label_instr(void)
 int post_type(CType *type, AttributeDef *ad, int storage, int td)
 {
   int n, l, t1, arg_size, align;
-  int param_volatile;
+  int param_volatile, empty_proto = 0;
   Sym **plast, *s, *first;
   AttributeDef ad1;
   CType pt;
@@ -80,15 +80,20 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
     if (TYPE_DIRECT == (td & (TYPE_DIRECT | TYPE_ABSTRACT)) && tok != TOK_DOTS)
       return 0;
     if (tok == ')')
-      l = 0;
+      /* C23 and yasc: `()` is `(void)`, a prototype; before C23 it says
+         nothing about the parameters */
+      l = (empty_proto = tcc_state->cversion >= 202311 || tcc_state->yasc) ? FUNC_NEW : 0;
     else if (tok == TOK_DOTS)
     {
       /* C23: f(...) — variadic function with no named parameters */
       l = FUNC_ELLIPSIS;
       next();
     }
-    else if (parse_btype(&pt, &ad1, 0))
+    else if ((func_param_decl_depth++, n = parse_btype(&pt, &ad1, 0), func_param_decl_depth--, n))
+    {
+      btype_no_auto(&ad1);
       l = FUNC_NEW;
+    }
     else if (td & (TYPE_DIRECT | TYPE_ABSTRACT))
     {
       merge_attr(ad, &ad1);
@@ -100,18 +105,23 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
     first = NULL;
     plast = &first;
     arg_size = 0;
+    int param_idx = 0; /* yasc_pp_name */
     ++local_scope;
-    if (l && l != FUNC_ELLIPSIS)
+    if (l && l != FUNC_ELLIPSIS && !empty_proto)
     {
       func_param_decl_depth++;
       for (;;)
       {
+        const int param_line = file->line_num; /* -Wunused-parameter */
         /* read param name and compute offset */
         if (l != FUNC_OLD)
         {
           if ((pt.t & VT_BTYPE) == VT_VOID && tok == ')')
             break;
+          const int pp_mark = yasc_pp_mark();
           type_decl(&pt, &ad1, &n, TYPE_DIRECT | TYPE_ABSTRACT | TYPE_PARAM);
+          if (yasc_pp_mark() != pp_mark)
+            yasc_pp_name(pp_mark, n, param_idx);
           if ((pt.t & VT_BTYPE) == VT_VOID)
             tcc_error("parameter declared as void");
           if (n == 0)
@@ -127,6 +137,7 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
         if (n < TOK_UIDENT)
           expect("identifier");
         param_volatile = (pt.t & VT_VOLATILE) != 0;
+        int param_array = (pt.t & VT_ARRAY) != 0;
         convert_parameter_type(&pt);
         arg_size += (type_size(&pt, &align) + PTR_SIZE - 1) / PTR_SIZE;
         /* these symbols may be evaluated for VLArrays (see below, under
@@ -134,8 +145,19 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
            temporarily.  Example: int func(int a, int b[++a]); */
         s = sym_push(n, &pt, VT_LOCAL | VT_LVAL, 0);
         s->a.param_volatile = param_volatile;
+        s->a.param_array = param_array;
+        if (tcc_state->unused_on)
+        {
+          if (l != FUNC_OLD && ad1.attr_unused)
+            s->ymod |= SYM_UNUSED_OK;
+          if (!local_stack && func_param_decl_depth == 1)
+            unused_param_line(n, param_line, plast == &first);
+        }
+        else if (tcc_warn_wanted(warn_shadow) && !local_stack && func_param_decl_depth == 1)
+          unused_param_line(n, param_line, plast == &first); /* -Wshadow's line */
         *plast = s;
         plast = &s->next;
+        param_idx++;
         if (tok == ')')
           break;
         skip(',');
@@ -147,13 +169,18 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
         }
         if (l == FUNC_NEW && !parse_btype(&pt, &ad1, 0))
           tcc_error("invalid type");
+        btype_no_auto(&ad1);
       }
       func_param_decl_depth--;
     }
-    else if (l != FUNC_ELLIPSIS)
+    else if (l != FUNC_ELLIPSIS && l != FUNC_NEW)
       /* if no parameters, then old type prototype */
       l = FUNC_OLD;
     skip(')');
+    /* -Wstrict-prototypes: `()` before C23.  A definition is checked where
+       it is known to be one (decl()), against the declarations before it. */
+    if (l == FUNC_OLD && !first && tok != '{' && tcc_warn_wanted(warn_strict_prototypes))
+      tcc_warning_once(warn_strict_prototypes, "function declaration isn't a prototype");
     /* remove parameter symbols from token table, keep on stack */
     if (first)
     {
@@ -275,6 +302,8 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
       {
         if (!is_integer_btype(vtop->type.t & VT_BTYPE))
           tcc_error("size of variable length array should be an integer");
+        if (tcc_state->sanitize & SAN_VLA)
+          ubsan_vla_bound();
         n = 0;
         t1 = VT_VLA;
       }
@@ -312,7 +341,9 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
         gen_op('*');
         vset(&int_type, VT_LOCAL | VT_LVAL, n);
         vswap();
+        fe_conv_quiet++; /* the compiler's own store of the size */
         vstore();
+        fe_conv_quiet--;
       }
     }
     if (n != -1)
@@ -370,10 +401,194 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
    type_decl().  If this (possibly abstract) declarator is a pointer chain
    it returns the innermost pointed to type (equals *type, but is a different
    pointer), otherwise returns type itself, that's used for recursive calls.  */
+/* yasc forbids a plain pointer: every '*' says owned or view.  A pointer to a
+   function is exempt (it can only borrow).  A pointer in a nested declarator
+   (`(*fp)(int)`) gets its target from the suffix the caller applies after
+   it, so it waits here until then (yasc_plain_check). */
+#define YASC_PLAIN_MAX 16
+static Sym *yasc_plain[YASC_PLAIN_MAX];
+static int yasc_plain_line[YASC_PLAIN_MAX];
+static int yasc_plain_nb;
+
+/* An error, but the declaration parses on: the pointer is then `view maybe`,
+   what a plain pointer was before yasc forbade it.  PARAM 1: a parameter's
+   own pointer -- a function's own parameter waits for its body, which decides
+   owned or view (decl/plain_param.c); one of a nested declarator is said
+   now, with the view fix-it.  PARAM 2: a pointer written in a declarator's
+   own chain (not abstract, nested or a parameter's), which a local's waits
+   for its body as a parameter's does. */
+static void yasc_plain_error(int line, int param)
+{
+  if (param == 1 && func_param_decl_depth == 1 && yasc_pp_hold(line))
+    return;
+  /* a local's own pointer waits for its body, which decides too (in an
+     inline expansion: the function's own body says it) */
+  if (param == 2 && yasc_pp_local_decl && !func_param_decl_depth &&
+      (tcc_state->in_inline_expansion || yasc_pp_hold_local(line)))
+    return;
+  if (param == 1)
+    tcc_fixit_next(line, "*", FIXIT_AFTER, " view ",
+                   "a parameter the function does not free only borrows: write '* view' ('* owned' when it frees it)");
+  tcc_error_noabort("%i:plain pointer in yasc: say owned or view", line);
+}
+
+/* error recovery: no pointer waits for its target any more */
+void yasc_plain_reset(void)
+{
+  yasc_plain_nb = 0;
+}
+
+/* the waiting pointers from FROM on now know their target */
+static void yasc_plain_check(int from)
+{
+  const int nb = yasc_plain_nb;
+  yasc_plain_nb = from;
+  for (int i = from; i < nb; i++)
+    if ((yasc_plain[i]->type.t & VT_BTYPE) != VT_FUNC)
+    {
+      yasc_plain_error(yasc_plain_line[i], 0);
+    }
+}
+
+#define YASC_BORROWS_MAX 28
+
+/* a struct member's borrows(...) names, for struct_decl (yasc_borrows_field_ok) */
+int yasc_borrows_field_ok, yasc_field_bnb, yasc_field_bstatic, yasc_field_bnames[YASC_BORROWS_MAX];
+
+/* yasc `T * borrows(a, b, static)` after a '*': the names (tokens) and
+   static.  Returns the YASC_BORROWS_STATIC bit; the names go in NAMES. */
+static int yasc_parse_borrows(int *names, int *nb)
+{
+  int st = 0;
+  next();
+  skip('(');
+  for (;;)
+  {
+    if (tok == TOK_STATIC)
+      st = YASC_BORROWS_STATIC;
+    else if (tok >= TOK_UIDENT)
+    {
+      if (*nb == YASC_BORROWS_MAX)
+        tcc_error("borrows(...) names too many sources");
+      names[(*nb)++] = tok;
+    }
+    else
+      expect("a parameter's name or 'static'");
+    next();
+    if (tok != ',')
+      break;
+    next();
+  }
+  skip(')');
+  return st;
+}
+
+/* yasc: where function F's result points, when it is a view -- what
+   borrows(...) names (NB names, or -1 for none written, and STATIC), else
+   the elision: every view parameter; a view result with none has no
+   source to point into. */
+static void yasc_result_sources(Sym *f, const int *names, int nb, int st)
+{
+  int q = type_yasc(&f->type), code = st, i;
+  Sym *pa;
+  if (!(q & YASC_VIEW) || (q & YASC_UNCHECKED) || (f->type.t & VT_ARRAY))
+    return;
+  for (i = 0; i < nb; i++)
+  {
+    int k = 0;
+    for (pa = sym_first(f); pa && (pa->v & ~SYM_FIELD) != names[i]; pa = pa->next)
+      k++;
+    if (!pa)
+      tcc_error("borrows(%s): no parameter is called '%s'", get_tok_str(names[i], NULL), get_tok_str(names[i], NULL));
+    if ((pa->type.t & (VT_BTYPE | VT_ARRAY)) != VT_PTR)
+      tcc_error("borrows(%s): '%s' is not a pointer", get_tok_str(names[i], NULL), get_tok_str(names[i], NULL));
+    if (type_yasc(&pa->type) & YASC_OWNED)
+      tcc_error("borrows(%s): an owned parameter is consumed, it is never a source", get_tok_str(names[i], NULL));
+    if (k < YASC_BORROWS_MAX)
+      code |= 1 << k;
+  }
+  if (nb < 0 && !st)
+  {
+    for (i = 0, pa = sym_first(f); pa; pa = pa->next, i++)
+    {
+      int pq = type_yasc(&pa->type);
+      if ((pa->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && (pq & YASC_VIEW) && !(pq & YASC_UNCHECKED) &&
+          i < YASC_BORROWS_MAX)
+        code |= 1 << i;
+    }
+    if (!code)
+      tcc_error("a view result needs a source: write borrows(static), or take a view parameter");
+  }
+  f->type.ref = sym_pointer_node_b(&f->type.ref->type, q, code);
+}
+
+/* F's result is a borrowing struct: what it borrows -- `struct T
+   borrows(src)` in AD, else the elision (every view parameter) */
+static void yasc_struct_result(Sym *f, AttributeDef *ad, int name)
+{
+  int code = 0, i;
+  Sym *pa;
+  if (!yasc_borrowing_struct(&f->type))
+    return;
+  if (ad->sbind_set)
+  {
+    code = ad->sbind_static ? YASC_BORROWS_STATIC : 0;
+    for (int k = 0; k < ad->sbind_nb; k++)
+    {
+      for (i = 0, pa = sym_first(f); pa && (pa->v & ~SYM_FIELD) != ad->sbind_names[k]; pa = pa->next)
+        i++;
+      if (!pa)
+        tcc_error("borrows(%s): no parameter is called '%s'", get_tok_str(ad->sbind_names[k], NULL),
+                  get_tok_str(ad->sbind_names[k], NULL));
+      if (type_yasc(&pa->type) & YASC_OWNED)
+        tcc_error("borrows(%s): an owned parameter is consumed, it is never a source",
+                  get_tok_str(ad->sbind_names[k], NULL));
+      if (i < YASC_BORROWS_MAX)
+        code |= 1 << i;
+    }
+  }
+  else
+  {
+    for (i = 0, pa = sym_first(f); pa; pa = pa->next, i++)
+      if ((type_yasc(&pa->type) & YASC_VIEW) && !(type_yasc(&pa->type) & YASC_UNCHECKED) && i < YASC_BORROWS_MAX)
+        code |= 1 << i;
+    if (!code)
+      tcc_error("a 'struct %s' result borrows: write borrows(static), or take a view parameter",
+                get_tok_str(f->type.ref->v & ~SYM_STRUCT, NULL));
+  }
+  if (name)
+    yasc_struct_result_bind(name, code);
+}
+
+/* takes(NAME) on F's result: the owned parameter it takes over */
+static void yasc_result_takes(Sym *f, int name)
+{
+  Sym *pa;
+  if (!(type_yasc(&f->type) & YASC_OWNED))
+    tcc_error("takes(%s): the result must be owned", get_tok_str(name, NULL));
+  for (pa = sym_first(f); pa && (pa->v & ~SYM_FIELD) != name; pa = pa->next)
+    ;
+  if (!pa)
+    tcc_error("takes(%s): no parameter is called '%s'", get_tok_str(name, NULL), get_tok_str(name, NULL));
+  if (!(type_yasc(&pa->type) & YASC_OWNED) || (type_yasc(&pa->type) & YASC_DROP))
+    tcc_error("takes(%s): '%s' must be an owned parameter that is not drop", get_tok_str(name, NULL),
+              get_tok_str(name, NULL));
+  yasc_requalify(&pa->type, pa->type.ref->yasc | YASC_TAKEN); /* a pointer or an int handle */
+}
+
 CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
 {
   CType *post, *ret;
   int qualifiers, storage;
+  int plain_from = yasc_plain_nb, nested = 0;
+  /* borrows(...) on the outermost pointer: resolved once the parameters
+     are known (yasc_result_sources) */
+  int bnames[YASC_BORROWS_MAX], bnb = -1, bstatic = 0;
+  int dealloc = 0; /* owned(fclose): the outermost pointer's deallocator */
+  int takes = 0;   /* takes(p) on the outermost pointer: the parameter's name */
+  /* -fstack-usage: where the declared name is (published at the end, after
+     the parameters' own declarators) */
+  int su_tok = 0, su_line = 0, su_col = 0;
 
   /* recursive type, remove storage bits first, apply them later again */
   storage = type->t & VT_STORAGE;
@@ -387,9 +602,71 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
 
   while (tok == '*')
   {
+    /* yasc: out / drop before the type qualify the first pointer's target */
+    int yq = ret == type ? ad->yasc & (YASC_OUT | YASC_DROP) : 0;
+    /* the '*' is in the dialect it was written in: `PTR(char) p` with a
+       regular-C PTR is a regular-C pointer, though the tokens after it are
+       yasc again (the marker after the expansion applies with the next one) */
+    const int star_yasc = tcc_state->yasc, star_c = pp_in_c();
+    if (bnb >= 0 || bstatic)
+      tcc_error("borrows(...) qualifies the outermost pointer");
     qualifiers = 0;
   redo:
     next();
+    if (tcc_state->yasc && tok == TOK_takes)
+    {
+      next();
+      skip('(');
+      if (tok < TOK_UIDENT)
+        expect("a parameter's name");
+      takes = tok;
+      next();
+      skip(')');
+      unget_tok(0);
+      goto redo;
+    }
+    if (tcc_state->yasc && tok == TOK_borrows)
+    {
+      if (yq & (YASC_OWNED | YASC_VIEW))
+        tcc_error("a pointer is owned, a view or borrows(...): one of them");
+      bnb = 0;
+      bstatic = yasc_parse_borrows(bnames, &bnb);
+      yq |= YASC_VIEW;
+      unget_tok(0);
+      goto redo;
+    }
+    if (tcc_state->yasc && tok >= TOK_owned && tok <= TOK_drop)
+    {
+      /* owned / view / maybe qualify this pointer; in yasc they are never
+         names, so `f(char * view)` and `(char * owned)x` are abstract */
+      int kw = tok;
+      if (kw != TOK_owned && kw != TOK_maybe && kw != TOK_view)
+        tcc_error("'%s' qualifies the object: write it before the type", get_tok_str(kw, NULL));
+      yq |= kw == TOK_owned ? YASC_OWNED : kw == TOK_view ? YASC_VIEW : YASC_MAYBE;
+      if (kw == TOK_owned)
+      {
+        /* owned(fclose): the deallocator; `owned (*fp)(...)` is a declarator */
+        next();
+        if (tok == '(')
+        {
+          next();
+          if (tok >= TOK_UIDENT)
+          {
+            dealloc = tok;
+            next();
+            if (tok != ')')
+              expect("')' after the deallocator's name");
+            next();
+          }
+          else
+            unget_tok('(');
+        }
+        unget_tok(0); /* redo's next() reads the token after */
+      }
+      if ((yq & (YASC_OWNED | YASC_VIEW)) == (YASC_OWNED | YASC_VIEW) || ((bnb >= 0 || bstatic) && kw != TOK_maybe))
+        tcc_error("a pointer is owned, a view or borrows(...): one of them");
+      goto redo;
+    }
     switch (tok)
     {
     case TOK__Atomic:
@@ -418,16 +695,48 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
       parse_attribute(ad);
       break;
     }
+    int plain = star_yasc && !(yq & (YASC_OWNED | YASC_VIEW));
+    /* yasc: a pointer written in regular C says nothing about ownership
+       (unless yasc code after it does: `PTR(char) owned p`) */
+    if (star_c && !(yq & (YASC_OWNED | YASC_VIEW)))
+      yq |= YASC_UNCHECKED;
     if (ret == type && (td & TYPE_NESTDECL))
+    {
       /* the caller applies its suffix to this pointer's target, in place */
       mk_private_pointer(type);
+      type->ref->yasc = yq;
+      if (dealloc)
+        type->ref->vreg = dealloc, dealloc = 0;
+      if (plain)
+      {
+        if (yasc_plain_nb == YASC_PLAIN_MAX)
+          yasc_plain_check(0);
+        yasc_plain_line[yasc_plain_nb] = file ? file->line_num : 0;
+        yasc_plain[yasc_plain_nb++] = type->ref;
+      }
+    }
     else
-      mk_pointer(type);
+    {
+      if (plain && (type->t & VT_BTYPE) != VT_FUNC)
+        yasc_plain_error(file ? file->line_num : 0,
+                         (td & TYPE_PARAM) ? 1 : !(td & (TYPE_ABSTRACT | TYPE_NESTDECL)) ? 2 : 0);
+      mk_pointer_yasc(type, yq);
+      if (dealloc)
+        type->ref = sym_pointer_node_b(&type->ref->type, yq, dealloc), dealloc = 0;
+      /* `regex_t owned(regfree) * view p`: the first pointer points at an
+         object owned as a whole */
+      else if (ad->yobj_dealloc && ret == type && (type->ref->type.t & VT_BTYPE) == VT_STRUCT && !(yq & YASC_OWNED))
+        type->ref = sym_pointer_node_b(&type->ref->type, yq, YASC_OBJ_MARK | ad->yobj_dealloc);
+    }
     type->t |= qualifiers;
     if (ret == type)
       /* innermost pointed to type is the one for the first derivation */
       ret = pointed_type(type);
   }
+  /* yasc `!T`: the type before the first function or array derivation is
+   * the union's payload -- `!char *f(void)` returns `!(char *)` */
+  if ((ad->yasc & YASC_ERRUNION) && !(td & TYPE_NESTDECL))
+    yasc_errunion_wrap(type);
 
   if (tok == '(')
   {
@@ -442,6 +751,8 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
       parse_attribute(ad);
       post = type_decl(type, ad, v, td | TYPE_NESTDECL);
       skip(')');
+      nested = 1;
+      su_tok = tcc_state->su_name_tok, su_line = tcc_state->su_name_line, su_col = tcc_state->su_name_col;
     }
     else
       goto abstract;
@@ -450,17 +761,65 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
   {
     /* type identifier */
     *v = tok;
+    if (TCC_SU_WANTED(tcc_state))
+      su_tok = tok, su_line = file ? file->line_num : 0, su_col = tcc_stack_usage_name_column(tok);
+    /* -Wshadow: a name a system header's macro wrote is none of its business */
+    if (((tcc_state->warn_shadow & WARN_ON) || tcc_state->nb_diag_snaps) && !(td & TYPE_PARAM))
+      shadow_name_sys = tcc_sys_macro_here();
+    /* decl()'s name: declared even if the rest of the declarator is wrong */
+    const int recover_name = recover_decl.l && !recover_decl.v && !(td & TYPE_PARAM);
+    if (recover_name)
+    {
+      recover_decl.v = tok;
+      recover_decl.type = *type;
+      recover_decl.scope = local_scope;
+    }
     next();
+    if (recover_name)
+      recover_decl.func = tok == '(' ? 1 : tok == '[' ? 2 : 0;
+    /* C23 `int f [[deprecated]] (void);`: the attributes of the declared name */
+    if (tok == '[')
+      parse_c23_attribute(ad);
   }
   else
   {
   abstract:
     if (!(td & TYPE_ABSTRACT))
+    {
+      if (tcc_state->yasc && tok >= TOK_owned && tok <= TOK_drop)
+        yasc_keyword_as_name(tok);
       expect("identifier");
+    }
     *v = 0;
   }
   post_type(post, ad, post != ret ? 0 : storage, td & ~(TYPE_DIRECT | TYPE_ABSTRACT | TYPE_NESTDECL));
+  if (takes && !(tcc_state->yasc && (post->t & VT_BTYPE) == VT_FUNC && post->ref))
+    tcc_error("takes(%s): only a function's result takes a parameter over", get_tok_str(takes, NULL));
+  if (tcc_state->yasc && (post->t & VT_BTYPE) == VT_FUNC && post->ref)
+  {
+    yasc_result_sources(post->ref, bnames, bnb, bstatic);
+    if (takes)
+      yasc_result_takes(post->ref, takes);
+    yasc_struct_result(post->ref, ad, (td & TYPE_DIRECT) && !nested ? *v : 0);
+  }
+  else if (bnb > 0 && yasc_borrows_field_ok && !nested && (type->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR)
+  {
+    /* a struct member: struct_decl resolves the names once every member is in */
+    memcpy(yasc_field_bnames, bnames, bnb * sizeof(int));
+    yasc_field_bnb = bnb;
+    yasc_field_bstatic = bstatic;
+  }
+  else if (bnb > 0)
+    tcc_error("borrows(%s): only a function's result or a struct member names its sources",
+              get_tok_str(bnames[0], NULL));
+  else if (bstatic && (type->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && type->ref)
+    type->ref = sym_pointer_node_b(&type->ref->type, type->ref->yasc, YASC_BORROWS_STATIC);
+  /* the suffix is on: the nested declarator's pointers know their target */
+  if (nested && yasc_plain_nb > plain_from)
+    yasc_plain_check(plain_from);
   parse_attribute(ad);
   type->t |= storage;
+  if (su_tok)
+    tcc_state->su_name_tok = su_tok, tcc_state->su_name_line = su_line, tcc_state->su_name_col = su_col;
   return ret;
 }

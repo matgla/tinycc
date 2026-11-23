@@ -1,0 +1,8 @@
+42 -1
+sum 42
+add failed: Empty
+label 7: item-7
+label 0: Empty
+label x: BadDigit
+label 123456: TooBig
+blocks left: 0

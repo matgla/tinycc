@@ -63,12 +63,73 @@ static int type_has_volatile(CType *t, int depth)
   return 0;
 }
 
+static void vstore_value(void);
+
 /* store vtop in lvalue pushed on stack */
 ST_FUNC void vstore(void)
+{
+  /* -Wlifetime: a store into an owned pointer in memory moves what it stores
+     (lifetime.c); what this store emits is recorded for it */
+  TCCIRState *ir = tcc_state->ir;
+  if (yasc_pp_live)
+    yasc_pp_store(vtop - 1, vtop); /* a plain pointer parameter kept (plain_param.c) */
+  /* yasc: a borrowing struct stored where it outlives the function (a
+     global, through a pointer) must be bound to static storage: another
+     global, or a result that borrows(static) */
+  if (tcc_state->yasc && yasc_borrowing_struct(&vtop[-1].type) && (vtop[-1].r & VT_LVAL) &&
+      (vtop[-1].r & VT_VALMASK) != VT_LOCAL && (vtop[-1].r & VT_VALMASK) != VT_LLOCAL &&
+      !((vtop->r & (VT_VALMASK | VT_SYM | VT_LVAL)) == (VT_CONST | VT_SYM | VT_LVAL)) && vtop->sym != &yasc_static_bound)
+    tcc_warning_once_always(
+        "a 'struct %s' borrows: stored here it outlives the function (it must borrow static storage)",
+        get_tok_str(vtop[-1].type.ref->v & ~SYM_STRUCT, NULL));
+  int owned_dst = ir && ir->lt_on && (type_yasc(&vtop[-1].type) & YASC_OWNED);
+  int field = ir && ir->lt_on ? type_borrows_field(&vtop[-1].type) : -1;
+  int from = ir ? ir->next_instruction_index : 0;
+  vstore_value();
+  if (owned_dst)
+    tcc_ir_lt_note_owned_store(ir, from, ir->next_instruction_index);
+  /* ... and a store into a borrows(member) member, checked against it */
+  if (field >= 0)
+    tcc_ir_lt_note_field_store(ir, from, ir->next_instruction_index, field);
+}
+
+/* A local-to-local copy's snapshot of the source's constant initializer
+   (vstore_value_1), freed by vstore_value.  Not a 256-byte buffer in
+   vstore_value_1's frame: every store is at the deepest point of its
+   expression's parse, an initializer's under the parser's recursion. */
+static unsigned char *vstore_cid;
+
+static __attribute__((noinline)) void vstore_value_1(void);
+
+static void vstore_value(void)
+{
+  unsigned char *outer = vstore_cid; /* a store vstore_value_1 makes nests */
+  vstore_cid = NULL;
+  vstore_value_1();
+  tcc_free(vstore_cid);
+  vstore_cid = outer;
+}
+
+static __attribute__((noinline)) void vstore_value_1(void)
 {
   int sbt, dbt, ft, r, size, align, bit_size, bit_pos, delayed_cast;
   if (vtop[-1].type.t & VT_RODATA_REL)
     rodata_rel_store_error();
+#ifdef CONFIG_TCC_BCHECK
+  /* -b: a scalar's destination and source are checked here (a struct copy
+     checks both before it takes their addresses, below) */
+  if ((vtop[-1].type.t & VT_BTYPE) != VT_STRUCT)
+  {
+    if (vtop->r & VT_MUSTBOUND)
+      gbound();
+    if (vtop[-1].r & VT_MUSTBOUND)
+    {
+      vswap();
+      gbound();
+      vswap();
+    }
+  }
+#endif
   /* A byte-reversed (big-endian scalar_storage_order) member is read through
      gv() and written by sso_store_reversed(), never copied as raw memory. */
   if ((vtop->r & VT_LVAL) && vtop->sso_reversed)
@@ -89,16 +150,12 @@ ST_FUNC void vstore(void)
   /* Eagerly snapshot source const_init_data before gaddrof in the memmove
    * path invalidates it.  Used at vstore_done to propagate through struct
    * copies. */
-  /* Snapshot storage is a fixed stack buffer, not a heap alloc: vstore has many
-   * early-return / branch exits (complex, bitfield, scalar, void) that bypass
-   * the vstore_done cleanup below, so a tcc_malloc'd snapshot leaked on every
-   * non-struct-copy path (LeakSanitizer, e.g. a 4-byte local-to-local scalar
-   * store).  The guard bounds the size to 256, and both consumers — the memcpy
-   * into dst_sym->const_init_data and attach_const_init_to_temp — copy the
-   * bytes rather than retain the pointer, so stack storage is safe and needs no
-   * free on any exit path. */
-  unsigned char vstore_src_cid_buf[256];
-  unsigned char *vstore_src_cid = NULL;
+  /* The snapshot is on the heap only when taken (vstore_cid), and vstore_value
+   * frees it whichever way this returns: vstore has many early-return /
+   * branch exits (complex, bitfield, scalar, void) that bypass the
+   * vstore_done consumer below.  Both consumers -- the memcpy into
+   * dst_sym->const_init_data and attach_const_init_to_temp -- copy the bytes
+   * rather than retain the pointer. */
   int vstore_src_cid_size = 0;
   if ((orig_src.r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_LOCAL | VT_LVAL) &&
       (orig_dst.r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_LOCAL | VT_LVAL))
@@ -107,8 +164,8 @@ ST_FUNC void vstore(void)
     unsigned char *sd = find_sv_const_init(&orig_src, src_size);
     if (sd && src_size > 0 && src_size <= 256)
     {
-      memcpy(vstore_src_cid_buf, sd, src_size);
-      vstore_src_cid = vstore_src_cid_buf;
+      vstore_cid = tcc_malloc(src_size);
+      memcpy(vstore_cid, sd, src_size);
       vstore_src_cid_size = src_size;
     }
   }
@@ -1287,7 +1344,7 @@ ST_FUNC void vstore(void)
      * invalidates the destination's const_init_data (the overlap loop above).
      * The exception is a local's own initializer (`v4 t = a;`), which runs
      * exactly where it is parsed. */
-    if (vstore_src_cid && !nocode_wanted)
+    if (vstore_cid && !nocode_wanted)
     {
       int dst_addr = (int)orig_dst.c.i;
       for (Sym *s = local_stack; s; s = s->prev)
@@ -1296,18 +1353,20 @@ ST_FUNC void vstore(void)
         if (f && f->const_init_in_progress && f->const_init_data && (int)s->c == dst_addr &&
             f->const_init_size == vstore_src_cid_size)
         {
-          memcpy(f->const_init_data, vstore_src_cid, vstore_src_cid_size);
+          memcpy(f->const_init_data, vstore_cid, vstore_src_cid_size);
           f->const_init_valid = 1;
           break;
         }
       }
-      /* vstore_src_cid points at the stack buffer above — no free needed. */
+      /* vstore_value frees vstore_cid */
     }
     ;
   }
   else if (ft & VT_BITFIELD)
   {
-    /* bitfield store handling */
+    /* bitfield store handling: the field's conversion was checked above;
+       the stores of its storage unit below are the compiler's own */
+    fe_conv_quiet++;
 
     /* The value of an assignment is the value stored (C11 6.5.16p3).  For an
      * ordinary field the lvalue stands in for it -- re-reading the field is
@@ -1406,6 +1465,7 @@ ST_FUNC void vstore(void)
         }
       }
     }
+    fe_conv_quiet--;
   }
   else if (dbt == VT_VOID)
   {
@@ -1629,6 +1689,9 @@ ST_FUNC void vstore(void)
       }
 
       update_local_scalar_max_bound(&orig_dst, &orig_src);
+      objsize_store(&orig_dst, &orig_src); /* the allocation tracker */
+      if (objsize_ab_watch)
+        objsize_ab_store(&orig_dst, &orig_src); /* -Warray-bounds in loops */
     }
     vswap();
     vtop--; /* NOT vpop() because on x86 it would flush the fp stack */

@@ -37,7 +37,9 @@ echo "Building newlib for -mfloat-abi=$FLOAT_ABI into $BUILD_DIR"
 
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
-export CFLAGS_FOR_TARGET="-g -Os $FLOAT_FLAGS -ffunction-sections -fdata-sections -mcpu=cortex-m33"
+# newlib is regular C: -ccompat when the target compiler is a tcc
+case "${CC:-}" in *tcc*) COMPAT=-ccompat ;; *) COMPAT= ;; esac
+export CFLAGS_FOR_TARGET="-g -Os $FLOAT_FLAGS -ffunction-sections -fdata-sections -mcpu=cortex-m33 $COMPAT"
 ../libs/newlib/configure \
     --target=$TARGET \
     --prefix=$PWD/newlib_install \

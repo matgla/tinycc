@@ -538,10 +538,10 @@ int __attribute__((noinline)) unary_funcall_opt_string_builtins(int func_tok, co
         vpushv(&match_sv);
       }
       else
-      {
         vpushi(0);
-        vtop->type = saved_args[0].type;
-      }
+      /* the declared result, not the converted argument's (a pointer: an
+       * implicit declaration's int would make an address an int) */
+      vtop->type = (ret_type->t & VT_BTYPE) == VT_PTR ? *ret_type : saved_args[0].type;
 
       vtop[-1] = vtop[0];
       --vtop;
@@ -575,6 +575,7 @@ int __attribute__((noinline)) unary_funcall_opt_string_builtins(int func_tok, co
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[2], &param_num, NULL);
 
         vpush_typed_helper_func(tok_alloc_const("__tcc_bcopy"), &func_old_void_type);
+        tcc_ir_lt_copy_call(tcc_state->ir, call_id, new_call_id);
         {
           SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, 3);
           tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
@@ -601,9 +602,10 @@ int __attribute__((noinline)) unary_funcall_opt_string_builtins(int func_tok, co
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &saved_args[2], &param_num, NULL);
 
         vpush_typed_helper_func(tok_alloc_const("__tcc_memmove"), &func_old_void_pointer_type);
+        tcc_ir_lt_copy_call(tcc_state->ir, call_id, new_call_id);
 
         svalue_init(&dest);
-        dest.type = saved_args[0].type;
+        dest.type = *ret_type;
         dest.r = 0;
         dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
         {
@@ -624,7 +626,9 @@ int __attribute__((noinline)) unary_funcall_opt_string_builtins(int func_tok, co
     }
   }
 
-  /* Simple redirects: NOP old call, emit __tcc_* replacement */
+  /* Simple redirects: NOP old call, emit __tcc_* replacement.  The value
+   * keeps the declared result type: in C strchr gives `char *` whatever its
+   * argument, and in yasc the result's qualifiers (`view maybe`) stay. */
   if (!can_fold_result && !optimized)
   {
     const char *helper = NULL;
@@ -647,7 +651,6 @@ int __attribute__((noinline)) unary_funcall_opt_string_builtins(int func_tok, co
       {
         helper = "__tcc_strcpy";
         nargs = 2;
-        result_type = saved_args[0].type;
       }
       break;
     case STRBI_STPCPY:
@@ -729,7 +732,6 @@ int __attribute__((noinline)) unary_funcall_opt_string_builtins(int func_tok, co
       {
         helper = "__tcc_strchr";
         nargs = 2;
-        result_type = saved_args[0].type;
       }
       break;
     default:

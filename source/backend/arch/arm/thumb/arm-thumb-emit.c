@@ -44,12 +44,197 @@ static int is_hgen_float_aggr(CType *type);
 /* The last instruction ot() emitted sat inside an IT block (set in dry and real passes). */
 static int th_ot_last_in_it;
 
+/* ---- Stack use (-Wframe-larger-than=, -Wstack-usage=, -fstack-usage) ----
+ * What SP does after the prologue, read off the instructions the real pass
+ * emits: the scratch PUSHes, the soft-float helpers' SUB SP windows, a call's
+ * own argument window, inline asm saves.  Only while th_su.active, which is
+ * never set when no stack option asks (tcc_stack_usage_wanted), and never in
+ * a dry run; it reads, it changes nothing. */
+static struct
+{
+  int active;    /* tracking the body of the function being generated */
+  int entry;     /* the prologue's drop */
+  int depth;     /* SP below its post-prologue position now */
+  int max_depth; /* ... at most */
+  int dynamic;   /* SP moved by a register amount */
+  int indirect_calls, indirect_tail;
+  int call_sig; /* the function type of the call being emitted (tcc_gen_machine_stack_call_sig) */
+  TCCStackIndirect by_sig[TCC_SU_MAX_INDIRECT_SIGS + 1];
+  int nb_sigs;
+} th_su;
+
+static uint32_t th_su_expand_imm(uint32_t imm12)
+{
+  const uint32_t imm8 = imm12 & 0xFF;
+  if (!(imm12 >> 10))
+  {
+    switch ((imm12 >> 8) & 3)
+    {
+    case 0:
+      return imm8;
+    case 1:
+      return imm8 * 0x00010001u;
+    case 2:
+      return imm8 * 0x01000100u;
+    default:
+      return imm8 * 0x01010101u;
+    }
+  }
+  const uint32_t v = 0x80 | (imm12 & 0x7F), rot = imm12 >> 7;
+  return (v >> rot) | (v << (32 - rot));
+}
+
+/* How far OP moves SP down (negative: up).  *reset: SP is set from a
+ * register (back to the frame); *dyn: down by a register amount. */
+static int th_su_sp_delta(thumb_opcode op, int *reset, int *dyn)
+{
+  if (op.size == 2)
+  {
+    const uint32_t v = op.opcode & 0xFFFF;
+    if ((v & 0xFE00) == 0xB400) /* PUSH */
+      return 4 * (__builtin_popcount(v & 0xFF) + ((v >> 8) & 1));
+    if ((v & 0xFE00) == 0xBC00) /* POP */
+      return -4 * (__builtin_popcount(v & 0xFF) + ((v >> 8) & 1));
+    if ((v & 0xFF80) == 0xB080) /* SUB SP, #imm */
+      return (int)(v & 0x7F) * 4;
+    if ((v & 0xFF80) == 0xB000) /* ADD SP, #imm */
+      return -(int)(v & 0x7F) * 4;
+    if ((v & 0xFF87) == 0x4685 || (v & 0xFF87) == 0x4485) /* MOV SP, Rm / ADD SP, Rm */
+      *reset = 1;
+    return 0;
+  }
+  const uint32_t h1 = op.opcode >> 16, h2 = op.opcode & 0xFFFF;
+  if (h1 == 0xE92D) /* PUSH.W (STMDB SP!) */
+    return 4 * __builtin_popcount(h2 & 0x5FFF);
+  if (h1 == 0xE8BD) /* POP.W (LDMIA SP!) */
+    return -4 * __builtin_popcount(h2 & 0xDFFF);
+  /* STR/LDR{,B,H} Rt, [SP, #+-imm]! / [SP], #+-imm */
+  if ((h1 & 0xFE0F) == 0xF80D && (h2 & 0x0900) == 0x0900)
+    return (h2 & 0x0200) ? -(int)(h2 & 0xFF) : (int)(h2 & 0xFF);
+  /* STRD/LDRD with write-back to SP */
+  if ((h1 & 0xFE4F) == 0xE84D && (h1 & 0x0020))
+    return (h1 & 0x0080) ? -(int)(h2 & 0xFF) * 4 : (int)(h2 & 0xFF) * 4;
+  if ((h2 & 0x8F00) == 0x0D00)
+  {
+    const uint32_t imm12 = ((h1 >> 10) & 1) << 11 | ((h2 >> 12) & 7) << 8 | (h2 & 0xFF);
+    if ((h1 & 0xFBEF) == 0xF1AD) /* SUB.W SP, SP, #const */
+      return (int)th_su_expand_imm(imm12);
+    if ((h1 & 0xFBEF) == 0xF10D) /* ADD.W SP, SP, #const */
+      return -(int)th_su_expand_imm(imm12);
+    if ((h1 & 0xFBFF) == 0xF2AD) /* SUBW SP, SP, #imm12 */
+      return (int)imm12;
+    if ((h1 & 0xFBFF) == 0xF20D) /* ADDW SP, SP, #imm12 */
+      return -(int)imm12;
+  }
+  if ((h2 & 0x0F00) == 0x0D00)
+  {
+    if ((h1 & 0xFFEF) == 0xEBAD) /* SUB.W SP, SP, Rm */
+      *dyn = 1;
+    else if ((h1 & 0xFFEF) == 0xEB0D || (h1 & 0xFFEF) == 0xEA4F) /* ADD.W SP, SP, Rm / MOV.W SP, Rm */
+      *reset = 1;
+  }
+  if ((h1 & 0xFFBF) == 0xED2D && (h2 & 0x0E00) == 0x0A00) /* VPUSH */
+    return 4 * (int)(h2 & 0xFF);
+  if ((h1 & 0xFFBF) == 0xECBD && (h2 & 0x0E00) == 0x0A00) /* VPOP */
+    return -4 * (int)(h2 & 0xFF);
+  return 0;
+}
+
+static void th_su_track(thumb_opcode op)
+{
+  int reset = 0, dyn = 0;
+  const int d = th_su_sp_delta(op, &reset, &dyn);
+  th_su.dynamic |= dyn;
+  /* A return's POP, or the epilogue of a tail call in the middle of the
+   * body, lifts SP above the frame: what follows is at the frame again. */
+  th_su.depth = reset ? 0 : th_su.depth + d < 0 ? 0 : th_su.depth + d;
+  if (th_su.depth > th_su.max_depth)
+    th_su.max_depth = th_su.depth;
+}
+
+ST_FUNC void tcc_gen_machine_stack_begin(int naked)
+{
+  memset(&th_su, 0, sizeof th_su);
+  th_su.active = naked; /* no prologue: the body is all there is */
+}
+
+/* The prologue is done (tcc_gen_machine_prolog): ENTRY bytes below the caller's SP. */
+void th_stack_prolog_done(int entry)
+{
+  if (!tcc_stack_usage_wanted(tcc_state))
+    return;
+  th_su.entry = entry;
+  th_su.depth = th_su.max_depth = 0;
+  th_su.active = 1;
+}
+
+/* The call about to be emitted is of function type SIG (0: not known); set
+ * before every IR call, read by the indirect branch it may emit. */
+ST_FUNC void tcc_gen_machine_stack_call_sig(int sig)
+{
+  th_su.call_sig = sig;
+}
+
+ST_FUNC void tcc_gen_machine_stack_indirect(int is_jmp)
+{
+  const int sig = th_su.call_sig;
+  th_su.call_sig = 0; /* one branch per call: anything after it is not known */
+  if (!th_su.active || dry_run_state.active)
+    return;
+  if (is_jmp)
+    th_su.indirect_tail++;
+  else
+    th_su.indirect_calls++;
+  /* by function type; past the table's size, with the calls of no known type */
+  int k;
+  for (k = 0; k < th_su.nb_sigs; k++)
+    if (th_su.by_sig[k].sig == sig)
+      break;
+  if (k == th_su.nb_sigs)
+  {
+    if (k < TCC_SU_MAX_INDIRECT_SIGS)
+    {
+      th_su.by_sig[k].sig = sig;
+      th_su.nb_sigs++;
+    }
+    else
+    {
+      for (k = 0; k < th_su.nb_sigs && th_su.by_sig[k].sig; k++)
+        ;
+      if (k == th_su.nb_sigs) /* the extra slot, of no known type */
+      {
+        k = TCC_SU_MAX_INDIRECT_SIGS;
+        th_su.by_sig[k].sig = 0;
+        th_su.nb_sigs = k + 1;
+      }
+    }
+  }
+  if (is_jmp)
+    th_su.by_sig[k].tail++;
+  else
+    th_su.by_sig[k].calls++;
+}
+
+ST_FUNC void tcc_gen_machine_stack_end(TCCStackFrame *f)
+{
+  f->entry = th_su.entry;
+  f->transient = th_su.max_depth;
+  f->dynamic = th_su.dynamic;
+  f->indirect_calls = th_su.indirect_calls;
+  f->indirect_tail = th_su.indirect_tail;
+  f->nb_sigs = th_su.nb_sigs;
+  memcpy(f->by_sig, th_su.by_sig, sizeof f->by_sig);
+  memset(&th_su, 0, sizeof th_su);
+}
+
 int ot(thumb_opcode op)
 {
   if (op.size == 0)
     return op.size;
   if (th_widen_armed)
     th_widen_armed_apply(&op);
+  if (th_su.active && !dry_run_state.active)
+    th_su_track(op);
 
 #if CONFIG_TCC_CHECKS
   /* Detect instructions that write to R9 when it's reserved for GOT pointer.

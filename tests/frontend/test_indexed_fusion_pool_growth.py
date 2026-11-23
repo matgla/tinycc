@@ -22,7 +22,7 @@ def tcc(request):
 def disassemble(tcc, tmp_path, source):
     src, obj = tmp_path / "t.c", tmp_path / "t.o"
     src.write_text(source)
-    r = subprocess.run([tcc, "-O2", "-nostdlib", "-c", str(src), "-o", str(obj)], capture_output=True, text=True)
+    r = subprocess.run([tcc, "-ccompat", "-O2", "-nostdlib", "-c", str(src), "-o", str(obj)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     return subprocess.run(["arm-none-eabi-objdump", "-d", str(obj)], capture_output=True, text=True, check=True).stdout
 

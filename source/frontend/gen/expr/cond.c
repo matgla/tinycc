@@ -41,6 +41,8 @@ static int condition_3way(void)
 
 void expr_landor(int op)
 {
+  if (objsize_ab_watch)
+    objsize_branch(); /* -Warray-bounds in loops (builtin/objsize.c) */
   int t = 0, cc = 1, f = 0, i = op == TOK_LAND, c;
 
   /* In classic (non-IR) codegen, jump-chain sentinel is 0.
@@ -71,7 +73,9 @@ void expr_landor(int op)
     next();
     {
       int saved_nocode = nocode_wanted;
-      expr_landor_next(op);
+      /* -Wparentheses: `a || b && c` */
+      if ((expr_landor_next(op)) == TOK_LAND && op == TOK_LOR)
+        check_parentheses(TOK_LOR, 0, TOK_LAND);
       nocode_wanted = saved_nocode;
     }
   }
@@ -185,6 +189,9 @@ __attribute__((noinline)) void expr_cond_ternary(void)
   if ((vtop->type.t & VT_BTYPE) == VT_FUNC)
     mk_pointer(&vtop->type);
   sv = *vtop; /* save value to handle it later */
+  /* builtin/objsize.c: what each arm points into, for a store of the result */
+  ObjHeap os_true, os_false;
+  const int os_true_known = objsize_value_heap(&sv, &os_true);
   vtop--;     /* no vpop so that FP stack is not flushed */
   print_vstack("expr_cond");
 
@@ -206,9 +213,11 @@ __attribute__((noinline)) void expr_cond_ternary(void)
     nocode_wanted++;
   skip(':');
   expr_cond();
+  fe_narrow_pend_begin(&sv); /* -Wconversion: both arms, as gcc */
 
   if ((vtop->type.t & VT_BTYPE) == VT_FUNC)
     mk_pointer(&vtop->type);
+  const int os_false_known = os_true_known && objsize_value_heap(vtop, &os_false);
 
   /* cast operands to correct type according to ISOC rules */
   if (!combine_types(&type, &sv, vtop, '?'))
@@ -361,6 +370,8 @@ __attribute__((noinline)) void expr_cond_ternary(void)
     objsize_vreg_fact_record(tcc_state ? tcc_state->ir : NULL, vtop->vr, true_max_valid && false_max_valid,
                              true_max > false_max ? true_max : false_max, true_strlen_valid && false_strlen_valid,
                              true_strlen > false_strlen ? true_strlen : false_strlen);
+    if (os_false_known)
+      objsize_cond_result(&os_true, &os_false);
 
     tcc_ir_backpatch_to_here(tcc_state->ir, tt);
   }
@@ -390,4 +401,5 @@ __attribute__((noinline)) void expr_cond_ternary(void)
       vpushv(&dst);
     }
   }
+  fe_narrow_pend_end();
 }

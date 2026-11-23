@@ -57,7 +57,7 @@ def _compile(tmp_path, name, *flags):
     src.write_text(SOURCE)
     obj = tmp_path / f"{name}.o"
     proc = subprocess.run(
-        [str(TCC), f"-B{TCC_TOP}", *flags, "-c", str(src), "-o", str(obj)],
+        [str(TCC), "-ccompat", f"-B{TCC_TOP}", *flags, "-c", str(src), "-o", str(obj)],
         capture_output=True,
         text=True,
     )
@@ -84,6 +84,7 @@ def _link_verbose(tmp_path, name, *flags):
     proc = subprocess.run(
         [
             str(TCC),
+            "-ccompat",
             f"-B{TCC_TOP}",
             f"-L{TCC_TOP}/lib",
             f"-L{TCC_TOP}/lib/fp",
@@ -201,6 +202,7 @@ def _link_yaff(tmp_path, name, *flags):
     proc = subprocess.run(
         [
             str(TCC),
+            "-ccompat",
             f"-B{TCC_TOP}",
             f"-L{TCC_TOP}/lib",
             f"-L{TCC_TOP}/lib/fp",

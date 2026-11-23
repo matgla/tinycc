@@ -122,6 +122,10 @@ if(BENCHMARK_COMPILER STREQUAL "TCC")
         -I${CMAKE_CURRENT_SOURCE_DIR}/../ir_tests/libc_includes/newlib
     )
 
+    # The benchmarks are plain C: -ccompat turns off tcc's safe-by-default
+    # dialect (C23 + yasc ownership checks), which rejects plain pointers.
+    set(TCC_DIALECT_FLAGS -ccompat)
+
     # Define source files and their object file mappings
     set(TCC_OBJECTS "")
     set(TCC_COMPILE_COMMANDS "")
@@ -134,7 +138,7 @@ if(BENCHMARK_COMPILER STREQUAL "TCC")
         # Add custom command for each object file
         add_custom_command(
             OUTPUT ${obj}
-            COMMAND ${TCC_EXE} -c ${BENCH_ARCH_FLAGS} ${BENCH_MFPU_FLAG} -O${BENCHMARK_OPT_LEVEL} -g
+            COMMAND ${TCC_EXE} -c ${TCC_DIALECT_FLAGS} ${BENCH_ARCH_FLAGS} ${BENCH_MFPU_FLAG} -O${BENCHMARK_OPT_LEVEL} -g
                 -DBENCHMARK_OPT_LEVEL=${BENCHMARK_OPT_LEVEL}
                 -I${CMAKE_CURRENT_SOURCE_DIR}
                 -I${CMAKE_CURRENT_SOURCE_DIR}/../../include
@@ -345,7 +349,7 @@ if(BUILD_FP_CONFORMANCE)
         set(FP_CONF_OBJ "${CMAKE_CURRENT_BINARY_DIR}/fp_conformance_tcc.o")
         add_custom_command(
             OUTPUT ${FP_CONF_OBJ}
-            COMMAND ${TCC_EXE} -c ${BENCH_ARCH_FLAGS} ${FP_MFPU_FLAG} -O${BENCHMARK_OPT_LEVEL} -g
+            COMMAND ${TCC_EXE} -c ${TCC_DIALECT_FLAGS} ${BENCH_ARCH_FLAGS} ${FP_MFPU_FLAG} -O${BENCHMARK_OPT_LEVEL} -g
                 -I${FP_CONF_DIR}
                 -I${CMAKE_CURRENT_SOURCE_DIR}/../../include
                 ${TCC_LIBC_INCLUDE_FLAGS}

@@ -294,6 +294,17 @@ void gen_cast(CType *type)
   int sbt, dbt, sf, df, c;
   int dbt_bt, sbt_bt, ds, ss, bits, trunc;
 
+  /* an error union is only ever cast to itself (gen_assign_cast) */
+  if ((MAYBE_ERRUNION(&vtop->type) || MAYBE_ERRUNION(type)) &&
+      (type_is_errunion(&vtop->type) || type_is_errunion(type)) && vtop->type.ref != type->ref)
+  {
+    if (!type_is_errunion(&vtop->type))
+      tcc_error("a cast to an error union: assign the value instead");
+    if ((type->t & VT_BTYPE) == VT_VOID)
+      yasc_errunion_discarded();
+    yasc_errunion_misuse();
+  }
+
   if (type->t & VT_RODATA_REL)
     rodata_rel_store_error();
 
@@ -923,7 +934,7 @@ again:
       goto done;
     if (dbt_bt == VT_PTR || sbt_bt == VT_PTR)
     {
-      tcc_warning("cast between pointer and integer of different size");
+      tcc_warning_once_always("cast between pointer and integer of different size");
       if (sbt_bt == VT_PTR)
       {
         /* put integer type to allow logical operations below */

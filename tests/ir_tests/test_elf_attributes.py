@@ -43,6 +43,7 @@ def _link(tmp_path, *extra_flags):
     top = TCC.parent
     cmd = [
         str(TCC),
+        "-ccompat",
         f"-B{top}",
         # soft/softfp pull in the __aeabi_* FP runtime unconditionally.
         f"-L{top}/lib",

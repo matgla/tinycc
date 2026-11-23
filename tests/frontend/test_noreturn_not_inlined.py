@@ -23,7 +23,7 @@ def calls_in(tcc, tmp_path, source, flags=("-O2",)):
     """{function: [functions it calls]} of the compiled source."""
     src, obj = tmp_path / "t.c", tmp_path / "t.o"
     src.write_text(source)
-    r = subprocess.run([tcc, *flags, "-fno-pic", "-nostdlib", "-c", str(src), "-o", str(obj)], capture_output=True, text=True)
+    r = subprocess.run([tcc, "-ccompat", *flags, "-fno-pic", "-nostdlib", "-c", str(src), "-o", str(obj)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     dump = subprocess.run(["arm-none-eabi-objdump", "-dr", str(obj)], capture_output=True, text=True, check=True).stdout
     calls, current = {}, None

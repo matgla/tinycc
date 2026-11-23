@@ -119,14 +119,15 @@ static int licm_q_may_clobber_memory(TCCIRState *ir, IRQuadCompact *q)
   /* Inline asm may write arbitrary memory; a store through a non-STORE op
    * shows up as an lvalue destination.  SET_CHAIN counts too: it precedes a
    * call to a nested function, which writes the caller's captured locals
-   * through the chain whatever purity its body was given. */
+   * through the chain whatever purity its body was given.  So does a
+   * non-local op: __builtin_apply calls a function, setjmp/longjmp and
+   * __builtin_apply_args move register state through memory. */
   return ir_q_hazards_except(ir, q,
                              IR_HZ_ALL & ~(IR_HZ_MEM_READ | IR_HZ_SRC_LVAL | IR_HZ_FLAGS_SET | IR_HZ_FLAGS_READ |
                                            IR_HZ_CALL_PARAM | IR_HZ_CALL_SEQ | IR_HZ_UPDATES_SRC | IR_HZ_HINT |
                                            IR_HZ_BRANCH | IR_HZ_RETURN | IR_HZ_TRAP | IR_HZ_JOIN |
                                            IR_HZ_JOIN_END |
-                                           IR_LEGACY_GAP_HZ(IR_HZ_VLA | IR_HZ_NONLOCAL | IR_HZ_VOLATILE |
-                                                            IR_HZ_DEST_STACKOFF)),
+                                           IR_LEGACY_GAP_HZ(IR_HZ_VLA | IR_HZ_VOLATILE | IR_HZ_DEST_STACKOFF)),
                              IR_LEGACY_GAP_OPS(TCCIR_OP_ASM_INPUT, TCCIR_OP_CALLARG_STACK,
                                                TCCIR_OP_INIT_CHAIN_SLOT)) != 0;
 }
@@ -351,6 +352,11 @@ static void glh_collect_global_writes(TCCIRState *ir, IRLoop *loop, GLHWrites *w
       continue;
     }
     default:
+      /* __builtin_apply calls anything; setjmp/longjmp likewise */
+      if (ir_op_has(q->op, IR_HZ_NONLOCAL | IR_HZ_ASM | IR_HZ_CHAIN)) {
+        w->unknown = 1;
+        continue;
+      }
       if (irop_config[q->op].has_dest) {
         IROperand d = tcc_ir_op_get_dest(ir, q);
         if (d.is_lval && !glh_dest_is_local_slot(d))

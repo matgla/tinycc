@@ -194,25 +194,335 @@ int expr_precedence(int tok)
 }
 
 
-void expr_infix(int p)
+static int is_comparison_op(int t)
+{
+  return precedence(t) == 6 || precedence(t) == 7;
+}
+
+static const char *op_name(int t)
+{
+  switch (t)
+  {
+  case '+':
+    return "+";
+  case '-':
+    return "-";
+  case '&':
+    return "&";
+  case '^':
+    return "^";
+  case '|':
+    return "|";
+  case TOK_SHL:
+    return "<<";
+  case TOK_SAR:
+    return ">>";
+  case TOK_EQ:
+    return "==";
+  case TOK_NE:
+    return "!=";
+  case TOK_LAND:
+    return "&&";
+  case TOK_LOR:
+    return "||";
+  default:
+    return "?";
+  }
+}
+
+/* -Wparentheses (gcc's warn_about_parentheses): operator T applied to operands
+ * whose own top operators, when written without parentheses, were L and R (0:
+ * a unary expression, or one in parentheses) */
+/* The right operand (vtop) looks like a truth value, as gcc's
+ * APPEARS_TO_BE_BOOLEAN_EXPR_P: a comparison, `&&`, `||` or `!` (R, its
+ * operator), a _Bool, or (WITH_ONE) the constant 0 or 1 */
+static int rhs_looks_boolean(int r, int with_one)
+{
+  int v = vtop->r & VT_VALMASK;
+  if (is_comparison_op(r) || r == TOK_LAND || r == TOK_LOR || r == '!')
+    return 1;
+  if (v == VT_CMP || v == VT_JMP || v == VT_JMPI) /* one in parentheses */
+    return 1;
+  if ((vtop->type.t & VT_BTYPE) == VT_BOOL)
+    return 1;
+  return with_one && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && is_integer_btype(vtop->type.t & VT_BTYPE) &&
+         (vtop->c.i == 0 || vtop->c.i == 1);
+}
+
+/* `!a == b`, `!a & b`: the left operand is a `!` not in parentheses (L is
+ * '!') and the right one is not a truth value */
+static void check_logical_not(int t, int r)
+{
+  const int line = file ? file->line_num : 0;
+  if (is_comparison_op(t))
+  {
+    if (!fe_check_on(tcc_state->warn_logical_not_parentheses) || rhs_looks_boolean(r, 0))
+      return;
+    /* `!x == 0` is `!(x == 0)` */
+    if ((t == TOK_EQ || t == TOK_NE) && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST &&
+        is_integer_btype(vtop->type.t & VT_BTYPE) && vtop->c.i == 0)
+      return;
+    /* quiet in an inline expansion (fe_check_on), so the check-only parse
+       of a body every call inlined reports it: tcc_diag_first, as the
+       other -Wparentheses cases */
+    if (!tcc_diag_first(tcc_state, line, DIAG_KEY(DIAG_KEY_PARENTHESES, ((unsigned)t << 1) | 1)))
+      return;
+    tcc_warning_c(warn_logical_not_parentheses)("%i:logical not is only applied to the left hand side of comparison",
+                                                line);
+    tcc_note("%i:add parentheses around left hand side expression to silence this warning", line);
+  }
+  else if ((t == '&' || t == '|') && fe_check_on(tcc_state->warn_parentheses) && !rhs_looks_boolean(r, 1) &&
+           tcc_diag_first(tcc_state, line, DIAG_KEY(DIAG_KEY_PARENTHESES, ((unsigned)t << 1) | 1)))
+    tcc_warning_c(warn_parentheses)("%i:suggest parentheses around operand of '!' or change '%c' to '%c%c' or '!' to '~'",
+                                    line, t, t, t);
+}
+
+void check_parentheses(int t, int l, int r)
+{
+  const int line = file ? file->line_num : 0;
+  char buf[96];
+  int o;
+  if (l == '!')
+  {
+    check_logical_not(t, r);
+    l = 0;
+  }
+  if (r == '!')
+    r = 0;
+  if (!(l | r) || !fe_check_on(tcc_state->warn_parentheses))
+    return;
+  buf[0] = 0;
+  switch (t)
+  {
+  case TOK_SHL:
+  case TOK_SAR:
+    o = (l == '+' || l == '-') ? l : (r == '+' || r == '-') ? r : 0;
+    if (o)
+      snprintf(buf, sizeof buf, "suggest parentheses around '%s' inside '%s'", op_name(o), op_name(t));
+    break;
+  case TOK_LOR:
+    if (l == TOK_LAND || r == TOK_LAND)
+      snprintf(buf, sizeof buf, "suggest parentheses around '&&' within '||'");
+    break;
+  case '|':
+  case '^':
+    if (l == '&' || l == '+' || l == '-' || r == '&' || r == '+' || r == '-' || (t == '|' && (l == '^' || r == '^')))
+      snprintf(buf, sizeof buf, "suggest parentheses around arithmetic in operand of '%s'", op_name(t));
+    else if (is_comparison_op(l) || is_comparison_op(r))
+      snprintf(buf, sizeof buf, "suggest parentheses around comparison in operand of '%s'", op_name(t));
+    break;
+  case '&':
+    o = (l == '+' || l == '-') ? l : (r == '+' || r == '-') ? r : 0;
+    if (o)
+      snprintf(buf, sizeof buf, "suggest parentheses around '%s' in operand of '&'", op_name(o));
+    else if (is_comparison_op(l) || is_comparison_op(r))
+      snprintf(buf, sizeof buf, "suggest parentheses around comparison in operand of '&'");
+    break;
+  case TOK_EQ:
+  case TOK_NE:
+    if (is_comparison_op(l) || is_comparison_op(r))
+      snprintf(buf, sizeof buf, "suggest parentheses around comparison in operand of '%s'", op_name(t));
+    break;
+  default:
+    /* < <= > >= */
+    if (precedence(t) == 7 && (precedence(l) == 7 || precedence(r) == 7))
+      snprintf(buf, sizeof buf, "comparisons like 'X<=Y<=Z' do not have their mathematical meaning");
+    break;
+  }
+  if (buf[0] && tcc_diag_first(tcc_state, line, DIAG_KEY(DIAG_KEY_PARENTHESES, (unsigned)t << 1)))
+    tcc_warning_c(warn_parentheses)("%i:%s", line, buf);
+}
+
+/* -Wtautological-compare: where an operand's tokens start (fe_tokfp_*, the
+ * hash before its first token) and the side effects parsed before it */
+typedef struct
+{
+  uint64_t h;
+  unsigned n;
+  int effects;
+} OperandStart;
+
+static inline void operand_start(OperandStart *o)
+{
+  o->h = fe_tokfp_prev;
+  o->n = fe_tokfp_n - 1;
+  o->effects = uv_effects;
+}
+
+/* the hash of the tokens from S to E (both operand_start states) */
+static uint64_t tokfp_span(const OperandStart *s, const OperandStart *e)
+{
+  uint64_t k = 0x100000001B3ull, pw = 1;
+  for (unsigned m = e->n - s->n; m; m >>= 1, k *= k)
+    if (m & 1)
+      pw *= k;
+  return e->h - s->h * pw;
+}
+
+/* A token span from here (before the current token) to where fe_span_end
+ * is called (before the token current then): for "the same expression" */
+void fe_span_begin(FeSpan *s)
+{
+  s->h = fe_tokfp_prev;
+  s->n = fe_tokfp_n - 1;
+}
+
+void fe_span_end(FeSpan *s)
+{
+  OperandStart b, e;
+  b.h = s->h, b.n = s->n;
+  operand_start(&e);
+  s->h = tokfp_span(&b, &e);
+  s->n = e.n - b.n;
+}
+
+/* `( X )` of the span X: '(' K^(n+1) + X K + ')' (tokfp_add's values) */
+static uint64_t fe_span_paren(const FeSpan *x)
+{
+  uint64_t k = 0x100000001B3ull, pw = 1, kk = k;
+  for (unsigned m = x->n + 1; m; m >>= 1, kk *= kk)
+    if (m & 1)
+      pw *= kk;
+  return ((uint64_t)'(' + 1) * pw + x->h * k + ((uint64_t)')' + 1);
+}
+
+/* A and B read the same tokens, or one of them in parentheses */
+int fe_span_same(const FeSpan *a, const FeSpan *b)
+{
+  if (!a->n || !b->n)
+    return 0;
+  if (a->n == b->n)
+    return a->h == b->h;
+  if (a->n == b->n + 2)
+    return a->h == fe_span_paren(b);
+  if (b->n == a->n + 2)
+    return b->h == fe_span_paren(a);
+  return 0;
+}
+
+/* `a OP b` with OP a comparison: did a and b read the same tokens, with no
+ * side effect from a's start on?  (`p->a == p->a`, `(x+1) == (x+1)`) */
+static void check_same_operands(int op, const OperandStart *ls, const OperandStart *le, const OperandStart *rs)
+{
+  OperandStart re;
+  operand_start(&re);
+  if (re.effects != ls->effects || le->n - ls->n != re.n - rs->n || le->n == ls->n ||
+      tokfp_span(ls, le) != tokfp_span(rs, &re))
+    return;
+  fe_check_same_operands(op);
+}
+
+static int expr_infix_l(int p, int l, const OperandStart *ls);
+
+/* expr_infix_l() while the operand hash is on (-Wtautological-compare,
+ * -Wsizeof-pointer-memaccess: fe_tokfp_on): the OperandStart records stay
+ * out of the frame of the plain variant below, which recursion through
+ * nested parentheses stacks once a level. */
+static __attribute__((noinline)) int expr_infix_l_fp(int p, int l, const OperandStart *ls)
 {
   int t = tok, p2;
   while ((p2 = precedence(t)) >= p)
   {
     if (t == TOK_LOR || t == TOK_LAND)
     {
+      if (t == TOK_LOR && l == TOK_LAND)
+        check_parentheses(TOK_LOR, l, 0);
       expr_landor(t);
+      /* -Wunused-value, as gcc: `c && (x = 1)` and `c || (f(), 0)` are
+         statements; `c && f()` computes a value nothing uses */
+      uv_last = uv_last == UV_ASSIGN || uv_last == UV_COMMA ? UV_EFFECT : UV_VALUE;
     }
     else
     {
+      int r;
+      OperandStart le = {0, 0, 0}, rs = {0, 0, 0};
+      if (ls && fe_tokfp_on)
+        operand_start(&le); /* the operator: the left operand ends before it */
       next();
+      if (fe_tokfp_on)
+        operand_start(&rs);
+      r = tok == '!' ? '!' : 0; /* a unary expression starting with `!` is one */
       unary();
       if (precedence(tok) > p2)
-        expr_infix(p2 + 1);
-      gen_op(t);
+        r = expr_infix_l(p2 + 1, r, fe_tokfp_on ? &rs : NULL);
+      if (l | r)
+        check_parentheses(t, l, r);
+      if (ls && fe_tokfp_on && TOK_ISCOND(t) && tcc_state->warn_tautological_compare)
+        check_same_operands(t, ls, &le, &rs);
+      gen_op_checked(t);
+      uv_last = UV_VALUE;
     }
+    l = t;
     t = tok;
   }
+  return l;
+}
+
+/* Returns the operator at the top of what it parsed (0: it applied none), for
+ * -Wparentheses: an operand's own operator, when it is not in parentheses.
+ * L is the left operand's ('!': a `!` expression, 0: another unary one), LS
+ * where it started (NULL: not known). */
+static int expr_infix_l(int p, int l, const OperandStart *ls)
+{
+  int t = tok, p2;
+  if (ls)
+    return expr_infix_l_fp(p, l, ls);
+  while ((p2 = precedence(t)) >= p)
+  {
+    if (t == TOK_LOR || t == TOK_LAND)
+    {
+      if (t == TOK_LOR && l == TOK_LAND)
+        check_parentheses(TOK_LOR, l, 0);
+      expr_landor(t);
+      /* -Wunused-value, as gcc: `c && (x = 1)` and `c || (f(), 0)` are
+         statements; `c && f()` computes a value nothing uses */
+      uv_last = uv_last == UV_ASSIGN || uv_last == UV_COMMA ? UV_EFFECT : UV_VALUE;
+    }
+    else if (fe_tokfp_on)
+      return expr_infix_l_fp(p, l, NULL); /* switched on by a pragma */
+    else
+    {
+      int r;
+      next();
+      r = tok == '!' ? '!' : 0; /* a unary expression starting with `!` is one */
+      unary();
+      if (precedence(tok) > p2)
+        r = expr_infix_l(p2 + 1, r, NULL);
+      if (l | r)
+        check_parentheses(t, l, r);
+      gen_op_checked(t);
+      uv_last = UV_VALUE;
+    }
+    l = t;
+    t = tok;
+  }
+  return l;
+}
+
+int expr_infix(int p)
+{
+  return expr_infix_l(p, 0, NULL);
+}
+
+/* unary(), then the operators after it from precedence P on */
+static __attribute__((noinline)) int expr_unary_infix_fp(int p)
+{
+  int l = tok == '!' ? '!' : 0;
+  OperandStart ls = {0, 0, 0};
+  if (fe_tokfp_on)
+    operand_start(&ls);
+  unary();
+  return expr_infix_l(p, l, fe_tokfp_on ? &ls : NULL);
+}
+
+int expr_unary_infix(int p)
+{
+  int l;
+  if (fe_tokfp_on)
+    return expr_unary_infix_fp(p); /* where the left operand starts */
+  l = tok == '!' ? '!' : 0;
+  unary();
+  return expr_infix_l(p, l, NULL);
 }
 #endif
 void expr_cond(void)
@@ -220,8 +530,13 @@ void expr_cond(void)
   expr_lor();
   if (tok == '?')
   {
+    /* -Wunused-value: gcc says nothing of a conditional with effects */
+    const int effects = uv_effects;
+    if (objsize_ab_watch)
+      objsize_branch(); /* -Warray-bounds in loops (builtin/objsize.c) */
     next();
     expr_cond_ternary();
+    uv_last = uv_effects != effects ? UV_EFFECT : UV_VALUE;
   }
 }
 
@@ -285,106 +600,161 @@ int nrvo_rhs_is_direct_call(void)
   return call;
 }
 
+/* -Wparentheses: the expr_eq() that returned last was an assignment `a = b`
+ * (in parentheses it is a primary expression, and the expr_eq() around it,
+ * finishing later, says 0) */
+int expr_eq_assigned;
+
+/* The right side of `p = ...`, a local pointer variable: what the value
+ * points into (objsize.c) */
+static __attribute__((noinline)) void expr_eq_objsize_rhs(void)
+{
+  ObjRec os_saved;
+  objsize_rhs_begin(&os_saved);
+  expr_eq();
+  objsize_rhs_end(&os_saved);
+}
+
+/* expr_eq() from an assignment operator T on (the left side is vtop):
+ * out of line, as its locals (the NRVO and objsize state) would sit in
+ * expr_eq()'s frame on every level of the recursion through nested
+ * parentheses. */
+static __attribute__((noinline)) void expr_eq_assign(int t)
+{
+  Sym *lhs;
+  test_lvalue();
+  lhs = t == '=' ? unused_lhs_assign() : unused_lhs(); /* -Wunused-but-set-variable */
+  next();
+  if (t == '=')
+  {
+    /* NRVO for plain assignment `dest = sret_call(...)`: hint that the
+     * first composite-returning call in the RHS may write its result
+     * directly into the destination, eliminating the temp buffer plus the
+     * temp->dst copy (a memmove for big structs).  Mirror the
+     * local-declaration NRVO path (see decl initializer handling).  Two
+     * destination shapes qualify, both of a non-volatile struct/complex
+     * type:
+     *   - a plain stack-local lvalue (`v = f()`): targeted by stack offset.
+     *   - a register-deref lvalue (`v.field = f()`, where this fork's
+     *     gaddrof materialized the field address into a vreg via LEA):
+     *     targeted by that address vreg.
+     * The call-site claim (gfunc_call) re-checks an exact size/align match
+     * before reusing the destination. */
+    int saved_nrvo_active = tcc_state->nrvo_target_active;
+    int saved_nrvo_loc = tcc_state->nrvo_target_loc;
+    int saved_nrvo_vreg = tcc_state->nrvo_target_vreg;
+    int saved_nrvo_size = tcc_state->nrvo_target_size;
+    int saved_nrvo_align = tcc_state->nrvo_target_align;
+    int saved_nrvo_ptr_vreg = tcc_state->nrvo_target_ptr_vreg;
+    int lhs_bt = vtop->type.t & VT_BTYPE;
+    int lhs_is_local =
+        (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_LOCAL | VT_LVAL);
+    int lhs_is_reg_deref =
+        (vtop->r & VT_LVAL) && (vtop->r & VT_VALMASK) < VT_CONST &&
+        vtop->vr >= 0;
+    if (tcc_state->ir && !nocode_wanted &&
+        (lhs_bt == VT_STRUCT || (vtop->type.t & VT_COMPLEX)) &&
+        !(vtop->type.t & VT_VECTOR) &&
+        (lhs_is_local || lhs_is_reg_deref) &&
+        !(vtop->type.t & VT_VOLATILE) && nrvo_rhs_is_direct_call())
+    {
+      int nrvo_align;
+      int nrvo_size = type_size(&vtop->type, &nrvo_align);
+      tcc_state->nrvo_target_active = 1;
+      tcc_state->nrvo_target_size = nrvo_size;
+      tcc_state->nrvo_target_align = nrvo_align;
+      if (lhs_is_local)
+      {
+        tcc_state->nrvo_target_loc = vtop->c.i;
+        tcc_state->nrvo_target_vreg = vtop->vr;
+        tcc_state->nrvo_target_ptr_vreg = -1;
+      }
+      else
+      {
+        tcc_state->nrvo_target_ptr_vreg = vtop->vr;
+      }
+    }
+    /* a local pointer variable: what the value points into (objsize.c) */
+    if ((vtop->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && lhs_is_local && !NOEVAL_WANTED)
+      expr_eq_objsize_rhs();
+    else
+      expr_eq();
+    tcc_state->nrvo_target_active = saved_nrvo_active;
+    tcc_state->nrvo_target_loc = saved_nrvo_loc;
+    tcc_state->nrvo_target_vreg = saved_nrvo_vreg;
+    tcc_state->nrvo_target_size = saved_nrvo_size;
+    tcc_state->nrvo_target_align = saved_nrvo_align;
+    tcc_state->nrvo_target_ptr_vreg = saved_nrvo_ptr_vreg;
+  }
+  else
+  {
+    vdup();
+    expr_eq();
+    int aop = TOK_ASSIGN_OP(t);
+    if (tcc_state->warn_conversion || tcc_state->warn_sign_conversion)
+      fe_compound_rhs = *vtop, fe_compound_pending = aop == TOK_SHL || aop == TOK_SAR ? 2 : 1;
+    gen_op_checked(aop);
+  }
+  vstore();
+  fe_compound_pending = 0;
+  unused_assigned_to(lhs);
+}
+
 void expr_eq(void)
 {
-  int t;
+  int t, assigned = 0;
 
   expr_cond();
+  while (tok == TOK_catch && tcc_state->yasc)
+  {
+    yasc_catch();
+    uv_effects++, uv_last = UV_EFFECT;
+  }
   if ((t = tok) == '=' || TOK_ASSIGN(t))
   {
-    test_lvalue();
-    next();
-    if (t == '=')
-    {
-      /* NRVO for plain assignment `dest = sret_call(...)`: hint that the
-       * first composite-returning call in the RHS may write its result
-       * directly into the destination, eliminating the temp buffer plus the
-       * temp->dst copy (a memmove for big structs).  Mirror the
-       * local-declaration NRVO path (see decl initializer handling).  Two
-       * destination shapes qualify, both of a non-volatile struct/complex
-       * type:
-       *   - a plain stack-local lvalue (`v = f()`): targeted by stack offset.
-       *   - a register-deref lvalue (`v.field = f()`, where this fork's
-       *     gaddrof materialized the field address into a vreg via LEA):
-       *     targeted by that address vreg.
-       * The call-site claim (gfunc_call) re-checks an exact size/align match
-       * before reusing the destination. */
-      int saved_nrvo_active = tcc_state->nrvo_target_active;
-      int saved_nrvo_loc = tcc_state->nrvo_target_loc;
-      int saved_nrvo_vreg = tcc_state->nrvo_target_vreg;
-      int saved_nrvo_size = tcc_state->nrvo_target_size;
-      int saved_nrvo_align = tcc_state->nrvo_target_align;
-      int saved_nrvo_ptr_vreg = tcc_state->nrvo_target_ptr_vreg;
-      int lhs_bt = vtop->type.t & VT_BTYPE;
-      int lhs_is_local =
-          (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_LOCAL | VT_LVAL);
-      int lhs_is_reg_deref =
-          (vtop->r & VT_LVAL) && (vtop->r & VT_VALMASK) < VT_CONST &&
-          vtop->vr >= 0;
-      if (tcc_state->ir && !nocode_wanted &&
-          (lhs_bt == VT_STRUCT || (vtop->type.t & VT_COMPLEX)) &&
-          !(vtop->type.t & VT_VECTOR) &&
-          (lhs_is_local || lhs_is_reg_deref) &&
-          !(vtop->type.t & VT_VOLATILE) && nrvo_rhs_is_direct_call())
-      {
-        int nrvo_align;
-        int nrvo_size = type_size(&vtop->type, &nrvo_align);
-        tcc_state->nrvo_target_active = 1;
-        tcc_state->nrvo_target_size = nrvo_size;
-        tcc_state->nrvo_target_align = nrvo_align;
-        if (lhs_is_local)
-        {
-          tcc_state->nrvo_target_loc = vtop->c.i;
-          tcc_state->nrvo_target_vreg = vtop->vr;
-          tcc_state->nrvo_target_ptr_vreg = -1;
-        }
-        else
-        {
-          tcc_state->nrvo_target_ptr_vreg = vtop->vr;
-        }
-      }
-      expr_eq();
-      tcc_state->nrvo_target_active = saved_nrvo_active;
-      tcc_state->nrvo_target_loc = saved_nrvo_loc;
-      tcc_state->nrvo_target_vreg = saved_nrvo_vreg;
-      tcc_state->nrvo_target_size = saved_nrvo_size;
-      tcc_state->nrvo_target_align = saved_nrvo_align;
-      tcc_state->nrvo_target_ptr_vreg = saved_nrvo_ptr_vreg;
-    }
-    else
-    {
-      vdup();
-      expr_eq();
-      gen_op(TOK_ASSIGN_OP(t));
-    }
-    vstore();
+    expr_eq_assign(t);
+    assigned = t == '=';
   }
+  expr_eq_assigned = assigned;
+}
+
+/* gexpr() at a ',' after its first operand (EFFECTS, LINE: where that
+ * operand started): out of line, as gexpr() is on the recursive path of
+ * nested parentheses. */
+static __attribute__((noinline)) void gexpr_comma(int effects, int line)
+{
+  do
+  {
+    unused_discard(effects, line, 1);
+    vpop_discarded();
+    next();
+    effects = uv_effects, line = file ? file->line_num : 0;
+    uv_last = 0;
+    expr_eq();
+  } while (tok == ',');
+  unused_comma_end(effects, uv_last);
+
+  /* convert array & function to pointer.  It also strips the qualifiers, so
+   * record a volatile access first — otherwise the comma expression's value
+   * arrives at its consumer (or at the statement-level discard) looking like
+   * an ordinary read, and `(void)(x, *REG)` loses the read. */
+  if (vtop->type.t & VT_VOLATILE)
+    vtop->volatile_access = 1;
+  convert_parameter_type(&vtop->type);
+
+  /* make builtin_constant_p((1,2)) return 0 (like on gcc) */
+  if ((vtop->r & VT_VALMASK) == VT_CONST && nocode_wanted && !CONST_WANTED)
+    gv(RC_TYPE(vtop->type.t));
 }
 
 ST_FUNC void gexpr(void)
 {
+  /* -Wunused-value: each operand from its start */
+  int effects = uv_effects, line = file ? file->line_num : 0;
+  uv_last = 0;
   expr_eq();
   if (tok == ',')
-  {
-    do
-    {
-      vpop_discarded();
-      next();
-      expr_eq();
-    } while (tok == ',');
-
-    /* convert array & function to pointer.  It also strips the qualifiers, so
-     * record a volatile access first — otherwise the comma expression's value
-     * arrives at its consumer (or at the statement-level discard) looking like
-     * an ordinary read, and `(void)(x, *REG)` loses the read. */
-    if (vtop->type.t & VT_VOLATILE)
-      vtop->volatile_access = 1;
-    convert_parameter_type(&vtop->type);
-
-    /* make builtin_constant_p((1,2)) return 0 (like on gcc) */
-    if ((vtop->r & VT_VALMASK) == VT_CONST && nocode_wanted && !CONST_WANTED)
-      gv(RC_TYPE(vtop->type.t));
-  }
+    gexpr_comma(effects, line);
 }
 
 /* parse a constant expression and return value in vtop.  */

@@ -146,7 +146,7 @@ void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, i
         if (len < nb)
           nb = len;
         if (len > nb)
-          tcc_warning("initializer-string for array is too long");
+          tcc_warning_once_always("initializer-string for array is too long");
         /* in order to go faster for common case (char
            string in global variable, we handle it
            specifically */
@@ -621,6 +621,8 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
   if ((r & VT_VALMASK) == VT_LOCAL)
   {
     sec = NULL;
+    if (tcc_state->stack_protector)
+      ssp_note_local(type);
 #ifdef CONFIG_TCC_BCHECK
     if (bcheck && v)
     {
@@ -635,12 +637,14 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
        * during type parsing (post_type); do not reuse that slot. */
       loc = (loc - PTR_SIZE) & -PTR_SIZE;
     }
-    else if (!((r & VT_LVAL) && ((type->t & VT_BTYPE) != VT_STRUCT) && !(type->t & VT_COMPLEX)))
+    else if (!v || !((r & VT_LVAL) && ((type->t & VT_BTYPE) != VT_STRUCT) && !(type->t & VT_COMPLEX)))
     {
       // allocate stack for variables that are not register allocation
       // candidates.  Complex types need explicit stack allocation since
       // they are too large for single vregs and use offset-based access
-      // via __real__/__imag__.
+      // via __real__/__imag__.  An anonymous object (a compound literal,
+      // !v) gets no vreg either: a scalar one without a slot sat at `loc`,
+      // on top of the local allocated last.
       // VLA structs allocate a pointer slot instead of
       // the full struct — the actual data is VLA_ALLOC'd later.
       if (struct_has_vla_member(type))
@@ -680,7 +684,21 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
     {
       /* local variable */
       sym = sym_push(v, type, r, addr);
+#ifdef CONFIG_TCC_BCHECK
+      if (bcheck)
+        bcheck_local_decl(sym);
+#endif
+      if (yasc_pp_binding)
+        yasc_pp_local_bind(sym); /* its plain pointer, followed (plain_param.c) */
+      /* -Wlifetime: owned pointers and handles inside a local struct or array */
+      if (tcc_state->ir && tcc_state->ir->lt_on && tcc_state->yasc && !(type->t & VT_VLA) &&
+          ((type->t & VT_ARRAY) || (type->t & VT_BTYPE) == VT_STRUCT))
+        tcc_ir_lt_note_slot(tcc_state->ir, addr, type, v, ad->yobj_dealloc);
+      check_shadow(sym);
       vreg = sym->vreg;
+      /* -W[maybe-]uninitialized: declared here with no value */
+      if (!has_init && vreg >= 0 && tcc_ir_un_wanted())
+        tcc_ir_un_add_var(tcc_state->ir, vreg, sym);
 #ifdef CONFIG_TCC_ASM
       /* `register T x __asm("rN")`: x is an ordinary local whose value is
        * placed in rN only where it is an asm operand.  Record rN in sym->r
@@ -846,6 +864,8 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
         sym = sym_push(v, type, r | VT_SYM, 0);
         vreg = sym->vreg;
         patch_storage(sym, ad, NULL);
+        if (local_stack) /* a static local */
+          check_shadow(sym);
       }
       /* update symbol definition */
       put_extern_sym(sym, sec, addr, size);
@@ -881,6 +901,16 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
 #endif
   }
 
+  if ((type->t & VT_VLA) || ((r & VT_VALMASK) == VT_LOCAL && struct_has_vla_member(type)))
+  {
+    if ((tcc_state->warn_vla & WARN_ON) && diag_stack_site())
+    {
+      if (v && v < SYM_FIRST_ANOM)
+        tcc_warning_c(warn_vla)("%i:variable length array '%s' is used", file->line_num, get_tok_str(v, NULL));
+      else
+        tcc_warning_c(warn_vla)("%i:variable length array is used", file->line_num);
+    }
+  }
   if (type->t & VT_VLA)
   {
     int a;
