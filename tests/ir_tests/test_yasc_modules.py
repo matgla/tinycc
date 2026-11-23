@@ -669,6 +669,41 @@ def test_header_is_c99_for_gcc(tmp_path):
     assert r.returncode == 0, r.stderr
 
 
+QUAL_ARGS_MODULE = """\
+module q;
+int close(int drop owned(close) maybe fd);
+struct grid { int n; };
+export struct tok borrows(text) { const char * borrows(text) pos; };
+static struct grid the_grid;
+export struct grid * borrows(static) grid_get(void) { return &the_grid; }
+export const char * borrows(s) skip(const char * view s) { return s + 1; }
+export char * owned takes(p) keep(char * owned p) { return p; }
+export int owned(close) maybe open_fd(int f);
+export struct tok borrows(src) tok_init(const char * view src);
+export int takes(int v);
+"""
+
+QUAL_ARGS_TEXT = """\
+struct grid * grid_get(void);
+const char * skip(const char * s);
+char * keep(char * p);
+int open_fd(int f);
+struct tok tok_init(const char * src);
+int takes(int v);
+"""
+
+
+def test_header_leaves_out_qualifier_arguments(tmp_path):
+    """borrows(...), takes(...) and owned(dealloc) are yasc: none of their
+    tokens reach the C header (a C caller failed on `borrows(static)`), while
+    a function called takes keeps its name"""
+    proc = _module(tmp_path, QUAL_ARGS_MODULE, f"-fmodule-header={tmp_path / 'inc'}")
+    assert proc.returncode == 0 and not proc.stderr, proc.stderr
+    text = (tmp_path / "inc" / "q.h").read_text()
+    assert QUAL_ARGS_TEXT in text, text
+    assert "borrows" not in text and "(close)" not in text and "(p)" not in text, text
+
+
 def test_header_unchanged_keeps_its_time(tmp_path):
     import os
 

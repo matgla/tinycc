@@ -456,6 +456,49 @@ static void yasc_check_piece_name(int t, int prev, int in_body)
     tcc_error("an exported inline function uses the private '%s': export it", get_tok_str(t, NULL));
 }
 
+/* The token after P that is not a line number. */
+static int yasc_peek(const int *p, const int *stop, const int **next)
+{
+  int t = TOK_EOF;
+  CValue cv;
+  while (p < stop)
+  {
+    tok_get(&t, &p, &cv);
+    if (t != TOK_LINENUM)
+      break;
+    t = TOK_EOF;
+  }
+  if (next)
+    *next = p;
+  return t & ~SYM_FIELD;
+}
+
+/* A pointer's qualifier: what may stand between a '*' and borrows(...) or
+   takes(...) (declarator.c type_decl). */
+static int yasc_ptr_qual(int t)
+{
+  return (t >= TOK_owned && t <= TOK_drop) || (t >= TOK_CONST1 && t <= TOK_CONST3) ||
+         (t >= TOK_VOLATILE1 && t <= TOK_VOLATILE3) || (t >= TOK_RESTRICT1 && t <= TOK_RESTRICT3) ||
+         t == TOK__Atomic;
+}
+
+/* T, read after PREV (and PREV2) with P at the token after it: a yasc
+   qualifier whose (...) follows -- `* borrows(x)`, `* takes(p)`,
+   `struct T borrows(x)`, owned(fclose) -- as the parser reads them. */
+static int yasc_qual_args(int t, int prev, int prev2, int ptr_quals, const int *p, const int *stop)
+{
+  const int *q;
+  if (yasc_peek(p, stop, &q) != '(')
+    return 0;
+  if (t == TOK_owned)
+    return yasc_peek(q, stop, &q) >= TOK_UIDENT && yasc_peek(q, stop, NULL) == ')';
+  if (t == TOK_takes)
+    return ptr_quals;
+  if (t == TOK_borrows)
+    return ptr_quals || ((prev2 == TOK_STRUCT || prev2 == TOK_UNION) && prev >= TOK_UIDENT);
+  return 0;
+}
+
 /* The export just parsed: append its piece to the interface.
  * - an object: `extern` in front, initializers left out;
  * - a function definition: its head and ';';
@@ -465,6 +508,9 @@ static void yasc_export_finish(void)
   TokenString *str = yasc_pending;
   const int *p, *start, *stop;
   int level = 0, prev = 0, t, has_extern = 0, has_static = 0, c_proto;
+  /* the C header leaves out a yasc qualifier's (...): armed by the
+     qualifier, then the depth inside them */
+  int prev2 = 0, ptr_quals = 0, c_arm = 0, c_skip = 0;
   CValue cv;
 
   yasc_pending = NULL;
@@ -562,7 +608,24 @@ static void yasc_export_finish(void)
     tok_str_add2(yasc_iface, t, &cv);
     const int prev_c = prev;
     prev = t;
-    if (yasc_cheader && !(c_proto && (in_body || yasc_is_inline_kw(t))) && !(t >= TOK_owned && t <= TOK_drop))
+    int c_drop = 0;
+    if (c_arm)
+    {
+      c_arm = 0;
+      c_skip = c_drop = 1; /* the '(' */
+    }
+    else if (c_skip)
+    {
+      c_drop = 1;
+      c_skip += t == '(' ? 1 : t == ')' ? -1 : 0;
+    }
+    else if (yasc_cheader && yasc_qual_args(t, prev_c, prev2, ptr_quals, p, stop))
+      c_arm = c_drop = 1;
+    if (!c_drop)
+      ptr_quals = t == '*' || (ptr_quals && yasc_ptr_qual(t));
+    prev2 = prev_c;
+    if (yasc_cheader && !c_drop && !(c_proto && (in_body || yasc_is_inline_kw(t))) &&
+        !(t >= TOK_owned && t <= TOK_drop))
     {
       if (in_body && (t == TOK_defer || t == TOK_errdefer))
         tcc_error("-fmodule-header: an exported static inline function uses '%s', which C does not have",
