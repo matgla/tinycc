@@ -714,6 +714,7 @@ void check_uncompiled_inline_functions(TCCState *s);
 void gc_unreferenced_statics(TCCState *s);
 void free_dropped_statics(TCCState *s);
 void gen_function_check_only(Sym *sym);
+void vla_param_exprs_free(TCCState *s1);
 void tcc_check_scratch_begin(TCCState *s);
 TokenString *tok_str_clone(TokenString *str);
 void prune_unused_statics(TCCState *s);

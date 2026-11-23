@@ -80,12 +80,10 @@ ST_FUNC void save_body_error(TCCState *s1, int line, const char *msg)
    the end of the compile as it was at -O0 */
 ST_FUNC void save_body_raise(TCCState *s1)
 {
-  char *m = s1->save_body_msg;
-  s1->save_body_msg = NULL;
-  if (!m)
+  if (!s1->save_body_msg)
     return;
   s1->error_fatal = 1;
-  tcc_error("%i:%s", s1->save_body_line, m); /* error1 frees nothing: m leaks with the compile */
+  tcc_error("%i:%s", s1->save_body_line, s1->save_body_msg); /* tccgen_finish frees it */
 }
 
 /* The save of SYM's body STR stopped: STOP 1 at an error of the lexer, 2 at
@@ -840,7 +838,9 @@ static int defer_function_body(Sym *sym, Section *section)
   d->filename = tcc_filename_intern(file->filename);
   d->sym = sym;
   d->section = section;
+  tcc_state->save_body_deferred = d;
   save_function_body(&d->body, &d->pack, 0, sym);
+  tcc_state->save_body_deferred = NULL;
   int unprototyped = body_calls_unprototyped(sym, d->body);
   tok_str_release(d->body);
   if (unprototyped)

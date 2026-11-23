@@ -2269,6 +2269,9 @@ struct TCCState
   jmp_buf *save_body_jmp;
   char *save_body_msg;         /* the lexer's error, said when the parse reaches it */
   int save_body_line;
+  struct DeferredFunc *save_body_deferred; /* defer_function_body's entry while its body is
+                                              saved: an error there ends the compile, and
+                                              tccgen_finish frees it */
   struct TypeSig *typesigs; /* -Wcross-tu: the link's type signatures (obj/tccelf_load.c) */
   int nb_typesigs;
 

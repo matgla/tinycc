@@ -60,6 +60,12 @@ void skip_or_save_block(TokenString **str)
       if (str || level > 0)
       {
         pp_pragma_capture = saved_capture;
+        if (str)
+        {
+          /* the error leaves the caller: nothing else holds the tokens */
+          tok_str_free(*str);
+          *str = NULL;
+        }
         tcc_error("unexpected end of file");
       }
       else

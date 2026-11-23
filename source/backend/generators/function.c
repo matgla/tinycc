@@ -95,6 +95,7 @@ extern void vpush_type_size(CType *type, int *a);
 void gen_instrument_call(Sym *cur_func_sym, const char *hook_name);
 static void func_vla_arg_code(Sym *arg);
 static void func_vla_arg(Sym *sym);
+void vla_param_exprs_free(TCCState *s1);
 
 /* A `V` operand (VAR vreg, is_local + is_lval) names a register-resident scalar;
  * every other lval — a stack slot, a symbol, a pointer deref — is real memory,
@@ -1753,6 +1754,7 @@ void gen_function_check_only(Sym *sym)
 
   sym_pop(&local_stack, NULL, 0);
   sym_pop(&all_cleanups, NULL, 0);
+  vla_param_exprs_free(tcc_state);
   if (errored)
     for (Sym *l = global_label_stack; l && l != global_label_stack_start; l = l->prev)
       if (l->r == LABEL_FORWARD)
@@ -1875,6 +1877,18 @@ static void func_vla_arg_code(Sym *arg)
   }
 }
 
+/* The outermost VLA dimensions of the parameters the declarator saved
+ * (declarator.c post_type): gen_function evaluates them (func_vla_arg), a
+ * check-only parse never; tccgen_finish takes what an error left. */
+void vla_param_exprs_free(TCCState *s1)
+{
+  for (int i = 0; i < s1->nb_vla_param_exprs; i++)
+    tcc_free(s1->vla_param_exprs[i].tokens);
+  tcc_free(s1->vla_param_exprs);
+  s1->vla_param_exprs = NULL;
+  s1->nb_vla_param_exprs = 0;
+}
+
 static void func_vla_arg(Sym *sym)
 {
   Sym *arg;
@@ -1903,12 +1917,5 @@ static void func_vla_arg(Sym *sym)
       }
     }
   }
-  if (tcc_state->nb_vla_param_exprs)
-  {
-    for (int i = 0; i < tcc_state->nb_vla_param_exprs; i++)
-      tcc_free(tcc_state->vla_param_exprs[i].tokens);
-    tcc_free(tcc_state->vla_param_exprs);
-    tcc_state->vla_param_exprs = NULL;
-    tcc_state->nb_vla_param_exprs = 0;
-  }
+  vla_param_exprs_free(tcc_state);
 }

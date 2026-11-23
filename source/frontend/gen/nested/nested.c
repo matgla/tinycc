@@ -354,6 +354,11 @@ void nested_names_free(void)
 
 void nested_func_release(NestedFunc *nf)
 {
+  /* the parent's compile frees the body and clears it (gen_function); one
+     still here is what an error that ended the parent left */
+  if (nf->func_str)
+    tok_str_free(nf->func_str);
+  nf->func_str = NULL;
   tcc_free(nf->def_vis);
   nf->def_vis = NULL;
   nf->nb_def_vis = 0;
@@ -626,7 +631,11 @@ void compile_nested_functions(Sym *parent_sym)
 
     /* Replay saved token stream (same as inline function expansion) */
     tccpp_setfile_replay(nf->filename);
-    begin_macro_kept(nf->func_str);
+    /* the replay owns the body from here: end_macro frees it, as does an
+       error's unwind of the macro stack */
+    TokenString *body = nf->func_str;
+    nf->func_str = NULL;
+    begin_macro_kept(body);
     next(); /* prime the first token - should be '{' */
 
     /* Set up text section for nested function (same as regular functions) */

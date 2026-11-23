@@ -373,6 +373,9 @@ def test_cut_body_same_at_every_level(tmp_path, case):
     for opt in ("-O0", "-O1", "-O2", "-Os", "-fsyntax-only"):
         p = _run(tmp_path, body, opt)
         assert p.returncode == 1
+        # an ASan build reports what the cut leaks: the deferred body's entry
+        # (defer_function_body) and the lexer's message (save_body_raise)
+        assert "Sanitizer" not in p.stderr, (opt, p.stderr)
         outs[opt] = p.stderr
         assert [(l, m) for l, _, m in _diags(p)] == expect, (opt, p.stderr)
     assert len(set(outs.values())) == 1, outs

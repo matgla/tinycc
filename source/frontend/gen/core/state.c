@@ -393,6 +393,17 @@ ST_FUNC void tccgen_finish(TCCState *s1)
      would have freed. */
   inline_release_hidden_label_bindings();
   free_deferred_functions(s1);
+  /* a body save an error cut (decl.c save_body_cut): its entry and message;
+     the tokens went with the macro stack */
+  if (s1->save_body_deferred)
+  {
+    tcc_free(s1->save_body_deferred->pack);
+    tcc_free(s1->save_body_deferred);
+    s1->save_body_deferred = NULL;
+  }
+  tcc_free(s1->save_body_msg);
+  s1->save_body_msg = NULL;
+  vla_param_exprs_free(s1); /* a declarator's, its function never parsed */
   unused_unit_free(s1);
   tcc_ir_taint_unit_free();
   free_dropped_statics(s1);
