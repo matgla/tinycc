@@ -1,0 +1,7 @@
+n=30
+dst: a=2 r=338 vr=8 c=10
+src: a=1 r=82 vr=7 c=9
+dst: a=2 r=338 vr=8 c=10
+src: a=1 r=82 vr=7 c=9
+two=1102
+k=12345678 m=30

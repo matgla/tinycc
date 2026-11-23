@@ -151,6 +151,7 @@ TEST_FILES = [
     ("bug_loop_unroll_do_while_eq_continue.c", 0),
     ("bug_sizeof_compound_literal_file_scope.c", 0),
     ("bug_init_compound_literal_member_relocs.c", 0),  # init_putv: member relocs use the member offset
+    ("bug_scalar_compound_literal_slot.c", 0),  # decl_initializer_alloc: an anonymous scalar gets a slot
     ("bug_inline_replay_scope_binding.c", 0),  # inlined callee names bind at definition, not in the caller scope
     ("bug_inline_nested_free_name_binding.c", 0),  # below depth 0, a callee's free name bound to an outer local keeps the call
     ("bug_inline_nested_free_array_shadow.c", 0),  # ... a local W must not replace the callee's array W

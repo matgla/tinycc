@@ -637,12 +637,14 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
        * during type parsing (post_type); do not reuse that slot. */
       loc = (loc - PTR_SIZE) & -PTR_SIZE;
     }
-    else if (!((r & VT_LVAL) && ((type->t & VT_BTYPE) != VT_STRUCT) && !(type->t & VT_COMPLEX)))
+    else if (!v || !((r & VT_LVAL) && ((type->t & VT_BTYPE) != VT_STRUCT) && !(type->t & VT_COMPLEX)))
     {
       // allocate stack for variables that are not register allocation
       // candidates.  Complex types need explicit stack allocation since
       // they are too large for single vregs and use offset-based access
-      // via __real__/__imag__.
+      // via __real__/__imag__.  An anonymous object (a compound literal,
+      // !v) gets no vreg either: a scalar one without a slot sat at `loc`,
+      // on top of the local allocated last.
       // VLA structs allocate a pointer slot instead of
       // the full struct — the actual data is VLA_ALLOC'd later.
       if (struct_has_vla_member(type))
