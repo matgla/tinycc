@@ -228,7 +228,8 @@ def test_quote_at_start_is_kept(tmp_path):
 def test_note_on_the_same_line_without_a_name(tmp_path):
     """A note about the line just shown, with no name of its own on it, does
     not show it again."""
-    src = "#include <string.h>\nvoid f(void) { char b[4]; strcpy(b, \"hello world\"); (void)b; }\n"
+    # declared, not included: a CI cross has no sysroot behind it
+    src = "char *strcpy(char *, const char *);\nvoid f(void) { char b[4]; strcpy(b, \"hello world\"); (void)b; }\n"
     proc, path = _compile(tmp_path, "-fdiagnostics-show-caret", src=src)
     lines = proc.stderr.splitlines()
     i = next(k for k, l in enumerate(lines) if "note:" in l)

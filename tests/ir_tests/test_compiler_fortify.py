@@ -68,7 +68,9 @@ def _compile(tmp_path, body, *flags, name="t", ccompat=True):
     src = tmp_path / f"{name}.c"
     src.write_text(body)
     obj = tmp_path / f"{name}.o"
-    cmd = [str(TCC), *(["-ccompat"] if ccompat else []), "-c", *flags, str(src), "-o", str(obj)]
+    # tcc's own <stddef.h>: a CI cross has no sysroot behind it
+    cmd = [str(TCC), *(["-ccompat"] if ccompat else []), "-nostdinc", f"-isystem{ROOT / 'include'}", "-c", *flags,
+           str(src), "-o", str(obj)]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     return proc, obj
 
