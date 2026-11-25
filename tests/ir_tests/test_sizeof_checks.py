@@ -17,8 +17,10 @@ from fe_check_cases import ALL_CHECKS, TCC, Case
 
 pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 
-# no plain pointers in yasc (the safe default): V is `view` there
-PRE = (
+# no plain pointers in yasc (the safe default): V is `view` there, and IO
+# `inout` (a view parameter's target is read-only without it)
+IO = "#ifdef __YASC__\n#define IO inout\n#else\n#define IO\n#endif\n"
+PRE = IO + (
     "#ifdef __YASC__\n#define V view\n#else\n#define V\n#endif\n"
     "typedef unsigned size_t;\n"
     "void * V memset(void * V d, int c, size_t n);\n"
@@ -27,17 +29,16 @@ PRE = (
     "char * V strncpy(char * V d, const char * V s, size_t n);\n"
     "int snprintf(char * V d, size_t n, const char * V f, ...);\n"
     "struct S { int a, b; };\n"
-)  # 12 lines
+)  # 17 lines
 
 CASES = {
     "sizeof-pointer-memaccess": Case(
         "sizeof-pointer-memaccess",
         True,
-        PRE + "void f1(struct S * V p, struct S * V q, char * V c)\n{\n"
+        PRE + "void f1(IO struct S * V p, IO struct S * V q, IO char * V c)\n{\n"
         "  memset(p, 0, sizeof p); /* W: argument to 'sizeof' in 'memset' call is the same expression as the "
         "destination; did you mean to dereference it? */\n"
-        "  memcpy(p, q, sizeof(q)); /* W: the same pointer type 'struct S *' as the destination; expected "
-        "'struct S' or an explicit length */\n"
+        "  memcpy(p, q, sizeof(q)); /* W: the same pointer type 'struct S * */\n"  # 'struct S * view' in yasc
         "  (void)memcmp(p, q, sizeof p); /* W: the same expression as the first source */\n"
         "  strncpy(c, c, sizeof c); /* W: in 'strncpy' call is the same expression as the destination; did you mean "
         "to provide an explicit length? */\n"
@@ -49,7 +50,7 @@ CASES = {
         "  memset(h->q, 0, sizeof h->q); /* W: the same expression as the destination; did you mean to dereference */\n"
         "  memset(h->q, 0, sizeof(h->q)); /* W: the same expression as the destination */\n"
         "  memset((h->n->q), 0, sizeof h->n->q); /* W: the same expression as the destination */\n"
-        "  memcpy(t->q, h->a[1], sizeof h->a[1]); /* W: the same pointer type 'int *' as the destination */\n"
+        "  memcpy(t->q, h->a[1], sizeof h->a[1]); /* W: the same pointer type 'int * */\n"
         "}\n",
         PRE + "void f1(struct S * V p, struct S * V q, char * V c)\n{\n  char buf[8];\n  buf[0] = 0;\n"
         "  memset(p, 0, sizeof *p);\n  memcpy(p, q, sizeof(struct S));\n  memset(buf, 0, sizeof buf);\n"
@@ -61,7 +62,7 @@ CASES = {
     "sizeof-array-argument": Case(
         "sizeof-array-argument",
         True,
-        "int f1(int arr[10], char buf[16])\n{\n"
+        IO + "int f1(IO int arr[10], IO char buf[16])\n{\n"
         "  int r = sizeof arr; /* W: 'sizeof' on array function parameter 'arr' will return size of 'int *' */\n"
         "  r += sizeof(buf); /* W: 'sizeof' on array function parameter 'buf' will return size of 'char *' */\n"
         "  return r;\n}\n",

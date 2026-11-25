@@ -491,6 +491,7 @@ void fe_note_sizeof(const SValue *op, const CType *type, const FeSpan *span)
     char tn[64];
     CType ct = *type;
     ct.t &= ~(VT_STORAGE | VT_CONSTANT | VT_VOLATILE);
+    type_yasc_strip(&ct); /* the view a yasc array parameter is: not written, not the size */
     type_to_str(tn, sizeof tn, &ct, NULL);
     tcc_fe_warning_c(warn_sizeof_array_argument, "'sizeof' on array function parameter '%s' will return size of '%s'",
                      get_tok_str(s->v & ~SYM_FIELD, NULL), tn);
@@ -1178,6 +1179,7 @@ static __attribute__((noinline)) void funcall_va_pack_clone(Sym **pcall_func_sym
       struct InlineFunc *clone_fn;
       clone_fn = tcc_mallocz(sizeof *clone_fn);
       clone_fn->filename = orig_fn->filename;
+      clone_fn->anchor = orig_fn->anchor;
       clone_fn->sym = clone_sym;
       clone_fn->func_str = clone_body;
       /* the caller's arguments bind at the call site: [count, start, end, ...] */
@@ -1242,22 +1244,31 @@ static __attribute__((noinline)) void funcall_va_pack_clone(Sym **pcall_func_sym
    the heap and only for a callee they apply to.  unary_funcall_body's frame
    is on the parser's recursive path twice -- arguments that are calls, and
    inline expansions, which replay a body inside it -- and the two states
-   (168 bytes on the device) were live across both. */
+   (168 bytes on the device) were live across both.  The -Wformat record
+   itself is attr_checks.c's (fmt_calls); the live ones are chained, so an
+   error's recovery frees those its longjmp left (call_arg_checks_unwind). */
 typedef struct CallArgChecks
 {
-  FmtCheck fc;
+  FmtCheck *fc;
+  struct CallArgChecks *outer;
   FeMemAccess ma;
 } CallArgChecks;
 
+static CallArgChecks *call_checks_live;
+
 static __attribute__((noinline)) CallArgChecks *call_arg_checks_begin(Sym *fsym, Sym *memsym)
 {
-  CallArgChecks ck, *p;
-  attr_format_begin(&ck.fc, fsym);
-  fe_memaccess_begin(&ck.ma, memsym);
-  if (!(ck.fc.state | ck.fc.fa_idx | ck.fc.kind) && !ck.ma.fn)
+  CallArgChecks *p;
+  FmtCheck *fc = attr_format_begin(fsym);
+  FeMemAccess ma;
+  fe_memaccess_begin(&ma, memsym);
+  if (!(fc->state | fc->fa_idx | fc->kind) && !ma.fn)
     return NULL;
   p = tcc_malloc(sizeof *p);
-  *p = ck;
+  p->fc = fc;
+  p->ma = ma;
+  p->outer = call_checks_live;
+  call_checks_live = p;
   return p;
 }
 
@@ -1276,11 +1287,31 @@ static __attribute__((noinline)) void call_arg_memaccess(CallArgChecks *ck, int 
 
 static __attribute__((noinline)) void call_arg_checks_end(CallArgChecks *ck, int nb_args)
 {
-  if (ck->fc.kind | ck->fc.fa_idx)
-    attr_format_end(&ck->fc, nb_args);
+  if (ck->fc->kind | ck->fc->fa_idx)
+    attr_format_end(ck->fc, nb_args);
   if (ck->ma.fn)
     fe_memaccess_end(&ck->ma);
+  call_checks_live = ck->outer;
   tcc_free(ck);
+}
+
+/* The calls whose arguments were being parsed when an error went to a
+   recovery point armed with MARK live (call_arg_checks_mark), or out of the
+   compile (NULL): their checks end unsaid (attr_checks_recover drops their
+   -Wformat records). */
+void *call_arg_checks_mark(void)
+{
+  return call_checks_live;
+}
+
+void call_arg_checks_unwind(void *mark)
+{
+  while (call_checks_live && call_checks_live != mark)
+  {
+    CallArgChecks *ck = call_checks_live;
+    call_checks_live = ck->outer;
+    tcc_free(ck);
+  }
 }
 
 static void unary_funcall_body(void)
@@ -1294,6 +1325,9 @@ static void unary_funcall_body(void)
   /* builtin/objsize.c: the call unary_funcall began for this body */
   ObjCall *oc = objsize_cur_call;
   objsize_cur_call = NULL;
+  /* builtin/fortify.c: the same call's -ffortify checks */
+  FortifyCall *fc = fortify_cur_call;
+  fortify_cur_call = NULL;
 
   SValue ret;
   Sym *sa;
@@ -1324,6 +1358,11 @@ static void unary_funcall_body(void)
   {
     vtop->r &= ~VT_LVAL; /* no lvalue */
   }
+#ifdef CONFIG_TCC_BCHECK
+  /* -b: memcpy, strcpy, longjmp, ... call the runtime's checking wrappers */
+  if (tcc_state->do_bounds_check)
+    bcheck_redirect_call();
+#endif
   /* get return type */
   /* Save function symbol before switching to type ref - needed for nested_func check */
   Sym *call_func_sym = vtop->sym;
@@ -1389,9 +1428,13 @@ static void unary_funcall_body(void)
     /* -Wlifetime: which arguments move into the callee */
     if (tcc_state->ir->lt_on)
       tcc_ir_lt_note_call(tcc_state->ir, call_id, s, regpair_callee);
+    /* -fyasc-facts: what the callee's checked parameter types promise */
+    if (tcc_state->yasc_facts && tcc_state->strict_lifetime && tcc_state->optimize)
+      tcc_ir_yf_note_call(tcc_state->ir, call_id, s);
     /* -Wtainted-format: the sources and the format arguments */
     if (tcc_state->ir->taint_on)
-      tcc_ir_taint_note_call(tcc_state->ir, call_id, call_func_sym && call_func_sym->type.ref == s ? call_func_sym : NULL);
+      tcc_ir_taint_note_call(tcc_state->ir, call_id, call_func_sym && call_func_sym->type.ref == s ? call_func_sym : NULL,
+                             s);
     /* -fcallgraph-info: the type an indirect call is resolved by */
     if (tcc_state->callgraph_info)
       tcc_stack_usage_note_call(tcc_state, call_id, s);
@@ -1751,10 +1794,12 @@ static void unary_funcall_body(void)
       {
         /* IR expects 0-based parameter indices.
          * Keep FUNCPARAMVAL numbering consistent across all call sites. */
-        if (ck && (ck->fc.state | ck->fc.fa_idx))
-          attr_format_before(&ck->fc, nb_args);
+        if (ck && (ck->fc->state | ck->fc->fa_idx))
+          attr_format_before(ck->fc, nb_args);
         if (oc)
           objsize_call_arg_before(oc, nb_args);
+        if (fc)
+          fortify_arg_before(fc, nb_args);
         if (self_pending)
           vpushv(&funcall_self_arg);
         else if (ck && ck->ma.fn)
@@ -1763,10 +1808,12 @@ static void unary_funcall_body(void)
           expr_eq();
         if (yasc_pp_live)
           yasc_pp_arg(vtop, call_func_sym, sa, nb_args); /* plain_param.c */
+        if (fc)
+          fortify_arg(fc, nb_args);
         if (oc)
           objsize_call_arg(oc, nb_args);
-        if (ck && (ck->fc.state | ck->fc.fa_idx))
-          attr_format_arg(&ck->fc, nb_args);
+        if (ck && (ck->fc->state | ck->fc->fa_idx))
+          attr_format_arg(ck->fc, nb_args);
         /* Materialize comparisons before applying the parameter conversion. */
         if (!NOEVAL_WANTED)
           tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
@@ -1774,6 +1821,8 @@ static void unary_funcall_body(void)
         /* Conversion to _Bool can leave a new VT_CMP on the value stack. */
         if (!NOEVAL_WANTED)
           tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
+        if (fc)
+          fortify_arg_emit(fc, nb_args);
 
         /* Save argument for potential constant folding or inline evaluation.
          * This must happen BEFORE the double-complex materialization below,
@@ -2612,6 +2661,7 @@ static void unary_funcall_body(void)
                              call_func_sym->type.ref->f.func_type == FUNC_OLD
                          ? call_func_sym->type.ref
                          : s;
+      const int saved_param_bounds = ubsan_param_bounds_mark(); /* -fsanitize=bounds */
       Sym *param_sym = sym_first(def_ref); /* first parameter from function type */
       for (int pi = 0; pi < nb_args && param_sym; pi++, param_sym = param_sym->next)
       {
@@ -2704,6 +2754,15 @@ static void unary_funcall_body(void)
         else
         {
           tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &arg_val, NULL, &store_dst);
+        }
+        /* -fsanitize=bounds: `char s[16]` keeps its end in the inlined body
+           (a parameter `p[n]` makes the function not inlinable) */
+        if (ubsan_param_bound_wanted(param_sym, 0))
+        {
+          vset(&psym->type, VT_LOCAL | VT_LVAL, loc);
+          vtop->sym = psym;
+          vtop->vr = psym->vreg;
+          ubsan_param_bound(param_sym, 0);
         }
         /* Propagate const_init_data from the call-site argument to the
          * inlined parameter's Sym so compile-time vector folding can
@@ -2860,7 +2919,9 @@ static void unary_funcall_body(void)
       inline_ts->src = inline_fn->func_str; /* its warnings' quiet ranges */
       int saved_pack[PACK_STACK_SIZE + 1];
       pp_pack_enter(tcc_state, inline_fn->pack, saved_pack);
+      const int saved_anchor = tcc_diag_anchor_enter(tcc_state, inline_fn->anchor); /* the callee speaks */
       replay_body_recovering(inline_ts, call_func_sym); /* begin_macro, block(0), end_macro */
+      tcc_state->diag_anchor = saved_anchor;
       pp_pack_leave(tcc_state, saved_pack);
       inline_restore_label_bindings(inline_label_tokens, saved_inline_labels, nb_inline_label_tokens);
 
@@ -2879,6 +2940,9 @@ static void unary_funcall_body(void)
       /* Read back inline_return_loc: the struct return handler may have
        * redirected it to point at the source local (skipping a memmove). */
       inline_ret_loc = tcc_state->inline_return_loc;
+      /* -Wlifetime: a borrowing struct's result borrows what the call's type says */
+      if (!saved_in_inline_expansion && !is_void_inline && tcc_state->ir && tcc_state->ir->lt_on)
+        tcc_ir_lt_inline_sresult(tcc_state->ir, inline_ret_loc, s, call_func_sym);
       /* The callee's objects die here; the local its return was redirected
        * into (inline_return_redirected) is the caller's value and lives on. */
       if (tcc_state->ir)
@@ -2887,6 +2951,7 @@ static void unary_funcall_body(void)
       if (!saved_in_inline_expansion && tcc_state->in_inline_expansion && tcc_state->ir && (tcc_state->ir->lt_on || tcc_state->ir->ab_on))
         tcc_ir_lt_inline_mark(tcc_state->ir, 0);
       tcc_state->in_inline_expansion = saved_in_inline_expansion;
+      ubsan_param_bounds_release(saved_param_bounds); /* the callee's parameters are gone */
       tcc_state->yasc = saved_yasc;
       tcc_state->diag_replay_file = saved_diag_replay_file;
       tcc_diag_parse_leave(tcc_state, saved_diag_parse);
@@ -3159,18 +3224,22 @@ void unary_funcall(void)
   /* a direct call: the callee's name (a borrowing struct result's binding) */
   int callee = (vtop->type.t & VT_BTYPE) == VT_FUNC && vtop->sym ? vtop->sym->v : 0;
   Sym *fsym = vtop->sym; /* the function, or the pointer variable called through */
+  const int direct = (vtop->type.t & VT_BTYPE) == VT_FUNC &&
+                     (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM);
   /* object sizes: allocations, and the checks at memcpy, free, ... */
-  ObjCall *oc = (vtop->type.t & VT_BTYPE) == VT_FUNC &&
-                        (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM)
-                    ? objsize_call_begin(fsym)
-                    : NULL;
+  ObjCall *oc = direct ? objsize_call_begin(fsym) : NULL;
+  /* -ffortify: the checks its declaration's attributes ask for */
+  FortifyCall *fc = direct ? fortify_call_begin(fsym) : NULL;
   if (!oc)
     attr_dep_call_flush(); /* a deprecated sprintf called through a cast */
   /* -Wconversion: the declared return type (a narrow one is promoted below) */
   const CType *callee_ft = (vtop->type.t & VT_BTYPE) == VT_PTR ? pointed_type(&vtop->type) : &vtop->type;
   const int ret_t = (callee_ft->t & VT_BTYPE) == VT_FUNC && callee_ft->ref ? callee_ft->ref->type.t : VT_VOID;
   objsize_cur_call = oc;
+  fortify_cur_call = fc;
   unary_funcall_body();
+  if (fc)
+    fortify_call_end(fc);
   if (oc) /* the result is the statement's, dropped at the ';' */
     objsize_call_end(oc, tok == ';' && discarded_call_vtop != NULL && vtop - 1 == discarded_call_vtop);
   if (tcc_state->warn_conversion || tcc_state->warn_sign_conversion)

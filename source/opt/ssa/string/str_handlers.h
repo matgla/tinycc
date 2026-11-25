@@ -50,4 +50,5 @@ extern const StrFoldHandler tcc_strfold_strrchr;
 extern const StrFoldHandler tcc_strfold_rindex;
 extern const StrFoldHandler tcc_strfold_strstr;
 extern const StrFoldHandler tcc_strfold_strpbrk;
+extern const StrFoldHandler tcc_strfold_fortify_str;
 

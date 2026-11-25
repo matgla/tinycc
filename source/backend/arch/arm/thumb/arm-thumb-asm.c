@@ -677,6 +677,49 @@ static const char *skip_constraint_modifiers(const char *p)
   return p;
 }
 
+/* What asm_compute_constraints would say that needs no register: said at
+   the asm statement (the parse drops it and goes on, as gcc), not when its
+   function is generated. */
+ST_FUNC void asm_check_constraints(ASMOperand *operands, int nb_operands, int nb_outputs)
+{
+  unsigned char referenced[MAX_ASM_OPERANDS] = {0};
+  for (int i = 0; i < nb_operands; i++)
+  {
+    const char *str = operands[i].constraint, *p;
+    for (p = str; *p; p++)
+      if ((*p == '+' || *p == '&') && i >= nb_outputs)
+        tcc_error("'%c' modifier can only be applied to outputs", *p);
+    str = skip_constraint_modifiers(str);
+    if (isnum(*str) || *str == '[')
+    {
+      int k = find_constraint(operands, nb_operands, str, NULL);
+      if ((unsigned)k >= i || i < nb_outputs)
+        tcc_error("invalid reference in constraint %d ('%s')", i, str);
+      if (referenced[k]++)
+        tcc_error("cannot reference twice the same operand");
+    }
+    else if (!operands[i].regvar)
+    {
+      /* gcc's register-preference hints: '*' ignores the next letter, '#'
+         the rest of the alternative */
+      char buf[64];
+      int n = 0;
+      for (p = str; *p && n < (int)sizeof buf - 1; p++)
+      {
+        if (*p == '*' && p[1])
+          p++;
+        else if (*p == '#')
+          while (p[1] && p[1] != ',')
+            p++;
+        else
+          buf[n++] = *p;
+      }
+      buf[n] = 0;
+      constraint_priority(buf);
+    }
+  }
+}
+
 #define REG_OUT_MASK 0x01
 #define REG_IN_MASK 0x02
 

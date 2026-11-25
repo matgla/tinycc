@@ -311,6 +311,135 @@ static void esp_collect(void *ctx, EspAddr a, int i)
   e->off[e->count++] = a.off;
 }
 
+/* src1 OP src2 of two int32 immediates (Phase 3c's arithmetic ops) */
+static uint32_t esp_fold_imm(int op, uint32_t a, uint32_t b)
+{
+  switch (op)
+  {
+  case TCCIR_OP_ADD:
+    return a + b;
+  case TCCIR_OP_SUB:
+    return a - b;
+  case TCCIR_OP_MUL:
+    return a * b;
+  case TCCIR_OP_AND:
+    return a & b;
+  case TCCIR_OP_OR:
+    return a | b;
+  default:
+    return a ^ b; /* XOR */
+  }
+}
+
+/* ---- -fyasc-facts (O1): objects only read by the calls they go to ---------
+ * A frame object whose address goes only to parameters that neither escape it
+ * nor write through it (a checked `const T * view`, tcc_ir_yf_param) --
+ * directly, or through a single-def TEMP that goes only there -- is written
+ * by nothing but the function's own stores by name: handing it over neither
+ * escapes it nor invalidates its entry stores. */
+#define ESP_MAX_RO 16
+
+static int esp_ro_param(TCCIRState *ir, IRQuadCompact *q)
+{
+  int ro = 0;
+  uint32_t enc;
+  if (q->op != TCCIR_OP_FUNCPARAMVAL)
+    return 0;
+  enc = (uint32_t)tcc_ir_op_src2_imm(ir, q);
+  return tcc_ir_yf_param(ir, TCCIR_DECODE_CALL_ID(enc), TCCIR_DECODE_PARAM_IDX(enc), &ro) && ro;
+}
+
+static int esp_ro_objects(TCCIRState *ir, int *rlo, int *rhi)
+{
+  const int n = ir->next_instruction_index, nt = ir->next_temporary_variable;
+  int olo[ESP_MAX_RO * 2], ohi[ESP_MAX_RO * 2], no = 0, nr = 0;
+  uint8_t obad[ESP_MAX_RO * 2];
+  if (!ir->yf_calls)
+    return 0;
+  uint8_t *tdef = tcc_mallocz(nt + 1), *tbad = tcc_mallocz(nt + 1);
+  /* temps: one def, every use a read-only parameter's argument */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    for (int k = 0; k < 4; k++)
+    {
+      int has = k == 0 ? irop_config[q->op].has_dest : k == 1 ? irop_config[q->op].has_src1
+                : k == 2 ? irop_config[q->op].has_src2
+                         : (tcc_ir_op_is_mac(q->op) || q->op == TCCIR_OP_LOAD_INDEXED ||
+                            q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_SELECT);
+      if (!has)
+        continue;
+      IROperand o = k < 3 ? tcc_ir_op_get_slot(ir, q, k)
+                          : ir->iroperand_pool[q->operand_base + irop_config[q->op].has_dest +
+                                               irop_config[q->op].has_src1 + irop_config[q->op].has_src2];
+      int32_t vr = irop_is_none(o) ? -1 : irop_get_vreg(o);
+      int t;
+      if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP || (t = TCCIR_DECODE_VREG_POSITION(vr)) >= nt)
+        continue;
+      if (k == 0 && !o.is_lval && irop_dest_defines_vreg(o))
+        tdef[t] = tdef[t] < 2 ? tdef[t] + 1 : 2;
+      else if (!(k == 1 && !o.is_lval && esp_ro_param(ir, q)))
+        tbad[t] = 1;
+    }
+  }
+  /* every address of an object: such a parameter's, or such a temp's def */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    for (int k = 0; k < 3; k++)
+    {
+      int has = k == 0 ? irop_config[q->op].has_dest : k == 1 ? irop_config[q->op].has_src1 : irop_config[q->op].has_src2;
+      if (!has)
+        continue;
+      IROperand o = tcc_ir_op_get_slot(ir, q, k);
+      int lo, hi, ok = 0, j;
+      if (irop_get_tag(o) != IROP_TAG_STACKOFF || o.is_lval || !irop_is_local(o) || irop_get_vreg(o) != -1)
+        continue;
+      int off = (int)irop_get_stack_offset(o);
+      if (!tcc_ir_frame_object_at(ir, off, &lo, &hi))
+        lo = off, hi = off + 1;
+      if (k == 1 && esp_ro_param(ir, q))
+        ok = 1;
+      else if (k == 1 && (q->op == TCCIR_OP_LEA || q->op == TCCIR_OP_ASSIGN) && irop_config[q->op].has_dest)
+      {
+        IROperand d = tcc_ir_op_get_dest(ir, q);
+        int32_t dv = irop_get_vreg(d);
+        int t = dv >= 0 && TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP ? TCCIR_DECODE_VREG_POSITION(dv) : -1;
+        ok = t >= 0 && t < nt && !d.is_lval && tdef[t] == 1 && !tbad[t];
+      }
+      for (j = 0; j < no; j++)
+        if (olo[j] == lo && ohi[j] == hi)
+          break;
+      if (j == no)
+      {
+        if (no == ESP_MAX_RO * 2)
+          goto out; /* too many to say: none */
+        olo[no] = lo, ohi[no] = hi, obad[no] = 0, no++;
+      }
+      obad[j] |= !ok;
+    }
+  }
+  for (int j = 0; j < no; j++)
+    if (!obad[j] && nr < ESP_MAX_RO)
+      rlo[nr] = olo[j], rhi[nr] = ohi[j], nr++;
+out:
+  tcc_free(tdef);
+  tcc_free(tbad);
+  return nr;
+}
+
+static int esp_in_ro(const int *rlo, const int *rhi, int nr, int64_t off)
+{
+  for (int j = 0; j < nr; j++)
+    if (off >= rlo[j] && off < rhi[j])
+      return 1;
+  return 0;
+}
+
 /* Forward constant entry-block stores into deref/indexed loads; entry stores dominate all code. */
 int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
 {
@@ -319,6 +448,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
 
   if (n < 4)
     return 0;
+  int ro_lo[ESP_MAX_RO], ro_hi[ESP_MAX_RO], nro = esp_ro_objects(ir, ro_lo, ro_hi);
 
   /* Phase 1: collect constant stores from the entry BB (up to the first jump target). */
 #define MAX_ENTRY_STORES 64
@@ -608,6 +738,8 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
         if (!irop_is_local(op) || op.is_lval || irop_get_tag(op) != IROP_TAG_STACKOFF)
           continue;
         int64_t aoff = irop_get_stack_offset(op);
+        if (esp_in_ro(ro_lo, ro_hi, nro, aoff))
+          continue; /* only read-only parameters get it */
         for (int k = 0; k < estore_count; k++)
         {
           if (estores[k].offset == aoff)
@@ -627,6 +759,8 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       for (int e = 0; !all && e < esc.count; e++)
       {
         int lo, hi;
+        if (esp_in_ro(ro_lo, ro_hi, nro, esc.off[e]))
+          continue; /* handed only to read-only parameters */
         if (!tcc_ir_frame_object_at(ir, (int)esc.off[e], &lo, &hi))
         {
           all = 1; /* extent unknown */
@@ -645,7 +779,8 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       if (all && esc.count + esc.many > 0)
       {
         for (int k = 0; k < estore_count; k++)
-          estores[k].offset = 0x7FFFFFFFLL;
+          if (!esp_in_ro(ro_lo, ro_hi, nro, estores[k].offset))
+            estores[k].offset = 0x7FFFFFFFLL;
       }
       tcc_free(esc.off);
     }
@@ -1087,7 +1222,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
     if (irop_is_local(op) && !op.is_lval && irop_get_tag(op) == IROP_TAG_STACKOFF)
     {
       int64_t aoff = irop_get_stack_offset(op);
-      int dup = 0;
+      int dup = esp_in_ro(ro_lo, ro_hi, nro, aoff); /* read only: not changed by the call */
       for (int ab = 0; ab < addrtaken_base_count; ab++)
         if (addrtaken_bases[ab] == aoff)
         {
@@ -1106,7 +1241,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
         if (p <= max_tmp && lea_map[p].valid)
         {
           int64_t aoff = lea_map[p].offset;
-          int dup = 0;
+          int dup = esp_in_ro(ro_lo, ro_hi, nro, aoff);
           for (int ab = 0; ab < addrtaken_base_count; ab++)
             if (addrtaken_bases[ab] == aoff)
             {
@@ -1378,6 +1513,67 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
+    /* a read folded into arithmetic (`T <- T2 ADD StackLoc[-20]`): its second
+       operand, or the first of a commutative op (swapped) */
+    if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB || q->op == TCCIR_OP_MUL || q->op == TCCIR_OP_AND ||
+         q->op == TCCIR_OP_OR || q->op == TCCIR_OP_XOR || q->op == TCCIR_OP_CMP) &&
+        irop_config[q->op].has_src1 && irop_config[q->op].has_src2)
+    {
+      for (int side = 2; side >= 1; side--)
+      {
+        IROperand o = side == 2 ? tcc_ir_op_get_src2(ir, q) : tcc_ir_op_get_src1(ir, q);
+        if (!irop_is_local(o) || !o.is_lval || irop_is_llocal(o) || o.is_complex ||
+            irop_get_tag(o) != IROP_TAG_STACKOFF || irop_get_vreg(o) >= 0 || tcc_ir_access_is_volatile(ir, o))
+          continue;
+        if (side == 1 && (q->op == TCCIR_OP_SUB || q->op == TCCIR_OP_CMP))
+          continue; /* not commutative */
+        /* beside an immediate (`5 - a[0]`: `#5 SUB StackLoc`) the result is a
+           constant: no `#a SUB #b` (esp_fold_imm) */
+        IROperand other = side == 2 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+        const int other_imm = irop_is_immediate(other);
+        if (other_imm && (q->op == TCCIR_OP_CMP || !irop_is_plain_imm(other) || irop_get_tag(other) != IROP_TAG_IMM32))
+          continue;
+        int bt = irop_get_btype(o);
+        if (bt != IROP_BTYPE_INT32)
+          continue;
+        int64_t off = irop_get_stack_offset(o);
+        for (int k = 0; k < estore_count; k++)
+        {
+          if (estores[k].offset != off || i <= estores[k].idx || !estores[k].anon_slot || estores[k].btype != bt ||
+              estores[k].is_unsigned != (int)o.is_unsigned || !irop_is_immediate(estores[k].value))
+            continue;
+          int base = q->operand_base + irop_config[q->op].has_dest;
+          if (other_imm)
+          {
+            if (!irop_is_plain_imm(estores[k].value) || irop_get_tag(estores[k].value) != IROP_TAG_IMM32)
+              break;
+            /* src1 OP src2: the stored value is side SIDE */
+            uint32_t a = (uint32_t)irop_get_imm32(other), b = (uint32_t)irop_get_imm32(estores[k].value);
+            if (side == 1)
+            {
+              uint32_t t = a;
+              a = b, b = t;
+            }
+            ir->iroperand_pool[base] = irop_make_imm32(-1, (int32_t)esp_fold_imm(q->op, a, b), IROP_BTYPE_INT32);
+            q->op = TCCIR_OP_ASSIGN;
+            changes++;
+            break;
+          }
+          if (side == 1)
+          {
+            ir->iroperand_pool[base] = ir->iroperand_pool[base + 1]; /* the other operand first */
+            ir->iroperand_pool[base + 1] = estores[k].value;
+          }
+          else
+            ir->iroperand_pool[base + 1] = estores[k].value;
+          LOG_IR_GEN("ENTRY_STORE_PROP: i=%d folded StackLoc read forwarded at off=%lld", i, (long long)off);
+          changes++;
+          break;
+        }
+        break; /* one operand per instruction */
+      }
+      continue;
+    }
     if (q->op != TCCIR_OP_LOAD && q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_FUNCPARAMVAL)
       continue;
 

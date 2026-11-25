@@ -49,6 +49,18 @@ void tccgen_predef_proto_interned(TokenSym *ts) { (void)ts; }
 void tcc_asm_cleanup(void) {}
 /* decl.c: the lexer's error in a body being saved, raised by its marker */
 void save_body_raise(TCCState *s1) { (void)s1; }
+/* errors said where the parse reaches their marker (core/recover.c): here
+   at once, as a plain error */
+int tcc_error_stash(const char *fmt, ...) { (void)fmt; return TCC_PCH_REPLAY_ERROR << 16; }
+void tcc_error_stash_raise(TCCState *s1, int idx) { (void)s1, (void)idx; }
+int tcc_pp_diag_deferred(int kind, const char *msg) { (void)kind, (void)msg; return 0; }
+int tcc_lex_error_deferred(const char *fmt, ...)
+{
+  if (tcc_state && tcc_state->error_set_jmp_enabled)
+    longjmp(tcc_state->error_jmp_buf, 1);
+  (void)fmt;
+  exit(1);
+}
 
 /* tccpp.c's preprocess_start() references the target machine predefs blob that
  * normally lives in the backend (arm-thumb-gen.c).  Supply a minimal ARMv8-M
@@ -209,6 +221,14 @@ void _tcc_ice(const char *fmt, ...)
 
 void _tcc_warning(const char *fmt, ...)
 {
+  (void)fmt;
+}
+
+/* macro_subst_tok: NULL in yasc code (-Wzero-as-null-pointer-constant) */
+void _tcc_warning_once(int woff, int line, const char *fmt, ...)
+{
+  (void)woff;
+  (void)line;
   (void)fmt;
 }
 

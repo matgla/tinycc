@@ -851,6 +851,48 @@ static const ObjFn *obj_fn_named(const char *name)
   return NULL;
 }
 
+/* -Warray-bounds=2 (ir/bounds.c): the size arguments of a call of FSYM
+   (from 1, *b 0 for one), as its alloc_size attribute or the C library's
+   allocator of that name says; 0 when it is no allocator with a size */
+int objsize_alloc_size_args(Sym *fsym, int *a, int *b)
+{
+  const SymLocalFacts *f;
+  const ObjFn *fn;
+  *a = *b = 0;
+  if (!fsym || (fsym->type.t & VT_BTYPE) != VT_FUNC)
+    return 0;
+  if (fsym->a.attr_facts && (f = sym_facts_peek(fsym)) != NULL && f->alloc_size_a)
+  {
+    *a = f->alloc_size_a, *b = f->alloc_size_b;
+    return 1;
+  }
+  if ((fsym->type.t & VT_STATIC) || (tcc_state->no_builtin_funcs & NO_BUILTIN_ALL) || fsym->v >= SYM_FIRST_ANOM)
+    return 0;
+  fn = obj_fn_named(get_tok_str(fsym->v, NULL));
+  if (!fn || fn->kind != OF_ALLOC || !fn->size_a)
+    return 0;
+  *a = fn->size_a, *b = fn->size_b;
+  return 1;
+}
+
+/* -Wuse-after-free (ir/bounds.c): the argument (from 1) a call of FSYM
+   releases -- free, or a deallocator a malloc(dealloc, i) attribute names
+   -- or 0.  Not realloc: its argument lives on when it fails. */
+int objsize_dealloc_arg(Sym *fsym)
+{
+  const SymLocalFacts *f;
+  const ObjFn *fn;
+  if (!fsym || (fsym->type.t & VT_BTYPE) != VT_FUNC)
+    return 0;
+  if (fsym->a.attr_facts && (f = sym_facts_peek(fsym)) != NULL && f->dealloc_arg && !f->alloc_size_a &&
+      !f->alloc_malloc)
+    return f->dealloc_arg;
+  if ((fsym->type.t & VT_STATIC) || (tcc_state->no_builtin_funcs & NO_BUILTIN_ALL) || fsym->v >= SYM_FIRST_ANOM)
+    return 0;
+  fn = obj_fn_named(get_tok_str(fsym->v, NULL));
+  return fn && fn->kind == OF_FREE ? fn->dealloc_arg : 0;
+}
+
 /* An allocation function's declaration AD (alloc_size, malloc, malloc(d, i))
    goes into its facts F; the deallocator it names learns which argument it
    releases. */
@@ -895,12 +937,57 @@ struct ObjCall
   ObjRec saved;
   unsigned char in_ctx;
   unsigned char fixit_done; /* its bound fix-it was given (objsize_bound_fixit) */
+  unsigned char overflow_seen; /* check_stringop found a sure overflow */
   Sym *nsym[2];             /* size arguments that are local variables */
   Sym *dep;                 /* deprecated: reported with the arguments in */
   int dep_line;
+  struct ObjCall *live_outer; /* objsize_live */
 };
 
 ObjCall *objsize_cur_call;
+
+/* The calls begun and not ended, innermost first: an error in one's
+   arguments goes to a recovery point outside it (core/recover.c), which
+   ends them (objsize_calls_unwind). */
+static ObjCall *objsize_live;
+
+static ObjCall *oc_new(void)
+{
+  ObjCall *n = tcc_mallocz(sizeof *n);
+  n->live_outer = objsize_live;
+  objsize_live = n;
+  return n;
+}
+
+static void oc_free(ObjCall *oc)
+{
+  ObjCall **pp = &objsize_live;
+  while (*pp && *pp != oc)
+    pp = &(*pp)->live_outer;
+  if (*pp)
+    *pp = oc->live_outer;
+  tcc_free(oc);
+}
+
+void *objsize_calls_mark(void)
+{
+  return objsize_live;
+}
+
+/* back to MARK (a recovery point's), NULL: all of them */
+void objsize_calls_unwind(void *mark)
+{
+  while (objsize_live && objsize_live != mark)
+  {
+    ObjCall *oc = objsize_live;
+    objsize_live = oc->live_outer;
+    if (oc->in_ctx)
+      objsize_leave(&oc->saved);
+    if (objsize_cur_call == oc)
+      objsize_cur_call = NULL;
+    tcc_free(oc);
+  }
+}
 
 static int any_check_wanted(void)
 {
@@ -937,7 +1024,7 @@ ObjCall *objsize_call_begin(Sym *fsym)
   /* the string and format functions matter to the warnings only */
   if (!f && fn->kind < OF_ALLOC && !any_check_wanted() && !dep_line)
     return NULL;
-  oc = tcc_mallocz(sizeof *oc);
+  oc = oc_new();
   oc->fsym = fsym;
   if (dep_line)
     oc->dep = fsym, oc->dep_line = dep_line > 0 ? dep_line : 0;
@@ -972,6 +1059,25 @@ ObjCall *objsize_call_begin(Sym *fsym)
         oc->kind = OF_FREE;
     }
   }
+  return oc;
+}
+
+/* __builtin___memcpy_chk and kin (chk.c): the checks of the plain function
+   NAME (memcpy, strcpy, sprintf, ...), as a call to it would get them; the
+   builtin numbers the plain call's arguments (its flag and size are not
+   among them).  NULL when no check is wanted. */
+ObjCall *objsize_call_begin_named(const char *name)
+{
+  const ObjFn *fn = obj_fn_named(name);
+  ObjCall *oc;
+
+  if (!fn || fn->kind >= OF_ALLOC || tcc_state->reverse_funcargs || !any_check_wanted())
+    return NULL;
+  oc = oc_new();
+  oc->name = fn->name;
+  oc->fn = fn;
+  oc->kind = fn->kind;
+  oc->line = file ? file->line_num : 0;
   return oc;
 }
 
@@ -1312,19 +1418,23 @@ static void check_stringop(ObjCall *oc)
   int sl;
   const char *s;
 
-  if (!tcc_state->warn_stringop_overflow && !tcc_state->nb_diag_snaps)
+  if (!tcc_warn_wanted(warn_stringop_overflow))
     return;
   switch (oc->kind)
   {
   case OF_MEM:
     if (dst_size(oc, 0, &size) && arg_uconst(oc, oc->fn->len, &n) && n > size)
+    {
+      oc->overflow_seen = 1;
       tcc_warning_once(warn_stringop_overflow, "'%s' writing %llu bytes into a region of size %llu overflows the destination",
                        oc->name, n, size);
+    }
     break;
   case OF_STRCPY:
   case OF_STRCAT:
     if (dst_size(oc, 1, &size) && (s = arg_string(oc, 1, &sl)) && (unsigned long long)sl + 1 > size)
     {
+      oc->overflow_seen = 1;
       tcc_warning_once(warn_stringop_overflow, "'%s' writing %llu bytes into a region of size %llu overflows the destination",
                        oc->name, (unsigned long long)sl + 1, size);
       objsize_bound_fixit(oc, 0); /* strcpy -> strlcpy */
@@ -1332,8 +1442,11 @@ static void check_stringop(ObjCall *oc)
     break;
   case OF_STRN:
     if (dst_size(oc, 1, &size) && arg_uconst(oc, oc->fn->len, &n) && n > size)
+    {
+      oc->overflow_seen = 1;
       tcc_warning_once(warn_stringop_overflow, "'%s' writing %llu bytes into a region of size %llu overflows the destination",
                        oc->name, n, size);
+    }
     break;
   case OF_STRNCAT:
     if (dst_size(oc, 1, &size) && arg_uconst(oc, oc->fn->len, &n) && n >= size)
@@ -1588,14 +1701,17 @@ void objsize_call_end(ObjCall *oc, int discarded)
       last_alloc.on = 1;
     }
   }
-  tcc_free(oc);
+  oc_free(oc);
 }
 
 /* -------------------------------------------------------------------------
  * __builtin___memcpy_chk and kin (chk.c): a constant length over a known
- * object size is a sure overflow */
-void objsize_chk_overflow(const char *name, unsigned long long n, unsigned long long size)
+ * object size is a sure overflow -- unless the plain function's check (OC,
+ * objsize_call_begin_named) already said so */
+void objsize_chk_overflow(ObjCall *oc, const char *name, unsigned long long n, unsigned long long size)
 {
+  if (oc && oc->overflow_seen)
+    return;
   if (fe_eval_checks_wanted() && !tcc_state->fe_speculative && tcc_warn_wanted(warn_stringop_overflow))
     tcc_warning_once(warn_stringop_overflow, "'%s' writing %llu bytes into a region of size %llu overflows the destination",
                      name, n, size);

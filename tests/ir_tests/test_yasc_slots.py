@@ -7,8 +7,9 @@ nested a few levels).  Stores, reads (folded loads too), arguments, moves
 into a variable, the end of the local's scope and the local's address
 passed to an owned out-parameter (`pipe(p)`, a status result's test
 deciding) are followed; a local whose address goes anywhere else, or that
-is indexed with a value that is neither a constant nor a variable
-(`a[i + 1]`), is not.  Elements at a variable index: test_lifetime_index.py.
+is indexed with a value that is neither a constant nor a variable (plus a
+constant: `a[i + 1]`), such as `a[i * 2]`, is not.  Elements at a variable
+index: test_lifetime_index.py.
 """
 
 import subprocess
@@ -30,7 +31,7 @@ int owned(close) maybe open(const char * view p, int f);
 int pipe(out int owned(close) maybe * view fds);
 int use(char * view p);
 struct box { char * owned maybe buf; int n; };
-void touch(struct box * view b);
+void touch(inout struct box * view b);
 """
 PRELUDE_LINES = PRELUDE.count("\n")
 LEVELS = ["-O0", "-O1", "-O2", "-Os"]
@@ -54,25 +55,33 @@ def _diags(tmp_path, body, *flags):
 
 
 BAD = {
-    "struct_member_leaks": ("void f(void)\n{\n  struct box b;\n  b.buf = malloc(4);\n}\n", 5,
+    # not followed, and said so
+    "computed_index": ("void f(int i)\n{\n  char * owned maybe a[4];\n  a[i * 2] = malloc(4);\n}\n", 4,
+                       "'a' is reached in a way the lifetime check does not follow: what it owns is not checked"),
+    "struct_member_leaks": ("void f(void)\n{\n  struct box b = undefined;\n  b.buf = malloc(4);\n}\n", 5,
                             "'b.buf' leaks: it still owns memory at the end of its scope"),
+    # an index variable plus a constant: its own element (test_lifetime_index.py)
+    "offset_index_leaks": ("void f(int i)\n{\n  char * owned maybe a[4];\n  a[i + 1] = malloc(4);\n}\n", 5,
+                           "'a[i + 1]' leaks: it may still own memory at the end of its scope"),
     "array_element_leaks": ("void f(void)\n{\n  char * owned maybe a[4];\n  a[0] = malloc(4);\n}\n", 5,
                             "'a[0]' leaks: it still owns memory at the end of its scope"),
     "handle_array_leaks": ("void f(void)\n{\n  int owned(close) maybe fds[2];\n  fds[0] = open(\"a\", 0);\n}\n", 5,
                            "'fds[0]' leaks: it still owns a handle at the end of its scope"),
-    "freed_twice": ("void f(void)\n{\n  struct box b;\n  b.buf = malloc(4);\n  free(b.buf);\n  free(b.buf);\n}\n", 6,
+    "freed_twice": ("void f(void)\n{\n  struct box b = undefined;\n  b.buf = malloc(4);\n  free(b.buf);\n  free(b.buf);\n}\n", 6,
                     "'b.buf' is freed twice"),
-    "used_after_free": ("void f(void)\n{\n  struct box b;\n  b.buf = malloc(4);\n  free(b.buf);\n  use(b.buf);\n}\n", 6,
+    "used_after_free": ("void f(void)\n{\n  struct box b = undefined;\n  b.buf = malloc(4);\n  free(b.buf);\n  use(b.buf);\n}\n", 6,
                         "'b.buf' is used after it was freed"),
-    "maybe_untested": ("void f(void)\n{\n  struct box b;\n  b.buf = malloc(4);\n  use(b.buf);\n  free(b.buf);\n}\n", 5,
+    "maybe_untested": ("void f(void)\n{\n  struct box b = undefined;\n  b.buf = malloc(4);\n  use(b.buf);\n  free(b.buf);\n}\n", 5,
                        "'b.buf' may be null, and is passed as argument 1 of 'use', which is not maybe"),
-    "pipe_half_closed": ("void f(void)\n{\n  int owned(close) maybe p[2];\n  if (pipe(p) < 0)\n    return;\n"
+    "pipe_half_closed": ("void f(void)\n{\n  int owned(close) maybe p[2] = undefined;\n  if (pipe(p) < 0)\n    return;\n"
                          "  close(p[0]);\n}\n", 7, "'p[1]' leaks: it still owns a handle at the end of its scope"),
-    "assigned_again": ("void f(void)\n{\n  struct box b;\n  b.buf = malloc(4);\n  b.buf = malloc(8);\n  free(b.buf);\n}\n",
+    "assigned_again": ("void f(void)\n{\n  struct box b = undefined;\n  b.buf = malloc(4);\n  b.buf = malloc(8);\n  free(b.buf);\n}\n",
                        5, "'b.buf' leaks: it still owns memory when it is assigned again"),
     "variable_index": ("void f(int i)\n{\n  char * owned maybe a[4];\n  a[i] = malloc(4);\n}\n", 5,
                        "'a[i]' leaks: it may still own memory at the end of its scope"),
-    "inner_scope": ("void f(int x)\n{\n  if (x)\n  {\n    struct box b;\n    b.buf = malloc(4);\n  }\n  x = 1;\n}\n",
+    "handed_to_view_leaks": ("void f(void)\n{\n  struct box b = undefined;\n  b.buf = malloc(4);\n  touch(&b);\n}\n", 6,
+                             "'b.buf' leaks: it may still own memory at the end of its scope"),
+    "inner_scope": ("void f(int x)\n{\n  if (x)\n  {\n    struct box b = undefined;\n    b.buf = malloc(4);\n  }\n  x = 1;\n}\n",
                     8, "'b.buf' leaks: it still owns memory at the end of its scope"),
 }
 
@@ -85,15 +94,17 @@ def test_reported(tmp_path, name, opt):
 
 
 CLEAN = {
-    "freed": "void f(void)\n{\n  struct box b;\n  b.buf = malloc(4);\n  free(b.buf);\n}\n",
-    "tested": "void f(void)\n{\n  struct box b;\n  b.buf = malloc(4);\n  if (b.buf)\n    use(b.buf);\n  free(b.buf);\n}\n",
-    "pipe_both_closed": "void f(void)\n{\n  int owned(close) maybe p[2];\n  if (pipe(p) < 0)\n    return;\n"
+    "freed": "void f(void)\n{\n  struct box b = undefined;\n  b.buf = malloc(4);\n  free(b.buf);\n}\n",
+    "tested": "void f(void)\n{\n  struct box b = undefined;\n  b.buf = malloc(4);\n  if (b.buf)\n    use(b.buf);\n  free(b.buf);\n}\n",
+    "pipe_both_closed": "void f(void)\n{\n  int owned(close) maybe p[2] = undefined;\n  if (pipe(p) < 0)\n    return;\n"
     "  close(p[0]);\n  close(p[1]);\n}\n",
-    "moved_out": "void f(void)\n{\n  struct box b;\n  b.buf = malloc(4);\n  char * owned maybe q = move(b.buf);\n"
+    "moved_out": "void f(void)\n{\n  struct box b = undefined;\n  b.buf = malloc(4);\n  char * owned maybe q = move(b.buf);\n"
     "  free(q);\n}\n",
-    "address_elsewhere": "void f(void)\n{\n  struct box b;\n  b.buf = malloc(4);\n  touch(&b);\n}\n",
-    "computed_index": "void f(int i)\n{\n  char * owned maybe a[4];\n  a[i + 1] = malloc(4);\n}\n",
-    "null_store": "void f(void)\n{\n  struct box b;\n  b.buf = 0;\n  (void)b;\n}\n",
+    # handed to a method's `struct T * view self`: still followed, the callee
+    # keeps the member valid (test_yasc_self.py)
+    "handed_to_view_then_freed": "void f(void)\n{\n  struct box b = undefined;\n  b.buf = malloc(4);\n  touch(&b);\n"
+    "  free(b.buf);\n}\n",
+    "null_store": "void f(void)\n{\n  struct box b = undefined;\n  b.buf = 0;\n  (void)b;\n}\n",
 }
 
 

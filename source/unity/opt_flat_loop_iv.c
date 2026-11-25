@@ -14,6 +14,7 @@
 #undef FPH_LOG
 #undef FPH_MAX_OCC
 #undef FPH_MAX_PER_LOOP
+#undef FPH_YF_ARGS
 #undef GLH_MAX_PER_LOOP
 #undef GLH_MAX_WRITTEN
 #undef LICM_LOOP_MAY_CLOBBER

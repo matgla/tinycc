@@ -20,7 +20,7 @@ extern int many(int a, int b, int c, int d, int e, int f);
 int stack_args(int a, int b, int c, int d, int e, int f) { return many(a, b, c, d, e, f); }
 u64 wide(u64 a, int b) { if (b) a <<= 3; return next(next(a, b), b) + 1; }
 int branches(int a) { int s = 0; while (a--) if (a & 1) s += a; return s; }
-int big_frame(int a) { volatile char p[300]; p[a] = 1; return p[0]; }
+int big_frame(int a) { volatile char p[300] = undefined; p[a] = 1; return p[0]; }
 int divide(int a, int b) { return a / b; }
 """
 

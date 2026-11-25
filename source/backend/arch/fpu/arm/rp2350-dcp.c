@@ -63,6 +63,7 @@ const FloatingPointConfig arm_rp2350_dcp_fpu_config = {
     .has_fsub = 1,
     .has_fmul = 1,
     .has_fdiv = 1,
+    .has_fminmax = 1, /* FPv5: vminnm/vmaxnm.f32 */
     .has_fcmp = 0,
     .has_fneg = 0,
     .has_itof = 0,

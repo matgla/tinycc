@@ -28,6 +28,8 @@
    with a '{').  If STR then allocates and stores the skipped tokens
    in *STR.  This doesn't check if () and {} are nested correctly,
    i.e. "({)}" is accepted.  */
+int skip_save_stop_semicolon;
+
 void skip_or_save_block(TokenString **str)
 {
   int braces = tok == '{';
@@ -48,6 +50,18 @@ void skip_or_save_block(TokenString **str)
     int t = tok;
     if (level == 0 && (t == ',' || t == ';' || t == '}' || t == ')' || t == ']'))
       break;
+    if (t == ';' && level == 1 && skip_save_stop_semicolon)
+    {
+      /* a static's initializer missing a '}' (a ';' right in its braces,
+         not a struct body's in them): kept with the ';' its parse says the
+         error at, which the declaration's parse then reads */
+      if (str)
+      {
+        tok_str_add_tok(*str);
+        recorded_len = (*str)->len;
+      }
+      break;
+    }
     if (t == TOK_EOF)
     {
       if (str && braces && tcc_state->save_body_jmp)

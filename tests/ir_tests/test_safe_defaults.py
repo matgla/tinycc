@@ -32,13 +32,19 @@ UNSAFE = [
     ("void f(int x) { return x; }", "return-type", "void function returns a value"),
     ("x;", "implicit-int", "type defaults to int"),
     ("char * VIEW f(const char * VIEW s) { char * VIEW t = s; return t; }", "discarded-qualifiers",
-     "assignment discards qualifiers from pointer target type"),
+     "discards 'const' qualifier from pointer target type"),
 ]
 
 
 # The default is yasc, where every pointer says owned or view; -ccompat is
 # regular C, where `view` is a name.  VIEW is the one or the other.
 VIEW = "#ifdef __YASC__\n#define VIEW view\n#else\n#define VIEW\n#endif\n"
+
+
+def _said(stderr, kind, message):
+    """A `kind: ...` line carrying message: a message that names types (`char
+    * view` in yasc, `char *` in regular C) is matched by its mode-free part."""
+    return any(f"{kind}: " in line and message in line for line in stderr.splitlines())
 
 
 def _compile(tmp_path, body, *flags):
@@ -53,21 +59,21 @@ def _compile(tmp_path, body, *flags):
 @pytest.mark.parametrize("body, flag, message", UNSAFE, ids=[u[1] + str(i) for i, u in enumerate(UNSAFE)])
 def test_unsafe_c_is_an_error_by_default(tmp_path, body, flag, message):
     proc = _compile(tmp_path, body)
-    assert proc.returncode != 0 and f"error: {message}" in proc.stderr, proc.stderr
+    assert proc.returncode != 0 and _said(proc.stderr, "error", message), proc.stderr
 
 
 @pytest.mark.parametrize("compat", [("-ccompat",), ("-std=c11",), ("-std=gnu17",), ("-std=c23",)])
 @pytest.mark.parametrize("body, flag, message", UNSAFE, ids=[u[1] + str(i) for i, u in enumerate(UNSAFE)])
 def test_regular_c_only_warns(tmp_path, body, flag, message, compat):
     proc = _compile(tmp_path, body, *compat)
-    assert proc.returncode == 0 and f"warning: {message}" in proc.stderr, proc.stderr
+    assert proc.returncode == 0 and _said(proc.stderr, "warning", message), proc.stderr
 
 
 @pytest.mark.parametrize("body, flag, message", UNSAFE, ids=[u[1] + str(i) for i, u in enumerate(UNSAFE)])
 def test_wno_error_wins_in_any_position(tmp_path, body, flag, message):
     for flags in ((f"-Wno-error={flag}",), (f"-Wno-error={flag}", "-O1"), ("-O1", f"-Wno-error={flag}")):
         proc = _compile(tmp_path, body, *flags)
-        assert proc.returncode == 0 and f"warning: {message}" in proc.stderr, proc.stderr
+        assert proc.returncode == 0 and _said(proc.stderr, "warning", message), proc.stderr
 
 
 def test_ccompat_anywhere_wins(tmp_path):
@@ -105,7 +111,8 @@ def test_safe_code_compiles_cleanly(tmp_path):
     body = """\
 void * owned maybe alloc(unsigned n);
 void release(drop void * owned maybe p);
-int sum(const int * view v, int n)
+int use(void);
+static int sum(const int * view v, int n)
 {
   int s = 0;
   for (int i = 0; i < n; i++)
@@ -123,3 +130,14 @@ int use(void)
 }"""
     proc = _compile(tmp_path, body)
     assert proc.returncode == 0 and proc.stderr == "", proc.stderr
+
+
+def test_pragma_yasc_is_c23_under_ccompat(tmp_path):
+    """yasc is C23: a regular-C build (-ccompat, C11) of a file that says
+    #pragma yasc has nullptr, true and false there (libc's libgen.c)"""
+    src = tmp_path / "p.c"
+    src.write_text("#pragma yasc\nint t0(int * view maybe q)\n{\n  return q == nullptr;\n}\n"
+                   "bool t(void)\n{\n  return true && !false;\n}\n")
+    proc = subprocess.run([str(TCC), "-ccompat", "-Wall", "-Werror", "-c", str(src), "-o", str(tmp_path / "p.o")],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr

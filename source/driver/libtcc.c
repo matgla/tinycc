@@ -1291,42 +1291,80 @@ enum
 };
 
 /* -fdiagnostics-color: gcc's escapes and colours (locus bold, error red,
-   warning magenta, note cyan).  "auto" colours when stderr is a terminal,
-   NO_COLOR is unset and TERM is not "dumb".  An unset TERM still colours:
-   YasOS sets none, and its consoles are ANSI terminals.  Output that goes to
-   tcc_set_error_func() is never coloured. */
+   warning magenta, note cyan, 'quoted' names bold).  "auto" colours when
+   stderr is a terminal, NO_COLOR is unset and TERM is not "dumb".  An unset
+   TERM still colours: YasOS sets none, and its consoles are ANSI terminals.
+   Output that goes to tcc_set_error_func() is never coloured. */
 #define DIAG_SGR(c) "\033[" c "m\033[K"
 #define DIAG_RESET DIAG_SGR("")
 #define DIAG_LOCUS DIAG_SGR("01")
+#define DIAG_QUOTE DIAG_SGR("01")
 #define DIAG_ERROR DIAG_SGR("01;31")
 #define DIAG_WARNING DIAG_SGR("01;35")
 #define DIAG_NOTE DIAG_SGR("01;36")
 
+/* stderr is a terminal a person reads: TERM is not "dumb" */
+static int diag_on_terminal(void)
+{
+#ifdef _WIN32
+  return 0;
+#else
+  const char *term = getenv("TERM");
+  if (term && !strcmp(term, "dumb"))
+    return 0;
+  return isatty(2);
+#endif
+}
+
 static int diag_color_on(TCCState *s1)
 {
+  const char *no_color;
   if (s1->error_func || s1->diag_color == DIAG_COLOR_NEVER)
     return 0;
   if (s1->diag_color == DIAG_COLOR_ALWAYS)
     return 1;
-#ifdef _WIN32
-  return 0;
-#else
-  {
-    const char *term = getenv("TERM");
-    const char *no_color = getenv("NO_COLOR");
-    if (no_color && no_color[0])
-      return 0;
-    if (term && !strcmp(term, "dumb"))
-      return 0;
-    return isatty(2);
-  }
-#endif
+  no_color = getenv("NO_COLOR");
+  if (no_color && no_color[0])
+    return 0;
+  return diag_on_terminal();
+}
+
+/* -fdiagnostics-show-caret / -show-option / -show-line-numbers (SHOW, a
+   DIAG_SHOW_*): the source line under a diagnostic, the [-Wname] after it.
+   Auto shows them where a person reads the text -- stderr a terminal, or
+   -fdiagnostics-color=always -- so a pipe, a log, an editor's parser or a
+   test reads the plain one-line format, byte for byte. */
+static int diag_show(TCCState *s1, int show)
+{
+  if (show != DIAG_SHOW_AUTO)
+    return show == DIAG_SHOW_ON;
+  if (s1->error_func)
+    return 0;
+  return s1->diag_color == DIAG_COLOR_ALWAYS || diag_on_terminal();
 }
 
 /* -fdiagnostics-color[=always|never|auto], -fno-diagnostics-color, and
-   clang's -f[no-]color-diagnostics.  Returns 0 when OPT was one of them. */
+   clang's -f[no-]color-diagnostics; -f[no-]diagnostics-show-caret,
+   -show-option, -show-line-numbers; -fdiagnostics-plain-output (no colour,
+   no source line, no [-Wname]: what a pipe gets).  Returns 0 when OPT was
+   one of them. */
 static int set_diag_color(TCCState *s, const char *opt)
 {
+  static const struct
+  {
+    const char *name;
+    size_t off; /* offsetof(TCCState, diag_show_x) */
+  } shows[] = {{"diagnostics-show-caret", offsetof(TCCState, diag_show_caret)},
+               {"diagnostics-show-option", offsetof(TCCState, diag_show_option)},
+               {"diagnostics-show-line-numbers", offsetof(TCCState, diag_line_numbers)}};
+  int no = !strncmp(opt, "no-", 3);
+
+  for (size_t i = 0; i < sizeof shows / sizeof shows[0]; i++)
+    if (!strcmp(opt + 3 * no, shows[i].name))
+    {
+      ((unsigned char *)s)[shows[i].off] = no ? DIAG_SHOW_OFF : DIAG_SHOW_ON;
+      return 0;
+    }
   if (!strcmp(opt, "diagnostics-color") || !strcmp(opt, "color-diagnostics") ||
       !strcmp(opt, "diagnostics-color=always"))
     s->diag_color = DIAG_COLOR_ALWAYS;
@@ -1335,6 +1373,11 @@ static int set_diag_color(TCCState *s, const char *opt)
     s->diag_color = DIAG_COLOR_NEVER;
   else if (!strcmp(opt, "diagnostics-color=auto"))
     s->diag_color = DIAG_COLOR_AUTO;
+  else if (!strcmp(opt, "diagnostics-plain-output"))
+  {
+    s->diag_color = DIAG_COLOR_NEVER;
+    s->diag_show_caret = s->diag_show_option = DIAG_SHOW_OFF;
+  }
   else
     return -1;
   return 0;
@@ -1349,7 +1392,7 @@ static int set_diag_color(TCCState *s, const char *opt)
 #define DIAG_W_SIZE (offsetof(TCCState, warn_num) - offsetof(TCCState, warn_none))
 typedef char diag_snap_fits[DIAG_W_SIZE <= DIAG_SNAP_SIZE ? 1 : -1];
 
-static void diag_record(TCCState *s1, const char *file, int line)
+static DiagSnap *diag_record_w(TCCState *s1, const char *file, int line, const unsigned char *w)
 {
   DiagSnap *d;
   if (!(s1->nb_diag_snaps & (s1->nb_diag_snaps - 1)))
@@ -1357,24 +1400,75 @@ static void diag_record(TCCState *s1, const char *file, int line)
   d = &s1->diag_snaps[s1->nb_diag_snaps++];
   d->file = file ? tcc_filename_intern(file) : NULL;
   d->line = line;
-  memcpy(d->w, &s1->warn_none, DIAG_W_SIZE);
+  d->unsafe = 0;
+  memmove(d->w, w, DIAG_W_SIZE);
+  for (size_t i = 0; i < DIAG_W_SIZE; i++)
+    s1->diag_snaps_or[i] |= w[i];
+  return d;
+}
+
+static void diag_record(TCCState *s1, const char *file, int line)
+{
+  diag_record_w(s1, file, line, &s1->warn_none);
 }
 
 /* the options at LINE of file F: the last change recorded there at or
    before it, else the command line's; the live ones when nothing says */
+static const unsigned char *diag_state_at_ex(TCCState *s1, const char *fname, int line, int skip_unsafe);
+static void diag_w_strict_off(unsigned char *w);
+
 static const unsigned char *diag_state_at(TCCState *s1, const char *fname, int line)
+{
+  return diag_state_at_ex(s1, fname, line, 0);
+}
+
+/* ... skip_unsafe: as if no unsafe region were recorded */
+static const unsigned char *diag_state_at_ex(TCCState *s1, const char *fname, int line, int skip_unsafe)
 {
   const char *name;
   if (!s1->nb_diag_snaps || !line || !fname)
     return &s1->warn_none;
   name = tcc_filename_intern(fname);
+  /* the closest record at or before LINE (the latest of equals): unsafe
+     regions are recorded when a body is parsed, which at -O1+ may come after
+     the records of later lines */
+  const DiagSnap *best = NULL, *edge = NULL;
   for (int i = s1->nb_diag_snaps; i-- > 0;)
   {
     const DiagSnap *d = &s1->diag_snaps[i];
-    if (!d->file || (d->file == name && d->line <= line))
+    if (d->unsafe && d->file == name && d->line <= line && (!edge || d->line > edge->line))
+      edge = d;
+    if (skip_unsafe && d->unsafe)
+      continue;
+    if (d->file == name && d->line <= line && (!best || d->line > best->line))
+      best = d;
+    else if (!d->file && !best)
       return d->w;
   }
-  return &s1->warn_none;
+  if (!best)
+    return &s1->warn_none;
+  /* a #pragma diagnostic inside a region, recorded before the body's parse
+     (-O1+) recorded the strict options on: the region keeps them off */
+  if (!best->unsafe && !skip_unsafe && edge && edge->unsafe == DIAG_UNSAFE_OFF)
+  {
+    static unsigned char w[DIAG_SNAP_SIZE];
+    memcpy(w, best->w, DIAG_W_SIZE);
+    diag_w_strict_off(w);
+    return w;
+  }
+  return best->w;
+}
+
+/* The warning WOFF (offsetof(TCCState, warn_x)) is shown at LINE of FNAME:
+   on there as #pragma diagnostic left it, and not in a system header -- for
+   a check that reports later, at the link, what it found in this unit
+   (-Wtainted-format across units). */
+ST_FUNC int tcc_warning_shown_at(TCCState *s1, int woff, const char *fname, int line)
+{
+  const unsigned char *w = diag_state_at(s1, fname, line);
+  if (w[0] || !(w[woff - offsetof(TCCState, warn_none)] & WARN_ON))
+    return 0;
+  return s1->warn_system_headers || !fname || !tcc_sys_file(s1, fname, line);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1481,6 +1575,8 @@ ST_FUNC int tcc_diag_marked(TCCState *s1, int line, int key)
   return !tcc_diag_once(s1, DIAG_ONCE_PLACE, (unsigned)key, tcc_diag_file(NULL), line <= 0 ? 1 : line, NULL, 0);
 }
 
+static void tcc_error_stash_free(TCCState *s1);
+
 /* a new unit: the command line's options again */
 ST_FUNC void tcc_diag_reset(TCCState *s1)
 {
@@ -1496,7 +1592,8 @@ ST_FUNC void tcc_diag_reset(TCCState *s1)
   tcc_free(s1->diag_snaps);
   tcc_free(s1->diag_stack);
   s1->diag_snaps = s1->diag_stack = NULL;
-  s1->nb_diag_snaps = s1->nb_diag_stack = 0;
+  s1->nb_diag_snaps = s1->nb_diag_stack = s1->nb_diag_pragmas = 0;
+  memset(s1->diag_snaps_or, 0, sizeof s1->diag_snaps_or);
   tcc_free(s1->diag_once);
   s1->diag_once = NULL;
   s1->nb_diag_once = s1->diag_once_cap = 0;
@@ -1504,6 +1601,7 @@ ST_FUNC void tcc_diag_reset(TCCState *s1)
   s1->sys_files = NULL;
   s1->nb_sys_files = 0;
   s1->diag_replay_file = NULL; /* an error may have left an expansion's */
+  tcc_error_stash_free(s1);
   s1->diag_parse = s1->diag_parse_next = 0;
   s1->diag_spec_recheck = 0;
 }
@@ -1526,9 +1624,157 @@ static int diag_in_sys_header(TCCState *s1, BufferedFile *f, const char *fname, 
 
 static const char *warn_option_name(int wnum);
 
+/* The next 'quoted' part of MSG at or after P: its closing quote, *OPEN at
+   its opening one; NULL when there is none.  An apostrophe inside a word
+   (the function's) neither opens nor closes one. */
+static const char *diag_next_quote(const char *msg, const char *p, const char **open)
+{
+  for (; *p; p++)
+  {
+    const char *q;
+    if (*p != '\'' || (p > msg && (isid(p[-1]) || isnum(p[-1]))))
+      continue;
+    for (q = p + 1; *q; q++)
+      if (*q == '\'' && !isid(q[1]) && !isnum(q[1]))
+        break;
+    if (!*q)
+      return NULL;
+    if (q > p + 1)
+    {
+      *open = p;
+      return q;
+    }
+    p = q; /* '' */
+  }
+  return NULL;
+}
+
+/* MSG onto CS, its 'quoted' names bold when COLOR (gcc's %qs) */
+static void diag_cat_msg(CString *cs, const char *msg, int color)
+{
+  const char *p = msg, *open, *close;
+  while (color && (close = diag_next_quote(msg, p, &open)))
+  {
+    if (open > p) /* cstr_cat's length 0 is the whole string with its NUL */
+      cstr_cat(cs, p, open - p);
+    cstr_cat(cs, DIAG_QUOTE, -1);
+    cstr_cat(cs, open, close + 1 - open);
+    cstr_cat(cs, DIAG_RESET, -1);
+    p = close + 1;
+  }
+  if (*p)
+    cstr_cat(cs, p, -1);
+}
+
+/* the display column after C at column COL: tabs to the next multiple of 8,
+   a UTF-8 continuation byte takes none */
+static int diag_col_next(int col, int c)
+{
+  if (c == '\t')
+    return (col + 8) & ~7;
+  return col + ((c & 0xc0) != 0x80);
+}
+
+/* The source line under a diagnostic, as gcc shows it:
+       3 | int main(void) { return f(1) + undefined_var; }
+         |                               ^~~~~~~~~~~~~
+   The caret is under the first 'quoted' name of MSG that is on the line
+   exactly once (tcc keeps no column); with none, the line alone.  A note
+   on the line shown last shows it again only with a caret of its own.
+   Out of line: error1 is reached from deep in the recursive parse. */
+#if defined(__GNUC__) || defined(__TINYC__)
+__attribute__((noinline))
+#endif
+static void diag_excerpt(TCCState *s1, CString *cs, int note, const char *fname, int line, const char *msg,
+                         int color, const char *kind_color)
+{
+  static char last_file[256];
+  static int last_line;
+  CString text;
+  const char *p, *open, *close;
+  int col = 0, len = 0, w, c, x;
+
+  cstr_new(&text);
+  if (!fixit_line(fname, line, &text))
+    goto out;
+  for (p = msg; !col && (close = diag_next_quote(msg, p, &open)); p = close + 1)
+  {
+    char word[128];
+    len = close - open - 1;
+    if (len >= (int)sizeof word)
+      continue;
+    memcpy(word, open + 1, len);
+    word[len] = 0;
+    col = fixit_find_in(text.data, word);
+  }
+  if (note && !col && line == last_line && !strcmp(fname, last_file))
+    goto out;
+  pstrcpy(last_file, sizeof last_file, fname);
+  last_line = line;
+
+  /* the line, its trailing CR and blanks off */
+  len = strlen(text.data);
+  while (len && (text.data[len - 1] == '\r' || text.data[len - 1] == ' ' || text.data[len - 1] == '\t'))
+    len--;
+  w = s1->diag_line_numbers != DIAG_SHOW_OFF; /* with the line, as gcc */
+  if (w)
+    cstr_printf(cs, "\n %4d | ", line);
+  else
+    cstr_cat(cs, "\n ", -1);
+  {
+    /* the name highlighted in the kind's colour; tabs expanded */
+    const int end = col ? col - 1 + (int)(close - open - 1) : 0;
+    for (int i = 0, d = 0; i < len; i++)
+    {
+      c = (unsigned char)text.data[i];
+      if (color && col && i == col - 1)
+        cstr_cat(cs, kind_color, -1);
+      if (c == '\t')
+        for (x = diag_col_next(d, c); d < x; d++)
+          cstr_ccat(cs, ' ');
+      else
+      {
+        cstr_ccat(cs, c);
+        d = diag_col_next(d, c);
+      }
+      if (color && col && i == end - 1)
+        cstr_cat(cs, DIAG_RESET, -1);
+    }
+    if (!col)
+      goto out;
+    /* the caret line: ^ at the name's first column, ~ under the rest */
+    cstr_cat(cs, w ? "\n      | " : "\n ", -1);
+    {
+      int from = 0, to = 0;
+      for (int i = 0; i < end && text.data[i]; i++)
+      {
+        if (i == col - 1)
+          from = to;
+        to = diag_col_next(to, (unsigned char)text.data[i]);
+      }
+      for (x = 0; x < from; x++)
+        cstr_ccat(cs, ' ');
+      if (color)
+        cstr_cat(cs, kind_color, -1);
+      cstr_ccat(cs, '^');
+      for (x = from + 1; x < to; x++)
+        cstr_ccat(cs, '~');
+      if (color)
+        cstr_cat(cs, DIAG_RESET, -1);
+    }
+  }
+out:
+  cstr_free(&text);
+}
+
 /* a finished line of text output: stderr, or tcc_set_error_func()'s */
 static void diag_text_out(TCCState *s1, const char *line)
 {
+  if (dq_on(s1))
+  {
+    dq_add(s1, DQ_TEXT)->a = tcc_strdup(line);
+    return;
+  }
   if (!s1->error_func)
   {
     /* default case: stderr */
@@ -1561,6 +1807,8 @@ static NORETURN void error_longjmp(TCCState *s1, int fatal)
   s1->diag_noabort = 0;
   longjmp(s1->error_jmp_buf, 1);
 }
+
+static int diag_is_strict(TCCState *s1, int wnum);
 
 static void error1(int mode, const char *tag, const char *fmt, va_list ap)
 {
@@ -1596,8 +1844,8 @@ static void error1(int mode, const char *tag, const char *fmt, va_list ap)
   }
 
   /* an inline expansion replays the body's lines: they are its file's, not
-     the caller's */
-  fname = !f ? NULL : s1->diag_replay_file ? s1->diag_replay_file : f->filename;
+     the caller's; the link names a unit's place itself (diag_link_file) */
+  fname = !f ? (line ? s1->diag_link_file : NULL) : s1->diag_replay_file ? s1->diag_replay_file : f->filename;
   if (mode == ERROR_WARN && s1->diag_flow_only && !line)
     return;
   /* As gcc: no warning in a system header -- whatever -Werror or the safe
@@ -1613,7 +1861,7 @@ static void error1(int mode, const char *tag, const char *fmt, va_list ap)
   /* nor in the expansion of a macro a system header defined (tccpp.c
      tcc_sys_macro_here): a warning about the position read now -- one given
      its line is about another place, which decided for itself */
-  if (mode == ERROR_WARN && f && !line && !any_header && !s1->warn_system_headers && tcc_sys_macro_here())
+  if (mode == ERROR_WARN && f && !line && !any_header && !s1->warn_system_headers && tcc_sys_macro_prev())
   {
     s1->warn_num = 0;
     return;
@@ -1637,7 +1885,8 @@ static void error1(int mode, const char *tag, const char *fmt, va_list ap)
       if (wopt & WARN_NOE)
         mode = ERROR_WARN;
     }
-    if (w[0]) /* warn_none */
+    /* warn_none (-w); the strict lifetime errors are errors still */
+    if (w[0] && !(mode == ERROR_ERROR && diag_is_strict(s1, wnum)))
       return;
     /* A warning made an error leaves the parser where it was: the compile
        goes on and reports what comes after it (gcc), only fails. */
@@ -1656,10 +1905,12 @@ static void error1(int mode, const char *tag, const char *fmt, va_list ap)
   else
     cstr_vprintf(&msg, fmt, ap);
   cstr_ccat(&msg, 0);
-  /* the lexer's error (it cannot read past it: error_fatal) in a body being
-     saved: said when the parse of the body reaches it, after the errors
-     before it (decl.c save_body_cut) */
-  if (mode == ERROR_ERROR && s1->save_body_jmp && s1->error_fatal && f && !tag && !s1->fe_speculative)
+  /* the lexer's error (it cannot read past it: error_fatal) or a
+     preprocessor directive's (a missing include) in a body being saved, or
+     read just after it: said when the parse of the body reaches it, after
+     the errors before it (decl.c save_body_cut) */
+  if (mode == ERROR_ERROR && s1->save_body_jmp && f && !tag && !s1->fe_speculative && !s1->asm_inline &&
+      (s1->error_fatal || pp_expr || (parse_flags & PARSE_FLAG_LINEFEED)))
   {
     s1->error_fatal = 0;
     char *m = tcc_strdup((char *)msg.data);
@@ -1679,6 +1930,8 @@ static void error1(int mode, const char *tag, const char *fmt, va_list ap)
     locus = cs.size;
     cstr_printf(&cs, "%s%s:%d:%s ", color ? DIAG_LOCUS : "", fname, line, color ? DIAG_RESET : "");
   }
+  else if (fname)
+    cstr_printf(&cs, "%s%s:%d:%s ", color ? DIAG_LOCUS : "", fname, line, color ? DIAG_RESET : "");
   else
   {
     cstr_printf(&cs, "%s%s:%s ", color ? DIAG_LOCUS : "", s1->current_filename ? s1->current_filename : "tcc",
@@ -1690,7 +1943,12 @@ static void error1(int mode, const char *tag, const char *fmt, va_list ap)
     kind = "note:", kind_color = DIAG_NOTE;
   else
     kind = "error:", kind_color = DIAG_ERROR;
-  cstr_printf(&cs, "%s%s%s %s", color ? kind_color : "", kind, color ? DIAG_RESET : "", (char *)msg.data);
+  cstr_printf(&cs, "%s%s%s ", color ? kind_color : "", kind, color ? DIAG_RESET : "");
+  diag_cat_msg(&cs, (char *)msg.data, color);
+  /* [-Wname] after a warning, [-Werror=name] after one made an error */
+  if (wnum && warn_option_name(wnum) && diag_show(s1, s1->diag_show_option))
+    cstr_printf(&cs, " %s[-W%s%s]%s", color ? kind_color : "", mode == ERROR_WARN ? "" : "error=",
+                warn_option_name(wnum), color ? DIAG_RESET : "");
   /* An error a replay says again (an inline expansion, then the function's
      own compile) is reported and counted once. */
   if ((mode == ERROR_ERROR || mode == ERROR_NOABORT) && s1->error_set_jmp_enabled && !s1->fe_speculative &&
@@ -1706,11 +1964,14 @@ static void error1(int mode, const char *tag, const char *fmt, va_list ap)
   }
   if (mode != ERROR_NOTE)
     diag_out_place(fname, line);
+  dq.head_next = mode == ERROR_NOTE ? 0 : mode == ERROR_WARN ? 2 : 1; /* held: where a diagnostic starts */
   if (diag_out_on(s1))
     diag_out_result(mode == ERROR_WARN ? 0 : mode == ERROR_NOTE ? 2 : 1, wnum ? warn_option_name(wnum) : NULL,
-                    f ? fname : s1->current_filename, f ? line : 0, (char *)msg.data);
+                    fname ? fname : s1->current_filename, fname ? line : 0, (char *)msg.data);
   else
   {
+    if (fname && line > 0 && diag_show(s1, s1->diag_show_caret))
+      diag_excerpt(s1, &cs, mode == ERROR_NOTE, fname, line, (char *)msg.data, color, kind_color);
     cstr_ccat(&cs, 0);
     diag_text_out(s1, cs.data);
   }
@@ -1727,35 +1988,56 @@ static void error1(int mode, const char *tag, const char *fmt, va_list ap)
     if (s1->error_set_jmp_enabled && !s1->fe_speculative && s1->max_errors > 0 &&
         s1->nb_errors >= s1->max_errors)
     {
-      char stop[80];
-      snprintf(stop, sizeof stop, "compilation terminated due to -fmax-errors=%d.", s1->max_errors);
-      if (diag_out_on(s1))
-        diag_out_result(2, NULL, NULL, 0, stop);
-      else if (!s1->error_func)
+      if (!dq_on(s1))
       {
-        fprintf(stderr, "%s\n", stop);
-        fflush(stderr);
+        diag_terminated(s1);
+        if (s1->max_errors_defer && mode != ERROR_ERROR)
+        {
+          /* the caller holds what a longjmp would leak: it stops the
+             compile itself (tcc_max_errors_stop) */
+          s1->max_errors_hit = 1;
+          return;
+        }
+        s1->error_fatal = 1;
+        mode = ERROR_ERROR;
       }
-      else
-        s1->error_func(s1->error_opaque, stop);
-      if (s1->max_errors_defer && mode != ERROR_ERROR)
+      else if (s1->diag_in_parse && !s1->diag_stop && s1->recover)
       {
-        /* the caller holds what a longjmp would leak: it stops the
-           compile itself (tcc_max_errors_stop) */
-        s1->max_errors_hit = 1;
-        return;
+        /* held (diag_out.c): the errors are counted in -O0's order when
+           written -- the parse stops, the bodies saved before here still
+           speak; at the end of the unit the parse goes on */
+        if (s1->max_errors_defer && mode != ERROR_ERROR)
+        {
+          s1->max_errors_hit = 2; /* tcc_max_errors_stop stops it */
+          return;
+        }
+        s1->diag_stop = 2;
+        mode = ERROR_ERROR;
+        tcc_recover_stop(s1);
+        s1->error_fatal = 1;
       }
-      s1->error_fatal = 1;
-      mode = ERROR_ERROR;
     }
   }
 raise:
   if (mode == ERROR_ERROR && s1->error_set_jmp_enabled)
+  {
     /* go on after it when the state allows (core/recover.c): not inside a
-       preprocessor directive, a macro's substitution or inline asm, nor
-       after an internal error */
-    error_longjmp(s1, s1->error_fatal || tag || pp_expr || pp_subst_depth ||
-                          (parse_flags & (PARSE_FLAG_LINEFEED | PARSE_FLAG_ASM_FILE)));
+       preprocessor directive, a macro's substitution or an assembler
+       file, nor after an internal error */
+    const int fatal = s1->error_fatal || tag || pp_expr || pp_subst_depth ||
+                      ((parse_flags & (PARSE_FLAG_LINEFEED | PARSE_FLAG_ASM_FILE)) && !s1->asm_inline);
+    /* held diagnostics (diag_out.c): a fatal error in the parse stops it,
+       but the bodies saved before it still speak, as they did at -O0 */
+    if (fatal && !tag && dq_on(s1) && s1->recover && !s1->fe_speculative && s1->diag_in_parse && !s1->diag_stop)
+    {
+      s1->error_fatal = 0;
+      s1->diag_stop = 1;
+      s1->diag_stop_anchor = s1->diag_anchor;
+      s1->diag_stop_seq = dq.seq - 1;
+      tcc_recover_stop(s1);
+    }
+    error_longjmp(s1, fatal);
+  }
 }
 
 /* -fmax-errors in a section whose allocations an error's longjmp would leak
@@ -1771,8 +2053,31 @@ ST_FUNC void tcc_max_errors_stop(TCCState *s1)
 {
   const int hit = s1->max_errors_hit;
   s1->max_errors_defer = s1->max_errors_hit = 0;
-  if (hit && s1->error_set_jmp_enabled)
-    error_longjmp(s1, 1);
+  if (!hit || !s1->error_set_jmp_enabled)
+    return;
+  if (hit == 2)
+  {
+    /* held diagnostics: the parse stops as error1 would have stopped it */
+    s1->diag_stop = 2;
+    tcc_recover_stop(s1);
+  }
+  error_longjmp(s1, 1);
+}
+
+/* "compilation terminated due to -fmax-errors=N." */
+static void diag_terminated(TCCState *s1)
+{
+  char stop[80];
+  snprintf(stop, sizeof stop, "compilation terminated due to -fmax-errors=%d.", s1->max_errors);
+  if (diag_out_on(s1))
+    diag_out_result(2, NULL, NULL, 0, stop);
+  else if (!s1->error_func)
+  {
+    fprintf(stderr, "%s\n", stop);
+    fflush(stderr);
+  }
+  else
+    s1->error_func(s1->error_opaque, stop);
 }
 
 /* The error message MSG (from its locus on) was printed in this unit already;
@@ -1804,6 +2109,15 @@ ST_FUNC int tcc_error_seen(TCCState *s1, const char *msg, int len)
   s1->err_seen[i] = h;
   s1->nb_err_seen++;
   return 0;
+}
+
+static void tcc_error_stash_free(TCCState *s1)
+{
+  for (int i = 0; i < s1->nb_diag_stash; i++)
+    tcc_free(s1->diag_stash[i].msg);
+  tcc_free(s1->diag_stash);
+  s1->diag_stash = NULL;
+  s1->nb_diag_stash = s1->diag_stash_cap = 0;
 }
 
 LIBTCCAPI void tcc_set_error_func(TCCState *s, void *error_opaque, TCCErrorFunc *error_func)
@@ -1949,15 +2263,15 @@ static void diag_vwarn_once(int woff, int at_line, int value_dependent, const ch
   int line, wrel = woff - (int)offsetof(TCCState, warn_none);
 
   s1->diag_last_shown = 0; /* a note after this one goes with it (tcc_note) */
-  if (!file || s1->warn_none || (value_dependent && s1->fe_speculative))
+  if (!file || (s1->warn_none && !diag_is_strict(s1, wrel)) || (value_dependent && s1->fe_speculative))
     return;
-  if (!s1->nb_diag_snaps && wrel && !(((unsigned char *)s1)[woff] & WARN_ON))
+  if (wrel && !s1->diag_snaps_or[wrel] && !(((unsigned char *)s1)[woff] & WARN_ON))
     return;
   name = tcc_diag_file(&f);
   if (!f)
     return;
   /* the position read now is in a system header's macro (error1's rule) */
-  if (!at_line && !s1->warn_system_headers && tcc_sys_macro_here())
+  if (!at_line && !s1->warn_system_headers && tcc_sys_macro_prev())
     return;
   line = at_line ? at_line : f->line_num - ((tok_flags & TOK_FLAG_BOL) && !macro_ptr);
   /* quiet in a system header: error1 decides, as for every warning
@@ -2194,11 +2508,14 @@ static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
     }
     tcc_init_stamp("elf end");
   }
+  tcc_diag_queue_flush(s1); /* the unit's held diagnostics, in order */
   tccgen_finish(s1);
   preprocess_end(s1);
   s1->error_set_jmp_enabled = 0;
   s1->recover = NULL;
   s1->error_fatal = 0;
+  s1->asm_inline = 0;
+  s1->diag_in_parse = 0;
   if (s1->recover_flipped)
   {
     /* an error turned the rest of the unit into -fsyntax-only */
@@ -2256,6 +2573,7 @@ LIBTCCAPI TCCState *tcc_new(void)
   s->gnu_ext = 1;
   s->tcc_ext = 1;
   s->nocommon = 1;
+  s->fortify = 2;
   s->dollars_in_identifiers = 1; /*on by default like in gcc/clang*/
   s->cversion = 201112;          /* default to C11 */
   s->warn_implicit_function_declaration = 1;
@@ -2355,6 +2673,7 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   diag_out_state_end();
   tcc_typesig_free(s1);
   tcc_typesig_reset();
+  tcc_taint_link_free(s1);
   tcc_stack_usage_free(s1);
   /* free target-specific backend state */
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
@@ -2364,6 +2683,7 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   /* free IR-level interprocedural caches */
   tcc_ir_free_switch_func_cache(s1);
   tcc_free(s1->func_purity_cache);
+  tcc_free(s1->sys_globals);
   tcc_free(s1->func_const_result_cache);
   tcc_free(s1->split_pads);  /* an error before the object is written */
   tcc_free(s1->text_pieces);
@@ -2412,6 +2732,7 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
   tcc_free(s1->yasc_files); /* its names belong to interned_files */
   tcc_free(s1->sys_files);  /* so do these */
   tcc_free(s1->diag_once);
+  tcc_error_stash_free(s1);
   dynarray_reset(&s1->interned_files, &s1->nb_interned_files);
   dynarray_reset(&s1->hot_text_flash_names, &s1->nb_hot_text_flash_names);
   dynarray_reset(&s1->ram_text_names, &s1->nb_ram_text_names);
@@ -3300,6 +3621,8 @@ typedef struct FlagDef
 #define WD_UNUSED 0x0010 /* switched by -Wunused (the "unused" entry) too */
 #define WD_EXTRA 0x0020  /* switched by -Wextra too (gcc's -Wextra members tcc has) */
 #define WD_EXTRA_UNUSED 0x0040 /* ... only with -Wunused or -Wall as well, as gcc */
+#define WD_STRICT 0x0080 /* the safe default: an error the command line and #pragma diagnostic cannot
+                            lower (strict lifetimes); only unsafe turns it off */
 
 /* options_W entries the command line set, by index */
 static int warn_user_test(TCCState *s, int i)
@@ -3313,24 +3636,27 @@ static void warn_user_set(TCCState *s, int i)
 
 static const FlagDef options_W[] = {
     {offsetof(TCCState, warn_all), WD_ALL, "all"},
-    /* the group: every WD_EXTRA entry follows it (set_flag walks on from here) */
-    {offsetof(TCCState, warn_extra), 0, "extra"},
+    /* the group: every WD_EXTRA entry follows it (set_flag walks on from here).
+       The safe default (WD_SAFE) has every check but the ones that take a
+       value (frame-larger-than=, stack-usage=) and the switches that are no
+       check (error, system-headers). */
+    {offsetof(TCCState, warn_extra), WD_SAFE, "extra"},
     {offsetof(TCCState, warn_error), 0, "error"},
-    {offsetof(TCCState, warn_write_strings), 0, "write-strings"},
-    {offsetof(TCCState, warn_unsupported), 0, "unsupported"},
+    {offsetof(TCCState, warn_write_strings), WD_SAFE, "write-strings"},
+    {offsetof(TCCState, warn_unsupported), WD_SAFE, "unsupported"},
     /* Not a warning: the warnings of system headers are not given (gcc), and
        this gives them (error1).  Not in -Wall, as in gcc. */
     {offsetof(TCCState, warn_system_headers), 0, "system-headers"},
     /* Not in -Wall: a signature per global symbol in each object, compared
        at the link (typesig.c) */
-    {offsetof(TCCState, warn_cross_tu), 0, "cross-tu"},
+    {offsetof(TCCState, warn_cross_tu), WD_SAFE, "cross-tu"},
     /* Not in -Wall (gcc has no such check): a CFG walk in a function with a
        printf-style call and an untrusted source (ir/taint.c) */
-    {offsetof(TCCState, warn_tainted_format), 0, "tainted-format"},
+    {offsetof(TCCState, warn_tainted_format), WD_SAFE, "tainted-format"},
     {offsetof(TCCState, warn_implicit_function_declaration), WD_ALL | WD_SAFE_ERR, "implicit-function-declaration"},
     {offsetof(TCCState, warn_discarded_qualifiers), WD_ALL | WD_SAFE_ERR, "discarded-qualifiers"},
     /* Not in -Wall: a CFG walk per function, yasc only; the safe default has it. */
-    {offsetof(TCCState, warn_lifetime), WD_SAFE, "lifetime"},
+    {offsetof(TCCState, warn_lifetime), WD_SAFE | WD_STRICT, "lifetime"},
     {offsetof(TCCState, warn_int_conversion), WD_ALL | WD_SAFE_ERR, "int-conversion"},
     {offsetof(TCCState, warn_incompatible_pointer_types), WD_ALL | WD_SAFE_ERR, "incompatible-pointer-types"},
     {offsetof(TCCState, warn_return_type), WD_ALL | WD_SAFE_ERR, "return-type"},
@@ -3338,25 +3664,34 @@ static const FlagDef options_W[] = {
     /* Not in -Wall: a CFG walk per function; the safe default has them. */
     {offsetof(TCCState, warn_uninitialized), WD_SAFE, "uninitialized"},
     {offsetof(TCCState, warn_maybe_uninitialized), WD_SAFE, "maybe-uninitialized"},
-    {offsetof(TCCState, warn_return_local_addr), WD_ALL, "return-local-addr"},
+    {offsetof(TCCState, warn_return_local_addr), WD_ALL | WD_STRICT, "return-local-addr"},
     /* Not in -Wall: -Wall -Werror builds of code using format() (tinycc's own)
        would stop; the safe default has it. */
     {offsetof(TCCState, warn_ignored_attributes), WD_SAFE, "ignored-attributes"},
     {offsetof(TCCState, warn_nonnull), WD_ALL, "nonnull"},
     /* Not in -Wall: a CFG walk per function holding a local's address; the safe default has it. */
-    {offsetof(TCCState, warn_dangling_pointer), WD_SAFE, "dangling-pointer"},
+    {offsetof(TCCState, warn_dangling_pointer), WD_SAFE | WD_STRICT, "dangling-pointer"},
     /* Not in -Wall: what it finds depends on -O; the safe default has it. */
     {offsetof(TCCState, warn_null_dereference), WD_SAFE, "null-dereference"},
     /* On by default, yasc only: an owned variable handed on without move(p). */
-    {offsetof(TCCState, warn_implicit_move), 0, "implicit-move"},
+    {offsetof(TCCState, warn_implicit_move), WD_STRICT, "implicit-move"},
+    {offsetof(TCCState, warn_unchecked), WD_STRICT, "unchecked"},
+    /* yasc spells the null pointer one way: nullptr (NULL and 0 are
+       regular C).  On in the safe default; -ccompat code says nothing. */
+    {offsetof(TCCState, warn_zero_as_null_pointer_constant), WD_SAFE, "zero-as-null-pointer-constant"},
+    /* yasc only: `REG->f = 1` on volatile memory is a hidden read-modify-write
+       of the whole unit (W1C bits, write-only registers, no atomicity) */
+    {offsetof(TCCState, warn_volatile_bitfield), WD_STRICT, "volatile-bitfield"},
+    /* yasc only: a register field marked ro written, wo read, w1c written back */
+    {offsetof(TCCState, warn_register_access), WD_STRICT, "register-access"},
     /* Not in -Wall (nor in gcc's).  The safe default reads `()` as `(void)`
        (C23), so what is left is an old-style definition: never written by
        accident. */
     {offsetof(TCCState, warn_strict_prototypes), WD_SAFE, "strict-prototypes"},
-    {offsetof(TCCState, warn_missing_prototypes), 0, "missing-prototypes"},
-    {offsetof(TCCState, warn_pointer_arith), 0, "pointer-arith"},
-    {offsetof(TCCState, warn_cast_qual), 0, "cast-qual"},
-    {offsetof(TCCState, warn_cast_align), 0, "cast-align"},
+    {offsetof(TCCState, warn_missing_prototypes), WD_SAFE, "missing-prototypes"},
+    {offsetof(TCCState, warn_pointer_arith), WD_SAFE, "pointer-arith"},
+    {offsetof(TCCState, warn_cast_qual), WD_SAFE, "cast-qual"},
+    {offsetof(TCCState, warn_cast_align), WD_SAFE, "cast-align"},
     /* gcc has it on by default */
     {offsetof(TCCState, warn_address_of_packed_member), WD_ALL, "address-of-packed-member"},
     /* Not in -Wall (nor in gcc's): they take a limit, -Wframe-larger-than=N
@@ -3381,13 +3716,13 @@ static const FlagDef options_W[] = {
     /* On by default, as with gcc */
     {offsetof(TCCState, warn_unused_result), WD_ALL, "unused-result"},
     {offsetof(TCCState, warn_deprecated_declarations), WD_ALL, "deprecated-declarations"},
-    /* Not in -Wall (gcc: -Wextra), nor the safe default: too many hits
-       where the signed side is known non-negative in ways tcc does not see. */
-    {offsetof(TCCState, warn_sign_compare), WD_EXTRA, "sign-compare"},
+    /* Not in -Wall (gcc: -Wextra): hits where the signed side is known
+       non-negative in ways tcc does not see. */
+    {offsetof(TCCState, warn_sign_compare), WD_EXTRA | WD_SAFE, "sign-compare"},
     /* Noisy (gcc: in neither -Wall nor -Wextra); -Wconversion implies
        -Wsign-conversion unless that is given. */
-    {offsetof(TCCState, warn_conversion), 0, "conversion"},
-    {offsetof(TCCState, warn_sign_conversion), 0, "sign-conversion"},
+    {offsetof(TCCState, warn_conversion), WD_SAFE, "conversion"},
+    {offsetof(TCCState, warn_sign_conversion), WD_SAFE, "sign-conversion"},
     /* gcc has these on by default: -Wall here, so the safe default too. */
     {offsetof(TCCState, warn_shift_count_overflow), WD_ALL, "shift-count-overflow"},
     {offsetof(TCCState, warn_shift_count_negative), WD_ALL, "shift-count-negative"},
@@ -3397,7 +3732,7 @@ static const FlagDef options_W[] = {
     {offsetof(TCCState, warn_tautological_compare), WD_ALL, "tautological-compare"},
     /* Not in -Wall (gcc: -Wextra): generic code compares unsigned values
        against limits that happen to be 0. */
-    {offsetof(TCCState, warn_type_limits), WD_EXTRA, "type-limits"},
+    {offsetof(TCCState, warn_type_limits), WD_EXTRA | WD_SAFE, "type-limits"},
     {offsetof(TCCState, warn_array_bounds), WD_ALL, "array-bounds"},
     {offsetof(TCCState, warn_sizeof_pointer_memaccess), WD_ALL, "sizeof-pointer-memaccess"},
     {offsetof(TCCState, warn_sizeof_array_argument), WD_ALL, "sizeof-array-argument"},
@@ -3415,8 +3750,8 @@ static const FlagDef options_W[] = {
     {offsetof(TCCState, warn_empty_body), WD_SAFE | WD_EXTRA, "empty-body"},
     {offsetof(TCCState, warn_switch), WD_ALL, "switch"},
     /* gcc: in neither -Wall nor -Wextra; noisy (every `i`, `len`, `buf` in an
-       inner block), so only when asked for. */
-    {offsetof(TCCState, warn_shadow), 0, "shadow"},
+       inner block). */
+    {offsetof(TCCState, warn_shadow), WD_SAFE, "shadow"},
     /* -Wunused-*: gcc's C -Wall has all of them but the parameter ones, which
        are -Wextra there (and noisy: callbacks keep their signatures). */
     {offsetof(TCCState, warn_unused), WD_UNUSED, "unused"},
@@ -3427,8 +3762,8 @@ static const FlagDef options_W[] = {
     {offsetof(TCCState, warn_unused_value), WD_ALL | WD_UNUSED, "unused-value"},
     {offsetof(TCCState, warn_unused_label), WD_ALL | WD_UNUSED, "unused-label"},
     {offsetof(TCCState, warn_unused_local_typedefs), WD_ALL | WD_UNUSED, "unused-local-typedefs"},
-    {offsetof(TCCState, warn_unused_parameter), WD_EXTRA_UNUSED, "unused-parameter"},
-    {offsetof(TCCState, warn_unused_but_set_parameter), WD_EXTRA_UNUSED, "unused-but-set-parameter"},
+    {offsetof(TCCState, warn_unused_parameter), WD_EXTRA_UNUSED | WD_SAFE, "unused-parameter"},
+    {offsetof(TCCState, warn_unused_but_set_parameter), WD_EXTRA_UNUSED | WD_SAFE, "unused-but-set-parameter"},
     /* Object sizes (builtin/objsize.c).  gcc has -Wstringop-overflow,
        -Walloc-size-larger-than and -Wfree-nonheap-object on by default and the
        rest in -Wall: -Wall here.  The safe default adds nothing to that. */
@@ -3438,9 +3773,10 @@ static const FlagDef options_W[] = {
     {offsetof(TCCState, warn_alloc_size_larger_than), WD_ALL, "alloc-size-larger-than"},
     /* Not in -Wall (no gcc counterpart): malloc(n * sizeof *p) is everywhere,
        and the check cannot see a test of n before it. */
-    {offsetof(TCCState, warn_alloc_mul_overflow), 0, "alloc-mul-overflow"},
+    {offsetof(TCCState, warn_alloc_mul_overflow), WD_SAFE, "alloc-mul-overflow"},
     {offsetof(TCCState, warn_free_nonheap_object), WD_ALL, "free-nonheap-object"},
     {offsetof(TCCState, warn_mismatched_dealloc), WD_ALL, "mismatched-dealloc"},
+    {offsetof(TCCState, warn_use_after_free), WD_ALL, "use-after-free"},
     {0, 0, NULL}};
 
 /* the -W name of the option at WNUM (TCCState.warn_num), for the
@@ -3462,15 +3798,25 @@ typedef char options_W_fit_warn_user[sizeof options_W / sizeof options_W[0] - 1 
    came. */
 static void tcc_safe_defaults(TCCState *s)
 {
+  TCCState *s1 = s; /* tcc_warning's */
   const FlagDef *p;
 
   if (s->ccompat)
     return;
   s->yasc_std = 1;
   s->cversion = 202311;
+  s->strict_lifetime = 1;
   for (p = options_W; p->name; ++p)
   {
     unsigned char *f = (unsigned char *)s + p->offset;
+    /* strict lifetimes: errors, whatever the command line said */
+    if (p->flags & WD_STRICT)
+    {
+      if (warn_user_test(s, p - options_W) && (!(*f & WARN_ON) || (*f & WARN_NOE)))
+        tcc_warning("-W%s is an error in yasc and cannot be lowered: use unsafe { } or -ccompat", p->name);
+      *f = WARN_ON | WARN_ERR;
+      continue;
+    }
     if (warn_user_test(s, p - options_W))
     {
       /* -Wno-error=X keeps X on as a warning, as it does for one on by default */
@@ -3486,13 +3832,21 @@ static void tcc_safe_defaults(TCCState *s)
 }
 
 /* As gcc: -Wconversion implies -Wsign-conversion, unless the command line
-   said something about that one. */
+   said something about that one; -Wno-extra turns off the unused
+   parameters. */
 static void tcc_implied_warnings(TCCState *s)
 {
+  int no_extra = 0;
+  for (const FlagDef *p = options_W; p->name; ++p)
+    if (p->offset == offsetof(TCCState, warn_extra))
+      no_extra = warn_user_test(s, p - options_W) && !(s->warn_extra & WARN_ON);
   for (const FlagDef *p = options_W; p->name; ++p)
   {
     if (warn_user_test(s, p - options_W))
       continue;
+    /* -Wno-extra: the unused parameters go too (the safe default has them) */
+    if ((p->flags & WD_EXTRA_UNUSED) && no_extra)
+      *((unsigned char *)s + p->offset) = 0;
     if (p->offset == offsetof(TCCState, warn_sign_conversion) && (s->warn_conversion & WARN_ON))
       s->warn_sign_conversion = s->warn_conversion;
     /* -Wextra with -Wunused or -Wall: the unused parameters, wherever the
@@ -3524,6 +3878,7 @@ static int sanitize_names(TCCState *s1, const char *list, unsigned *bits, int le
                {"vla-bound", SAN_VLA},
                {"bounds", SAN_BOUNDS},
                {"array-bounds", SAN_BOUNDS},
+               {"unreachable", SAN_UNREACHABLE},
                {"all", SAN_UNDEFINED}};
   *bits = 0;
   while (*list)
@@ -3642,6 +3997,9 @@ static const FlagDef options_f[] = {{offsetof(TCCState, char_is_unsigned), 0, "u
                                     {offsetof(TCCState, data_sections), 0, "data-sections"},
                                     {offsetof(TCCState, internal_spill), 0, "internal-spill"},
                                     {offsetof(TCCState, syntax_only), 0, "syntax-only"},
+                                    {offsetof(TCCState, unsafe_report), 0, "unsafe-report"},
+                                    {offsetof(TCCState, yasc_facts), 0, "yasc-facts"},
+                                    {offsetof(TCCState, fortify), 0, "fortify"},
                                     /* IR optimization flags */
                                     {offsetof(TCCState, opt_dce), 0, "dce"},
                                     {offsetof(TCCState, opt_const_prop), 0, "const-prop"},
@@ -3679,6 +4037,18 @@ static const FlagDef options_m[] = {{offsetof(TCCState, ms_bitfields), 0, "ms-bi
                                     {offsetof(TCCState, inline_atomics), 0, "inline-atomics"},
                                     {0, 0, NULL}};
 
+/* WNUM (an option's offset from warn_none) is a strict lifetime error in this
+   unit: -w does not hide it */
+static int diag_is_strict(TCCState *s1, int wnum)
+{
+  if (!s1->strict_lifetime || wnum <= 0)
+    return 0;
+  for (const FlagDef *p = options_W; p->name; ++p)
+    if ((int)(p->offset - offsetof(TCCState, warn_none)) == wnum)
+      return (p->flags & WD_STRICT) != 0;
+  return 0;
+}
+
 /* a -W option by name, for #pragma diagnostic */
 static const struct FlagDef *diag_option(const char *name)
 {
@@ -3690,6 +4060,8 @@ static const struct FlagDef *diag_option(const char *name)
       return p;
   return NULL;
 }
+
+static void unsafe_live(TCCState *s1, int what);
 
 ST_FUNC void tcc_pragma_diagnostic(TCCState *s1, int action, const char *option, const char *file, int line)
 {
@@ -3710,6 +4082,14 @@ ST_FUNC void tcc_pragma_diagnostic(TCCState *s1, int action, const char *option,
       return;
     }
     memcpy(&s1->warn_none, s1->diag_stack[--s1->nb_diag_stack].w, DIAG_W_SIZE);
+    /* the strict options are what the region says, not what the push saw: a
+       push inside unsafe { } saved them off */
+    if (s1->unsafe_depth)
+      unsafe_live(s1, 2);
+    else if (s1->strict_lifetime)
+      for (const FlagDef *p = options_W; p->name; ++p)
+        if (p->flags & WD_STRICT)
+          *((unsigned char *)s1 + p->offset) = WARN_ON | WARN_ERR;
   }
   else
   {
@@ -3730,6 +4110,11 @@ ST_FUNC void tcc_pragma_diagnostic(TCCState *s1, int action, const char *option,
       return;
     }
     value = action == DIAG_PRAGMA_IGNORED ? 0 : action == DIAG_PRAGMA_ERROR ? WARN_ON | WARN_ERR : WARN_ON | WARN_NOE;
+    if (s1->strict_lifetime && value != (WARN_ON | WARN_ERR) && (all ? 0 : (p->flags & WD_STRICT)))
+    {
+      tcc_warning("#pragma diagnostic: -W%s is an error in yasc and cannot be lowered: use unsafe { }", p->name);
+      return;
+    }
     const int group = !all && !strcmp(option, "unused");
     for (const struct FlagDef *q = all || group ? options_W : p; q->name; ++q)
     {
@@ -3741,13 +4126,111 @@ ST_FUNC void tcc_pragma_diagnostic(TCCState *s1, int action, const char *option,
         continue;
       if (group && !(q->flags & WD_UNUSED))
         continue;
+      if (s1->strict_lifetime && (q->flags & WD_STRICT))
+        continue; /* an error outside unsafe { }, off inside: no group moves it */
       *((unsigned char *)s1 + q->offset) = value;
     }
     unused_options_changed(s1);
+    s1->nb_diag_pragmas++;
     if ((s1->warn_tautological_compare | s1->warn_sizeof_pointer_memaccess) & WARN_ON)
       fe_tokfp_on = 1; /* the operand hash from here on */
   }
   diag_record(s1, file, line);
+}
+
+/* yasc `unsafe { ... }` / `unsafe(expr)`: the way past strict lifetimes.
+   -Wlifetime and -Wimplicit-move (and the yasc ownership rules said under
+   it) are off from LINE of FILE to the region's end -- now, for what the
+   parse says, and recorded by line for the flow checks, which report after
+   the body.  By lines: what else is on the first and the last line goes with
+   it.  The records carry the options the file has at those lines, not the
+   live ones: a body is parsed later at -O1+ (diag_state_at takes the closest
+   record at or before a line). */
+static void diag_w_strict_off(unsigned char *w)
+{
+  for (const FlagDef *p = options_W; p->name; ++p)
+    if (p->flags & WD_STRICT)
+      w[p->offset - offsetof(TCCState, warn_none)] = 0;
+}
+
+static void unsafe_record(TCCState *s1, const char *file, int line, int off)
+{
+  unsigned char w[DIAG_SNAP_SIZE];
+  const int kind = off ? DIAG_UNSAFE_OFF : DIAG_UNSAFE_ON;
+  memcpy(w, diag_state_at_ex(s1, file, line, 1), DIAG_W_SIZE);
+  if (off)
+    diag_w_strict_off(w);
+  /* the same edge again (the inliner replays the body at each call site):
+     one record, or the records grow with the calls */
+  const char *name = tcc_filename_intern(file);
+  for (int i = s1->nb_diag_snaps; i-- > 0;)
+  {
+    DiagSnap *d = &s1->diag_snaps[i];
+    if (d->unsafe == kind && d->line == line && d->file == name)
+    {
+      memmove(d->w, w, DIAG_W_SIZE);
+      return;
+    }
+  }
+  diag_record_w(s1, file, line, w)->unsafe = kind;
+}
+
+/* the strict options (WD_STRICT), saved / restored / turned off now */
+static void unsafe_live(TCCState *s1, int what)
+{
+  int k = 0;
+  for (const FlagDef *p = options_W; p->name; ++p)
+    if ((p->flags & WD_STRICT) && k < (int)sizeof s1->unsafe_saved)
+    {
+      unsigned char *f = (unsigned char *)s1 + p->offset;
+      if (what == 0)
+        s1->unsafe_saved[k] = *f;
+      else if (what == 1)
+        *f = s1->unsafe_saved[k];
+      else
+        *f = 0;
+      k++;
+    }
+}
+
+ST_FUNC void tcc_unsafe_begin(TCCState *s1, const char *file, int line)
+{
+  if (!s1->nb_diag_snaps)
+    diag_record(s1, NULL, 0); /* the command line's, before the first change */
+  if (!s1->unsafe_depth++)
+    unsafe_live(s1, 0);
+  unsafe_live(s1, 2);
+  if (file && line)
+  {
+    unsafe_record(s1, file, line, 1);
+    /* -funsafe-report: each region once, however often its body is parsed */
+    if (s1->unsafe_report &&
+        diag_once_set(s1, diag_once_hash(0x5afe, 0, tcc_filename_intern(file), line, NULL), 1))
+      fprintf(stderr, "%s:%d: note: unsafe region\n", file, line);
+  }
+}
+
+/* LINE: the first line after the region */
+ST_FUNC void tcc_unsafe_end(TCCState *s1, const char *file, int line)
+{
+  if (!s1->unsafe_depth)
+    return;
+  if (!--s1->unsafe_depth)
+    unsafe_live(s1, 1);
+  if (file && line)
+    unsafe_record(s1, file, line, s1->unsafe_depth > 0);
+}
+
+/* an error recovered from inside a region: its end was not parsed, so the
+   region ends where the parse goes on (FILE, LINE) */
+ST_FUNC void tcc_unsafe_reset(TCCState *s1, const char *file, int line)
+{
+  if (!s1->unsafe_depth)
+    return;
+  unsafe_live(s1, 1);
+  s1->unsafe_depth = 0;
+  if (file && line)
+    unsafe_record(s1, file, line, 0);
 }
 
 /* -Wframe-larger-than=N, -Wstack-usage=N (also after -Werror=), and their

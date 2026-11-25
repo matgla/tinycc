@@ -54,10 +54,14 @@
  * TS_MAX_ENT summary entries (more fall back to whole objects), no walk
  * whose state passes TF_MAX_STATE bytes.
  *
- * Not followed: other units, memory through pointers of unknown origin,
- * indirect calls, scanf %s buffers, struct copies made by a helper call
- * (`s = *p` of a large struct), what a summary writes through a parameter
- * past the first TM_NPARAM.
+ * Also: scanf, fscanf and sscanf fill their %s, %[ and %c arguments; a call
+ * through a pointer takes the join of the summaries of the functions of its
+ * type whose address is taken; and across units, at the link (see "Across
+ * units" below).
+ *
+ * Not followed: memory through pointers of unknown origin, struct copies
+ * made by a helper call (`s = *p` of a large struct), what a summary writes
+ * through a parameter past the first TM_NPARAM.
  */
 
 #define USING_GLOBALS
@@ -81,7 +85,10 @@ struct IRTaintCall
   int callee;         /* token, or 0 */
   uint32_t taint_arg; /* what argument k points to is untrusted after it */
   unsigned char taint_ret, fmt_idx, noted;
+  unsigned char scan; /* scanf & co: the format (from 1); taint_arg comes from it */
   signed char copy_dst, copy_src; /* memcpy & co: what src points to goes where dst points */
+  signed char fill_from;          /* taint_arg's bytes: argument k's (sscanf), -1 untrusted */
+  int shape;                      /* a call through a pointer: its calling shape (taint_shape) */
 };
 
 /* an inline expansion (outermost), a call for the summaries */
@@ -90,6 +97,8 @@ struct IRTaintInl
   int callee, end, ret_vreg, nparams, line;
   int32_t pvreg[TM_NPARAM], pfo[TM_NPARAM]; /* the parameter's vreg, else its frame offset (1: none) */
 };
+
+static int taint_shape(Sym *ftype);
 
 int tcc_ir_taint_active(void)
 {
@@ -107,8 +116,9 @@ static const struct
 {
   const char *name;
   /* result untrusted; argument filled (from 0, -1 none); format (from 1, 0
-     none); copy into dst from src (from 0, -1 none) */
-  signed char ret, arg, fmt, dst, src;
+     none); copy into dst from src (from 0, -1 none); a scanf format (from
+     1, 0 none) and what it reads from (the argument, from 0; -1 untrusted) */
+  signed char ret, arg, fmt, dst, src, scan, from;
 } taint_known[] = {
     {"getenv", 1, -1, 0, -1, -1},    {"secure_getenv", 1, -1, 0, -1, -1}, {"fgets", 0, 0, 0, -1, -1},
     {"gets", 0, 0, 0, -1, -1},       {"fread", 0, 0, 0, -1, -1},          {"read", 0, 1, 0, -1, -1},
@@ -122,13 +132,14 @@ static const struct
     {"stpcpy", 0, -1, 0, 0, 1},      {"strcat", 0, -1, 0, 0, 1},          {"strncat", 0, -1, 0, 0, 1},
     {"strlcpy", 0, -1, 0, 0, 1},     {"strlcat", 0, -1, 0, 0, 1},         {"strdup", 0, -1, 0, -1, 0},
     {"strndup", 0, -1, 0, -1, 0},
+    {"scanf", 0, -1, 0, -1, -1, 1, -1},  {"fscanf", 0, -1, 0, -1, -1, 2, -1}, {"sscanf", 0, -1, 0, -1, -1, 2, 0},
 };
 
-void tcc_ir_taint_note_call(TCCIRState *ir, int call_id, Sym *callee)
+void tcc_ir_taint_note_call(TCCIRState *ir, int call_id, Sym *callee, Sym *ftype)
 {
   struct IRTaintCall *c;
   const SymLocalFacts *f;
-  if (call_id < 0 || !callee || tcc_state->in_inline_expansion)
+  if (call_id < 0 || (!callee && !ftype) || tcc_state->in_inline_expansion)
     return;
   if (call_id >= ir->taint_nb_calls)
   {
@@ -138,8 +149,14 @@ void tcc_ir_taint_note_call(TCCIRState *ir, int call_id, Sym *callee)
     ir->taint_nb_calls = n;
   }
   c = &ir->taint_calls[call_id];
+  if (!callee)
+  {
+    /* through a pointer: the functions of its shape whose address is taken */
+    c->shape = taint_shape(ftype);
+    return;
+  }
   c->callee = callee->v;
-  c->copy_dst = c->copy_src = -1;
+  c->copy_dst = c->copy_src = c->fill_from = -1;
   f = callee->a.attr_facts ? sym_facts_peek(callee) : NULL;
   if (f)
   {
@@ -159,11 +176,13 @@ void tcc_ir_taint_note_call(TCCIRState *ir, int call_id, Sym *callee)
         c->fmt_idx = taint_known[i].fmt;
         c->copy_dst = taint_known[i].dst;
         c->copy_src = taint_known[i].src;
+        c->scan = taint_known[i].scan;
+        c->fill_from = taint_known[i].scan ? taint_known[i].from : -1;
         break;
       }
   }
-  c->noted = c->taint_ret || c->taint_arg || c->fmt_idx || c->copy_src >= 0;
-  if (c->taint_ret || c->taint_arg)
+  c->noted = c->taint_ret || c->taint_arg || c->fmt_idx || c->copy_src >= 0 || c->scan;
+  if (c->taint_ret || c->taint_arg || (c->scan && c->fill_from < 0))
     ir->taint_sources = 1;
 }
 
@@ -291,10 +310,11 @@ typedef struct TArg
 typedef struct TCall
 {
   int callee, arg0, nargs, pos; /* pos: an inline expansion's end, else -1 */
+  int shape;                    /* through a pointer: its calling shape */
   TOp ret;                      /* an inline expansion's result variable */
   uint32_t taint_arg;
-  uint8_t taint_ret, fmt_idx, noted, line_set;
-  int8_t copy_dst, copy_src;
+  uint8_t taint_ret, fmt_idx, noted, scan; /* scan: scanf & co, the format (from 1), while encoding */
+  int8_t copy_dst, copy_src, fill_from;
   int line;
 } TCall;
 
@@ -303,13 +323,13 @@ typedef struct TEnt
 {
   uint8_t fill, m; /* fill: from off on (else the path at off) */
   int8_t param;    /* the parameter whose pointee it is, -1: the global */
-  Sym *g;
+  const void *g; /* the global: its Sym, at the link its name (interned) */
   int32_t off;
 } TEnt;
 
 typedef struct TaintSum
 {
-  int tok;
+  int tok, unit;
   uint8_t ret, sinkp;
   uint8_t pw[TM_NPARAM];
   int sink_line[TM_NPARAM], sink_tok[TM_NPARAM];
@@ -323,7 +343,7 @@ typedef struct TLoc
   int8_t bk;  /* BK_* */
   uint8_t lb; /* off is a lower bound: somewhere from there on */
   int32_t id, off; /* off TF_OFF_ANY: not known */
-  Sym *g;
+  const void *g; /* the global: its Sym, at the link its name (interned) */
 } TLoc;
 
 enum
@@ -339,11 +359,12 @@ typedef struct TaintFn
 {
   struct TaintFn *next;
   int tok, line, rank;
+  int unit; /* at the link: the unit it is from (its records' number) */
   const char *file;
   int n, nb, nvar, nparam, ntemp, nfobj, nglob, ncalls, nargs, argv_slot, ninl;
   TIns *ins;
   int *bstart, *bend, *bsucc0, *bsucc, *rpo, nrpo;
-  Sym **glob;
+  const void **glob; /* Sym *, at the link names (interned) */
   TCall *calls;
   TArg *args;
   int *inl; /* the inline expansions' calls, by end */
@@ -366,7 +387,172 @@ static struct
     int line, tok;
   } * said;
   int nsaid;
+  /* the function types (-Wcross-tu's text) of the calls through pointers
+     and of the functions whose address is taken, interned (id: index + 1) */
+  char **shapes;
+  int nshapes;
+  unsigned char *shape_open; /* per shape: it has no prototype ("int ()") */
+  /* the functions whose address is taken: what a call through a pointer of
+     their shape may reach */
+  struct
+  {
+    int tok, shape;
+  } * taken;
+  int ntaken;
+  /* the link (tcc_taint_link_check): the units' functions together; names
+     (functions, globals, files) interned, an id is 1 + the index */
+  int link;
+  TCCState *s1; /* the link's (tcc_state is set only while it reports) */
+  char **names;
+  int nnames, *nhash, ncap;
 } tu;
+
+static unsigned str_hash(const char *s)
+{
+  unsigned h = 2166136261u;
+  for (; *s; s++)
+    h = (h ^ (unsigned char)*s) * 16777619u;
+  return h;
+}
+
+/* an open hash of strings (ids 1 + index) */
+static int strtab_id(char ***tab, int *n, int **hash, int *cap, const char *str)
+{
+  unsigned h;
+  if (2 * (*n + 1) > *cap)
+  {
+    *cap = *cap ? 2 * *cap : 256;
+    tcc_free(*hash);
+    *hash = tcc_mallocz(*cap * sizeof(int));
+    for (int i = 0; i < *n; i++)
+    {
+      for (h = str_hash((*tab)[i]) & (*cap - 1); (*hash)[h]; h = (h + 1) & (*cap - 1))
+        ;
+      (*hash)[h] = i + 1;
+    }
+  }
+  for (h = str_hash(str) & (*cap - 1); (*hash)[h]; h = (h + 1) & (*cap - 1))
+    if (!strcmp((*tab)[(*hash)[h] - 1], str))
+      return (*hash)[h];
+  dynarray_add(tab, n, tcc_strdup(str));
+  (*hash)[h] = *n;
+  return *n;
+}
+
+/* a name (a function, global or file) as an id: 1 + its index in tu.names */
+static int lk_id(const char *str)
+{
+  if (!str[0])
+    return 0;
+  return strtab_id(&tu.names, &tu.nnames, &tu.nhash, &tu.ncap, str);
+}
+
+/* ... and the interned string: a global's identity, a file's */
+static const char *lk_str(int id)
+{
+  return id > 0 && id <= tu.nnames ? tu.names[id - 1] : "";
+}
+
+static int shape_intern(const char *str)
+{
+  for (int i = 0; i < tu.nshapes; i++)
+    if (!strcmp(tu.shapes[i], str))
+      return i + 1;
+  dynarray_add(&tu.shapes, &tu.nshapes, tcc_strdup(str));
+  tu.shape_open = tcc_realloc(tu.shape_open, tu.nshapes);
+  {
+    size_t len = strlen(str);
+    tu.shape_open[tu.nshapes - 1] = len > 3 && !strcmp(str + len - 3, " ()") && !memchr(str, '(', len - 3);
+  }
+  return tu.nshapes;
+}
+
+static int taint_shape(Sym *ftype)
+{
+  char buf[512];
+  CType t;
+  if (!ftype)
+    return 0;
+  t.t = VT_FUNC;
+  t.ref = ftype;
+  tcc_typesig_type(buf, sizeof buf, &t);
+  return shape_intern(buf);
+}
+
+/* a call through a pointer of type A may reach a function of type B: the
+   same (as -Wcross-tu writes them), or one of them without a prototype
+   ("int ()") and the same result */
+static int shape_match(int a, int b)
+{
+  const char *x, *y;
+  size_t lx, ly;
+  if (a == b)
+    return 1;
+  if (!a || !b || !(tu.shape_open[a - 1] | tu.shape_open[b - 1]))
+    return 0;
+  x = tu.shapes[a - 1], y = tu.shapes[b - 1];
+  lx = strlen(x), ly = strlen(y);
+  if (lx > 3 && !strcmp(x + lx - 3, " ()") && ly > lx && !strncmp(x, y, lx - 1) && y[ly - 1] == ')')
+    return !memchr(x, '(', lx - 3);
+  if (ly > 3 && !strcmp(y + ly - 3, " ()") && lx > ly && !strncmp(y, x, ly - 1) && x[lx - 1] == ')')
+    return !memchr(y, '(', ly - 3);
+  return 0;
+}
+
+static void taken_add(int tok, int shape)
+{
+  for (int i = 0; i < tu.ntaken; i++)
+    if (tu.taken[i].tok == tok)
+      return;
+  if (!(tu.ntaken & (tu.ntaken - 1)))
+    tu.taken = tcc_realloc(tu.taken, (tu.ntaken ? 2 * tu.ntaken : 8) * sizeof *tu.taken);
+  tu.taken[tu.ntaken].tok = tok;
+  tu.taken[tu.ntaken].shape = shape;
+  tu.ntaken++;
+}
+
+/* OP names a function other than as a call's callee: its address is taken */
+static void taken_op(TCCIRState *ir, IROperand op)
+{
+  IRPoolSymref *r;
+  if (irop_get_tag(op) != IROP_TAG_SYMREF || !(r = irop_get_symref_ex(ir, op)) || !r->sym ||
+      (r->sym->type.t & VT_BTYPE) != VT_FUNC || (r->sym->v & (SYM_STRUCT | SYM_FIELD)) ||
+      r->sym->v >= SYM_FIRST_ANOM)
+    return;
+  taken_add(r->sym->v, taint_shape(r->sym->type.ref));
+}
+
+/* the functions an initializer stores the address of (a table of handlers):
+   the data sections' relocations, -O does not change them */
+static void taken_data(TCCState *s1)
+{
+  Section *symtab = symtab_section;
+  int nsyms;
+  unsigned char *seen;
+  if (!symtab || !symtab->data)
+    return;
+  nsyms = (int)(symtab->data_offset / sizeof(ElfW(Sym)));
+  seen = tcc_mallocz(nsyms + 1);
+  for (int i = 1; i < s1->nb_sections; i++)
+  {
+    Section *sec = s1->sections[i], *sr = sec ? sec->reloc : NULL;
+    if (!sr || !sr->data || !(sec->sh_flags & SHF_ALLOC) || (sec->sh_flags & SHF_EXECINSTR) ||
+        sec->sh_type == SHT_ARM_EXIDX || !strcmp(sec->name, ".eh_frame"))
+      continue;
+    for (size_t off = 0; off + sizeof(ElfW_Rel) <= sr->data_offset; off += sizeof(ElfW_Rel))
+    {
+      const ElfW_Rel *rel = (const ElfW_Rel *)(sr->data + off);
+      int si = ELFW(R_SYM)(rel->r_info);
+      if (si > 0 && si < nsyms)
+        seen[si] = 1;
+    }
+  }
+  for (Sym *s = global_stack; s; s = s->prev)
+    if ((s->type.t & VT_BTYPE) == VT_FUNC && !(s->v & (SYM_STRUCT | SYM_FIELD)) && s->v < SYM_FIRST_ANOM &&
+        (s->r & VT_SYM) && s->c > 0 && s->c < nsyms && seen[s->c])
+      taken_add(s->v, taint_shape(s->type.ref));
+  tcc_free(seen);
+}
 
 static TaintSum *tu_sum(int tok, int create)
 {
@@ -429,6 +615,11 @@ void tcc_ir_taint_unit_free(void)
     tcc_free(tu.sums[i]);
   tcc_free(tu.sums);
   tcc_free(tu.said);
+  dynarray_reset(&tu.shapes, &tu.nshapes);
+  tcc_free(tu.shape_open);
+  tcc_free(tu.taken);
+  dynarray_reset(&tu.names, &tu.nnames);
+  tcc_free(tu.nhash);
   memset(&tu, 0, sizeof tu);
 }
 
@@ -439,20 +630,41 @@ typedef struct TEnc
   TCCIRState *ir;
   TaintFn *f;
   int globcap;
+  Sym **gsym; /* the globals' symbols, while the function is encoded */
 } TEnc;
+
+/* a global's identity: its name (interned), and for the unit's own one (a
+   static, a string literal) also its ELF symbol's index -- so the same at the
+   link, and a block's static gone with its scope is not mistaken for another */
+static const void *glob_key(Sym *s)
+{
+  const char *name = s->v < SYM_FIRST_ANOM ? get_tok_str(s->v, NULL) : "";
+  int nsyms = (int)(symtab_section->data_offset / sizeof(ElfSym));
+  char buf[300];
+  if (!(s->type.t & VT_STATIC) && name[0])
+    pstrcpy(buf, sizeof buf, name);
+  else if (s->c > 0 && s->c < nsyms)
+    snprintf(buf, sizeof buf, "%s\x01%d", name, (int)s->c);
+  else
+    snprintf(buf, sizeof buf, "%s\x01p%p", name, (void *)s);
+  return lk_str(lk_id(buf));
+}
 
 static int tf_glob(TEnc *e, Sym *s)
 {
   TaintFn *f = e->f;
+  const void *g = glob_key(s);
   for (int i = 0; i < f->nglob; i++)
-    if (f->glob[i] == s)
+    if (f->glob[i] == g)
       return i;
   if (f->nglob >= e->globcap)
   {
     e->globcap = e->globcap ? 2 * e->globcap : 8;
-    f->glob = tcc_realloc(f->glob, e->globcap * sizeof(Sym *));
+    f->glob = tcc_realloc(f->glob, e->globcap * sizeof *f->glob);
+    e->gsym = tcc_realloc(e->gsym, e->globcap * sizeof *e->gsym);
   }
-  f->glob[f->nglob] = s;
+  e->gsym[f->nglob] = s;
+  f->glob[f->nglob] = g;
   return f->nglob++;
 }
 
@@ -557,6 +769,75 @@ static int tf_is_call(int op)
   return op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID;
 }
 
+/* the bytes of the string literal OP's address points to, else NULL */
+static const char *tf_literal(TEnc *e, TOp op, int *len)
+{
+  ElfSym *es;
+  Section *sec;
+  Sym *s;
+  if (op.kind != TK_GLOBAL || op.lval || !(s = e->gsym[op.id]) || !(s->type.t & VT_STATIC) || !(es = elfsym(s)))
+    return NULL;
+  if (es->st_shndx == SHN_UNDEF || es->st_shndx >= SHN_LORESERVE || es->st_shndx >= tcc_state->nb_sections)
+    return NULL;
+  sec = tcc_state->sections[es->st_shndx];
+  if (!sec || !sec->data || sec->sh_type == SHT_NOBITS || es->st_value + op.off >= sec->data_offset)
+    return NULL;
+  *len = (int)(sec->data_offset - (es->st_value + op.off));
+  return (const char *)sec->data + es->st_value + op.off;
+}
+
+/* the arguments (bit k: argument k, from 0) a scanf format FMT fills with
+   text -- %s, %[...] and %c, not suppressed with '*' -- the first one
+   FIRST; every argument from FIRST on when the format is not a literal or
+   numbers its operands */
+static uint32_t scan_text_args(TEnc *e, TOp fmt, int first)
+{
+  int len = 0, arg = first;
+  const char *p = tf_literal(e, fmt, &len), *end = p + len;
+  uint32_t m = 0;
+  if (!p)
+    return first < 32 ? ~0u << first : 0;
+  while (p < end && *p)
+  {
+    int suppress = 0;
+    char c;
+    if (*p++ != '%')
+      continue;
+    if (p < end && *p == '%')
+    {
+      p++;
+      continue;
+    }
+    if (p < end && *p == '*')
+      suppress = 1, p++;
+    while (p < end && *p >= '0' && *p <= '9')
+      p++;
+    if (p < end && *p == '$')
+      return first < 32 ? ~0u << first : 0;
+    while (p < end && *p && strchr("mhlLqjzt", *p))
+      p++;
+    if (p >= end || !(c = *p++))
+      break;
+    if (c == '[')
+    {
+      if (p < end && *p == '^')
+        p++;
+      if (p < end && *p == ']')
+        p++;
+      while (p < end && *p && *p != ']')
+        p++;
+      if (p < end && *p)
+        p++;
+    }
+    if (suppress)
+      continue;
+    if ((c == 's' || c == '[' || c == 'c' || c == 'S' || c == 'C') && arg < 32)
+      m |= 1u << arg;
+    arg++;
+  }
+  return m;
+}
+
 /* the function's raw IR in compact form; NULL when there is nothing to keep */
 static TaintFn *tf_encode(TCCIRState *ir, Sym *func, size_t *bytes)
 {
@@ -585,9 +866,18 @@ static TaintFn *tf_encode(TCCIRState *ir, Sym *func, size_t *bytes)
     if (cfgq->has_dest)
       tf_scan_vreg(f, irop_get_vreg(tcc_ir_op_get_dest(ir, q)));
     if (cfgq->has_src1)
-      tf_scan_vreg(f, irop_get_vreg(tcc_ir_op_get_src1(ir, q)));
+    {
+      IROperand a = tcc_ir_op_get_src1(ir, q);
+      tf_scan_vreg(f, irop_get_vreg(a));
+      if (!tf_is_call(q->op))
+        taken_op(ir, a);
+    }
     if (cfgq->has_src2 && q->op != TCCIR_OP_FUNCPARAMVAL && !tf_is_call(q->op))
-      tf_scan_vreg(f, irop_get_vreg(tcc_ir_op_get_src2(ir, q)));
+    {
+      IROperand b = tcc_ir_op_get_src2(ir, q);
+      tf_scan_vreg(f, irop_get_vreg(b));
+      taken_op(ir, b);
+    }
     if (q->op == TCCIR_OP_FUNCPARAMVAL || tf_is_call(q->op))
     {
       int id = tf_call_id(ir, q, NULL);
@@ -641,12 +931,13 @@ static TaintFn *tf_encode(TCCIRState *ir, Sym *func, size_t *bytes)
         k->arg0 = nargs;
         k->nargs = na[id];
         k->pos = -1;
-        k->copy_dst = k->copy_src = -1;
+        k->copy_dst = k->copy_src = k->fill_from = -1;
         nargs += na[id];
         if (id < ir->taint_nb_calls)
         {
           struct IRTaintCall *t = &ir->taint_calls[id];
           k->callee = t->callee;
+          k->shape = t->shape;
           if (t->noted)
           {
             k->noted = 1;
@@ -655,6 +946,11 @@ static TaintFn *tf_encode(TCCIRState *ir, Sym *func, size_t *bytes)
             k->fmt_idx = t->fmt_idx;
             k->copy_dst = t->copy_dst;
             k->copy_src = t->copy_src;
+            k->fill_from = t->fill_from;
+            /* scanf & co: the text conversions' arguments, after the
+               instructions (their format argument) */
+            if (t->scan)
+              k->taint_arg = 0, k->scan = t->scan;
           }
         }
       }
@@ -665,7 +961,7 @@ static TaintFn *tf_encode(TCCIRState *ir, Sym *func, size_t *bytes)
       k->arg0 = nargs;
       k->nargs = ir->taint_inl[x].nparams;
       k->pos = ir->taint_inl[x].end >= 0 ? ir->taint_inl[x].end : n;
-      k->copy_dst = k->copy_src = -1;
+      k->copy_dst = k->copy_src = k->fill_from = -1;
       k->line = ir->taint_inl[x].line;
       if (ir->taint_inl[x].ret_vreg >= 0)
         k->ret = tf_vreg(&e, ir->taint_inl[x].ret_vreg, 0);
@@ -777,6 +1073,16 @@ static TaintFn *tf_encode(TCCIRState *ir, Sym *func, size_t *bytes)
     }
   }
   tcc_free(cmap);
+  /* scanf & co: what the format fills with text */
+  for (int x = 0; x < ncalls; x++)
+    if (f->calls[x].scan)
+    {
+      TCall *k = &f->calls[x];
+      int fi = k->scan - 1;
+      k->scan = 0;
+      k->taint_arg = fi < k->nargs ? scan_text_args(&e, f->args[k->arg0 + fi].op, fi + 1) : 0;
+    }
+  tcc_free(e.gsym);
   /* the CFG */
   if (!(cfg = tcc_ir_cfg_build(ir)))
   {
@@ -809,7 +1115,7 @@ static TaintFn *tf_encode(TCCIRState *ir, Sym *func, size_t *bytes)
   memcpy(f->rpo, cfg->rpo_order, f->nrpo * sizeof(int));
   tcc_ir_cfg_free(cfg);
   *bytes = sizeof *f + n * sizeof(TIns) + (size_t)f->ncalls * sizeof(TCall) + (size_t)nargs * sizeof(TArg) +
-           (size_t)(4 * f->nb + f->bsucc0[f->nb] + f->nrpo) * sizeof(int) + f->nglob * sizeof(Sym *) +
+           (size_t)(4 * f->nb + f->bsucc0[f->nb] + f->nrpo) * sizeof(int) + f->nglob * sizeof *f->glob +
            (size_t)(f->ntemp + f->nvar + f->nparam) * sizeof(TLoc);
   return f;
 }
@@ -822,7 +1128,7 @@ static TLoc tl_none(void)
   return l;
 }
 
-static TLoc tl_make(int bk, int32_t id, int32_t off, Sym *g)
+static TLoc tl_make(int bk, int32_t id, int32_t off, const void *g)
 {
   TLoc l = {(int8_t)bk, 0, id, off, g};
   return l;
@@ -1152,13 +1458,22 @@ static void def(TCtx *c, TOp d, uint8_t m, TLoc l)
 
 static const char *tok_copy(int tok, char *buf, size_t n)
 {
+  if (tu.link)
+  {
+    /* a unit's own (a static): its name, without what tells it apart */
+    const char *name = tok > 0 && tok <= tu.nnames ? tu.names[tok - 1] : "";
+    snprintf(buf, n, "%.*s", (int)strcspn(name, "\x01"), name);
+    return buf;
+  }
   pstrcpy(buf, n, get_tok_str(tok, NULL));
   return buf;
 }
 
-static void taint_report(TCtx *c, const char *file, int line, int sink, int via, int call_line)
+static void link_report(TCtx *c, const char *file, int line, const char *name, int via, int call_line, int indirect);
+
+static void taint_report(TCtx *c, const char *file, int line, int sink, int via, int call_line, int indirect)
 {
-  TCCState *s1 = tcc_state;
+  TCCState *s1 = tu.link ? tu.s1 : tcc_state;
   const char *saved = s1->diag_replay_file;
   char name[128], vname[128], fname[128];
   for (int i = 0; i < tu.nsaid; i++)
@@ -1169,6 +1484,11 @@ static void taint_report(TCtx *c, const char *file, int line, int sink, int via,
   tu.said[tu.nsaid].file = file, tu.said[tu.nsaid].line = line, tu.said[tu.nsaid].tok = sink;
   tu.nsaid++;
   tok_copy(sink, name, sizeof name);
+  if (tu.link)
+  {
+    link_report(c, file, line, name, via, call_line, indirect);
+    return;
+  }
   s1->diag_replay_file = file;
   tcc_warning_once_at(warn_tainted_format, line, "the format of '%s' comes from untrusted input: write %s(\"%%s\", ...)",
                       name, name);
@@ -1177,16 +1497,20 @@ static void taint_report(TCtx *c, const char *file, int line, int sink, int via,
     s1->diag_replay_file = c->f->file;
     tok_copy(via, vname, sizeof vname);
     tok_copy(c->f->tok, fname, sizeof fname);
-    tcc_note("%i:untrusted input reaches it through the call to '%s' in '%s'", call_line, vname, fname);
+    if (indirect)
+      tcc_note("%i:untrusted input reaches it through a call through a pointer in '%s', which may call '%s'",
+               call_line, fname, vname);
+    else
+      tcc_note("%i:untrusted input reaches it through the call to '%s' in '%s'", call_line, vname, fname);
   }
   s1->diag_replay_file = saved;
 }
 
 /* a format argument with mask m */
-static void sink_hit(TCtx *c, uint8_t m, const char *file, int line, int sink, int via, int call_line)
+static void sink_hit(TCtx *c, uint8_t m, const char *file, int line, int sink, int via, int call_line, int indirect)
 {
   if ((m & TM_SRC) && c->report)
-    taint_report(c, file, line, sink, via, call_line);
+    taint_report(c, file, line, sink, via, call_line, indirect);
   if (!c->final)
     return;
   for (int j = 0; j < TM_NPARAM; j++)
@@ -1209,6 +1533,36 @@ static uint8_t sum_map(uint8_t m, const uint8_t *argm, int nargs)
   return r;
 }
 
+/* a callee's summary S applied at the call K (arguments' masks ARGM):
+   what it leaves in memory, its sinks; its result's mask */
+static uint8_t apply_sum(TCtx *c, const TCall *k, const TaintSum *s, const uint8_t *argm, int indirect)
+{
+  const TArg *args = c->f->args + k->arg0;
+  int nargs = k->nargs < TF_MAX_ARGS ? k->nargs : TF_MAX_ARGS;
+  for (int j = 0; j < TM_NPARAM && j < nargs; j++)
+  {
+    if (s->pw[j])
+      op_fill(c, args[j].op, sum_map(s->pw[j], argm, nargs), 0, 1);
+    if (s->sinkp & (1u << j))
+      sink_hit(c, argm[j], s->sink_file[j], s->sink_line[j], s->sink_tok[j], s->tok, k->line, indirect);
+  }
+  for (int e = 0; e < s->nent; e++)
+  {
+    const TEnt *x = &s->ent[e];
+    uint8_t m = sum_map(x->m, argm, nargs);
+    if (!m)
+      continue;
+    if (x->param >= 0)
+    {
+      if (x->param < nargs)
+        op_fill(c, args[x->param].op, m, x->off, x->fill);
+    }
+    else
+      mem_write(c, tl_make(BK_GLOBAL, 0, x->off, x->g), m, x->fill);
+  }
+  return sum_map(s->ret, argm, nargs);
+}
+
 static void do_call(TCtx *c, const TCall *k, TOp d)
 {
   TaintFn *f = c->f;
@@ -1221,12 +1575,12 @@ static void do_call(TCtx *c, const TCall *k, TOp d)
   if (k->noted)
   {
     if (k->fmt_idx && k->fmt_idx <= k->nargs)
-      sink_hit(c, argm[k->fmt_idx - 1], f->file, args[k->fmt_idx - 1].line, k->callee, 0, 0);
+      sink_hit(c, argm[k->fmt_idx - 1], f->file, args[k->fmt_idx - 1].line, k->callee, 0, 0, 0);
     if (k->taint_ret)
       ret |= TM_SRC;
     for (int j = 0; j < k->nargs && j < 32; j++)
       if ((k->taint_arg >> j) & 1)
-        op_fill(c, args[j].op, TM_SRC, 0, 1);
+        op_fill(c, args[j].op, k->fill_from >= 0 && k->fill_from < k->nargs ? argm[k->fill_from] : TM_SRC, 0, 1);
     if (k->copy_src >= 0 && k->copy_src < k->nargs)
     {
       if (k->copy_dst >= 0 && k->copy_dst < k->nargs)
@@ -1238,30 +1592,14 @@ static void do_call(TCtx *c, const TCall *k, TOp d)
     }
   }
   else if ((s = tu_sum(k->callee, 0)) != NULL)
+    ret |= apply_sum(c, k, s, argm, 0);
+  else if (!k->callee && k->shape)
   {
-    int nargs = k->nargs < TF_MAX_ARGS ? k->nargs : TF_MAX_ARGS;
-    for (int j = 0; j < TM_NPARAM && j < nargs; j++)
-    {
-      if (s->pw[j])
-        op_fill(c, args[j].op, sum_map(s->pw[j], argm, nargs), 0, 1);
-      if (s->sinkp & (1u << j))
-        sink_hit(c, argm[j], s->sink_file[j], s->sink_line[j], s->sink_tok[j], k->callee, k->line);
-    }
-    for (int e = 0; e < s->nent; e++)
-    {
-      const TEnt *x = &s->ent[e];
-      uint8_t m = sum_map(x->m, argm, nargs);
-      if (!m)
-        continue;
-      if (x->param >= 0)
-      {
-        if (x->param < nargs)
-          op_fill(c, args[x->param].op, m, x->off, x->fill);
-      }
-      else
-        mem_write(c, tl_make(BK_GLOBAL, 0, x->off, x->g), m, x->fill);
-    }
-    ret |= sum_map(s->ret, argm, nargs);
+    /* through a pointer: the join of what the functions of its shape whose
+       address is taken do */
+    for (int i = 0; i < tu.ntaken; i++)
+      if (shape_match(k->shape, tu.taken[i].shape) && (s = tu_sum(tu.taken[i].tok, 0)) != NULL)
+        ret |= apply_sum(c, k, s, argm, 1);
   }
   if (k->pos >= 0)
   {
@@ -1273,7 +1611,7 @@ static void do_call(TCtx *c, const TCall *k, TOp d)
   def(c, d, ret, none);
 }
 
-static void sum_ent(TaintSum *s, int param, Sym *g, int32_t off, int fill, uint8_t m)
+static void sum_ent(TaintSum *s, int param, const void *g, int32_t off, int fill, uint8_t m)
 {
   if (!m)
     return;
@@ -1413,7 +1751,7 @@ static void tf_run(TaintFn *f, int report)
       e0[f->argv_slot] |= TM_SRC;
     reached[f->rpo[0]] = 1;
   }
-  tcc_state->diag_noabort++;
+  (tu.link ? tu.s1 : tcc_state)->diag_noabort++;
   for (c->final = 0; c->final < 2; c->final++)
   {
     c->report = c->final && report;
@@ -1459,10 +1797,10 @@ static void tf_run(TaintFn *f, int report)
         again = 1;
     }
   }
-  tcc_state->diag_noabort--;
+  (tu.link ? tu.s1 : tcc_state)->diag_noabort--;
   /* the summary grows: a caller walked before sees it on the next round */
-  if (!f->sum)
-    f->sum = tu_sum(f->tok, 1);
+  if (!f->sum && (f->sum = tu_sum(f->tok, 1)) != NULL)
+    f->sum->unit = f->unit;
   if (f->sum)
   {
     TaintSum *s = f->sum, *n = &c->ns;
@@ -1513,20 +1851,15 @@ void tcc_ir_taint_check(TCCIRState *ir, Sym *func)
   tu.last = &f->next;
 }
 
-/* End of the unit: the summaries to a fixpoint, then the reports, in the
-   order of the functions' files and lines */
-void tcc_ir_taint_unit_end(void)
+/* The summaries to a fixpoint, then the reports, in the order of the
+   functions' files and lines (at the link: their units', then theirs) */
+static void tu_solve(void)
 {
   int nf = 0, changed = 1;
   TaintFn **v;
-  if (!tu.first || !tu.has_source)
-  {
-    tcc_ir_taint_unit_free();
-    return;
-  }
   for (TaintFn *f = tu.first; f; f = f->next)
     nf++;
-  v = tcc_malloc(nf * sizeof *v);
+  v = tcc_malloc((nf + 1) * sizeof *v);
   nf = 0;
   for (TaintFn *f = tu.first; f; f = f->next)
   {
@@ -1562,5 +1895,632 @@ void tcc_ir_taint_unit_end(void)
   for (int i = 0; i < nf; i++)
     tf_run(v[i], 1);
   tcc_free(v);
+}
+
+static void taint_export(TCCState *s1);
+
+/* End of the unit: the summaries and the reports; the unit's records for a
+   link that looks across units */
+void tcc_ir_taint_unit_end(void)
+{
+  TCCState *s1 = tcc_state;
+  if (!tu.first)
+  {
+    tcc_ir_taint_unit_free();
+    return;
+  }
+  taken_data(s1);
+  if (tu.has_source)
+    tu_solve();
+  if (s1->output_type != TCC_OUTPUT_PREPROCESS && !s1->syntax_only)
+    taint_export(s1);
   tcc_ir_taint_unit_free();
+}
+
+/* ------------------------------------------------------------------------ */
+/* Across units.  With -c the unit's functions go, in their compact form, in
+   the object's non-allocated section ".tcc.taint" (only with
+   -Wtainted-format: objects without it stay byte-identical; `tcc -ar` keeps
+   the section, `-r` concatenates the records); a unit compiled straight into
+   a link hands them to the linker (TCCState.taint_link).  The link with
+   -Wtainted-format reads every unit's, solves the summaries over the whole
+   program -- a call to another unit's function now has its summary, a call
+   through a pointer the program's address-taken functions of its type -- and
+   reports what no unit said by itself: a source in one unit reaching a
+   format in another, at the sink, with a note at the call that crosses.
+
+   A unit's records: "TNT1", the payload's length (4 bytes, little-endian),
+   then the payload in LEB128 numbers (signed ones zigzag) and NUL-ended
+   strings: the string table; the functions (name, file, sizes, globals,
+   instructions, blocks, calls, arguments, inline expansions); the sinks the
+   unit said or keeps quiet (#pragma diagnostic, a system header) -- the
+   link says those never; the functions whose address is taken.  Names: a
+   function or global of the unit's own (static) ends in "\x01" (a global:
+   "\x01" and its symbol's index), and the link adds the unit's number. */
+
+typedef struct TBuf
+{
+  unsigned char *p;
+  size_t n, cap;
+  char **str; /* the string table */
+  int nstr, *shash, scap;
+} TBuf;
+
+static void tb_put(TBuf *b, const void *d, size_t n)
+{
+  if (b->n + n > b->cap)
+  {
+    b->cap = b->cap ? 2 * b->cap : 1024;
+    if (b->cap < b->n + n)
+      b->cap = b->n + n;
+    b->p = tcc_realloc(b->p, b->cap);
+  }
+  memcpy(b->p + b->n, d, n);
+  b->n += n;
+}
+
+static void tb_u(TBuf *b, uint32_t v)
+{
+  unsigned char c;
+  while (v >= 0x80)
+  {
+    c = (unsigned char)(v | 0x80);
+    tb_put(b, &c, 1);
+    v >>= 7;
+  }
+  c = (unsigned char)v;
+  tb_put(b, &c, 1);
+}
+
+static void tb_s(TBuf *b, int32_t v)
+{
+  tb_u(b, ((uint32_t)v << 1) ^ (uint32_t)(v >> 31));
+}
+
+static int tb_str(TBuf *b, const char *str)
+{
+  return strtab_id(&b->str, &b->nstr, &b->shash, &b->scap, str ? str : "");
+}
+
+/* a function's name in the records */
+static int tb_fn(TBuf *b, int tok)
+{
+  Sym *s;
+  char buf[300];
+  if (!tok)
+    return tb_str(b, "");
+  s = sym_find(tok);
+  snprintf(buf, sizeof buf, "%s%s", get_tok_str(tok, NULL), s && (s->type.t & VT_STATIC) ? "\x01" : "");
+  return tb_str(b, buf);
+}
+
+/* an operand: its kind, lval and which of id / off follow (most are 0); a
+   temp's id from the last temp's (*LAST), which is mostly near */
+static void tb_op(TBuf *b, TOp o, int *last)
+{
+  int id = o.kind == TK_TEMP ? o.id - *last : o.id;
+  tb_u(b, o.kind | (o.lval << 3) | (!!id << 4) | (!!o.off << 5));
+  if (id)
+    tb_s(b, id);
+  if (o.off)
+    tb_s(b, o.off);
+  if (o.kind == TK_TEMP)
+    *last = o.id;
+}
+
+static void tb_fun(TBuf *b, TaintFn *f)
+{
+  /* the instructions that do nothing here (a jump, a compare, an argument
+     -- kept in the call's) go: MAP gives the new index of each, and of the
+     end; an inline expansion's end stays */
+  int *map = tcc_malloc((f->n + 1) * sizeof(int)), n = 0;
+  unsigned char *keep = tcc_mallocz(f->n + 1);
+  for (int i = 0; i < f->n; i++)
+    keep[i] = f->ins[i].op != TI_NOP;
+  for (int i = 0; i < f->ncalls; i++)
+    if (f->calls[i].pos >= 0 && f->calls[i].pos < f->n)
+      keep[f->calls[i].pos] = 1;
+  for (int i = 0; i < f->n; i++)
+  {
+    map[i] = n;
+    n += keep[i];
+  }
+  map[f->n] = n;
+  int last = 0;
+  tb_u(b, tb_fn(b, f->tok));
+  tb_u(b, tb_str(b, f->file));
+  tb_s(b, f->line);
+  tb_u(b, n), tb_u(b, f->nb), tb_u(b, f->nvar), tb_u(b, f->nparam), tb_u(b, f->ntemp);
+  tb_u(b, f->nfobj), tb_u(b, f->nglob), tb_u(b, f->ncalls), tb_u(b, f->nargs), tb_u(b, f->ninl);
+  tb_u(b, f->nrpo), tb_s(b, f->argv_slot);
+  for (int i = 0; i < f->nglob; i++)
+    tb_u(b, tb_str(b, f->glob[i]));
+  for (int i = 0, line = f->line; i < f->n; i++)
+  {
+    TIns *t = &f->ins[i];
+    if (!keep[i])
+      continue;
+    /* the line from the instruction before's, when it changes */
+    tb_u(b, t->op | (t->sub << 3) | ((t->line != line) << 6));
+    if (t->line != line)
+      tb_s(b, t->line - line);
+    line = t->line;
+    if (t->op == TI_NOP)
+      continue;
+    if (t->op == TI_CALL)
+      tb_u(b, t->aux);
+    tb_op(b, t->d, &last), tb_op(b, t->a, &last), tb_op(b, t->b, &last);
+  }
+  /* the blocks: each from the end of the one before, its length, its
+     successors and the order, from their neighbours (all mostly near) */
+  for (int i = 0, end = 0; i < f->nb; i++)
+  {
+    tb_s(b, map[f->bstart[i]] - end);
+    tb_u(b, map[f->bend[i]] - map[f->bstart[i]]);
+    tb_u(b, f->bsucc0[i + 1] - f->bsucc0[i]);
+    for (int k = f->bsucc0[i]; k < f->bsucc0[i + 1]; k++)
+      tb_s(b, f->bsucc[k] - i);
+    end = map[f->bend[i]];
+  }
+  for (int i = 0; i < f->nrpo; i++)
+    tb_s(b, f->rpo[i] - (i ? f->rpo[i - 1] : 0));
+  for (int i = 0; i < f->ncalls; i++)
+  {
+    TCall *k = &f->calls[i];
+    tb_u(b, tb_fn(b, k->callee));
+    tb_u(b, k->shape ? tb_str(b, tu.shapes[k->shape - 1]) : 0);
+    tb_u(b, k->arg0), tb_u(b, k->nargs), tb_s(b, k->pos >= 0 ? map[k->pos] : -1);
+    tb_op(b, k->ret, &last);
+    tb_u(b, k->taint_arg);
+    tb_u(b, k->taint_ret | (k->noted << 1));
+    tb_u(b, k->fmt_idx);
+    tb_s(b, k->copy_dst), tb_s(b, k->copy_src), tb_s(b, k->fill_from);
+    tb_s(b, k->line - f->line);
+  }
+  for (int i = 0; i < f->nargs; i++)
+  {
+    tb_op(b, f->args[i].op, &last);
+    tb_s(b, f->args[i].line - f->line);
+  }
+  for (int i = 0; i < f->ninl; i++)
+    tb_u(b, f->inl[i]);
+  tcc_free(map);
+  tcc_free(keep);
+}
+
+static void taint_export(TCCState *s1)
+{
+  TBuf body = {0}, out = {0};
+  int nf = 0, nsaid = tu.nsaid;
+  uint32_t len;
+  for (TaintFn *f = tu.first; f; f = f->next)
+    nf++;
+  /* the sinks no link reports: said here, or quiet here */
+  for (TaintFn *f = tu.first; f; f = f->next)
+    for (int i = 0; i < f->ncalls; i++)
+    {
+      TCall *k = &f->calls[i];
+      int line;
+      if (!k->noted || !k->fmt_idx || k->fmt_idx > k->nargs)
+        continue;
+      line = f->args[k->arg0 + k->fmt_idx - 1].line;
+      if (tcc_warning_shown_at(s1, offsetof(TCCState, warn_tainted_format), f->file, line))
+        continue;
+      if (!(tu.nsaid & (tu.nsaid - 1)))
+        tu.said = tcc_realloc(tu.said, (tu.nsaid ? 2 * tu.nsaid : 8) * sizeof *tu.said);
+      tu.said[tu.nsaid].file = f->file, tu.said[tu.nsaid].line = line, tu.said[tu.nsaid].tok = k->callee;
+      tu.nsaid++;
+    }
+  tb_u(&body, tu.has_source);
+  tb_u(&body, nf);
+  for (TaintFn *f = tu.first; f; f = f->next)
+    tb_fun(&body, f);
+  tb_u(&body, tu.nsaid);
+  for (int i = 0; i < tu.nsaid; i++)
+  {
+    tb_u(&body, tb_str(&body, tu.said[i].file));
+    tb_s(&body, tu.said[i].line);
+    tb_u(&body, tb_fn(&body, tu.said[i].tok));
+  }
+  tb_u(&body, tu.ntaken);
+  for (int i = 0; i < tu.ntaken; i++)
+  {
+    tb_u(&body, tb_fn(&body, tu.taken[i].tok));
+    tb_u(&body, tu.taken[i].shape ? tb_str(&body, tu.shapes[tu.taken[i].shape - 1]) : 0);
+  }
+  tu.nsaid = nsaid;
+  /* the string table goes first */
+  tb_put(&out, "TNT1\0\0\0\0", 8);
+  tb_u(&out, body.nstr);
+  for (int i = 0; i < body.nstr; i++)
+    tb_put(&out, body.str[i], strlen(body.str[i]) + 1);
+  tb_put(&out, body.p, body.n);
+  len = (uint32_t)(out.n - 8);
+  for (int i = 0; i < 4; i++)
+    out.p[4 + i] = (unsigned char)(len >> (8 * i));
+  if (s1->output_type == TCC_OUTPUT_OBJ)
+  {
+    Section *sec = new_section(s1, ".tcc.taint", SHT_PROGBITS, 0);
+    sec->sh_addralign = 1; /* `-r` concatenates them: no padding */
+    memcpy(section_ptr_add(sec, out.n), out.p, out.n);
+  }
+  else
+    tcc_taint_link_add(s1, out.p, out.n);
+  tcc_free(out.p);
+  tcc_free(body.p);
+  dynarray_reset(&body.str, &body.nstr);
+  tcc_free(body.shash);
+}
+
+ST_FUNC void tcc_taint_link_add(TCCState *s1, const void *data, size_t size)
+{
+  s1->taint_link = tcc_realloc(s1->taint_link, s1->taint_link_size + size);
+  memcpy(s1->taint_link + s1->taint_link_size, data, size);
+  s1->taint_link_size += size;
+}
+
+ST_FUNC void tcc_taint_link_free(TCCState *s1)
+{
+  tcc_free(s1->taint_link);
+  s1->taint_link = NULL;
+  s1->taint_link_size = 0;
+}
+
+/* ---- the link's reading of the records ---- */
+
+typedef struct TRd
+{
+  const unsigned char *p, *end;
+  int bad, unit;
+  int *sid; /* the unit's strings: their ids at the link */
+  int nstr;
+} TRd;
+
+static uint32_t rd_u(TRd *r)
+{
+  uint32_t v = 0;
+  for (int sh = 0; r->p < r->end;)
+  {
+    int c = *r->p++;
+    if (sh < 32)
+      v |= (uint32_t)(c & 0x7f) << sh;
+    sh += 7;
+    if (!(c & 0x80))
+      return v;
+  }
+  r->bad = 1;
+  return 0;
+}
+
+static int32_t rd_s(TRd *r)
+{
+  uint32_t u = rd_u(r);
+  return (int32_t)(u >> 1) ^ -(int32_t)(u & 1);
+}
+
+/* a count of things each at least one byte long: no more than the bytes left */
+static int rd_n(TRd *r, int limit)
+{
+  uint32_t n = rd_u(r);
+  if (n > (uint32_t)(r->end - r->p) || (limit >= 0 && n > (uint32_t)limit))
+  {
+    r->bad = 1;
+    return 0;
+  }
+  return (int)n;
+}
+
+static int rd_idx(TRd *r, int n)
+{
+  uint32_t v = rd_u(r);
+  if (v >= (uint32_t)n)
+  {
+    r->bad = 1;
+    return 0;
+  }
+  return (int)v;
+}
+
+/* string I of the unit (0: none), as a link name: a unit's own one gets the
+   unit's number */
+static int rd_name(TRd *r)
+{
+  int i = rd_idx(r, r->nstr + 1);
+  return i ? r->sid[i - 1] : 0;
+}
+
+static TOp rd_op(TRd *r, TaintFn *f, int *last)
+{
+  TOp o;
+  uint32_t k = rd_u(r);
+  o.kind = k & 7, o.lval = (k >> 3) & 1;
+  o.id = k & 16 ? rd_s(r) : 0;
+  o.off = k & 32 ? rd_s(r) : 0;
+  if (o.kind == TK_TEMP)
+    *last = o.id += *last;
+  switch (o.kind)
+  {
+  case TK_NONE:
+  case TK_IMM:
+    break;
+  case TK_TEMP:
+    r->bad |= o.id < 0 || o.id >= f->ntemp;
+    break;
+  case TK_SLOT:
+    r->bad |= o.id < 0 || o.id >= f->nvar + f->nparam;
+    break;
+  case TK_FRAME:
+    r->bad |= o.id < 0 || o.id > f->nfobj;
+    break;
+  case TK_GLOBAL:
+    r->bad |= o.id < 0 || o.id >= f->nglob;
+    break;
+  default:
+    r->bad = 1;
+  }
+  return o;
+}
+
+static TaintFn *rd_fun(TRd *r)
+{
+  TaintFn *f = tcc_mallocz(sizeof *f);
+  int ns = 0, last = 0, end = 0, cap = 0;
+  f->unit = r->unit;
+  f->tok = rd_name(r);
+  f->file = lk_str(rd_name(r));
+  f->line = rd_s(r);
+  f->n = rd_n(r, -1), f->nb = rd_n(r, -1), f->nvar = rd_n(r, 1 << 20), f->nparam = rd_n(r, 1 << 20);
+  f->ntemp = rd_n(r, 1 << 24), f->nfobj = rd_n(r, 1 << 20), f->nglob = rd_n(r, -1), f->ncalls = rd_n(r, -1);
+  f->nargs = rd_n(r, -1), f->ninl = rd_n(r, -1), f->nrpo = rd_n(r, -1);
+  f->argv_slot = rd_s(r);
+  if (r->bad || f->ninl > f->ncalls || f->nrpo > f->nb || f->argv_slot < -1 || f->argv_slot >= f->nvar + f->nparam)
+  {
+    r->bad = 1;
+    return f;
+  }
+  f->glob = tcc_mallocz((f->nglob + 1) * sizeof *f->glob);
+  for (int i = 0; i < f->nglob && !r->bad; i++)
+    f->glob[i] = lk_str(rd_name(r));
+  f->ins = tcc_mallocz((f->n + 1) * sizeof(TIns));
+  for (int i = 0, line = f->line; i < f->n && !r->bad; i++)
+  {
+    TIns *t = &f->ins[i];
+    uint32_t k = rd_u(r);
+    t->op = k & 7, t->sub = (k >> 3) & 7;
+    t->line = line += k & 64 ? rd_s(r) : 0;
+    if (t->op > TI_RET || t->sub > TS_OTHER)
+      r->bad = 1;
+    if (t->op == TI_NOP)
+      continue;
+    if (t->op == TI_CALL)
+      t->aux = rd_idx(r, f->ncalls);
+    t->d = rd_op(r, f, &last), t->a = rd_op(r, f, &last), t->b = rd_op(r, f, &last);
+  }
+  f->bstart = tcc_malloc((f->nb + 1) * sizeof(int));
+  f->bend = tcc_malloc((f->nb + 1) * sizeof(int));
+  f->bsucc0 = tcc_malloc((f->nb + 1) * sizeof(int));
+  for (int i = 0; i < f->nb && !r->bad; i++)
+  {
+    int nsucc;
+    uint32_t len;
+    f->bstart[i] = end + rd_s(r);
+    len = rd_u(r);
+    r->bad |= f->bstart[i] < 0 || f->bstart[i] > f->n || len > (uint32_t)(f->n - f->bstart[i]);
+    f->bend[i] = r->bad ? f->bstart[i] : f->bstart[i] + (int)len;
+    end = f->bend[i];
+    f->bsucc0[i] = ns;
+    nsucc = rd_n(r, f->nb);
+    if (ns + nsucc > cap)
+    {
+      cap = 2 * (ns + nsucc) + 4;
+      f->bsucc = tcc_realloc(f->bsucc, cap * sizeof(int));
+    }
+    for (int k = 0; k < nsucc; k++)
+    {
+      int t = i + rd_s(r);
+      r->bad |= t < 0 || t >= f->nb;
+      f->bsucc[ns++] = t;
+    }
+  }
+  f->bsucc0[f->nb] = ns;
+  if (r->bad)
+    return f;
+  if (!f->bsucc)
+    f->bsucc = tcc_malloc(sizeof(int));
+  f->rpo = tcc_malloc((f->nrpo + 1) * sizeof(int));
+  for (int i = 0, prev = 0; i < f->nrpo; i++)
+  {
+    prev += rd_s(r);
+    r->bad |= prev < 0 || prev >= f->nb;
+    f->rpo[i] = prev;
+  }
+  f->calls = tcc_mallocz((f->ncalls + 1) * sizeof(TCall));
+  for (int i = 0; i < f->ncalls && !r->bad; i++)
+  {
+    TCall *k = &f->calls[i];
+    uint32_t fl;
+    int sh;
+    k->callee = rd_name(r);
+    sh = rd_idx(r, r->nstr + 1);
+    k->shape = sh ? shape_intern(lk_str(r->sid[sh - 1])) : 0;
+    k->arg0 = rd_idx(r, f->nargs + 1), k->nargs = rd_n(r, TF_MAX_ARGS), k->pos = rd_s(r);
+    k->ret = rd_op(r, f, &last);
+    k->taint_arg = rd_u(r);
+    fl = rd_u(r);
+    k->taint_ret = fl & 1, k->noted = (fl >> 1) & 1;
+    k->fmt_idx = (uint8_t)rd_u(r);
+    k->copy_dst = (int8_t)rd_s(r), k->copy_src = (int8_t)rd_s(r), k->fill_from = (int8_t)rd_s(r);
+    k->line = f->line + rd_s(r);
+    r->bad |= k->arg0 + k->nargs > f->nargs || k->pos < -1 || k->pos > f->n;
+  }
+  f->args = tcc_mallocz((f->nargs + 1) * sizeof(TArg));
+  for (int i = 0; i < f->nargs && !r->bad; i++)
+  {
+    f->args[i].op = rd_op(r, f, &last);
+    f->args[i].line = f->line + rd_s(r);
+  }
+  f->inl = tcc_malloc((f->ninl + 1) * sizeof(int));
+  for (int i = 0; i < f->ninl && !r->bad; i++)
+  {
+    f->inl[i] = rd_idx(r, f->ncalls);
+    r->bad |= f->calls[f->inl[i]].pos < 0;
+  }
+  return f;
+}
+
+/* one unit's records (P to END): its functions in the list, its sinks
+   said, its address-taken functions */
+static void rd_unit(TRd *r)
+{
+  int nf;
+  r->nstr = rd_n(r, -1);
+  r->sid = tcc_malloc((r->nstr + 1) * sizeof(int));
+  for (int i = 0; i < r->nstr && !r->bad; i++)
+  {
+    const unsigned char *z = memchr(r->p, 0, r->end - r->p);
+    const char *str = (const char *)r->p;
+    if (!z)
+    {
+      r->bad = 1;
+      break;
+    }
+    r->p = z + 1;
+    if (strchr(str, '\x01'))
+    {
+      /* the unit's own: tell it apart from another unit's */
+      size_t len = strlen(str) + 16;
+      char *q = tcc_malloc(len);
+      snprintf(q, len, "%s\x02%d", str, r->unit);
+      r->sid[i] = lk_id(q);
+      tcc_free(q);
+    }
+    else
+      r->sid[i] = lk_id(str);
+  }
+  if (rd_u(r))
+    tu.has_source = 1;
+  nf = rd_n(r, -1);
+  for (int i = 0; i < nf && !r->bad; i++)
+  {
+    TaintFn *f = rd_fun(r);
+    size_t bytes = sizeof *f + f->n * sizeof(TIns) + (size_t)f->ncalls * sizeof(TCall) +
+                   (size_t)f->nargs * sizeof(TArg) + (size_t)(4 * f->nb + f->nrpo) * sizeof(int) +
+                   (size_t)(f->ntemp + f->nvar + f->nparam) * sizeof(TLoc);
+    if (r->bad || tu.bytes + bytes > 4 * TU_MAX_BYTES)
+    {
+      tf_free(f); /* past the budget: the rest of the program is not looked at */
+      continue;
+    }
+    tu.bytes += bytes;
+    if (!tu.last)
+      tu.last = &tu.first;
+    *tu.last = f;
+    tu.last = &f->next;
+  }
+  for (int i = 0, n = rd_n(r, -1); i < n && !r->bad; i++)
+  {
+    const char *file = lk_str(rd_name(r));
+    int line = rd_s(r), tok = rd_name(r);
+    if (!(tu.nsaid & (tu.nsaid - 1)))
+      tu.said = tcc_realloc(tu.said, (tu.nsaid ? 2 * tu.nsaid : 8) * sizeof *tu.said);
+    tu.said[tu.nsaid].file = file, tu.said[tu.nsaid].line = line, tu.said[tu.nsaid].tok = tok;
+    tu.nsaid++;
+  }
+  for (int i = 0, n = rd_n(r, -1); i < n && !r->bad; i++)
+  {
+    int tok = rd_name(r), sh = rd_idx(r, r->nstr + 1);
+    taken_add(tok, sh ? shape_intern(lk_str(r->sid[sh - 1])) : 0);
+  }
+  tcc_free(r->sid);
+  r->sid = NULL;
+}
+
+/* the link: every unit's records, the summaries over the program, the flows
+   that cross units */
+ST_FUNC void tcc_taint_link_check(TCCState *s1)
+{
+  const unsigned char *p = s1->taint_link, *end = p + s1->taint_link_size;
+  int unit = 0;
+  tcc_ir_taint_unit_free();
+  tu.link = 1;
+  tu.s1 = s1;
+  while (p < end)
+  {
+    TRd r;
+    uint32_t len;
+    if (!*p)
+    {
+      p++; /* padding between two merged sections */
+      continue;
+    }
+    if (end - p < 8 || memcmp(p, "TNT1", 4))
+      break; /* not ours, or another version: the rest says nothing */
+    len = p[4] | p[5] << 8 | p[6] << 16 | (uint32_t)p[7] << 24;
+    if (len > (size_t)(end - p) - 8)
+      break;
+    memset(&r, 0, sizeof r);
+    r.p = p + 8, r.end = p + 8 + len, r.unit = unit++;
+    rd_unit(&r);
+    p += 8 + len;
+  }
+  if (tu.first && tu.has_source)
+    tu_solve();
+  tcc_ir_taint_unit_free();
+  tcc_taint_link_free(s1);
+}
+
+/* the link's report of a flow no unit said: at the sink, with a note at the
+   call that crosses into it (or, for a source another unit's function gives,
+   at that call) */
+static void link_report(TCtx *c, const char *file, int line, const char *name, int via, int call_line, int indirect)
+{
+  TCCState *s1 = tu.s1;
+  char vname[128], fname[128];
+  const char *saved = s1->diag_link_file;
+  TaintFn *f = c->f;
+  s1->diag_link_file = file;
+  tcc_enter_state(s1); /* left by every diagnostic */
+  tcc_warning_c(warn_tainted_format)("%i:the format of '%s' comes from untrusted input: write %s(\"%%s\", ...)", line,
+                                     name, name);
+  s1->diag_link_file = f->file;
+  tok_copy(f->tok, fname, sizeof fname);
+  if (via)
+  {
+    tok_copy(via, vname, sizeof vname);
+    tcc_enter_state(s1);
+    if (indirect)
+      tcc_note("%i:untrusted input reaches it through a call through a pointer in '%s', which may call '%s'",
+               call_line, fname, vname);
+    else
+      tcc_note("%i:untrusted input reaches it through the call to '%s' in '%s'", call_line, vname, fname);
+  }
+  else
+  {
+    /* the format is this function's own: the call, before it, to another
+       unit's function that gives untrusted input */
+    const TCall *best = NULL;
+    for (int i = 0; i < f->ncalls; i++)
+    {
+      const TCall *k = &f->calls[i];
+      const TaintSum *s;
+      uint8_t m;
+      if (k->noted || k->line > line || (best && k->line < best->line) || !(s = tu_sum(k->callee, 0)) ||
+          s->unit == f->unit)
+        continue;
+      m = s->ret;
+      for (int j = 0; j < TM_NPARAM; j++)
+        m |= s->pw[j];
+      for (int e = 0; e < s->nent; e++)
+        m |= s->ent[e].m;
+      if (m & TM_SRC)
+        best = k;
+    }
+    if (best)
+    {
+      tok_copy(best->callee, vname, sizeof vname);
+      tcc_enter_state(s1);
+      tcc_note("%i:untrusted input comes from the call to '%s' in '%s'", best->line, vname, fname);
+    }
+  }
+  s1->diag_link_file = saved;
 }

@@ -332,3 +332,11 @@ void elf_names_materialize(struct TCCState *s1)
 {
   (void)s1;
 }
+
+/* -Wtainted-format's records for the link (ir/taint.c) */
+void tcc_taint_link_add(struct TCCState *s1, const void *data, size_t size)
+{
+  (void)s1;
+  (void)data;
+  (void)size;
+}

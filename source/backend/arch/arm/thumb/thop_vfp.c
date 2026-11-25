@@ -244,6 +244,11 @@ TH_TABLE(TH_VMUL_F_DP, "vmul.f64", {THOP_SHAPE_VFP_DP, 0xee200b00, THOP_CUSTOM_v
 TH_TABLE(TH_VDIV_F_SP, "vdiv.f32", {THOP_SHAPE_VFP_SP, 0xee800a00, THOP_CUSTOM_vfp_arith3_emit});
 TH_TABLE(TH_VDIV_F_DP, "vdiv.f64", {THOP_SHAPE_VFP_DP, 0xee800b00, THOP_CUSTOM_vfp_arith3_emit});
 
+/* VMINNM.F32 / VMAXNM.F32 (FPv5, ARMv8-M FP): IEEE minNum/maxNum, a quiet NaN
+ * operand loses to a number; unconditional (no IT) */
+TH_TABLE(TH_VMINNM_F_SP, "vminnm.f32", {THOP_SHAPE_VFP_SP, 0xfe800a40, THOP_CUSTOM_vfp_arith3_emit});
+TH_TABLE(TH_VMAXNM_F_SP, "vmaxnm.f32", {THOP_SHAPE_VFP_SP, 0xfe800a00, THOP_CUSTOM_vfp_arith3_emit});
+
 /* VNEG.F32 / VNEG.F64 */
 TH_TABLE(TH_VNEG_F_SP, "vneg.f32", {THOP_SHAPE_VFP_SP, 0xeeb10a40, THOP_CUSTOM_vfp_arith2_emit});
 TH_TABLE(TH_VNEG_F_DP, "vneg.f64", {THOP_SHAPE_VFP_DP, 0xeeb10b40, THOP_CUSTOM_vfp_arith2_emit});
@@ -321,6 +326,11 @@ thumb_opcode th_vdiv_f(uint32_t vd, uint32_t vn, uint32_t vm, uint32_t sz)
   if (sz == 0)
     return thop_emit_table(&TH_VDIV_F_SP, (thop_args){.rd = vd, .rn = vn, .rm = vm});
   return thop_emit_table(&TH_VDIV_F_DP, (thop_args){.rd = vd, .rn = vn, .rm = vm});
+}
+
+thumb_opcode th_vminmaxnm_f32(uint32_t vd, uint32_t vn, uint32_t vm, int is_max)
+{
+  return thop_emit_table(is_max ? &TH_VMAXNM_F_SP : &TH_VMINNM_F_SP, (thop_args){.rd = vd, .rn = vn, .rm = vm});
 }
 
 thumb_opcode th_vneg_f(uint32_t vd, uint32_t vm, uint32_t sz)

@@ -21,6 +21,9 @@
 #include "opt_alias.h"
 #include "opt_loop_utils.h"
 #include "licm.h"
+#include "cfg.h"
+#include "core.h"
+#include "pool.h"
 
 /* A FUNCCALL whose callee is provably PURE or CONST writes no observable memory
  * (its only stores are to its own stack frame; a store through a pointer param
@@ -425,6 +428,570 @@ int tcc_ir_opt_sl_forward(TCCIRState *ir)
   TCC_PASS_TIMED(r, "sl_forward", tcc_ir_opt_sl_forward__timed(ir));
   return r;
 }
+/* ---- -fyasc-facts (S4, O1): frame objects whose address does not escape --
+ *
+ * A frame object whose address (Addr[StackLoc], and the temps copied or
+ * offset from it) goes only to memory accesses through it, comparisons and
+ * parameters that do not escape (a checked yasc `view`, tcc_ir_yf_param) is
+ * no longer reachable by later calls: only the calls it is handed to see it,
+ * and of those only the ones whose parameter may write change it.  Every use
+ * is looked at; anything else (stored, returned, passed elsewhere, held in a
+ * VAR) leaves the object escaped. */
+typedef struct
+{
+  int lo, hi;
+  uint8_t bad;
+} YfObj;
+typedef struct
+{
+  int call, lo, hi;
+} YfWrite;
+typedef struct
+{
+  TCCIRState *ir;
+  int n;
+  int *use_at, *use; /* uses of temp t: use[use_at[t] .. use_at[t + 1]) (instruction indexes) */
+  int ntemps;
+  YfWrite *w;
+  int nw, wcap;
+  int lo, hi; /* the object being classified */
+} YfCtx;
+
+static int yf_ops(TCCIRState *ir, IRQuadCompact *q, IROperand *ops)
+{
+  int n = 0;
+  if (irop_config[q->op].has_dest)
+    ops[n++] = tcc_ir_op_get_dest(ir, q);
+  if (irop_config[q->op].has_src1)
+    ops[n++] = tcc_ir_op_get_src1(ir, q);
+  if (irop_config[q->op].has_src2)
+    ops[n++] = tcc_ir_op_get_src2(ir, q);
+  if (tcc_ir_op_is_mac(q->op) || q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_STORE_INDEXED ||
+      q->op == TCCIR_OP_SELECT)
+  {
+    ops[n] = ir->iroperand_pool[q->operand_base + n];
+    n++;
+  }
+  return n;
+}
+
+static int yf_temp_pos(IROperand o, int ntemps)
+{
+  int32_t v = irop_is_none(o) ? -1 : irop_get_vreg(o);
+  if (v < 0 || TCCIR_DECODE_VREG_TYPE(v) != TCCIR_VREG_TYPE_TEMP || TCCIR_DECODE_VREG_POSITION(v) >= ntemps)
+    return -1;
+  return TCCIR_DECODE_VREG_POSITION(v);
+}
+
+/* the call instruction of the FUNCPARAMVAL at p, -1 */
+static int yf_call_of(TCCIRState *ir, int n, int p)
+{
+  int cid = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, &ir->compact_instructions[p]));
+  for (int j = p + 1; j < n; j++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[j];
+    if ((q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL) &&
+        TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q)) == cid)
+      return j;
+  }
+  return -1;
+}
+
+static int yf_use_ok(YfCtx *y, int j, int k, IROperand o, int depth);
+
+/* every use of temp t keeps the address in */
+static int yf_temp_ok(YfCtx *y, int t, int depth)
+{
+  if (depth > 4)
+    return 0;
+  for (int u = y->use_at[t]; u < y->use_at[t + 1]; u++)
+  {
+    int j = y->use[u];
+    IROperand ops[4];
+    int nops = yf_ops(y->ir, &y->ir->compact_instructions[j], ops);
+    for (int k = 0; k < nops; k++)
+      if (yf_temp_pos(ops[k], y->ntemps) == t && !yf_use_ok(y, j, k, ops[k], depth))
+        return 0;
+  }
+  return 1;
+}
+
+/* operand K of instruction J holds an address into the object (as a value,
+   or the memory it names): does the address stay in? */
+static int yf_use_ok(YfCtx *y, int j, int k, IROperand o, int depth)
+{
+  TCCIRState *ir = y->ir;
+  IRQuadCompact *q = &ir->compact_instructions[j];
+  const int has_dest = irop_config[q->op].has_dest;
+  int ro = 0;
+  /* memory through it, at it or at a constant index from it */
+  if (o.is_lval)
+    return 1;
+  if ((q->op == TCCIR_OP_LOAD_INDEXED && k == 1) || (q->op == TCCIR_OP_STORE_INDEXED && k == 0))
+    return 1;
+  if (q->op == TCCIR_OP_CMP || q->op == TCCIR_OP_TEST_ZERO)
+    return 1;
+  /* its definition (the temp it defines is followed on its own) */
+  if (has_dest && k == 0 && irop_dest_defines_vreg(o))
+    return 1;
+  if (q->op == TCCIR_OP_FUNCPARAMVAL && k == (has_dest ? 1 : 0))
+  {
+    uint32_t enc = (uint32_t)tcc_ir_op_src2_imm(ir, q);
+    int call = yf_call_of(ir, y->n, j);
+    if (call < 0 || !tcc_ir_yf_param(ir, TCCIR_DECODE_CALL_ID(enc), TCCIR_DECODE_PARAM_IDX(enc), &ro))
+      return 0;
+    if (!ro)
+    {
+      if (y->nw == y->wcap)
+        y->wcap = y->wcap ? 2 * y->wcap : 16, y->w = tcc_realloc(y->w, y->wcap * sizeof(YfWrite));
+      y->w[y->nw++] = (YfWrite){call, y->lo, y->hi};
+    }
+    return 1;
+  }
+  /* copied or offset by a constant into a temp: follow that temp */
+  if (has_dest && (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LEA || q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB))
+  {
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    int dt = yf_temp_pos(d, y->ntemps);
+    if (q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB)
+    {
+      IROperand other = tcc_ir_op_get_src1_or_2(ir, q, k == 1);
+      if (!irop_is_immediate(other) || other.is_lval || irop_is_sym(other))
+        return 0;
+    }
+    return dt >= 0 && !d.is_lval && irop_dest_defines_vreg(d) && yf_temp_ok(y, dt, depth + 1);
+  }
+  return 0;
+}
+
+/* the escape-free frame objects, and the calls that may write them */
+static YfObj *yf_classify(TCCIRState *ir, int n, int *nobj, YfWrite **writes, int *nwrites)
+{
+  YfCtx y = {ir, n, NULL, NULL, ir->next_temporary_variable, NULL, 0, 0, 0, 0};
+  YfObj *obj = NULL;
+  int no = 0;
+  *nobj = 0, *writes = NULL, *nwrites = 0;
+  /* the uses of each temp (counting sort) */
+  y.use_at = tcc_mallocz((y.ntemps + 2) * sizeof(int));
+  for (int pass = 0; pass < 2; pass++)
+  {
+    for (int i = 0; i < n; i++)
+    {
+      IROperand ops[4];
+      int nops = yf_ops(ir, &ir->compact_instructions[i], ops), t;
+      for (int k = 0; k < nops; k++)
+        if ((t = yf_temp_pos(ops[k], y.ntemps)) >= 0)
+        {
+          if (pass == 0)
+            y.use_at[t + 1]++;
+          else
+            y.use[y.use_at[t]++] = i;
+        }
+    }
+    if (pass == 0)
+    {
+      for (int t = 0; t < y.ntemps; t++)
+        y.use_at[t + 1] += y.use_at[t];
+      y.use = tcc_malloc((y.use_at[y.ntemps] + 1) * sizeof(int));
+    }
+    else
+    {
+      for (int t = y.ntemps; t > 0; t--)
+        y.use_at[t] = y.use_at[t - 1];
+      y.use_at[0] = 0;
+    }
+  }
+  /* every place an object's address appears as a value */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    IROperand ops[4];
+    int nops, lo, hi, k2;
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    nops = yf_ops(ir, q, ops);
+    for (int k = 0; k < nops; k++)
+    {
+      IROperand o = ops[k];
+      if (irop_get_tag(o) != IROP_TAG_STACKOFF || o.is_lval || irop_get_vreg(o) != -1 || irop_is_llocal(o) ||
+          !irop_is_local(o))
+        continue;
+      if (!tcc_ir_frame_object_at(ir, (int)irop_get_stack_offset(o), &lo, &hi))
+      {
+        lo = (int)irop_get_stack_offset(o);
+        hi = lo + 1;
+      }
+      for (k2 = 0; k2 < no; k2++)
+        if (obj[k2].lo == lo && obj[k2].hi == hi)
+          break;
+      if (k2 == no)
+      {
+        obj = tcc_realloc(obj, (no + 1) * sizeof(YfObj));
+        obj[no++] = (YfObj){lo, hi, 0};
+      }
+      y.lo = lo, y.hi = hi;
+      if (!obj[k2].bad && !yf_use_ok(&y, i, k, o, 0))
+        obj[k2].bad = 1;
+    }
+  }
+  /* only the escape-free objects' writes matter: the others stay addrtaken */
+  int nw = 0;
+  for (int w = 0; w < y.nw; w++)
+  {
+    int good = 0;
+    for (int k = 0; k < no; k++)
+      if (obj[k].lo == y.w[w].lo && obj[k].hi == y.w[w].hi && !obj[k].bad)
+        good = 1;
+    if (good)
+      y.w[nw++] = y.w[w];
+  }
+  tcc_free(y.use_at);
+  tcc_free(y.use);
+  *nobj = no, *writes = y.w, *nwrites = nw;
+  return obj;
+}
+
+/* ---- -fyasc-facts (S4, O1): scalar VARs whose address only goes to calls --
+ *
+ * `int x; ... get(&x); ... x ...`: x is an addrtaken VAR, kept in its frame
+ * slot and reloaded after every call.  When each `T <-- &x` feeds only
+ * no-escape parameters (tcc_ir_yf_param) -- no deref, no copy, no other use
+ * -- the slot is needed only while those calls run.  x then gets a register
+ * VAR X (SSA, the register allocator) and the slot is written from X just
+ * before each such call (when X may hold a value there) and read back into
+ * X just after one whose parameter may write.  Runs once per function, after
+ * ptr_local_fwd has turned derefs of `p = &x` into direct accesses. */
+#define YFP_MAX 32
+typedef struct
+{
+  int32_t v;        /* the addrtaken VAR */
+  IROperand tmpl;   /* a direct access of it */
+  int ndefs;        /* direct defs */
+  int *calls, ncalls, ccap;
+  uint8_t *ro;      /* per call: the parameters are all read-only */
+  int bad;
+} YfpVar;
+
+static void yfp_add_call(YfpVar *p, int call, int ro)
+{
+  for (int k = 0; k < p->ncalls; k++)
+    if (p->calls[k] == call)
+    {
+      p->ro[k] &= ro;
+      return;
+    }
+  if (p->ncalls == p->ccap)
+  {
+    p->ccap = p->ccap ? 2 * p->ccap : 4;
+    p->calls = tcc_realloc(p->calls, p->ccap * sizeof(int));
+    p->ro = tcc_realloc(p->ro, p->ccap);
+  }
+  p->calls[p->ncalls] = call, p->ro[p->ncalls] = ro, p->ncalls++;
+}
+
+/* the call at CALL returns its value into VAR V itself (put.c coalesced
+   `x = f(&x)` into `X <-- CALL`) */
+static int yfp_call_defines(TCCIRState *ir, int call, int32_t v)
+{
+  IRQuadCompact *q = &ir->compact_instructions[call];
+  if (!irop_config[q->op].has_dest)
+    return 0;
+  IROperand d = tcc_ir_op_get_dest(ir, q);
+  return !irop_is_none(d) && irop_get_vreg(d) == v;
+}
+
+static IRQuadCompact yfp_assign(TCCIRState *ir, IROperand d, IROperand s, int line)
+{
+  IRQuadCompact q = {0};
+  q.op = TCCIR_OP_ASSIGN;
+  q.operand_base = tcc_ir_pool_add(ir, d);
+  tcc_ir_pool_add(ir, s);
+  q.line_num = line;
+  q.orig_index = tcc_ir_fresh_orig_index(ir);
+  return q;
+}
+
+typedef struct
+{
+  int at, call;
+  int8_t store; /* 1: slot <-- X before the call, 0: X <-- slot after it */
+  int8_t var;
+} YfpIns;
+
+static int yfp_ins_cmp(const void *a, const void *b)
+{
+  const YfpIns *x = a, *y = b;
+  return x->at != y->at ? (y->at > x->at ? 1 : -1) : x->store - y->store;
+}
+
+int tcc_ir_opt_yf_promote(TCCIRState *ir)
+{
+  const int n = ir->next_instruction_index, nvar = ir->next_local_variable, ntemp = ir->next_temporary_variable;
+  if (!ir->yf_calls || ir->yf_promoted || nvar <= 0 || n <= 0)
+    return 0;
+  ir->yf_promoted = 1;
+  /* a nested function reaches captured locals through the static chain */
+  if ((tcc_state && tcc_state->nb_nested_funcs > 0) || ir->captured_count > 0)
+    return 0;
+  for (int i = 0; i < n; i++)
+  {
+    TccIrOp op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_INLINE_ASM || op == TCCIR_OP_ASM_INPUT || op == TCCIR_OP_ASM_OUTPUT)
+      return 0;
+  }
+  int8_t *slot = tcc_malloc(nvar); /* index into pv, -1 not a candidate, -2 rejected */
+  memset(slot, -1, nvar);
+  int32_t *tvar = tcc_malloc((ntemp + 1) * sizeof(int32_t)); /* the VAR position whose address temp t holds */
+  int *tdefs = tcc_mallocz((ntemp + 1) * sizeof(int));
+  for (int t = 0; t < ntemp; t++)
+    tvar[t] = -1;
+  YfpVar pv[YFP_MAX];
+  int np = 0, changes = 0;
+  /* the candidates: VARs whose address is taken by plain LEAs into temps */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    IROperand ops[4];
+    int nops = yf_ops(ir, q, ops), t;
+    for (int k = 0; k < nops; k++)
+    {
+      int32_t vr = irop_is_none(ops[k]) ? -1 : irop_get_vreg(ops[k]);
+      if (k == 0 && irop_config[q->op].has_dest && !ops[0].is_lval && irop_dest_defines_vreg(ops[0]) &&
+          (t = yf_temp_pos(ops[0], ntemp)) >= 0)
+        tdefs[t]++;
+      if (q->op != TCCIR_OP_LEA || k != 1 || vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
+        continue;
+      int pos = TCCIR_DECODE_VREG_POSITION(vr);
+      if (pos >= nvar || slot[pos] == -2)
+        continue;
+      IROperand d = ops[0];
+      IRLiveInterval *iv = tcc_ir_get_live_interval(ir, vr);
+      t = yf_temp_pos(d, ntemp);
+      if (irop_config[q->op].has_src2 || ops[1].is_lval || t < 0 || d.is_lval || !iv || !iv->addrtaken ||
+          iv->is_volatile || iv->is_complex || iv->is_struct || (tvar[t] >= 0 && tvar[t] != pos))
+      {
+        if (slot[pos] >= 0)
+          pv[slot[pos]].bad = 1;
+        slot[pos] = -2;
+        if (t >= 0)
+          tvar[t] = -2;
+        continue;
+      }
+      if (tvar[t] == -2)
+        continue;
+      tvar[t] = pos;
+      if (slot[pos] == -1)
+      {
+        if (np == YFP_MAX)
+        {
+          slot[pos] = -2;
+          continue;
+        }
+        memset(&pv[np], 0, sizeof pv[np]);
+        pv[np].v = vr;
+        pv[np].tmpl = irop_make_none();
+        slot[pos] = np++;
+      }
+    }
+  }
+  if (!np)
+    goto out;
+  /* every other operand naming a candidate: a direct access of the scalar,
+     or the address temp handed to a no-escape parameter */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    IROperand ops[4];
+    int nops = yf_ops(ir, q, ops), t;
+    for (int k = 0; k < nops; k++)
+    {
+      IROperand o = ops[k];
+      int32_t vr = irop_is_none(o) ? -1 : irop_get_vreg(o);
+      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && TCCIR_DECODE_VREG_POSITION(vr) < nvar &&
+          slot[TCCIR_DECODE_VREG_POSITION(vr)] >= 0)
+      {
+        YfpVar *p = &pv[slot[TCCIR_DECODE_VREG_POSITION(vr)]];
+        IRLiveInterval *iv = tcc_ir_get_live_interval(ir, vr);
+        if (q->op == TCCIR_OP_LEA && k == 1)
+          continue;
+        /* the value (a VREG operand; through it when lval, the value is
+           still X's), or the slot itself (an lval STACKOFF at its offset) */
+        int tag = irop_get_tag(o), value = tag == IROP_TAG_VREG ? !o.is_lval : tag == IROP_TAG_STACKOFF && o.is_lval;
+        if (irop_is_llocal(o) || o.is_complex || irop_get_btype(o) == IROP_BTYPE_STRUCT ||
+            !(tag == IROP_TAG_VREG || (tag == IROP_TAG_STACKOFF && o.is_lval && irop_get_stack_offset(o) == iv->original_offset)) ||
+            (!irop_is_none(p->tmpl) && irop_get_btype(o) != irop_get_btype(p->tmpl)))
+          p->bad = 1;
+        else if (irop_is_none(p->tmpl) && value)
+          p->tmpl = o;
+        if (k == 0 && irop_config[q->op].has_dest && irop_dest_defines_vreg(o))
+          p->ndefs++;
+        continue;
+      }
+      if ((t = yf_temp_pos(o, ntemp)) < 0 || tvar[t] < 0 || slot[tvar[t]] < 0)
+        continue;
+      if (k == 0 && q->op == TCCIR_OP_LEA)
+        continue; /* its definition */
+      YfpVar *p = &pv[slot[tvar[t]]];
+      int ro = 0, call = -1;
+      if (q->op == TCCIR_OP_FUNCPARAMVAL && k == (irop_config[q->op].has_dest ? 1 : 0) && !o.is_lval &&
+          tdefs[t] == 1)
+      {
+        uint32_t enc = (uint32_t)tcc_ir_op_src2_imm(ir, q);
+        if (tcc_ir_yf_param(ir, TCCIR_DECODE_CALL_ID(enc), TCCIR_DECODE_PARAM_IDX(enc), &ro))
+          call = yf_call_of(ir, n, i);
+      }
+      if (call < 0 || call + 1 >= n || ir->compact_instructions[call].is_jump_target)
+        p->bad = 1;
+      else
+        yfp_add_call(p, call, ro);
+    }
+  }
+  /* may X hold a value just before each call?  Forward over the CFG: a
+     direct def, or a call that writes the slot (X reloaded after it) */
+  uint32_t live = 0;
+  for (int k = 0; k < np; k++)
+    if (!pv[k].bad && !irop_is_none(pv[k].tmpl))
+      live |= 1u << k;
+  if (!live)
+    goto out;
+  IRCFG *cfg = tcc_ir_cfg_build(ir);
+  if (!cfg || cfg->num_blocks <= 0)
+  {
+    if (cfg)
+      tcc_ir_cfg_free(cfg);
+    goto out;
+  }
+  const int nb = cfg->num_blocks;
+  uint32_t *gen = tcc_mallocz(nb * sizeof(uint32_t)), *in = tcc_mallocz(nb * sizeof(uint32_t));
+  uint32_t *gen_at = tcc_mallocz(n * sizeof(uint32_t));
+  for (int k = 0; k < np; k++)
+  {
+    if (!((live >> k) & 1))
+      continue;
+    for (int c = 0; c < pv[k].ncalls; c++)
+      if (!pv[k].ro[c])
+        gen_at[pv[k].calls[c]] |= 1u << k;
+  }
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    int32_t vr = irop_is_none(d) ? -1 : irop_get_vreg(d);
+    if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && TCCIR_DECODE_VREG_POSITION(vr) < nvar &&
+        slot[TCCIR_DECODE_VREG_POSITION(vr)] >= 0 && irop_dest_defines_vreg(d))
+      gen_at[i] |= 1u << slot[TCCIR_DECODE_VREG_POSITION(vr)];
+  }
+  for (int i = 0; i < n; i++)
+    if (cfg->instr_to_block[i] < nb)
+      gen[cfg->instr_to_block[i]] |= gen_at[i];
+  for (int changed = 1; changed;)
+  {
+    changed = 0;
+    for (int b = 0; b < nb; b++)
+    {
+      uint32_t x = 0;
+      for (int e = 0; e < cfg->blocks[b].num_preds; e++)
+      {
+        int pb = cfg->blocks[b].preds[e];
+        x |= in[pb] | gen[pb];
+      }
+      if (x != in[b])
+        in[b] = x, changed = 1;
+    }
+  }
+  /* the insertions: stores before the calls, reloads after the writing ones */
+  YfpIns *ins = NULL;
+  int nins = 0, cap = 0;
+  for (int k = 0; k < np; k++)
+  {
+    if (!((live >> k) & 1))
+      continue;
+    for (int c = 0; c < pv[k].ncalls; c++)
+    {
+      int call = pv[k].calls[c], b = cfg->instr_to_block[call], need = 0;
+      if (pv[k].ndefs && b < nb)
+      {
+        uint32_t x = in[b];
+        for (int i = cfg->blocks[b].start_idx; i < call; i++)
+          x |= gen_at[i];
+        need = (x >> k) & 1;
+      }
+      if (nins + 2 > cap)
+        cap = cap ? 2 * cap : 16, ins = tcc_realloc(ins, cap * sizeof(YfpIns));
+      if (need)
+        ins[nins++] = (YfpIns){call, call, 1, (int8_t)k};
+      /* `x = f(&x)`: the call's result is x's value after it, not the slot */
+      if (!pv[k].ro[c] && !yfp_call_defines(ir, call, pv[k].v))
+        ins[nins++] = (YfpIns){call + 1, call, 0, (int8_t)k};
+    }
+  }
+  tcc_free(gen), tcc_free(in), tcc_free(gen_at);
+  tcc_ir_cfg_free(cfg);
+  /* X for each promoted scalar, and every direct access renamed to it */
+  int32_t xv[YFP_MAX];
+  for (int k = 0; k < np; k++)
+  {
+    if (!((live >> k) & 1))
+      continue;
+    xv[k] = tcc_ir_vreg_alloc_var(ir);
+    IRLiveInterval *src = tcc_ir_get_live_interval(ir, pv[k].v), *dst = tcc_ir_get_live_interval(ir, xv[k]);
+    dst->is_float = src->is_float, dst->is_double = src->is_double, dst->is_llong = src->is_llong;
+    dst->use_vfp = src->use_vfp, dst->is_lvalue = src->is_lvalue;
+    changes++;
+  }
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || q->op == TCCIR_OP_LEA)
+      continue;
+    IROperand ops[4];
+    int nops = yf_ops(ir, q, ops);
+    for (int k = 0; k < nops; k++)
+    {
+      int32_t vr = irop_is_none(ops[k]) ? -1 : irop_get_vreg(ops[k]);
+      if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR || TCCIR_DECODE_VREG_POSITION(vr) >= nvar)
+        continue;
+      int s = slot[TCCIR_DECODE_VREG_POSITION(vr)];
+      if (s < 0 || !((live >> s) & 1))
+        continue;
+      IROperand o = ops[k];
+      irop_set_vreg(&o, xv[s]);
+      if (irop_get_tag(o) == IROP_TAG_STACKOFF)
+        o.u.imm32 = tcc_ir_get_live_interval(ir, xv[s])->original_offset;
+      ir->iroperand_pool[q->operand_base + k] = o;
+    }
+  }
+  /* from the end, so the indexes before stay put */
+  if (nins)
+    tcc_qsort(ins, nins, sizeof *ins, yfp_ins_cmp);
+  for (int j = 0; j < nins; j++)
+  {
+    YfpVar *p = &pv[ins[j].var];
+    IROperand mem = p->tmpl, reg = p->tmpl;
+    irop_set_vreg(&reg, xv[ins[j].var]);
+    if (irop_get_tag(reg) == IROP_TAG_STACKOFF)
+      reg.u.imm32 = tcc_ir_get_live_interval(ir, xv[ins[j].var])->original_offset;
+    int line = ir->compact_instructions[ins[j].call].line_num;
+    IRQuadCompact a = ins[j].store ? yfp_assign(ir, mem, reg, line) : yfp_assign(ir, reg, mem, line);
+    tcc_ir_insert_instruction_before(ir, ins[j].at, &a);
+  }
+  tcc_free(ins);
+  if (changes && getenv("TCC_YF_STATS"))
+    fprintf(stderr, "yasc-facts: yf_promote: %d scalar%s, %d slot cop%s in '%s'\n", changes, changes == 1 ? "" : "s",
+            nins, nins == 1 ? "y" : "ies", funcname ? funcname : "?");
+out:
+  for (int k = 0; k < np; k++)
+    tcc_free(pv[k].calls), tcc_free(pv[k].ro);
+  tcc_free(slot), tcc_free(tvar), tcc_free(tdefs);
+  return changes;
+}
+
 static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
 {
   /* The entries and every jump target's snapshot of them were the peak of a
@@ -1005,6 +1572,33 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
     }
   }
 
+  /* -fyasc-facts: an anonymous slot of an object whose address does not
+     escape is reached by no call but those it is handed to (the writes) */
+  YfWrite *yf_w = NULL;
+  int yf_nw = 0, yf_hits = 0;
+  if (ir->yf_calls && addrtaken_count > 0)
+  {
+    int yf_no;
+    YfObj *yf_obj = yf_classify(ir, n, &yf_no, &yf_w, &yf_nw);
+    for (int k = 0; k < addrtaken_count; k++)
+    {
+      int lo, hi;
+      if (addrtaken_slots[k].sym != NULL ||
+          !tcc_ir_frame_object_at(ir, (int)addrtaken_slots[k].offset, &lo, &hi))
+        continue;
+      for (int o = 0; o < yf_no; o++)
+        if (yf_obj[o].lo == lo && yf_obj[o].hi == hi && !yf_obj[o].bad)
+        {
+          addrtaken_slots[k].earliest_lea_idx = INT_MAX;
+          yf_hits++;
+        }
+    }
+    tcc_free(yf_obj);
+    if (yf_hits && getenv("TCC_YF_STATS"))
+      fprintf(stderr, "yasc-facts: sl_forward: %d slot%s not escaped, %d call write%s in '%s'\n", yf_hits,
+              yf_hits == 1 ? "" : "s", yf_nw, yf_nw == 1 ? "" : "s", funcname ? funcname : "?");
+  }
+
   /* Track constants assigned to TEMPs so later stores use the resolved constant. */
   IROperand *fwd_tmp_val = tcc_mallocz(sizeof(IROperand) * (max_tmp + 1));
   uint8_t *fwd_tmp_valid = tcc_mallocz(max_tmp + 1);
@@ -1318,6 +1912,20 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
             }
           }
         }
+        /* -fyasc-facts: a non-escaping object handed to this call through a
+           parameter that may write it */
+        for (int w = 0; w < yf_nw; w++)
+        {
+          if (yf_w[w].call != i)
+            continue;
+          for (j = 0; j < entry_count; j++)
+          {
+            int sz = ir_opt_store_btype_size_bytes(entries[j].store_btype);
+            if (entries[j].valid && entries[j].local_sym == NULL && entries[j].local_offset < yf_w[w].hi &&
+                entries[j].local_offset + (sz > 0 ? sz : 1) > yf_w[w].lo)
+              entries[j].valid = 0;
+          }
+        }
       }
       /* FUNCCALLVAL redefines its dest vreg — invalidate stores of that vreg and track the write. */
       if (q->op == TCCIR_OP_FUNCCALLVAL)
@@ -1390,6 +1998,11 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
        * not also skip the bookkeeping its DESTINATION owes (see
        * skip_load_fwd). */
       if (tcc_ir_access_is_volatile(ir, src1))
+        goto skip_load_fwd;
+      /* `T <- Addr[StackLoc[x]] [LOAD]` is the slot's address (a frame
+       * object's address widened to 64 bits is materialised so), not a read
+       * of it: the slot's stored value is no answer. */
+      if (q->op == TCCIR_OP_LOAD && irop_is_local(src1) && !src1.is_lval)
         goto skip_load_fwd;
 
       /* Only forward for stack locals or LEA-resolvable non-locals. */
@@ -3406,6 +4019,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
   tcc_free(var_lea_map);
   tcc_free(var_def_count);
   tcc_free(addrtaken_slots);
+  tcc_free(yf_w);
   tcc_free(active_call_ids);
   tcc_free(fwd_tmp_val);
   tcc_free(fwd_tmp_valid);

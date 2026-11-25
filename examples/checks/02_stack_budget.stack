@@ -1,0 +1,8 @@
+run_unbounded: UNBOUNDED (recursion, dynamic); 2344 bytes on the deepest bounded path
+         24      24  run_unbounded  [static]
+       2064    2088  checksum_big  [static]
+        256    2344  __tcc_memset  [budget]
+run_bounded: 296 bytes
+         24      24  run_bounded  [static]
+         16      40  checksum_static  [static]
+        256     296  __tcc_memset  [budget]

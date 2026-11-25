@@ -5729,6 +5729,10 @@ ST_FUNC const char *tcc_get_abi_softcall_name(SValue *src1, SValue *src2, SValue
       return "__aeabi_ddiv";
     case TCCIR_OP_FNEG:
       return "__aeabi_dneg";
+    case TCCIR_OP_FMIN:
+      return "fmin";
+    case TCCIR_OP_FMAX:
+      return "fmax";
     default:
       break;
     }
@@ -5747,6 +5751,10 @@ ST_FUNC const char *tcc_get_abi_softcall_name(SValue *src1, SValue *src2, SValue
       return "__aeabi_fdiv";
     case TCCIR_OP_FNEG:
       return "__aeabi_fneg";
+    case TCCIR_OP_FMIN:
+      return "fminf";
+    case TCCIR_OP_FMAX:
+      return "fmaxf";
     default:
       break;
     }

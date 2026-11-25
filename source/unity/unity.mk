@@ -75,6 +75,7 @@ UNITY_GROUPS_frontend = frontend_gen_builtin frontend_gen_core frontend_gen_decl
 UNITY_MEMBERS_frontend_gen_builtin = \
 	source/frontend/gen/builtin/call.c \
 	source/frontend/gen/builtin/chk.c \
+	source/frontend/gen/builtin/fortify.c \
 	source/frontend/gen/builtin/fp.c \
 	source/frontend/gen/builtin/fp2.c \
 	source/frontend/gen/builtin/misc.c \
@@ -106,7 +107,8 @@ UNITY_MEMBERS_frontend_gen_expr = \
 	source/frontend/gen/expr/infix.c \
 	source/frontend/gen/expr/primary.c \
 	source/frontend/gen/expr/unary.c \
-	source/frontend/gen/expr/yasc_errors.c
+	source/frontend/gen/expr/yasc_errors.c \
+	source/frontend/gen/expr/yasc_slices.c
 UNITY_MEMBERS_frontend_gen_inline = \
 	source/frontend/gen/inline/analysis.c \
 	source/frontend/gen/inline/const_eval.c \
@@ -155,6 +157,7 @@ UNITY_MEMBERS_ir = \
 	source/ir/machine_op.c \
 	source/ir/op_props.c \
 	source/ir/pool.c \
+	source/ir/regaccess.c \
 	source/ir/self_store.c \
 	source/ir/ssa.c \
 	source/ir/taint.c \
@@ -283,6 +286,7 @@ UNITY_MEMBERS_opt_flat_ipa = \
 	source/opt/flat/ipa/tu_func_summary.c \
 	source/opt/flat/ipa/tu_noreturn.c
 UNITY_MEMBERS_opt_flat_loop = \
+	source/opt/flat/loop/bounds_iv.c \
 	source/opt/flat/loop/const_sim.c \
 	source/opt/flat/loop/decrement_carry.c \
 	source/opt/flat/loop/func_purity.c \
@@ -442,6 +446,7 @@ UNITY_MEMBERS_opt_ssa_scalar_prop = \
 	source/opt/ssa/scalar/sccp.c
 UNITY_MEMBERS_opt_ssa_string = \
 	source/opt/ssa/string/const_string_fold.c \
+	source/opt/ssa/string/str_fortify.c \
 	source/opt/ssa/string/str_memchr.c \
 	source/opt/ssa/string/str_strchr.c \
 	source/opt/ssa/string/str_strcmp.c \

@@ -38,6 +38,9 @@ void type_to_str(char *buf, int buf_size, CType *type, const char *varstr)
   bt = t & VT_BTYPE;
   buf[0] = '\0';
 
+  /* yasc: `[]T`, `[:0]T` */
+  if (MAYBE_ERRUNION(type) && yasc_slice_to_str(buf, buf_size, type, varstr))
+    return;
   /* yasc: `!T`, `error NAME`, `error` */
   if (MAYBE_ERRUNION(type) && type_is_errunion(type))
   {
@@ -184,10 +187,45 @@ void type_to_str(char *buf, int buf_size, CType *type, const char *varstr)
         pstrcat(buf1, buf_size, "volatile ");
       if (t & VT_RODATA_REL)
         pstrcat(buf1, buf_size, "__rodata_relative ");
-      if (s->yasc & YASC_OWNED)
-        pstrcat(buf1, sizeof(buf1), "owned ");
-      if (s->yasc & YASC_MAYBE)
-        pstrcat(buf1, sizeof(buf1), "maybe ");
+      /* yasc: as written, `char * owned(fclose) maybe`, `T * view` */
+      if ((s->yasc & (YASC_OWNED | YASC_VIEW | YASC_MAYBE)) && !(s->yasc & YASC_UNCHECKED))
+      {
+        if (!buf1[1])
+          pstrcat(buf1, sizeof(buf1), " ");
+        if (s->yasc & YASC_OWNED)
+        {
+          pstrcat(buf1, sizeof(buf1), "owned");
+          if (s->vreg > 0 && s->vreg < YASC_OBJ_MARK)
+          {
+            pstrcat(buf1, sizeof(buf1), "(");
+            pstrcat(buf1, sizeof(buf1), get_tok_str(s->vreg, NULL));
+            pstrcat(buf1, sizeof(buf1), ")");
+          }
+        }
+        else if ((s->yasc & YASC_VIEW) && s->vreg == YASC_BORROWS_STATIC)
+          pstrcat(buf1, sizeof(buf1), "borrows(static)");
+        else if ((s->yasc & YASC_VIEW) && s->vreg <= -2 && yasc_field_borrows(-2 - s->vreg))
+        {
+          /* a member's `borrows(buf)` */
+          YascFieldBorrows *e = yasc_field_borrows(-2 - s->vreg);
+          pstrcat(buf1, sizeof(buf1), "borrows(");
+          for (int k = 0; k < e->nsrc; k++)
+          {
+            if (k)
+              pstrcat(buf1, sizeof(buf1), ", ");
+            pstrcat(buf1, sizeof(buf1), get_tok_str(e->src_tok[k], NULL));
+          }
+          if (e->is_static)
+            pstrcat(buf1, sizeof(buf1), e->nsrc ? ", static" : "static");
+          pstrcat(buf1, sizeof(buf1), ")");
+        }
+        else if (s->yasc & YASC_VIEW)
+          pstrcat(buf1, sizeof(buf1), "view"); /* or borrows(params): their names are not here */
+        if (s->yasc & YASC_MAYBE)
+          pstrcat(buf1, sizeof(buf1), (s->yasc & (YASC_OWNED | YASC_VIEW)) ? " maybe" : "maybe");
+        if (varstr)
+          pstrcat(buf1, sizeof(buf1), " ");
+      }
       if (varstr)
         pstrcat(buf1, sizeof(buf1), varstr);
       type_to_str(buf, buf_size, &s->type, buf1);
@@ -232,6 +270,29 @@ int is_null_pointer(SValue *p)
          ((p->type.t & VT_BTYPE) == VT_PTR && (PTR_SIZE == 4 ? (uint32_t)p->c.i == 0 : p->c.i == 0) &&
           ((pointed_type(&p->type)->t & VT_BTYPE) == VT_VOID) &&
           0 == (pointed_type(&p->type)->t & (VT_CONSTANT | VT_VOLATILE)));
+}
+
+/* yasc writes the null pointer one way, nullptr: an integer constant zero
+   (`0`, `'\0'`, `1 - 1`) used as one -- stored, passed, returned, compared
+   or cast to a pointer -- says so (-Wzero-as-null-pointer-constant, on in
+   the safe default).  NULL is the preprocessor's (macro_subst_tok); in a
+   regular-C macro's expansion and under -ccompat nothing is said. */
+void yasc_null_spelling(SValue *p)
+{
+  if (tcc_state->yasc && (p->type.t & VT_BTYPE) != VT_PTR && tcc_warn_wanted(warn_zero_as_null_pointer_constant) &&
+      is_null_pointer(p))
+    tcc_warning_once(warn_zero_as_null_pointer_constant, "0 as a null pointer: write nullptr");
+}
+
+/* the same for the operands A and B of a comparison or a ?: the source
+   wrote (gen_op_checked, expr_cond_ternary): the one beside a pointer --
+   not `!p`, which tcc makes `p == 0` */
+void yasc_null_pair(SValue *a, SValue *b)
+{
+  if ((a->type.t & VT_BTYPE) == VT_PTR)
+    yasc_null_spelling(b);
+  else if ((b->type.t & VT_BTYPE) == VT_PTR)
+    yasc_null_spelling(a);
 }
 
 /* compare function types. OLD functions match any new functions */
@@ -418,6 +479,9 @@ int compare_types(CType *type1, CType *type2, int unqualified)
 
   /* yasc error unions: the same payload (their nodes are interned) */
   if ((MAYBE_ERRUNION(type1) || MAYBE_ERRUNION(type2)) && (type_is_errunion(type1) || type_is_errunion(type2)))
+    return type1->ref == type2->ref;
+  /* yasc slices: the same element type and sentinel (interned too) */
+  if ((MAYBE_ERRUNION(type1) || MAYBE_ERRUNION(type2)) && (type_is_slice(type1) || type_is_slice(type2)))
     return type1->ref == type2->ref;
 
   if (IS_ENUM(type1->t))

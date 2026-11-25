@@ -30,9 +30,14 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 TRAPS = """add add_const sub sub_const mul mul_min neg inc compound inline ladd lsub lmul lmul_min
 div0 mod0 udiv0 divmin ldiv0 shl_big shl_neg shr_big shl_sign shl_negbase null null_store align
 vla vla_neg bounds bounds_neg bounds_store""".split()
-TRAPS += ["add_loop"]
+TRAPS += ["add_loop", "null_compound", "null_inc", "null_postinc", "null_member", "null_member_store", "null_dot",
+          "align_store", "align_member", "null_inline", "null_after_inline"]
+TRAPS += ["param_bounds", "param_bounds_neg", "param_bounds_const", "param_bounds_walk", "param_bounds_store",
+          "param_bounds_loop", "param_bounds_inline", "param_bounds_down"]
 RUNS = """add_ok add_const_ok sub_ok mul_ok neg_ok lmul_ok lmul_shift_ok negret_ok uadd_ok short_ok
-div_ok shl_ok ushl_ok align_ok vla_ok bounds_ok bounds_addr_ok bounds_flex_ok""".split()
+div_ok shl_ok ushl_ok align_ok vla_ok bounds_ok bounds_addr_ok bounds_flex_ok null_inline_ok""".split()
+RUNS += ["param_bounds_down_ok", "param_bounds_inline_ok", "param_bounds_ok", "param_bounds_const_ok", "param_bounds_min_ok", "param_bounds_walk_ok",
+         "param_bounds_addr_ok", "param_bounds_loop_ok"]
 
 
 def _runtime(tmp_path):
@@ -186,6 +191,101 @@ def test_constant_contexts_untouched(tmp_path):
     assert "udf" not in nm.stdout, nm.stdout
 
 
+PROVEN = """
+int sum(int n, const int a[n]) { int s = 0; for (int i = 0; i < n; i++) s += a[i]; return s; }
+unsigned usum(unsigned n, const unsigned a[n]) { unsigned s = 0; for (unsigned i = 0; i < n; i++) s += a[i]; return s; }
+int loc(int k) { int buf[16]; for (int i = 0; i < 16; i++) buf[i] = i * k; return buf[k & 15]; }
+int g[32];
+int sumg(void) { int s = 0; for (int i = 0; i < 32; i++) s += g[i]; return s; }
+void fill(int n, char d[n], char c) { for (int i = 0; i < n; i++) d[i] = c; }
+unsigned last_slash(unsigned len, const char s[len])
+{
+  unsigned i;
+  if (len == 0)
+    return 0;
+  for (i = len - 1; i > 0 && s[i] != '/'; i--)
+    ;
+  while (i > 0 && s[i - 1] == '/')
+    i--;
+  return s[i] == '/' ? i : len;
+}
+"""
+
+
+def _udf_count(tmp_path, src, opt):
+    c = tmp_path / "t.c"
+    c.write_text(src)
+    proc = subprocess.run([str(TCC), "-ccompat", "-c", opt, "-fsanitize=bounds", str(c), "-o", str(tmp_path / "t.o")],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    dis = subprocess.run(["arm-none-eabi-objdump", "-d", str(tmp_path / "t.o")], capture_output=True, text=True)
+    return dis.stdout.count("udf"), dis.stdout
+
+
+def _text(tmp_path, src, flags, tag):
+    c = tmp_path / f"{tag}.c"
+    c.write_text(src)
+    o = tmp_path / f"{tag}.o"
+    proc = subprocess.run([str(TCC), "-ccompat", "-c", *flags, str(c), "-o", str(o)], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    dis = subprocess.run(["arm-none-eabi-objdump", "-d", str(o)], capture_output=True, text=True).stdout
+    # instructions only: no addresses, encodings, file names or pc-relative comments
+    return [re.sub(r"\s+@.*$|[0-9a-f]+ <([^>+]*)(\+0x[0-9a-f]+)?>", r"<\1>", l.split("\t", 2)[-1])
+            for l in dis.splitlines() if re.match(r"\s+[0-9a-f]+:\t", l)]
+
+
+PARAM_LOOPS = """
+int s4(const int p[4]) { int s = 0; for (int i = 0; i < 4; i++) s += p[i]; return s; }
+int sn(int n, const int p[n]) { int s = 0; for (int i = 0; i < n; i++) s += p[i]; return s; }
+void zero(int n, char d[n]) { for (int i = 0; i < n; i++) d[i] = 0; }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O2"])
+def test_proven_checks_leave_the_loop_passes_the_same_loop(tmp_path, opt):
+    """ssa:bounds_iv folds them before unrolling and IV strength reduction:
+    buf[16] is unrolled, g[32] walks a post-incremented pointer, p[4] unrolls,
+    exactly as without -fsanitize"""
+    for name, src in (("proven", PROVEN), ("params", PARAM_LOOPS)):
+        plain = _text(tmp_path, src, [opt], name + "0")
+        checked = _text(tmp_path, src, [opt, "-fsanitize=bounds"], name + "1")
+        assert plain == checked, "\n".join(f"{a:40} | {b}" for a, b in zip(plain, checked))
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-Os"])
+def test_bounds_proven_by_the_loop_cost_nothing(tmp_path, opt):
+    """i < n bounds i for a[n] (ssa:vrp sv_try_fold_iv_bound), i < 16 for buf[16],
+    k & 15 too: no check is left"""
+    n, dis = _udf_count(tmp_path, PROVEN, opt)
+    assert n == 0, dis
+
+
+def test_count_down_without_its_precondition_keeps_the_check(tmp_path):
+    """len - 1 wraps at len == 0: without `if (len == 0)` the first s[i] is a real check"""
+    src = ("unsigned f(unsigned len, const char s[len])\n"
+           "{ unsigned i = len - 1; while (i > 0 && s[i] == '/') i--; return i; }\n")
+    n, dis = _udf_count(tmp_path, src, "-O2")
+    assert n >= 1, dis
+
+
+def test_unsigned_loop_bound_does_not_decide_a_signed_compare(tmp_path):
+    """i <u n says nothing of (int)i < (int)n: n = 0x80000001 makes it false at
+    i = 1, so the signed compare (and its branch) must stay"""
+    src = "int f(unsigned n) { int bad = 0; for (unsigned i = 0; i < n; i++) if ((int)i >= (int)n) bad++; return bad; }\n"
+    _, dis = _udf_count(tmp_path, src, "-O2")
+    assert re.search(r"\tb(lt|ge|gt|le)(\.n|\.w)?\t", dis), dis
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2"])
+def test_param_bounds_check_is_one_compare(tmp_path, opt):
+    """`int p[n]`: (p - start) + i folds to i while p keeps its value (ssa:fold's
+    barrel-shifted constant, ssa:cprop's never-written PARAM): cmp, branch, udf"""
+    n, dis = _udf_count(tmp_path, "int get(int n, const int p[n], int i) { return p[i]; }\n", opt)
+    assert n == 1, dis
+    body = [l for l in dis.splitlines() if re.match(r"\s+[0-9a-f]+:\t", l)]
+    assert len(body) == 5, dis  # cmp, bcc, udf, ldr, bx
+
+
 # ------------------------------------------------------------- handler mode
 
 CASES_SRC = (CURRENT_DIR / "sanitize_cases.c").read_text().splitlines()
@@ -220,7 +320,19 @@ REPORTS = {
     "shl_sign": rf"left shift of 1 by 31 places {INT}",
     "shl_negbase": "left shift of negative value -1",
     "null": "load of null pointer of type 'int'",
+    # a store (also compound assignment and ++/--), a member access: clang's
+    # type_mismatch kinds 1 and 3
+    "null_store": "store to null pointer of type 'int'",
+    "null_compound": "store to null pointer of type 'int'",
+    "null_inc": "store to null pointer of type 'int'",
+    "null_postinc": "store to null pointer of type 'int'",
+    "null_member": "member access within null pointer of type 'struct P'",
+    "null_member_store": "member access within null pointer of type 'struct P'",
+    "null_dot": "member access within null pointer of type 'struct P'",
     "align": "load of misaligned address 0x[0-9a-f]+ for type 'int', which requires 4 byte alignment",
+    "align_store": "store to misaligned address 0x[0-9a-f]+ for type 'int', which requires 4 byte alignment",
+    "align_member": "member access within misaligned address 0x[0-9a-f]+ for type 'struct P', which requires 4 byte "
+                    "alignment",
     "bounds": r"index 4 out of bounds for type 'int \[4\]'",
     "bounds_neg": r"index -1 out of bounds for type 'int \[4\]'",
     "bounds_store": r"index 4 out of bounds for type 'int \[4\]'",

@@ -37,10 +37,10 @@
 60_errors_and_warnings.c:92: warning: assignment from incompatible pointer type
 60_errors_and_warnings.c:94: warning: assignment from incompatible pointer type
 60_errors_and_warnings.c:95: warning: assignment from incompatible pointer type
-60_errors_and_warnings.c:98: warning: assignment discards qualifiers from pointer target type
-60_errors_and_warnings.c:99: warning: assignment discards qualifiers from pointer target type
-60_errors_and_warnings.c:103: warning: assignment discards qualifiers from pointer target type
-60_errors_and_warnings.c:104: warning: assignment discards qualifiers from pointer target type
+60_errors_and_warnings.c:98: warning: assignment to 'char **' from 'const char **' discards 'const' qualifier from pointer target type
+60_errors_and_warnings.c:99: warning: assignment to 'char *' from 'const char *' discards 'const' qualifier from pointer target type
+60_errors_and_warnings.c:103: warning: assignment to 'unsigned char **' from 'const char **' discards 'const' qualifier from pointer target type
+60_errors_and_warnings.c:104: warning: assignment to 'unsigned char *' from 'const char *' discards 'const' qualifier from pointer target type
 60_errors_and_warnings.c:109: warning: assignment of read-only location
 
 [test_enum_compat]
@@ -203,7 +203,7 @@ bar  : 3 ; 3
 60_errors_and_warnings.c:429: warning: 'stuff' attribute ignored
 
 [test_switch_W3]
-60_errors_and_warnings.c:426: error: assignment discards qualifiers from pointer target type
+60_errors_and_warnings.c:426: error: assignment to 'char *' from 'const char [4]' discards 'const' qualifier from pointer target type
 
 [test_switch_W4]
 60_errors_and_warnings.c:427: warning: implicit declaration of function 'fink'

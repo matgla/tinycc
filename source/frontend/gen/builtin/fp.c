@@ -55,13 +55,32 @@ void __attribute__((noinline)) unary_builtin_alloca(void)
 
       /* Emit VLA_ALLOC: adjusts SP down by size and aligns to 8 bytes. */
       SValue size_sv = *vtop;
-      tcc_ir_gen_vla_alloc(tcc_state->ir, &size_sv, 8 /* 8-byte alignment */);
+#ifdef CONFIG_TCC_BCHECK
+      /* -b: a byte more, so the block's one-past-the-end address is not
+         the next object's */
+      if (tcc_state->do_bounds_check)
+      {
+        if (vtop->r & VT_LVAL)
+          gv(RC_INT), size_sv = *vtop;
+        vpushv(vtop);
+        vpushi(1);
+        gen_op('+');
+        tcc_ir_gen_vla_alloc(tcc_state->ir, vtop, 8);
+        vpop();
+      }
+      else
+#endif
+        tcc_ir_gen_vla_alloc(tcc_state->ir, &size_sv, 8 /* 8-byte alignment */);
       vpop(); /* pop size */
 
       /* Allocate a local slot to capture the resulting SP (= alloca pointer). */
       loc -= PTR_SIZE;
       int alloca_slot = loc;
       tcc_ir_gen_vla_sp_save(tcc_state->ir, alloca_slot);
+#ifdef CONFIG_TCC_BCHECK
+      if (tcc_state->do_bounds_check)
+        bcheck_alloca(alloca_slot, &size_sv);
+#endif
 
       /* Push the saved pointer as the return value (void *). */
       type.t = VT_VOID;

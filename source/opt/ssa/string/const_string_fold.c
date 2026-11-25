@@ -30,6 +30,7 @@ static const StrFoldHandler *const g_handlers[] = {
     &tcc_strfold_rindex,
     &tcc_strfold_strstr,
     &tcc_strfold_strpbrk,
+    &tcc_strfold_fortify_str,
 };
 
 static const StrFoldHandler *g_by_id[STRBI__COUNT];
@@ -76,7 +77,12 @@ static int const_string_fold_core(TCCIRState *ir, IRSSAOptCtx *ctx)
     if (!callee)
       continue;
 
-    id = resolve_str_builtin_id(callee->v, get_tok_str(callee->v, NULL));
+    const char *cname = get_tok_str(callee->v, NULL);
+    id = resolve_str_builtin_id(callee->v, cname);
+    /* -ffortify's string check (builtin/fortify.c): known only here, so the
+       frontend does not take it for a string builtin */
+    if (id == STRBI_UNKNOWN && cname && cname[0] == '_' && !strcmp(cname, "__tcc_fortify_str"))
+      id = STRBI_FORTIFY_STR;
     if (id <= STRBI_UNKNOWN || id >= STRBI__COUNT)
       continue;
 

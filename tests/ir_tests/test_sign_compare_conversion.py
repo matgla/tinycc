@@ -156,7 +156,7 @@ def test_value_ranges_as_gcc(tmp_path, opt):
     conversion it words differently)"""
     src = tmp_path / "t.c"
     src.write_text(RANGES)
-    proc = subprocess.run([str(TCC), "-ccompat", "-c", "-Wconversion", "-Wsign-compare", opt, str(src), "-o",
+    proc = subprocess.run([str(TCC), "-Wno-missing-prototypes", "-ccompat", "-c", "-Wconversion", "-Wsign-compare", opt, str(src), "-o",
                            str(tmp_path / "t.o")], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
     lines = sorted({int(l.split(":")[1]) for l in proc.stderr.splitlines() if ": warning: " in l})

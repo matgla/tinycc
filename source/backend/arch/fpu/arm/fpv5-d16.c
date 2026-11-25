@@ -46,6 +46,7 @@ const FloatingPointConfig arm_fpv5_d16_fpu_config = {
     .has_fsub = 1,
     .has_fmul = 1,
     .has_fdiv = 1,
+    .has_fminmax = 1, /* FPv5: vminnm/vmaxnm.f32 */
     .has_fcmp = 0,
     .has_ftof = 0,
     .has_itof = 0,

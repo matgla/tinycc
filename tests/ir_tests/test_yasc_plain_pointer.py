@@ -56,7 +56,7 @@ ANNOTATED = {
     "function_pointer": "void (*fp)(int);",
     "function_pointer_param": "void h(void (*cb)(char * view));",
     "function_typedef": "typedef int fn(int);\nfn *f2;",
-    "array_decay_and_string": "int f(void) { char b[4]; char * view p = b; const char * view s = \"x\"; return p != s; }",
+    "array_decay_and_string": "int f(void) { char b[4] = undefined; char * view p = b; const char * view s = \"x\"; return p != s; }",
     "address_of": "int f(void) { int x = 1; int * view p = &x; return *p; }",
 }
 
@@ -67,7 +67,7 @@ def _compile(tmp_path, body, *flags, header=None):
     src = tmp_path / "t.c"
     src.write_text(body + "\n")
     return subprocess.run(
-        [str(TCC), *INCLUDE_FLAGS, "-c", "-Wno-lifetime", f"-I{tmp_path}", *flags, str(src), "-o", str(tmp_path / "t.o")],
+        [str(TCC), "-Wno-missing-prototypes", *INCLUDE_FLAGS, "-c", "-Wno-lifetime", f"-I{tmp_path}", *flags, str(src), "-o", str(tmp_path / "t.o")],
         capture_output=True,
         text=True,
     )
@@ -120,11 +120,68 @@ int f(const char * view s)
   void * view maybe p = NULL;
   void * view maybe q = MY_NULL;
   cstr c = find(s, 'x');
-  char * view maybe d = first(c);
+  char * view maybe d = unsafe(first(c));
   return p == q && d == c;
 }"""
     proc = _compile(tmp_path, body, "-std=yasc", opt, header=HEADER)
     assert proc.returncode == 0, proc.stderr
+
+
+# regular C defining functions in a macro, as utest.h's UTEST does
+FN_MACRO_HEADER = """\
+#include <stdlib.h>
+struct reg { char **names; int n; };
+extern struct reg registry;
+#define DEFINE(NAME)                                   \\
+  static void reg_##NAME(void) {                       \\
+    char *name = malloc(8);                            \\
+    if (name && registry.names)                        \\
+      registry.names[registry.n++] = name;             \\
+    else if (name)                                     \\
+      free(name);                                      \\
+  }                                                    \\
+  void run_##NAME(int *result)
+#define FIRST(s) (*(const char *)(s))
+"""
+
+
+def _compile_strict(tmp_path, body, header, *flags):
+    (tmp_path / "h.h").write_text(header)
+    src = tmp_path / "t.c"
+    src.write_text(body + "\n")
+    return subprocess.run(
+        [str(TCC), "-Wno-missing-prototypes", *INCLUDE_FLAGS, "-c", f"-I{tmp_path}", *flags, str(src), "-o", str(tmp_path / "t.o")],
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2", "-Os"])
+def test_regular_c_macro_defines_functions(tmp_path, opt):
+    """A function a regular-C macro defines is regular C at every -O: from -O1
+    its body is saved and parsed later, in its file's dialect unless the saved
+    tokens say it began in a regular-C expansion."""
+    body = """\
+#include "h.h"
+DEFINE(one) { (void)result; reg_one(); }
+DEFINE(two) { (void)result; reg_two(); }
+int first(const char * view s) { return FIRST(s); }"""
+    proc = _compile_strict(tmp_path, body, FN_MACRO_HEADER, opt)
+    assert proc.returncode == 0, proc.stderr
+    assert [line for line in proc.stderr.splitlines() if "error" in line or "warning" in line] == []
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2", "-Os"])
+def test_yasc_after_a_function_macro_is_checked(tmp_path, opt):
+    """The yasc body after the expansion, and yasc code around a regular-C
+    macro in a function, stay yasc."""
+    body = """\
+#include "h.h"
+DEFINE(one) { int *p = result; (void)p; reg_one(); }
+int first(const char * view s) { int *q = 0; (void)q; return FIRST(s); }"""
+    proc = _compile_strict(tmp_path, body, FN_MACRO_HEADER, opt)
+    assert proc.returncode != 0
+    assert f"t.c:2: error: {ERROR}" in proc.stderr and f"t.c:3: error: {ERROR}" in proc.stderr, proc.stderr
 
 
 def test_yasc_header_is_checked(tmp_path):
@@ -142,16 +199,16 @@ def test_regular_c_pointer_is_unchecked(tmp_path):
 #include "h.h"
 int f(const char * view s)
 {
-  char * view a = find(s, 'a');
-  char * view maybe b = find(s, 'b');
+  char * view a = unsafe(find(s, 'a'));
+  char * view maybe b = unsafe(find(s, 'b'));
   cstr c = find(s, 'c');
-  return *a + (b != 0) + *c;
+  return *a + (b != nullptr) + unsafe(*c);
 }"""
     src = tmp_path / "t.c"
     (tmp_path / "h.h").write_text(HEADER)
     src.write_text(body + "\n")
     proc = subprocess.run(
-        [str(TCC), *INCLUDE_FLAGS, "-c", "-std=yasc", f"-I{tmp_path}", str(src), "-o", str(tmp_path / "t.o")],
+        [str(TCC), "-Wno-missing-prototypes", *INCLUDE_FLAGS, "-c", "-std=yasc", f"-I{tmp_path}", str(src), "-o", str(tmp_path / "t.o")],
         capture_output=True,
         text=True,
     )

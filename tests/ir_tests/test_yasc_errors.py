@@ -6,6 +6,7 @@ T or an error, and can only be used through try, catch, return, assignment
 of the same type or an argument of that type.  docs/plans/yasc_errors.md.
 """
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -123,7 +124,7 @@ def test_used_without_try_or_catch(tmp_path, body):
 
 def test_union_payloads_must_match(tmp_path):
     proc = _yasc(tmp_path, "!char * borrows(static) p(void);\n!int k(void) { return p(); }\n")
-    assert _error(proc) == "cannot convert '!char *' to '!int'"
+    assert _error(proc) == "cannot convert '!char * view' to '!int'"
 
 
 def test_try_outside_an_error_union_function(tmp_path):
@@ -207,3 +208,16 @@ def test_union_is_not_unsigned_long_long(tmp_path):
     body = "#pragma yasc\n!int f(void);\nunsigned long long f(void);\n"
     proc = _compile(tmp_path, body)
     assert proc.returncode != 0
+
+
+@pytest.mark.parametrize("decl", ["static !int", "static !void", "static inline !int"])
+def test_storage_class_before_the_union_stays(tmp_path, decl):
+    # `static` before the '!' used to be dropped: the function was global
+    # (and -Wmissing-prototypes asked for a prototype of it)
+    ret = "return;" if "void" in decl else "return 1;"
+    proc = _yasc(tmp_path, f"{decl} s(void) {{ {ret} }}\nvoid use(void);\nvoid use(void) {{ s() catch {{}}; }}\n",
+                 "-Wmissing-prototypes", "-Wno-unused-function")
+    assert "no previous prototype for 's'" not in proc.stderr, proc.stderr
+    assert proc.returncode == 0, proc.stderr
+    nm = subprocess.run(["arm-none-eabi-nm", str(tmp_path / "t.o")], capture_output=True, text=True).stdout
+    assert not re.search(r"(?m) T s$", nm), nm

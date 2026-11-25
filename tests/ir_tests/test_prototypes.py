@@ -49,6 +49,7 @@ def _diags(proc, kind="warning"):
 
 
 NOPROTO = "function declaration isn't a prototype"
+MISSING = "no previous prototype for '%s'"
 
 BODY = """\
 int ext(int);
@@ -161,11 +162,11 @@ def test_not_in_a_system_header(tmp_path):
 
 
 def test_safe_default(tmp_path):
-    # -Wstrict-prototypes is on, `()` is a prototype, -Wmissing-prototypes off
+    # -Wstrict-prototypes and -Wmissing-prototypes are on, `()` is a prototype
     body = "int f();\nint f() { return 0; }\nint knr(a) int a; { return a; }\nint g(int a) { return a; }\n"
     proc = _run(tmp_path, body, compat=False)
     assert proc.returncode == 0, proc.stderr
-    assert _diags(proc) == [(3, NOPROTO)], proc.stderr
+    assert sorted(_diags(proc)) == sorted([(3, NOPROTO), (3, MISSING % "knr"), (4, MISSING % "g")]), proc.stderr
 
 
 def test_module_export_is_its_declaration(tmp_path):

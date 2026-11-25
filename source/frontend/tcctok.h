@@ -96,6 +96,16 @@ DEF(TOK_ENDIF, "endif")
 DEF(TOK_DEFINED, "defined")
 /* C23 spells _Static_assert as static_assert; an identifier before C23 */
 DEF(TOK_static_assert, "static_assert")
+/* C23 keywords whose C11 spellings are _Alignas, _Alignof, _Thread_local;
+   identifiers before C23 (next() maps them, after macro expansion) */
+DEF(TOK_alignas, "alignas")
+DEF(TOK_alignof, "alignof")
+DEF(TOK_thread_local, "thread_local")
+DEF(TOK_constexpr, "constexpr")
+/* C23's true, false and nullptr: constants (expr/primary.c) */
+DEF(TOK_true, "true")
+DEF(TOK_false, "false")
+DEF(TOK_nullptr, "nullptr")
 DEF(TOK_UNDEF, "undef")
 DEF(TOK_ERROR, "error")
 DEF(TOK_WARNING, "warning")
@@ -118,6 +128,8 @@ DEF(TOK___HAS_BUILTIN, "__has_builtin")
 
 /* special identifiers */
 DEF(TOK___FUNC__, "__func__")
+/* the regular-C null pointer macro: yasc code writes nullptr (macro_subst_tok) */
+DEF(TOK_NULL, "NULL")
 
 /* special floating point values */
 DEF(TOK___NAN__, "__nan__")
@@ -198,6 +210,8 @@ DEF(TOK_NOIPA2, "__noipa__")
 DEF(TOK_NORETURN3, "_Noreturn")
 DEF(TOK_PURE1, "pure")
 DEF(TOK_PURE2, "__pure__")
+DEF(TOK_LEAF1, "leaf")
+DEF(TOK_LEAF2, "__leaf__")
 /* Note: TOK_CONST1/2/3 already defined for const keyword */
 DEF(TOK_VISIBILITY1, "visibility")
 DEF(TOK_VISIBILITY2, "__visibility__")
@@ -448,20 +462,41 @@ DEF(TOK_owned, "owned")
 DEF(TOK_view, "view")
 DEF(TOK_maybe, "maybe")
 DEF(TOK_out, "out")
+/* yasc `inout T * view p`: the callee may read and write *p (without it,
+   a view parameter's target is read-only: `in`, which may be written) */
+DEF(TOK_inout, "inout")
 DEF(TOK_drop, "drop")
+/* `in`, the default, only where a parameter's declaration starts: a name
+   everywhere else */
+DEF(TOK_in, "in")
+/* not a yasc word (it was `const T * view`): only its error knows it */
+DEF(TOK_readonly, "readonly")
 DEF(TOK_option, "option")
 /* yasc move(p) / borrow(p), unless a name of that spelling is in scope */
 DEF(TOK_move, "move")
 DEF(TOK_borrow, "borrow")
+/* yasc unsafe { ... } / unsafe(expr), unless a name of that spelling is in scope */
+DEF(TOK_unsafe, "unsafe")
+/* yasc `T x = undefined;`: a local with no value on purpose, unless a name of
+   that spelling is in scope */
+DEF(TOK_undefined, "undefined")
 /* yasc `T * borrows(x, ...)`: after a '*' in yasc */
 DEF(TOK_borrows, "borrows")
 /* yasc `T * owned takes(p)`: on a function's result */
 DEF(TOK_takes, "takes")
+/* yasc `T m when(K, ...);` in a tagged union `union(k) { ... }` */
+DEF(TOK_when, "when")
+/* yasc register fields: `uint32_t irq:1 w1c;` after a member's declarator */
+DEF(TOK_ro, "ro")
+DEF(TOK_wo, "wo")
+DEF(TOK_w1c, "w1c")
 /* yasc statements (identifiers outside the dialect) */
 DEF(TOK_defer, "defer")
 DEF(TOK_errdefer, "errdefer")
 DEF(TOK_try, "try")
 DEF(TOK_catch, "catch")
+/* yasc `unreachable`: a checked point control never reaches (op/ubsan.c gen_unreachable) */
+DEF(TOK_unreachable, "unreachable")
 DEF(TOK_error_from, "error_from")
 DEF(TOK_error_name, "error_name")
 DEF(TOK___yasc_error_name, "__yasc_error_name")

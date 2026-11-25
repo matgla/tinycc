@@ -4,10 +4,10 @@ test_array_bounds.py, test_sizeof_checks.py).
 
 A case is one -W option: a source with hits (each `/* W: text */` comment
 marks a line that must warn, with text in the message), a clean source, and
-whether the option is in -Wall (and so in the safe default).  Every case is
+whether the option is in -Wall (the safe default has every one).  Every case is
 run through the same switches: -W<name>, -Wno-<name>, -Werror=<name>,
 -Wno-error=<name> under -Werror, -ccompat (off unless -Wall / -W<name>), the
-safe default, #pragma GCC diagnostic ignored, the same warnings at
+safe default (on), #pragma GCC diagnostic ignored, the same warnings at
 -O0/-O1/-O2/-Os -- once each, also in a static inline function called twice
 -- and the objects identical with and without the option.
 """
@@ -104,9 +104,20 @@ def check_ccompat(tmp_path, c):
 
 
 def check_safe_default(tmp_path, c):
+    """every check is on in the safe default: what -Wno-<name> takes away
+    there is the case's warnings (the other checks say what they say)"""
     proc = run(tmp_path, c.hit, *c.extra, ccompat=False)
     assert proc.returncode == 0, proc.stderr
-    matches(proc, c.expected() if c.wall else [])
+    off = run(tmp_path, c.hit, "-Wno-" + c.option, *c.extra, ccompat=False, obj="off.o")
+    got = diags(proc, "warning")
+    for d in diags(off, "warning"):
+        if d in got:
+            got.remove(d)
+    for n, text in c.expected():
+        hits = [d for d in got if d[0] == n and text in d[2]]
+        assert len(hits) == 1, f"line {n} '{text}': {got}\n{proc.stderr}"
+        got.remove(hits[0])
+    assert not got, f"unexpected: {got}\n{proc.stderr}"
 
 
 def check_pragma(tmp_path, c):

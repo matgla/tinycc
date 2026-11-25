@@ -25,10 +25,10 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 PRELUDE = """\
 #pragma yasc
 void free(drop void * owned maybe p);
-long getl(char * owned maybe * view lineptr, unsigned long * view n);
+long getl(inout char * owned maybe * view lineptr, inout unsigned long * view n);
 int pma(out void * owned maybe * view memptr, unsigned long sz);
 int aspr(out char * owned maybe * view strp, const char * view fmt);
-void g(char * view maybe * view p);
+void g(inout char * view maybe * view p);
 """
 PRELUDE_LINES = PRELUDE.count("\n")
 LEVELS = ["-O0", "-O1", "-O2", "-Os"]
@@ -58,7 +58,6 @@ CLEAN = {
     "in_out_twice": GETL + "  getl(&line, &n);\n  getl(&line, &n);\n  free(line);\n}\n",
     "out_status_tested": "void f(void)\n{\n  void * owned maybe m;\n  if (pma(&m, 16))\n    return;\n  free(m);\n}\n",
     "out_status_lt_zero": "void f(void)\n{\n  char * owned maybe s;\n  if (aspr(&s, \"x\") < 0)\n    return;\n  free(s);\n}\n",
-    "address_elsewhere_untracked": GETL + "  g(&line);\n  free(line);\n}\n",
     # the status kept in a local defined once, tested in another block
     "out_status_in_variable": "void f(void)\n{\n  void * owned maybe m;\n  int r = pma(&m, 16);\n  if (r)\n    return;\n"
     "  free(m);\n}\n",
@@ -77,6 +76,12 @@ def test_clean(tmp_path, name, opt):
 
 
 BAD = {
+    # its address to a parameter that may write it: not followed, and said so
+    "address_elsewhere_untracked": (
+        GETL + "  g(&line);\n  free(line);\n}\n",
+        5,
+        "the address of 'line' goes where it may be written: the lifetime check does not follow 'line'",
+    ),
     "in_out_leaks": (GETL + "  getl(&line, &n);\n}\n", 6, "'line' leaks: it still owns memory at the end of its scope"),
     "in_out_after_free": (GETL + "  free(line);\n  getl(&line, &n);\n  free(line);\n}\n", 6, "'line' is used after it was freed"),
     "out_overwrites": (

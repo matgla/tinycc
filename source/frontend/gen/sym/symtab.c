@@ -692,7 +692,8 @@ static Sym **ptr_node_slot(int t, const Sym *ref, int yasc, int borrows)
   for (h = ptr_node_hash(t, ref, yasc) + (unsigned)borrows * 2654435761u;; h++)
   {
     e = &ptr_nodes[h & ptr_nodes_mask];
-    if (!*e || ((*e)->type.t == t && (*e)->type.ref == ref && (*e)->yasc == yasc && (*e)->vreg == borrows))
+    if (!*e || ((*e)->type.t == t && (*e)->type.ref == ref &&
+                ((*e)->yasc | (((*e)->ymod & YASC_PMOD_RESTRICT) ? YASC_RESTRICT : 0)) == yasc && (*e)->vreg == borrows))
       return e;
   }
 }
@@ -721,7 +722,8 @@ ST_FUNC Sym *sym_pointer_node_b(CType *type, int yasc, int borrows)
     ptr_nodes = tcc_mallocz((ptr_nodes_mask + 1) * sizeof *ptr_nodes);
     for (i = 0; i < n; i++)
       if (old[i])
-        *ptr_node_slot(old[i]->type.t, old[i]->type.ref, old[i]->yasc, old[i]->vreg) = old[i];
+        *ptr_node_slot(old[i]->type.t, old[i]->type.ref,
+                       old[i]->yasc | ((old[i]->ymod & YASC_PMOD_RESTRICT) ? YASC_RESTRICT : 0), old[i]->vreg) = old[i];
     tcc_free(old);
     e = ptr_node_slot(type->t, type->ref, yasc, borrows);
   }
@@ -732,7 +734,8 @@ ST_FUNC Sym *sym_pointer_node_b(CType *type, int yasc, int borrows)
   s->type = *type;
   s->c = -1;
   s->vreg = borrows;
-  s->yasc = yasc;
+  s->yasc = yasc & 0xff;
+  s->ymod = (yasc & YASC_RESTRICT) ? YASC_PMOD_RESTRICT : 0;
   *e = s;
   ptr_nodes_nb++;
   return s;
@@ -1261,7 +1264,7 @@ void check_shadow(Sym *s)
 
 /* the declarator's name decl() read last came from a system header's macro
    (type_decl, while -Wshadow is on) */
-int shadow_name_sys;
+int shadow_name_sys, shadow_param_sys;
 
 /* the same, S declared at LINE (0: here) */
 static void check_shadow_at(Sym *s, int line)
@@ -1314,7 +1317,7 @@ void check_shadow_params(Sym *func)
   for (q = local_stack; q && q->v != SYM_FIELD; q = q->prev)
     ;
   shadow_params_bottom = q;
-  if (!(tcc_state->warn_shadow & WARN_ON) && !tcc_state->nb_diag_snaps)
+  if (!(tcc_state->warn_shadow & WARN_ON) && !tcc_diag_snaps_on(warn_shadow))
     return;
   /* in the order they were written, each at its own line */
   Sym *small[16], **ps = small;
@@ -1331,6 +1334,9 @@ void check_shadow_params(Sym *func)
     struct shadow_place *where = (struct shadow_place *)shadow_place_of(ps[i]);
     if (where && line)
       where->line = line; /* a local hiding it names this line too */
+    /* a parameter a system header's macro named is quiet, as a declaration */
+    if (func && !tcc_state->warn_system_headers && unused_param_decl_sys(func, ps[i]->v))
+      continue;
     check_shadow_at(ps[i], line);
   }
   if (ps != small)
@@ -1429,15 +1435,20 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
   s->r = r;
   s->vreg = vreg;
   /* -Wlifetime follows pointer locals and parameters through the raw IR,
-     and the maybe members of local structs and arrays of them (no vreg) */
-  if ((vreg >= 0 || (type->t & (VT_BTYPE | VT_ARRAY)) == VT_STRUCT ||
-       ((type->t & VT_ARRAY) && type->ref && (type->ref->type.t & (VT_BTYPE | VT_ARRAY)) == VT_STRUCT)) &&
-      tcc_state->ir && tcc_state->ir->lt_on)
+     and the maybe members of local structs and arrays of them (no vreg);
+     other arrays only for their names */
+  if ((vreg >= 0 || (type->t & (VT_BTYPE | VT_ARRAY)) == VT_STRUCT || (type->t & VT_ARRAY)) && tcc_state->ir &&
+      tcc_state->ir->lt_on)
     tcc_ir_lt_add_var(tcc_state->ir, vreg, s);
   /* -Wtainted-format: the frame's objects (arrays, structs, locals whose
      address is taken), each its own memory */
   if (vreg < 0 && local_stack && (r & VT_VALMASK) == VT_LOCAL && tcc_state->ir && tcc_state->ir->taint_on)
     tcc_ir_taint_add_local(tcc_state->ir, s);
+  /* -Warray-bounds=2: the frame's objects, for the accesses through pointers
+     to them; -Wuse-after-free: the pointer variables' names */
+  if (((local_stack && (r & VT_VALMASK) == VT_LOCAL) || (r & VT_PARAM)) && tcc_state->ir &&
+      (tcc_state->ir->ab_on || tcc_state->ir->ab_uaf))
+    tcc_ir_ab_add_local(tcc_state->ir, s);
   /* -Wdangling-pointer names the pointer variables it follows */
   if (vreg >= 0 && (type->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && tcc_state->ir && tcc_ir_dp_wanted())
     tcc_ir_dp_add_name(tcc_state->ir, vreg, s);

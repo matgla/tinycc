@@ -17,6 +17,7 @@
 #include "ssa_opt.h"
 #include "opt_utils.h"
 #include "opt_ssa_domwalk.h"
+#include "opt_range.h"
 #include "opt/ssa/vrp.h"
 #include "memory/small_sequence.h"
 #include "memory/vector.h"
@@ -58,7 +59,15 @@ typedef struct
   uint8_t *var_stable;  /* [var_cap]: VAR v written exactly once + address never taken + not volatile */
   int var_cap;
   SVUndoVec *log;       /* dominator-scope undo trail: (slot, prior range); owned by ssa_opt_vrp */
+  int *var_writes;      /* [var_cap * SV_VAR_WRITES]: a VAR's writes, all of them (-1 after the last), or
+                           var_writes[v * SV_VAR_WRITES] == -2: not known (addressed, volatile, too many, partial) */
+  uint8_t *var_addr;    /* [var_cap]: the VAR's address is taken */
+  int chain_steps;      /* what is left of one proof's steps (sv_chain_step) */
 } SVState;
+
+/* the writes of a VAR the value folds may look through (inlined functions'
+   return slots, which SSA leaves in memory: ssa.c's store-only rule) */
+#define SV_VAR_WRITES 4
 
 /* ------------------------------------------------------------------ pure range math */
 
@@ -1313,6 +1322,781 @@ static void sv_seed_phis(SVState *s, int block)
   }
 }
 
+/* ------------------------------------------------------- induction-variable bounds */
+
+static int sv_same_value_d(SVState *s, IROperand x, IROperand y, int depth);
+static int sv_def_past_copies(SVState *s, int32_t *vr);
+
+/* Two TEMPs, each defined once by the same pure operation on operands with
+ * the same values: one value (a yasc slice's `s.len` is `s >> 32` wherever
+ * it is read, each read a TEMP of its own). */
+static int sv_same_def(SVState *s, int32_t a, int32_t b, int depth)
+{
+  TCCIRState *ir = s->ctx->ir;
+  if (depth > 4 || a < 0 || b < 0 || TCCIR_DECODE_VREG_TYPE(a) != TCCIR_VREG_TYPE_TEMP ||
+      TCCIR_DECODE_VREG_TYPE(b) != TCCIR_VREG_TYPE_TEMP)
+    return 0;
+  /* through copies first: `T1 <- T0` is T0 */
+  sv_def_past_copies(s, &a);
+  sv_def_past_copies(s, &b);
+  if (a == b)
+    return 1;
+  if (a < 0 || b < 0 || TCCIR_DECODE_VREG_TYPE(a) != TCCIR_VREG_TYPE_TEMP || TCCIR_DECODE_VREG_TYPE(b) != TCCIR_VREG_TYPE_TEMP)
+    return 0;
+  IRSSAVregInfo *va = ssa_opt_vinfo(s->ctx, a), *vb = ssa_opt_vinfo(s->ctx, b);
+  if (!va || !vb || va->def_instr < 0 || vb->def_instr < 0 || ssa_opt_def_total(va) != 1 || ssa_opt_def_total(vb) != 1)
+    return 0;
+  IRQuadCompact *qa = &ir->compact_instructions[va->def_instr], *qb = &ir->compact_instructions[vb->def_instr];
+  if (qa->op != qb->op || tcc_ir_barrel_shift_at(ir, qa) || tcc_ir_barrel_shift_at(ir, qb))
+    return 0;
+  switch (qa->op)
+  {
+  case TCCIR_OP_ADD: case TCCIR_OP_SUB: case TCCIR_OP_AND: case TCCIR_OP_OR: case TCCIR_OP_XOR:
+  case TCCIR_OP_SHL: case TCCIR_OP_SHR: case TCCIR_OP_SAR: case TCCIR_OP_ASSIGN:
+    break;
+  default:
+    return 0;
+  }
+  IROperand da = tcc_ir_op_get_dest(ir, qa), db = tcc_ir_op_get_dest(ir, qb);
+  if (da.btype != db.btype || da.is_unsigned != db.is_unsigned)
+    return 0;
+  IROperand a1 = tcc_ir_op_get_src1(ir, qa), b1 = tcc_ir_op_get_src1(ir, qb);
+  if (a1.is_lval || b1.is_lval || !sv_same_value_d(s, a1, b1, depth + 1))
+    return 0;
+  if (qa->op == TCCIR_OP_ASSIGN)
+    return 1;
+  IROperand a2 = tcc_ir_op_get_src2(ir, qa), b2 = tcc_ir_op_get_src2(ir, qb);
+  return !a2.is_lval && !b2.is_lval && sv_same_value_d(s, a2, b2, depth + 1);
+}
+
+/* Two operands with the same value: one vreg, one constant, or one
+   computation (sv_same_def). */
+static int sv_same_value_d(SVState *s, IROperand x, IROperand y, int depth)
+{
+  int64_t xl, xh, yl, yh;
+  if (x.btype == IROP_BTYPE_INT64 || y.btype == IROP_BTYPE_INT64)
+  {
+    /* a 64-bit operand: the same register or the same constant only */
+    if (irop_is_immediate(x) && irop_is_immediate(y))
+      return irop_get_imm64_ex(s->ctx->ir, x) == irop_get_imm64_ex(s->ctx->ir, y);
+    return sv_same_operand(x, y) || (!x.is_lval && !y.is_lval && sv_same_def(s, irop_get_vreg(x), irop_get_vreg(y), depth));
+  }
+  if (sv_same_operand(x, y))
+    return 1;
+  if (sv_operand_range(s, x, &xl, &xh) && sv_operand_range(s, y, &yl, &yh) && xl == xh && yl == yh && xl == yl)
+    return 1;
+  return !x.is_lval && !y.is_lval && !irop_is_immediate(x) && !irop_is_immediate(y) &&
+         sv_same_def(s, irop_get_vreg(x), irop_get_vreg(y), depth);
+}
+
+static int sv_same_value(SVState *s, IROperand x, IROperand y)
+{
+  return sv_same_value_d(s, x, y, 0);
+}
+
+/* A loop bound Y that is one value through the whole loop at header H: a
+ * constant, a never-written PARAM, or a TEMP defined before H. */
+static int sv_loop_invariant(SVState *s, IROperand y, int header)
+{
+  IRCFG *cfg = s->ctx->cfg;
+  int32_t vr;
+  if (irop_is_immediate(y))
+    return irop_is_plain_imm(y);
+  if (sv_operand_slot(s, y) < 0)
+    return 0;
+  vr = irop_get_vreg(y);
+  /* a stable VAR's one store may sit inside the loop */
+  if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+    return 0;
+  if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+  {
+    IRSSAVregInfo *vi = ssa_opt_vinfo(s->ctx, vr);
+    int b = !vi ? -1 : vi->def_phi_block >= 0 ? vi->def_phi_block
+                     : vi->def_instr >= 0 ? cfg->instr_to_block[vi->def_instr] : -1;
+    if (b < 0 || b == header || !tcc_ir_cfg_dominates(cfg, b, header))
+      return 0;
+  }
+  return 1;
+}
+
+/* The compare that an edge PRED -> BLOCK is taken under, read as `v TOK y`
+ * for the value V: 1 and *y, *tok, or 0 when the edge is not conditional on
+ * such a compare. */
+static int sv_edge_cmp(SVState *s, int pred, int block, IROperand v, IROperand *y, int *tok)
+{
+  TCCIRState *ir = s->ctx->ir;
+  IRBasicBlock *pb = &s->ctx->cfg->blocks[pred];
+  int target_block, ft_block, t;
+  int term = sv_last_real(ir, pb->start_idx, pb->end_idx);
+  if (term < 0 || ir->compact_instructions[term].op != TCCIR_OP_JUMPIF)
+    return 0;
+  int cmp = sv_last_real(ir, pb->start_idx, term);
+  IRQuadCompact *cq = cmp >= 0 ? &ir->compact_instructions[cmp] : NULL;
+  if (!cq || cq->op != TCCIR_OP_CMP || tcc_ir_barrel_shift_at(ir, cq) ||
+      tcc_ir_instr_access_is_volatile(ir, cq))
+    return 0;
+  sv_jumpif_edges(s->ctx, term, &target_block, &ft_block);
+  if (target_block == ft_block)
+    return 0;
+  t = (int)tcc_ir_op_src1_imm(ir, &ir->compact_instructions[term]);
+  if (block == ft_block)
+    t = vrp_negate_cmp_tok(t);
+  else if (block != target_block)
+    return 0;
+  IROperand a = tcc_ir_op_get_src1(ir, cq), b = tcc_ir_op_get_src2(ir, cq);
+  if (a.btype != IROP_BTYPE_INT32 || b.btype != IROP_BTYPE_INT32)
+    return 0;
+  if (sv_same_value(s, a, v))
+    *y = b;
+  else if (sv_same_value(s, b, v))
+  {
+    *y = a;
+    t = vrp_swap_cmp_tok(t);
+  }
+  else
+    return 0;
+  *tok = t;
+  return t >= 0;
+}
+
+/* An induction variable against its loop's own bound.  x = phi(init, next)
+ * at the header H, next = x + 1, and each edge into H is taken only under
+ * `v < Y` for the value v it brings (init on the way in, next on the back
+ * edge; both signed or both unsigned): every x then is below Y, so x + 1
+ * never wraps and x only grows from init.  Signed with init >= 0, or
+ * unsigned: x <u Y.  Decides the CMP x,Y / CMP x,#K (K >= Y) of a check like
+ * -fsanitize=bounds' `i <u n` for `for (i = 0; i < n; i++) a[i]`, a[n]. */
+static int sv_try_fold_iv_bound(IRSSAOptCtx *ctx, SVState *s, int cmp_idx, int jmp_idx)
+{
+  TCCIRState *ir = ctx->ir;
+  IRCFG *cfg = ctx->cfg;
+  IRQuadCompact *cq = &ir->compact_instructions[cmp_idx];
+  int tok = (int)tcc_ir_op_src1_imm(ir, &ir->compact_instructions[jmp_idx]);
+  if (cq->op != TCCIR_OP_CMP || tok < 0 || tcc_ir_barrel_shift_at(ir, cq) ||
+      tcc_ir_instr_access_is_volatile(ir, cq) || sv_next_reads_flags(ir, jmp_idx))
+    return 0;
+  IROperand x = tcc_ir_op_get_src1(ir, cq), k = tcc_ir_op_get_src2(ir, cq);
+  IRPhiNode *phi = NULL;
+  for (int side = 0; side < 2 && !phi; side++)
+  {
+    if (side)
+    {
+      IROperand t = x;
+      x = k;
+      k = t;
+      tok = vrp_swap_cmp_tok(tok);
+      if (tok < 0)
+        return 0;
+    }
+    if (x.btype == IROP_BTYPE_INT32 && !x.is_lval && !irop_is_immediate(x) && irop_get_vreg(x) >= 0 &&
+        TCCIR_DECODE_VREG_TYPE(irop_get_vreg(x)) == TCCIR_VREG_TYPE_TEMP)
+      phi = sv_phi_for(s, irop_get_vreg(x));
+  }
+  if (!phi || phi->num_operands != 2 || k.btype != IROP_BTYPE_INT32)
+    return 0;
+  int32_t xvr = irop_get_vreg(x);
+  IRSSAVregInfo *xvi = ssa_opt_vinfo(ctx, xvr);
+  if (!xvi || ssa_opt_def_total(xvi) != 1)
+    return 0;
+  int h = xvi->def_phi_block;
+  int back = -1, entry = -1;
+  for (int i = 0; i < 2; i++)
+  {
+    int p = phi->operands[i].pred_block;
+    if (p < 0 || p >= cfg->num_blocks)
+      return 0;
+    if (tcc_ir_cfg_dominates(cfg, h, p))
+      back = i;
+    else
+      entry = i;
+  }
+  if (back < 0 || entry < 0)
+    return 0;
+
+  /* next = x + 1 */
+  int32_t nvr = phi->operands[back].vreg;
+  IRSSAVregInfo *nvi = nvr >= 0 ? ssa_opt_vinfo(ctx, nvr) : NULL;
+  if (!nvi || nvi->def_instr < 0 || ssa_opt_def_total(nvi) != 1)
+    return 0;
+  IRQuadCompact *nq = &ir->compact_instructions[nvi->def_instr];
+  if (nq->op != TCCIR_OP_ADD || tcc_ir_barrel_shift_at(ir, nq))
+    return 0;
+  IROperand n1 = tcc_ir_op_get_src1(ir, nq), n2 = tcc_ir_op_get_src2(ir, nq), one;
+  if (sv_same_operand(n1, x))
+    one = n2;
+  else if (sv_same_operand(n2, x))
+    one = n1;
+  else
+    return 0;
+  int64_t c, lo, hi;
+  if (!irop_is_immediate(one) || !irop_is_plain_imm(one) || !sv_read_const32(ir, one, &c) || c != 1)
+    return 0;
+  IROperand next = tcc_ir_op_get_dest(ir, nq), init;
+  init = irop_make_vreg(phi->operands[entry].vreg, IROP_BTYPE_INT32);
+
+  /* the back edge: next < Y */
+  IROperand y, y2;
+  int btok, etok;
+  if (!sv_edge_cmp(s, phi->operands[back].pred_block, h, next, &y, &btok) || (btok != VRP_TOK_LT && btok != VRP_TOK_ULT))
+    return 0;
+  if (!sv_loop_invariant(s, y, h))
+    return 0;
+  /* the way in: init < Y, compared on the edge or both constants */
+  if (sv_edge_cmp(s, phi->operands[entry].pred_block, h, init, &y2, &etok))
+  {
+    if (etok != btok || !sv_same_value(s, y, y2))
+      return 0;
+  }
+  else
+  {
+    int64_t yl, yh;
+    if (!sv_operand_range(s, init, &lo, &hi) || !sv_operand_range(s, y, &yl, &yh) || lo != hi || yl != yh)
+      return 0;
+    if (btok == VRP_TOK_LT ? !(lo < yl) : !((uint32_t)lo < (uint32_t)yl))
+      return 0;
+  }
+  /* x <u Y: unsigned guards, or signed ones from a non-negative start */
+  if (btok == VRP_TOK_LT && (!sv_operand_range(s, init, &lo, &hi) || lo < 0))
+    return 0;
+
+  /* the check: x against Y itself, or against a constant at or above a constant Y */
+  int verdict = -1;
+  int64_t kl, kh, yl, yh;
+  int above = sv_same_value(s, k, y) ||
+              (sv_operand_range(s, k, &kl, &kh) && sv_operand_range(s, y, &yl, &yh) && kl == kh && yl == yh &&
+               (uint32_t)kl >= (uint32_t)yl && kl >= yl);
+  if (!above)
+    return 0;
+  /* signed guards (from a start >= 0) give x <s Y and x <u Y; unsigned ones
+     only x <u Y (x = 5, Y = 0x80000000) */
+  switch (tok)
+  {
+  case VRP_TOK_ULT: case VRP_TOK_ULE: case VRP_TOK_NE:
+    verdict = 1;
+    break;
+  case VRP_TOK_UGE: case VRP_TOK_UGT: case VRP_TOK_EQ:
+    verdict = 0;
+    break;
+  case VRP_TOK_LT: case VRP_TOK_LE:
+    verdict = btok == VRP_TOK_LT ? 1 : -1;
+    break;
+  case VRP_TOK_GE: case VRP_TOK_GT:
+    verdict = btok == VRP_TOK_LT ? 0 : -1;
+    break;
+  default:
+    return 0;
+  }
+  if (verdict < 0)
+    return 0;
+  sv_commit_jumpif(ctx, cmp_idx, jmp_idx, verdict);
+  sv_drop_cmp_use(ctx, irop_get_vreg(tcc_ir_op_get_src1(ir, cq)), cmp_idx);
+  sv_drop_cmp_use(ctx, irop_get_vreg(tcc_ir_op_get_src2(ir, cq)), cmp_idx);
+  return 1;
+}
+
+/* ---------------------------------------------- decreasing loops: v <u Y by chains */
+
+#define SV_PROVE_DEPTH 8
+/* sv_prove_below / sv_nonzero / sv_dec_iv: how deep one proof goes (dirname's
+   end <= len: three loops after each other, an inlined function's return
+   slot, ~12 levels), and how many steps it may take in all -- a phi joining
+   phis would otherwise make a failing search exponential in the depth */
+#define SV_CHAIN_DEPTH 16
+#define SV_CHAIN_STEPS 512
+
+static int sv_chain_step(SVState *s, int depth)
+{
+  if (depth == 0)
+    s->chain_steps = SV_CHAIN_STEPS;
+  return depth <= SV_CHAIN_DEPTH && --s->chain_steps >= 0;
+}
+
+/* The instruction defining vr, past plain copies (*vr follows them), or -1. */
+static int sv_def_past_copies(SVState *s, int32_t *vr)
+{
+  TCCIRState *ir = s->ctx->ir;
+  for (int k = 0; k < SV_PROVE_DEPTH; k++)
+  {
+    if (*vr < 0 || TCCIR_DECODE_VREG_TYPE(*vr) != TCCIR_VREG_TYPE_TEMP)
+      return -1;
+    IRSSAVregInfo *vi = ssa_opt_vinfo(s->ctx, *vr);
+    if (!vi || vi->def_instr < 0 || ssa_opt_def_total(vi) != 1)
+      return -1;
+    IRQuadCompact *q = &ir->compact_instructions[vi->def_instr];
+    IROperand src = tcc_ir_op_get_src1(ir, q);
+    if (q->op == TCCIR_OP_ASSIGN && src.tag == IROP_TAG_VREG && !src.is_lval && !irop_is_local(src) &&
+        !irop_is_llocal(src) && src.btype == IROP_BTYPE_INT32 && irop_get_vreg(src) >= 0)
+    {
+      *vr = irop_get_vreg(src);
+      continue;
+    }
+    return vi->def_instr;
+  }
+  return -1;
+}
+
+static int sv_dec_iv(SVState *s, int32_t xvr, IROperand *init, int depth);
+
+/* v != 0: a constant, a fact in scope (one about the value, so true
+   wherever it is defined), or a decreasing loop's variable (always >= 1) */
+static int sv_nonzero(SVState *s, IROperand v, int depth)
+{
+  int64_t lo, hi;
+  IROperand init;
+  if (sv_operand_range(s, v, &lo, &hi) && (lo > 0 || hi < 0))
+    return 1;
+  int slot = sv_operand_slot(s, v);
+  if (slot >= 0 && s->ranges[slot].nz)
+    return 1;
+  int32_t vr = irop_get_vreg(v);
+  if (vr < 0 || v.is_lval || irop_is_immediate(v) || !sv_chain_step(s, depth))
+    return 0;
+  sv_def_past_copies(s, &vr);
+  return sv_dec_iv(s, vr, &init, depth + 1);
+}
+
+/* Is the edge PRED -> BLOCK taken only with v > 0 (`v >u 0`, `v != 0`,
+ * `v >s 0`)?  Its own compare, or one on the single-predecessor edge into a
+ * block on PRED's dominator chain (every way to PRED took it), or v known
+ * non-zero. */
+static int sv_edge_positive(SVState *s, int pred, int block, IROperand v, int depth)
+{
+  IRCFG *cfg = s->ctx->cfg;
+  IROperand y;
+  int tok, from = pred, to = block;
+  for (int k = 0; k < SV_PROVE_DEPTH && from >= 0; k++)
+  {
+    int64_t c;
+    if (sv_edge_cmp(s, from, to, v, &y, &tok) && irop_is_immediate(y) && irop_is_plain_imm(y) &&
+        sv_read_const32(s->ctx->ir, y, &c) && c == 0 &&
+        (tok == VRP_TOK_UGT || tok == VRP_TOK_NE || tok == VRP_TOK_GT))
+      return 1;
+    /* up PRED's dominator chain: the edge into a block with one predecessor */
+    to = k == 0 ? pred : cfg->blocks[to].idom;
+    if (to < 0 || cfg->blocks[to].num_preds != 1)
+    {
+      if (to < 0 || to == cfg->blocks[to].idom)
+        break;
+      from = -1;
+      for (int j = 0; j < SV_PROVE_DEPTH && to >= 0 && cfg->blocks[to].num_preds != 1; j++)
+        to = to == cfg->blocks[to].idom ? -1 : cfg->blocks[to].idom;
+      if (to < 0)
+        break;
+    }
+    from = cfg->blocks[to].preds[0];
+  }
+  return sv_nonzero(s, v, depth + 1);
+}
+
+/* A decreasing loop's variable: x = phi(init, next) at H, next = x - 1, and
+ * every edge into H is taken only with the value it brings above 0.  Then x
+ * is >= 1 at each trip, x - 1 never wraps, and x <=u init. */
+static int sv_dec_iv(SVState *s, int32_t xvr, IROperand *init, int depth)
+{
+  IRCFG *cfg = s->ctx->cfg;
+  TCCIRState *ir = s->ctx->ir;
+  if (xvr < 0 || TCCIR_DECODE_VREG_TYPE(xvr) != TCCIR_VREG_TYPE_TEMP || !sv_chain_step(s, depth))
+    return 0;
+  IRPhiNode *phi = sv_phi_for(s, xvr);
+  IRSSAVregInfo *xvi = ssa_opt_vinfo(s->ctx, xvr);
+  if (!phi || phi->num_operands != 2 || !xvi || ssa_opt_def_total(xvi) != 1)
+    return 0;
+  int h = xvi->def_phi_block, back = -1, entry = -1;
+  for (int i = 0; i < 2; i++)
+  {
+    int p = phi->operands[i].pred_block;
+    if (p < 0 || p >= cfg->num_blocks)
+      return 0;
+    if (tcc_ir_cfg_dominates(cfg, h, p))
+      back = i;
+    else
+      entry = i;
+  }
+  if (back < 0 || entry < 0)
+    return 0;
+  int32_t nvr = phi->operands[back].vreg;
+  IROperand next = irop_make_vreg(nvr, IROP_BTYPE_INT32);
+  int def = sv_def_past_copies(s, &nvr);
+  if (def < 0)
+    return 0;
+  IRQuadCompact *nq = &ir->compact_instructions[def];
+  if ((nq->op != TCCIR_OP_ADD && nq->op != TCCIR_OP_SUB) || tcc_ir_barrel_shift_at(ir, nq))
+    return 0;
+  IROperand a = tcc_ir_op_get_src1(ir, nq), b = tcc_ir_op_get_src2(ir, nq);
+  int64_t c;
+  if (!irop_is_immediate(b) || !irop_is_plain_imm(b) || !sv_read_const32(ir, b, &c) ||
+      c != (nq->op == TCCIR_OP_ADD ? -1 : 1) || a.tag != IROP_TAG_VREG || a.is_lval)
+    return 0;
+  int32_t avr = irop_get_vreg(a);
+  sv_def_past_copies(s, &avr);
+  if (avr != xvr)
+    return 0;
+  *init = irop_make_vreg(phi->operands[entry].vreg, IROP_BTYPE_INT32);
+  return sv_edge_positive(s, phi->operands[back].pred_block, h, next, depth + 1) &&
+         sv_edge_positive(s, phi->operands[entry].pred_block, h, *init, depth + 1);
+}
+
+/* The writes of the VAR the LOAD at DEF reads, every one (-1 ends the
+   list), or NULL when they are not all known */
+static const int *sv_load_var_writes(SVState *s, int def)
+{
+  TCCIRState *ir = s->ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[def];
+  if (!s->var_writes || q->op != TCCIR_OP_LOAD || tcc_ir_instr_access_is_volatile(ir, q))
+    return NULL;
+  IROperand src = tcc_ir_op_get_src1(ir, q);
+  int32_t vr = irop_get_vreg(src);
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR || !src.is_lval || !irop_is_local(src) ||
+      irop_is_llocal(src) || src.btype != IROP_BTYPE_INT32)
+    return NULL;
+  int pos = TCCIR_DECODE_VREG_POSITION(vr);
+  if (pos < 0 || pos >= s->var_cap || s->var_writes[pos * SV_VAR_WRITES] < 0)
+    return NULL;
+  return &s->var_writes[pos * SV_VAR_WRITES];
+}
+
+static IROperand sv_write_value(SVState *s, int w)
+{
+  IROperand v = tcc_ir_op_get_src1(s->ctx->ir, &s->ctx->ir->compact_instructions[w]);
+  if (!irop_is_immediate(v) && !v.is_lval && irop_get_vreg(v) >= 0)
+    v.btype = IROP_BTYPE_INT32;
+  return v;
+}
+
+/* v <u y (STRICT) or v <=u y, from v's definition: a decreasing loop's
+ * variable is at most its start, `w - 1` with w != 0 is below w, a phi
+ * joining values is below y when each one is. */
+static int sv_prove_below(SVState *s, IROperand v, IROperand y, int strict, int depth)
+{
+  int64_t vl, vh, yl, yh;
+  if (v.btype != IROP_BTYPE_INT32)
+    return 0;
+  /* what needs no search first: a chain's last step is often one of these,
+     one level past where the search stops (dirname: three loops, then an
+     inlined function's return slot) */
+  if (!strict && sv_same_value(s, v, y))
+    return 1;
+  int64_t vc;
+  if (!strict && irop_is_immediate(v) && irop_is_plain_imm(v) && sv_read_const32(s->ctx->ir, v, &vc) && vc == 0)
+    return 1; /* 0 <=u anything */
+  if (sv_operand_range(s, v, &vl, &vh) && sv_operand_range(s, y, &yl, &yh) && vl >= 0 && yl >= 0 &&
+      (strict ? vh < yl : vh <= yl))
+    return 1;
+  if (!sv_chain_step(s, depth))
+    return 0;
+  int32_t vr = irop_get_vreg(v);
+  if (vr < 0 || v.is_lval || irop_is_immediate(v))
+    return 0;
+  int def = sv_def_past_copies(s, &vr);
+  IROperand init;
+  if (def < 0)
+  {
+    IRPhiNode *phi = sv_phi_for(s, vr);
+    if (!phi)
+      return 0;
+    if (sv_dec_iv(s, vr, &init, depth + 1))
+      return sv_prove_below(s, init, y, strict, depth + 1);
+    if (sv_phi_is_loop_phi(s, phi, vr) || phi->num_operands <= 0)
+      return 0;
+    for (int i = 0; i < phi->num_operands; i++)
+      if (!sv_prove_below(s, irop_make_vreg(phi->operands[i].vreg, IROP_BTYPE_INT32), y, strict, depth + 1))
+        return 0;
+    return 1;
+  }
+  TCCIRState *ir = s->ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[def];
+  /* a VAR's value: below y when everything ever stored there is (an inlined
+     function's return slot: dirname's `end`) */
+  const int *w = sv_load_var_writes(s, def);
+  if (w)
+  {
+    for (int k = 0; k < SV_VAR_WRITES && w[k] >= 0; k++)
+    {
+      IROperand wv = sv_write_value(s, w[k]);
+      if (wv.is_lval || !sv_prove_below(s, wv, y, strict, depth + 1))
+        return 0;
+    }
+    return 1;
+  }
+  if ((q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB) || tcc_ir_barrel_shift_at(ir, q))
+    return 0;
+  IROperand a = tcc_ir_op_get_src1(ir, q), b = tcc_ir_op_get_src2(ir, q);
+  int64_t c;
+  if (!irop_is_immediate(b) || !irop_is_plain_imm(b) || !sv_read_const32(ir, b, &c) || a.is_lval ||
+      a.btype != IROP_BTYPE_INT32)
+    return 0;
+  /* w + 1 <= y when w <u y: no wrap, y is at most UINT_MAX (dirname's
+     `end = i + 1` against len, i below len) */
+  if (!strict && c == (q->op == TCCIR_OP_ADD ? 1 : -1))
+    return sv_prove_below(s, a, y, 1, depth + 1);
+  if (c != (q->op == TCCIR_OP_ADD ? -1 : 1))
+    return 0;
+  /* w - 1 < w <= y */
+  return sv_nonzero(s, a, depth + 1) && sv_prove_below(s, a, y, 0, depth + 1);
+}
+
+/* ---- the zero strnlen found ---------------------------------------------
+ * r = strnlen(p, m) is at most m, and below m only at a zero: p[r] == 0.  A
+ * byte load p[i] reads that zero when i is r on a path where `r != m` (or
+ * `r <u m`) held and nothing wrote memory between the call and the load
+ * (yasc's `p[0:n:0]` after n = strnlen(p, max): path lengths).  r = strlen(p)
+ * is always at a zero: no test needed, only no write since (libgen). */
+#define SV_WRITES (IR_HZ_MEM_WRITE | IR_HZ_CALL | IR_HZ_ASM | IR_HZ_NONLOCAL | IR_HZ_UPDATES_SRC | \
+                   IR_HZ_DEST_LVAL | IR_HZ_DEST_STACKOFF | IR_HZ_CHAIN | IR_HZ_VLA)
+
+/* A write into a VAR whose address is never taken: no pointer reaches it */
+static int sv_private_var_write(SVState *s, IRQuadCompact *q)
+{
+  TCCIRState *ir = s->ctx->ir;
+  if (!s->var_addr || (q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_ASSIGN))
+    return 0;
+  IROperand d = tcc_ir_op_get_dest(ir, q);
+  int32_t vr = irop_get_vreg(d);
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR || irop_is_llocal(d) ||
+      (d.is_lval && !irop_is_local(d)))
+    return 0;
+  int pos = TCCIR_DECODE_VREG_POSITION(vr);
+  return pos >= 0 && pos < s->var_cap && !s->var_addr[pos];
+}
+
+/* Any instruction in [lo, hi) that may write memory a pointer reaches */
+static int sv_writes_in(SVState *s, int lo, int hi)
+{
+  TCCIRState *ir = s->ctx->ir;
+  for (int k = lo; k < hi; k++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[k];
+    if (q->op != TCCIR_OP_NOP && ir_q_hazards(ir, q, SV_WRITES) && !sv_private_var_write(s, q))
+      return 1;
+  }
+  return 0;
+}
+
+/* From instruction AT (exclusive) in block TO up to instruction FROM_IDX
+ * (exclusive) in block FROM, along predecessors when each block on the way
+ * has one (the only path): 1 when it gets there with no write on the way.
+ * R, M (R's vreg >= 0): one edge on the way also has to be taken under
+ * `r != m` or `r <u m`. */
+static int sv_clean_path(SVState *s, int from, int from_idx, int to, int at, IROperand r, IROperand m)
+{
+  IRCFG *cfg = s->ctx->cfg;
+  int fact = irop_get_vreg(r) < 0, b = to, end = at;
+  for (int k = 0; k < 4 * SV_PROVE_DEPTH; k++)
+  {
+    IRBasicBlock *bb = &cfg->blocks[b];
+    if (b == from)
+      return from_idx < end && !sv_writes_in(s, from_idx + 1, end) && fact;
+    if (sv_writes_in(s, bb->start_idx, end) || bb->num_preds != 1)
+      return 0;
+    int pred = bb->preds[0];
+    IROperand y;
+    int tok;
+    if (!fact && sv_edge_cmp(s, pred, b, r, &y, &tok) && (tok == VRP_TOK_NE || tok == VRP_TOK_ULT) &&
+        sv_same_value(s, y, m))
+      fact = 1;
+    b = pred;
+    end = cfg->blocks[b].end_idx;
+  }
+  return 0;
+}
+
+/* VR (past copies) is strnlen(BASE, m)'s result (1; *M its m) or
+   strlen(BASE)'s (2: the zero needs no test); *CALL its call */
+static int sv_strnlen_of(SVState *s, int32_t vr, IROperand base, int *call, IROperand *m)
+{
+  TCCIRState *ir = s->ctx->ir;
+  int def = sv_def_past_copies(s, &vr);
+  if (def < 0 || ir->compact_instructions[def].op != TCCIR_OP_FUNCCALLVAL)
+    return 0;
+  Sym *callee = tcc_ir_op_src1_sym(ir, &ir->compact_instructions[def]);
+  const char *name = callee ? get_tok_str(callee->v, NULL) : NULL;
+  if (!name)
+    return 0;
+  int id = resolve_str_builtin_id(callee->v, name), kind;
+  if (!strcmp(name, "__tcc_strnlen") || id == STRBI_STRNLEN)
+    kind = 1;
+  else if (!strcmp(name, "__tcc_strlen") || id == STRBI_STRLEN)
+    kind = 2;
+  else
+    return 0;
+  IROperand p;
+  if (!ir_opt_get_call_param_operand(ir, def, 0, &p) || !sv_same_value(s, p, base))
+    return 0;
+  if (kind == 1 && !ir_opt_get_call_param_operand(ir, def, 1, m))
+    return 0;
+  if (kind == 2)
+    *m = irop_make_vreg(-1, IROP_BTYPE_INT32);
+  *call = def;
+  return kind;
+}
+
+/* The write at W (block WB) stores strnlen(base, m)'s result with the fact
+   on its way and nothing written since the call, or a constant k that IX
+   (read here) is not */
+static int sv_strnlen_write(SVState *s, int w, int wb, IROperand base, IROperand ix)
+{
+  TCCIRState *ir = s->ctx->ir;
+  IROperand v = sv_write_value(s, w), m;
+  int64_t k, lo, hi;
+  int call;
+  if (irop_is_immediate(v))
+    return irop_is_plain_imm(v) && sv_read_const32(ir, v, &k) &&
+           ((k == 0 && sv_nonzero(s, ix, 0)) || (sv_operand_range(s, ix, &lo, &hi) && (k < lo || k > hi)));
+  int kind;
+  if (v.is_lval || !(kind = sv_strnlen_of(s, irop_get_vreg(v), base, &call, &m)))
+    return 0;
+  return sv_clean_path(s, s->ctx->cfg->instr_to_block[call], call, wb, w,
+                       kind == 2 ? irop_make_vreg(-1, IROP_BTYPE_INT32) : v, m);
+}
+
+/* IX = the VAR's value read at VDEF (its writes VW): every write that may
+   reach VDEF, the last in its block, with nothing written after it on the
+   way -- up VDEF's single-predecessor chain to a write, or to a join whose
+   every predecessor ends by writing the VAR (the phi SSA did not make) */
+static int sv_strnlen_var(SVState *s, int vdef, const int *vw, IROperand base, IROperand ix)
+{
+  IRCFG *cfg = s->ctx->cfg;
+  int b = cfg->instr_to_block[vdef], end = vdef;
+  for (int step = 0; step < 4 * SV_PROVE_DEPTH; step++)
+  {
+    IRBasicBlock *bb = &cfg->blocks[b];
+    int last = -1;
+    for (int k = 0; k < SV_VAR_WRITES && vw[k] >= 0; k++)
+      if (cfg->instr_to_block[vw[k]] == b && vw[k] < end && vw[k] > last)
+        last = vw[k];
+    if (last >= 0)
+      return !sv_writes_in(s, last + 1, end) && sv_strnlen_write(s, last, b, base, ix);
+    if (sv_writes_in(s, bb->start_idx, end))
+      return 0;
+    if (bb->num_preds == 1)
+    {
+      b = bb->preds[0];
+      end = cfg->blocks[b].end_idx;
+      continue;
+    }
+    if (bb->num_preds < 2)
+      return 0;
+    for (int j = 0; j < bb->num_preds; j++)
+    {
+      int p = bb->preds[j], pl = -1;
+      for (int k = 0; k < SV_VAR_WRITES && vw[k] >= 0; k++)
+        if (cfg->instr_to_block[vw[k]] == p && vw[k] > pl)
+          pl = vw[k];
+      if (pl < 0 || sv_writes_in(s, pl + 1, cfg->blocks[p].end_idx) || !sv_strnlen_write(s, pl, p, base, ix))
+        return 0;
+    }
+    return 1;
+  }
+  return 0;
+}
+
+/* the load at LD (block LB): T <- base LOAD_INDEXED i, a byte, scale 0.
+   1 when it reads the zero strnlen found */
+static int sv_strnlen_zero(SVState *s, int lb, int ld)
+{
+  TCCIRState *ir = s->ctx->ir;
+  IRCFG *cfg = s->ctx->cfg;
+  IRQuadCompact *q = &ir->compact_instructions[ld];
+  IROperand dest = tcc_ir_op_get_dest(ir, q), base = tcc_ir_op_get_src1(ir, q), ix = tcc_ir_op_get_src2(ir, q);
+  IROperand sc = tcc_ir_op_get_scale(ir, q);
+  int64_t scale;
+  if (dest.btype != IROP_BTYPE_INT8 || tcc_ir_instr_access_is_volatile(ir, q) || base.is_lval || ix.is_lval ||
+      ix.btype != IROP_BTYPE_INT32 || irop_get_vreg(ix) < 0 || irop_is_immediate(ix) ||
+      (irop_is_immediate(sc) && (!sv_read_const32(ir, sc, &scale) || scale != 0)))
+    return 0;
+  IROperand m;
+  IROperand none = irop_make_vreg(-1, IROP_BTYPE_INT32);
+  int call, kind;
+  if ((kind = sv_strnlen_of(s, irop_get_vreg(ix), base, &call, &m)))
+    return sv_clean_path(s, cfg->instr_to_block[call], call, lb, ld,
+                         kind == 2 ? none : irop_make_vreg(irop_get_vreg(ix), IROP_BTYPE_INT32), m);
+  int32_t vr = irop_get_vreg(ix);
+  int vdef = sv_def_past_copies(s, &vr);
+  const int *vw = vdef >= 0 ? sv_load_var_writes(s, vdef) : NULL;
+  if (vw)
+    return sv_clean_path(s, cfg->instr_to_block[vdef], vdef, lb, ld, none, none) &&
+           sv_strnlen_var(s, vdef, vw, base, ix);
+  /* i = phi(r..., k...): each r strnlen's with the fact on its way in, each
+     constant k not a value i has here (`if (len == 0) return`) */
+  if (vdef >= 0 || vr < 0)
+    return 0;
+  IRPhiNode *phi = sv_phi_for(s, vr);
+  IRSSAVregInfo *vi = ssa_opt_vinfo(s->ctx, vr);
+  if (!phi || !vi || phi->num_operands <= 0 || sv_phi_is_loop_phi(s, phi, vr))
+    return 0;
+  int pb = vi->def_phi_block;
+  if (pb < 0 || !sv_clean_path(s, pb, cfg->blocks[pb].start_idx - 1, lb, ld, none, none))
+    return 0;
+  int64_t lo, hi;
+  int have_range = sv_operand_range(s, ix, &lo, &hi);
+  int nonzero = sv_nonzero(s, ix, 0);
+  for (int j = 0; j < phi->num_operands; j++)
+  {
+    int32_t ovr = phi->operands[j].vreg;
+    int pred = phi->operands[j].pred_block;
+    int64_t k;
+    IROperand o = irop_make_vreg(ovr, IROP_BTYPE_INT32);
+    int odef = ovr;
+    int d = ovr >= 0 ? sv_def_past_copies(s, &odef) : -1;
+    if (d >= 0 && ir->compact_instructions[d].op == TCCIR_OP_ASSIGN)
+    {
+      IROperand c = tcc_ir_op_get_src1(ir, &ir->compact_instructions[d]);
+      if (irop_is_immediate(c) && irop_is_plain_imm(c) && sv_read_const32(ir, c, &k) &&
+          ((k == 0 && nonzero) || (have_range && (k < lo || k > hi))))
+        continue;
+    }
+    if (pred < 0 || !(kind = sv_strnlen_of(s, ovr, base, &call, &m)))
+      return 0;
+    /* strlen's zero needs no test; strnlen's may be the edge into the phi's
+       block itself */
+    IROperand y;
+    int tok;
+    if (kind == 2 || (sv_edge_cmp(s, pred, pb, o, &y, &tok) && (tok == VRP_TOK_NE || tok == VRP_TOK_ULT) &&
+                      sv_same_value(s, y, m)))
+      o = none;
+    if (!sv_clean_path(s, cfg->instr_to_block[call], call, pred, cfg->blocks[pred].end_idx, o, m))
+      return 0;
+  }
+  return 1;
+}
+
+/* Decide an unsigned CMP a,b from sv_prove_below (the check of a[i] when i
+ * counts down from len - 1: dirname, basename). */
+static int sv_try_fold_below(IRSSAOptCtx *ctx, SVState *s, int cmp_idx, int jmp_idx)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *cq = &ir->compact_instructions[cmp_idx];
+  int tok = (int)tcc_ir_op_src1_imm(ir, &ir->compact_instructions[jmp_idx]);
+  if (cq->op != TCCIR_OP_CMP || tok < 0 || tcc_ir_barrel_shift_at(ir, cq) ||
+      tcc_ir_instr_access_is_volatile(ir, cq) || sv_next_reads_flags(ir, jmp_idx))
+    return 0;
+  IROperand a = tcc_ir_op_get_src1(ir, cq), b = tcc_ir_op_get_src2(ir, cq);
+  if (a.btype != IROP_BTYPE_INT32 || b.btype != IROP_BTYPE_INT32)
+    return 0;
+  int verdict = -1;
+  for (int side = 0; side < 2 && verdict < 0; side++)
+  {
+    IROperand x = side ? b : a, k = side ? a : b;
+    int t = side ? vrp_swap_cmp_tok(tok) : tok;
+    if (t == VRP_TOK_ULT || t == VRP_TOK_UGE)
+    {
+      if (sv_prove_below(s, x, k, 1, 0))
+        verdict = t == VRP_TOK_ULT;
+    }
+    else if (t == VRP_TOK_ULE || t == VRP_TOK_UGT)
+    {
+      if (sv_prove_below(s, x, k, 0, 0))
+        verdict = t == VRP_TOK_ULE;
+    }
+  }
+  if (verdict < 0)
+    return 0;
+  sv_commit_jumpif(ctx, cmp_idx, jmp_idx, verdict);
+  sv_drop_cmp_use(ctx, irop_get_vreg(a), cmp_idx);
+  sv_drop_cmp_use(ctx, irop_get_vreg(b), cmp_idx);
+  return 1;
+}
+
 static int sv_visit(IRSSAOptCtx *ctx, int block, void *state)
 {
   SVState *s = state;
@@ -1339,6 +2123,10 @@ static int sv_visit(IRSSAOptCtx *ctx, int block, void *state)
           int fired = sv_try_fold_jumpif(ctx, s, i, j);
           if (!fired && q->op == TCCIR_OP_CMP && !tcc_ir_op_src2_is_imm(ir, q))
             fired = sv_try_fold_regreg(ctx, block, i, j);
+          if (!fired)
+            fired = sv_try_fold_iv_bound(ctx, s, i, j);
+          if (!fired)
+            fired = sv_try_fold_below(ctx, s, i, j);
           changes += fired;
         }
         else if (op2 == TCCIR_OP_SETIF)
@@ -1350,6 +2138,12 @@ static int sv_visit(IRSSAOptCtx *ctx, int block, void *state)
     }
     changes += sv_try_fold_mask_identity(ctx, s, i);
     sv_seed_def(s, q);
+    if (q->op == TCCIR_OP_LOAD_INDEXED && sv_strnlen_zero(s, block, i))
+    {
+      int dslot = sv_slot(s, irop_get_vreg(tcc_ir_op_get_dest(ir, q)));
+      if (dslot >= 0)
+        sv_set(s, dslot, 0, 0);
+    }
   }
   return changes;
 }
@@ -1395,6 +2189,9 @@ int ssa_opt_vrp(IRSSAOptCtx *ctx)
     uint8_t *pt = pw ? pw + s.param_cap : NULL;
     uint8_t *vw = s.var_cap > 0 ? tcc_mallocz((size_t)s.var_cap * 2) : NULL;
     uint8_t *vt = vw ? vw + s.var_cap : NULL;
+    int *vwr = s.var_cap > 0 ? tcc_malloc((size_t)s.var_cap * SV_VAR_WRITES * sizeof(int)) : NULL;
+    for (int k = 0; vwr && k < s.var_cap * SV_VAR_WRITES; k++)
+      vwr[k] = -1;
     for (int i = 0; i < n; i++)
     {
       IRQuadCompact *q = &ir->compact_instructions[i];
@@ -1423,6 +2220,19 @@ int ssa_opt_vrp(IRSSAOptCtx *ctx)
           pw[dp] = 1;
         if (vw && dt == TCCIR_VREG_TYPE_VAR && dp >= 0 && dp < s.var_cap && vw[dp] < 2)
           vw[dp]++;
+        if (vwr && dt == TCCIR_VREG_TYPE_VAR && dp >= 0 && dp < s.var_cap && vwr[dp * SV_VAR_WRITES] != -2)
+        {
+          IROperand d = tcc_ir_op_get_dest(ir, q);
+          int *w = &vwr[dp * SV_VAR_WRITES], k = 0;
+          while (k < SV_VAR_WRITES && w[k] >= 0)
+            k++;
+          if (k == SV_VAR_WRITES || (q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_ASSIGN) ||
+              d.btype != IROP_BTYPE_INT32 || irop_is_llocal(d) || (d.is_lval && !irop_is_local(d)) ||
+              tcc_ir_barrel_shift_at(ir, q))
+            w[0] = -2;
+          else
+            w[k] = i;
+        }
       }
     }
     if (s.param_cap > 0)
@@ -1442,7 +2252,13 @@ int ssa_opt_vrp(IRSSAOptCtx *ctx)
         int is_vol = (v < ir->variables_live_intervals_size &&
                       ir->variables_live_intervals[v].is_volatile);
         s.var_stable[v] = !is_vol && vw[v] == 1 && !vt[v];
+        if (is_vol || vt[v])
+          vwr[v * SV_VAR_WRITES] = -2;
       }
+      s.var_writes = vwr;
+      s.var_addr = tcc_mallocz((size_t)s.var_cap);
+      for (int v = 0; v < s.var_cap; v++)
+        s.var_addr[v] = vt[v];
     }
     tcc_free(pw);
     tcc_free(vw);
@@ -1456,6 +2272,8 @@ int ssa_opt_vrp(IRSSAOptCtx *ctx)
       .visit = sv_visit,
   };
   int changes = opt_ssa_domwalk(ctx, &walk);
+  tcc_free(s.var_writes);
+  tcc_free(s.var_addr);
   /* Our branch folds strand blocks, whose phi operands must go the same way
    * ssa_opt_branch prunes its own (a stale operand's def is later NOP'd by
    * dce, leaving it unresolvable for good). */

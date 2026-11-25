@@ -26,7 +26,7 @@ int use_after_free(void)
 {
   char * owned maybe s = mem_strdup("x");
   mem_free(s);
-  return s != 0 && s[0] == 'x';
+  return s != nullptr && s[0] == 'x';
 }
 
 int null_deref(void)
@@ -42,7 +42,7 @@ void discarded(void)
   mem_strdup("x"); /* an owned result nobody frees */
 }
 
-void not_mine(char * view borrowed)
+void not_mine(inout char * view borrowed)
 {
   mem_free(borrowed); /* a view owns nothing to free */
 }
@@ -68,7 +68,7 @@ int * borrows(static) local_address(void)
 
 void null_argument(void)
 {
-  char * owned maybe s = mem_strdup(0); /* nonnull(1) */
+  char * owned maybe s = mem_strdup(nullptr); /* nonnull(1) */
   mem_free(s);
 }
 
@@ -109,7 +109,7 @@ int borrow_outlives_owner(void)
   return tail[0]; /* s is gone, and tail with it */
 }
 
-void dangling(int * view * view slot)
+void dangling(inout int * view * view slot)
 {
   int x = 1;
   *slot = &x; /* x dies when dangling returns; *slot lives on */
@@ -117,10 +117,53 @@ void dangling(int * view * view slot)
 
 static int * borrows(static) maybe nothing(void)
 {
-  return 0;
+  return nullptr;
 }
 
 int null_dereference(void)
 {
   return *nothing(); /* after inlining: a load from address 0 */
+}
+
+/* Arrays and handles (chapter 10): a loop over an owned array is followed
+ * element by element, and an int handle is owned like a pointer. */
+#include "slots.h"
+
+int array_leak(void)
+{
+  char * owned maybe a[4] = undefined;
+  int i, n = 0;
+  for (i = 0; i < 4; i++)
+    a[i] = mem_strdup("x");
+  for (i = 0; i < 4; i++)
+    n += a[i] != nullptr;
+  return n; /* no loop freed them */
+}
+
+void array_freed_twice(void)
+{
+  char * owned maybe a[4] = undefined;
+  int i;
+  for (i = 0; i < 4; i++)
+    a[i] = mem_strdup("x");
+  for (i = 0; i < 4; i++)
+    mem_free(a[i]);
+  for (i = 0; i < 4; i++)
+    mem_free(a[i]);
+}
+
+int handle_leak(void)
+{
+  int owned(slot_close) maybe h = slot_open(1);
+  if (h < 0)
+    return -1;
+  return slot_read(h); /* forgot slot_close(h) */
+}
+
+int handle_untested(void)
+{
+  int owned(slot_close) maybe h = slot_open(1);
+  int v = slot_read(h); /* h may be -1 */
+  slot_close(h);
+  return v;
 }

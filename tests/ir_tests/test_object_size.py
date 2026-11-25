@@ -207,7 +207,7 @@ def test_has_builtin(tmp_path):
 
 
 def test_safe_default(tmp_path):
-    body = "void f(void) { char a[10]; _Static_assert(__builtin_object_size(&a[2], 1) == 8, \"\"); }\n"
+    body = "void f(void) { char a[10] = undefined; _Static_assert(__builtin_object_size(&a[2], 1) == 8, \"\"); }\n"
     src = tmp_path / "s.c"
     src.write_text("typedef unsigned int size_t;\n" + body)
     proc = subprocess.run([str(TCC), "-c", str(src), "-o", str(tmp_path / "s.o")], capture_output=True, text=True)

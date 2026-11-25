@@ -32,6 +32,25 @@ void convert_parameter_type(CType *pt)
   /* remove const and volatile qualifiers (XXX: const could be used
      to indicate a const function parameter */
   pt->t &= ~(VT_CONSTANT | VT_VOLATILE);
+  /* yasc: the pointer an array becomes says what its brackets wrote
+     (`a[owned]`, kept on the array's Sym), else it is a view -- unchecked
+     when declared in regular C.  A VLA keeps its Sym (its bound's tokens
+     are found by it), so it carries them itself. */
+  if (tcc_state->yasc && (pt->t & (VT_ARRAY | VT_VLA)) && pt->ref)
+  {
+    Sym *a = pt->ref;
+    int q = a->yasc | ((a->ymod & YASC_PMOD_RESTRICT) ? YASC_RESTRICT : 0);
+    if (!(q & (YASC_OWNED | YASC_VIEW)))
+      q |= pp_in_c() ? YASC_UNCHECKED : YASC_VIEW;
+    if (pt->t & VT_VLA)
+    {
+      a->yasc = q & 0xff;
+      if (q & YASC_RESTRICT)
+        a->ymod |= YASC_PMOD_RESTRICT;
+    }
+    else
+      pt->ref = sym_pointer_node_q(&a->type, q);
+  }
   /* array must be transformed to pointer according to ANSI C */
   pt->t &= ~(VT_ARRAY | VT_VLA);
   if ((pt->t & VT_BTYPE) == VT_FUNC)
@@ -61,6 +80,110 @@ int asm_label_instr(void)
   v = tok_alloc_const(astr);
   return v;
 }
+
+/* yasc parameter arrays that say what a call must pass (builtin/fortify.c):
+ * `char s[:0]` a C string whose NUL is inside its buffer, `T p[n]` n
+ * elements where n is another parameter -- also one declared after it
+ * (`void *buf[n], size_t n`), resolved when the list ends.  post_type's
+ * bracket parse notes them for the parameter being read. */
+static struct
+{
+  int cstr;      /* `[:0]` */
+  int bound_tok; /* `[name]`: the name */
+  int deferred;  /* not a parameter yet: one after it, or an error */
+} param_note;
+
+/* the names of the parameters read so far in every open list, the innermost
+   list's from param_names_base on: one stack, so error recovery puts it back
+   (decl_param_names) where the frames the longjmp left cannot */
+static int *param_names;
+static int nb_param_names, param_names_base, param_names_cap;
+
+/* SET: put back what GET *nb / *base said; the stack freed once empty */
+void decl_param_names(int set, int *nb, int *base)
+{
+  if (!set)
+  {
+    *nb = nb_param_names, *base = param_names_base;
+    return;
+  }
+  nb_param_names = *nb, param_names_base = *base;
+  if (!nb_param_names)
+  {
+    tcc_free(param_names);
+    param_names = NULL, param_names_cap = 0;
+  }
+}
+
+/* `T * readonly p` (and `a[readonly]`) was yasc's `const T * view p`; a
+   view parameter's target is read-only already (in), and elsewhere the long
+   spelling says it */
+static void yasc_readonly_gone(void)
+{
+  tcc_error("readonly is gone: a view parameter's target is read-only already (inout or out to write it); "
+            "elsewhere write 'const T * view'");
+}
+
+static int param_list_has(int v)
+{
+  for (int i = param_names_base; i < nb_param_names; i++)
+    if (param_names[i] == v)
+      return 1;
+  return 0;
+}
+
+/* a saved token string that is one identifier (line markers aside): it */
+static int single_ident_tokens(const int *str)
+{
+  int v = 0;
+  for (;; str++)
+  {
+    if (*str == TOK_LINENUM)
+    {
+      str++; /* its line */
+      continue;
+    }
+    if (*str == 0 || *str == TOK_EOF)
+      return v;
+    if (*str < TOK_UIDENT || v)
+      return 0;
+    v = *str;
+  }
+}
+
+typedef struct
+{
+  int param, bound_tok, deferred;
+  unsigned char mode;
+} ParamBound;
+
+/* the list FIRST ended: its notes go to AD as the attributes they spell */
+static void param_bounds_apply(AttributeDef *ad, Sym *first, ParamBound *pb, int npb)
+{
+  for (int k = 0; k < npb; k++)
+  {
+    int j = 0;
+    Sym *q;
+    for (q = first; q; q = q->next, j++)
+      if ((q->v & ~SYM_FIELD) == pb[k].bound_tok)
+        break;
+    if (!q)
+    {
+      if (pb[k].deferred)
+        tcc_error("'%s' undeclared", get_tok_str(pb[k].bound_tok, NULL));
+      continue; /* a global or a macro's value: no parameter to check */
+    }
+    if (j == pb[k].param || !is_integer_btype(q->type.t & VT_BTYPE))
+      tcc_error("'%s' in [ ]: a parameter's bound is an integer parameter", get_tok_str(pb[k].bound_tok, NULL));
+    if (pb[k].param < 255 && j < 255 && ad->attr_access_n < FORTIFY_MAX_ACCESS)
+    {
+      unsigned char *a = ad->attr_access[ad->attr_access_n++];
+      a[0] = pb[k].mode, a[1] = pb[k].param + 1, a[2] = j + 1;
+    }
+  }
+}
+
+static void yasc_param_access(CType *pt, int adq);
 
 int post_type(CType *type, AttributeDef *ad, int storage, int td)
 {
@@ -106,6 +229,12 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
     plast = &first;
     arg_size = 0;
     int param_idx = 0; /* yasc_pp_name */
+    /* yasc `[:0]` / `[n]` of this list (param_note), the enclosing list's kept */
+    int saved_names_base = param_names_base;
+    ParamBound pbounds[FORTIFY_MAX_ACCESS];
+    int npb = 0;
+    uint32_t cstr_args = 0;
+    param_names_base = nb_param_names;
     ++local_scope;
     if (l && l != FUNC_ELLIPSIS && !empty_proto)
     {
@@ -119,7 +248,23 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
           if ((pt.t & VT_BTYPE) == VT_VOID && tok == ')')
             break;
           const int pp_mark = yasc_pp_mark();
+          shadow_param_sys = 0;
+          memset(&param_note, 0, sizeof param_note);
           type_decl(&pt, &ad1, &n, TYPE_DIRECT | TYPE_ABSTRACT | TYPE_PARAM);
+          if (param_note.cstr && param_idx < 32)
+            cstr_args |= 1u << param_idx;
+          if (param_note.bound_tok && npb < FORTIFY_MAX_ACCESS)
+          {
+            ParamBound *b = &pbounds[npb++];
+            b->param = param_idx;
+            b->bound_tok = param_note.bound_tok;
+            b->deferred = param_note.deferred;
+            /* const elements: read; out: written; else both */
+            b->mode = (pt.t & VT_ARRAY) && (pointed_type(&pt)->t & VT_CONSTANT) ? ATTR_ACCESS_READ
+                      : (ad1.yasc & YASC_OUT)                                    ? ATTR_ACCESS_WRITE
+                                                                                 : ATTR_ACCESS_RW;
+          }
+          memset(&param_note, 0, sizeof param_note);
           if (yasc_pp_mark() != pp_mark)
             yasc_pp_name(pp_mark, n, param_idx);
           if ((pt.t & VT_BTYPE) == VT_VOID)
@@ -130,6 +275,7 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
         else
         {
           n = tok;
+          shadow_param_sys = ((tcc_state->warn_shadow & WARN_ON) || tcc_diag_snaps_on(warn_shadow)) && tcc_sys_macro_here();
           pt.t = VT_VOID; /* invalid type */
           pt.ref = NULL;
           next();
@@ -139,6 +285,8 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
         param_volatile = (pt.t & VT_VOLATILE) != 0;
         int param_array = (pt.t & VT_ARRAY) != 0;
         convert_parameter_type(&pt);
+        if (l != FUNC_OLD)
+          yasc_param_access(&pt, ad1.yasc);
         arg_size += (type_size(&pt, &align) + PTR_SIZE - 1) / PTR_SIZE;
         /* these symbols may be evaluated for VLArrays (see below, under
            nocode_wanted) which is why we push them here as normal symbols
@@ -151,12 +299,18 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
           if (l != FUNC_OLD && ad1.attr_unused)
             s->ymod |= SYM_UNUSED_OK;
           if (!local_stack && func_param_decl_depth == 1)
-            unused_param_line(n, param_line, plast == &first);
+            unused_param_line(n, param_line, plast == &first, shadow_param_sys);
         }
         else if (tcc_warn_wanted(warn_shadow) && !local_stack && func_param_decl_depth == 1)
-          unused_param_line(n, param_line, plast == &first); /* -Wshadow's line */
+          unused_param_line(n, param_line, plast == &first, shadow_param_sys); /* -Wshadow's line */
         *plast = s;
         plast = &s->next;
+        if (nb_param_names == param_names_cap)
+        {
+          param_names_cap = param_names_cap ? 2 * param_names_cap : 8;
+          param_names = tcc_realloc(param_names, param_names_cap * sizeof *param_names);
+        }
+        param_names[nb_param_names++] = n;
         param_idx++;
         if (tok == ')')
           break;
@@ -176,6 +330,13 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
     else if (l != FUNC_ELLIPSIS && l != FUNC_NEW)
       /* if no parameters, then old type prototype */
       l = FUNC_OLD;
+    {
+      int nb = param_names_base;
+      decl_param_names(1, &nb, &saved_names_base);
+    }
+    ad->attr_cstr_args |= cstr_args;
+    if (npb)
+      param_bounds_apply(ad, first, pbounds, npb);
     skip(')');
     /* -Wstrict-prototypes: `()` before C23.  A definition is checked where
        it is known to be one (decl()), against the declarations before it. */
@@ -209,6 +370,14 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
     s->a.proto_own = 0;
     declarator_last_functype = s;
     s->f = ad->f;
+    {
+      /* a prototype a system header gives (libc): -Wlifetime trusts it not
+         to write the program's globals */
+      BufferedFile *f = file;
+      while (f && f->filename[0] == ':' && f->prev)
+        f = f->prev;
+      s->f.func_sys_decl = f && f->sys;
+    }
     s->next = first;
     type->t = VT_FUNC;
     type->ref = s;
@@ -222,24 +391,62 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
     next();
     n = -1;
     t1 = 0;
+    int bq = 0;        /* yasc: what the brackets say of the pointer the array becomes */
+    int param_min = 0; /* `[static N]`: at least N elements */
     if (td & TYPE_PARAM)
       while (1)
       {
         /* XXX The optional type-quals and static should only be accepted
            in parameter decls.  The '*' as well, and then even only
            in prototypes (not function defs).  */
+        if (tcc_state->yasc && tok == TOK_readonly && !pp_in_c() && !sym_find(tok))
+          yasc_readonly_gone();
+        if (tcc_state->yasc && tok >= TOK_owned && tok <= TOK_drop && !pp_in_c())
+        {
+          int kw = tok;
+          if (kw != TOK_owned && kw != TOK_maybe && kw != TOK_view)
+            tcc_error("'%s' in [ ]: only owned, view and maybe qualify the pointer a parameter array is",
+                      get_tok_str(kw, NULL));
+          if (td & TYPE_NEST)
+            tcc_error("'%s' in [ ] qualifies a parameter's outermost array only", get_tok_str(kw, NULL));
+          bq |= kw == TOK_owned ? YASC_OWNED : kw == TOK_view ? YASC_VIEW : YASC_MAYBE;
+          if ((bq & (YASC_OWNED | YASC_VIEW)) == (YASC_OWNED | YASC_VIEW))
+            tcc_error("a pointer is owned, a view or borrows(...): one of them");
+          next();
+          if (kw == TOK_owned && tok == '(')
+            tcc_error("owned(...) in [ ]: write the parameter as a pointer");
+          continue;
+        }
         switch (tok)
         {
         case TOK_RESTRICT1:
         case TOK_RESTRICT2:
         case TOK_RESTRICT3:
+          /* yasc: as after a '*', an exclusive borrow */
+          if (tcc_state->yasc && !pp_in_c() && !(td & TYPE_NEST))
+            bq |= YASC_RESTRICT;
+          next();
+          continue;
         case TOK_CONST1:
         case TOK_VOLATILE1:
         case TOK_STATIC:
         case '*':
+          if (tok == TOK_STATIC)
+            param_min = 1;
           next();
           continue;
         default:
+          break;
+        }
+        if (tok == ':' && tcc_state->yasc && !pp_in_c() && !(td & TYPE_NEST))
+        {
+          /* yasc `char s[:0]`: a C string, its NUL inside the buffer a call
+             passes (builtin/fortify.c), as null_terminated_string_arg */
+          next();
+          if (tok != TOK_CINT || tokc.i != 0)
+            expect("0: a parameter array's sentinel");
+          next();
+          param_note.cstr = 1;
           break;
         }
         if (tok != ']')
@@ -251,6 +458,24 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
           unget_tok(0);
           vla_array_str = tok_str_ensure_heap(vla_array_tok);
           vla_array_str_on_heap = 1;
+          /* `T p[n]`, n a name: n elements, n another parameter (fortify at
+             calls); in yasc also one declared after p, which the function's
+             entry evaluates with every parameter in scope */
+          const int bt = !(td & TYPE_NEST) ? single_ident_tokens(vla_array_str) : 0;
+          param_note.bound_tok = bt;
+          if (bt && tcc_state->yasc && !pp_in_c() && !param_list_has(bt))
+          {
+            param_note.deferred = 1;
+            /* no replay to free the header (end_macro): the tokens stay, in
+               vla_array_str, for the function's entry */
+            vla_array_tok->data.str = NULL;
+            tok_str_free(vla_array_tok);
+            vla_array_tok = NULL;
+            next(); /* the ']' (unget above) */
+            vpushi(0);
+            vtop->r = VT_LOCAL | VT_LVAL; /* a run-time size, as a parameter's */
+            goto check;
+          }
           begin_macro(vla_array_tok, 2);
           next();
           gexpr();
@@ -314,7 +539,10 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
 
     if ((type->t & VT_BTYPE) == VT_FUNC)
       tcc_error("declaration of an array of functions");
-    if ((type->t & VT_BTYPE) == VT_VOID || type_size(type, &align) < 0)
+    /* yasc `const void buf[n]`: a parameter's bytes (a `void *`, as memcpy's) */
+    if ((type->t & VT_BTYPE) == VT_VOID && (td & TYPE_PARAM) && !(td & TYPE_NEST) && tcc_state->yasc && !pp_in_c())
+      ;
+    else if ((type->t & VT_BTYPE) == VT_VOID || type_size(type, &align) < 0)
       tcc_error("declaration of an array of incomplete type elements");
 
     t1 |= type->t & VT_VLA;
@@ -355,6 +583,12 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
     s = sym_push(SYM_FIELD, type, 0, n);
     type->t = (t1 ? VT_VLA : VT_ARRAY) | VT_PTR;
     type->ref = s;
+    /* for convert_parameter_type (an array's own Sym: type_yasc never reads it) */
+    s->yasc = bq & 0xff;
+    if (bq & YASC_RESTRICT)
+      s->ymod |= YASC_PMOD_RESTRICT;
+    if (param_min)
+      sym_flag_set(s, SYMF_PARAM_MIN); /* -fsanitize=bounds: no end to check */
 
     if (vla_array_str)
     {
@@ -500,7 +734,7 @@ static void yasc_result_sources(Sym *f, const int *names, int nb, int st)
       k++;
     if (!pa)
       tcc_error("borrows(%s): no parameter is called '%s'", get_tok_str(names[i], NULL), get_tok_str(names[i], NULL));
-    if ((pa->type.t & (VT_BTYPE | VT_ARRAY)) != VT_PTR)
+    if ((pa->type.t & (VT_BTYPE | VT_ARRAY)) != VT_PTR && !type_is_slice(&pa->type))
       tcc_error("borrows(%s): '%s' is not a pointer", get_tok_str(names[i], NULL), get_tok_str(names[i], NULL));
     if (type_yasc(&pa->type) & YASC_OWNED)
       tcc_error("borrows(%s): an owned parameter is consumed, it is never a source", get_tok_str(names[i], NULL));
@@ -512,7 +746,9 @@ static void yasc_result_sources(Sym *f, const int *names, int nb, int st)
     for (i = 0, pa = sym_first(f); pa; pa = pa->next, i++)
     {
       int pq = type_yasc(&pa->type);
-      if ((pa->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && (pq & YASC_VIEW) && !(pq & YASC_UNCHECKED) &&
+      /* a slice is a view and its length: a source too */
+      if ((((pa->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && (pq & YASC_VIEW) && !(pq & YASC_UNCHECKED)) ||
+           type_is_slice(&pa->type)) &&
           i < YASC_BORROWS_MAX)
         code |= 1 << i;
     }
@@ -520,6 +756,103 @@ static void yasc_result_sources(Sym *f, const int *names, int nb, int st)
       tcc_error("a view result needs a source: write borrows(static), or take a view parameter");
   }
   f->type.ref = sym_pointer_node_b(&f->type.ref->type, q, code);
+}
+
+/* yasc: what a parameter may do with what it points to.  A view's target
+   is read-only (`in`, the default) unless the parameter says inout (read
+   and written) or out (written before it is read); drop consumes it.
+   Owned pointers, handles and pointers written in regular C are not views
+   this asks about. */
+static void yasc_param_access(CType *pt, int adq)
+{
+  int q = type_yasc(pt);
+  int ptr = (pt->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && pt->ref;
+  int view = ptr && (q & YASC_VIEW) && !(q & (YASC_OWNED | YASC_UNCHECKED));
+  if ((adq & (YASC_INOUT | YASC_IN)) && !view)
+    tcc_error("%s: only a view parameter's target is read or written through it",
+              (adq & YASC_INOUT) ? "inout" : "in");
+  if (!view || (adq & (YASC_OUT | YASC_DROP | YASC_INOUT)))
+    return;
+  CType target = pt->ref->type;
+  if ((target.t & VT_BTYPE) == VT_FUNC || (target.t & VT_CONSTANT))
+    return;
+  target.t |= VT_CONSTANT;
+  pt->ref = sym_pointer_node_b(&target, q, pt->ref->vreg);
+}
+
+/* `out T * borrows(s) * view p`: the names written on the pointer an out
+   parameter points to, until the parameter list they name is complete */
+typedef struct YascTbPending
+{
+  int names[YASC_BORROWS_MAX];
+  int nb, st; /* st: YASC_BORROWS_STATIC or 0 */
+} YascTbPending;
+static YascTbPending *yasc_tb_pending;
+static int yasc_tb_npending, yasc_tb_cap, yasc_tb_open;
+
+ST_FUNC void yasc_tb_pending_free(void)
+{
+  tcc_free(yasc_tb_pending);
+  yasc_tb_pending = NULL;
+  yasc_tb_npending = yasc_tb_cap = yasc_tb_open = 0;
+}
+
+/* the pointer node REF with borrows(...) bits CODE (the qualifiers and the
+   pointed-to type as they are) */
+static Sym *yasc_node_with_borrows(Sym *ref, int code)
+{
+  return sym_pointer_node_b(&ref->type, ref->yasc | ((ref->ymod & YASC_PMOD_RESTRICT) ? YASC_RESTRICT : 0), code);
+}
+
+/* parameter type PT (a pointer to a pointer): the pointer it points to takes
+   CODE (YASC_BORROWS_* bits, or a pending index) */
+static void yasc_set_target_borrows(CType *pt, int code)
+{
+  CType target = pt->ref->type;
+  target.ref = yasc_node_with_borrows(target.ref, code);
+  pt->ref = sym_pointer_node_b(&target, pt->ref->yasc | ((pt->ref->ymod & YASC_PMOD_RESTRICT) ? YASC_RESTRICT : 0),
+                               pt->ref->vreg);
+}
+
+/* F's parameters are all known: the names on their targets' borrows(...)
+   become positions */
+static void yasc_param_target_sources(Sym *f)
+{
+  if (!yasc_tb_open)
+    return;
+  for (Sym *pa = sym_first(f); pa; pa = pa->next)
+  {
+    int code, pend;
+    if ((pa->type.t & (VT_BTYPE | VT_ARRAY)) != VT_PTR || !pa->type.ref ||
+        (pa->type.ref->type.t & (VT_BTYPE | VT_ARRAY)) != VT_PTR || !pa->type.ref->type.ref)
+      continue;
+    pend = pa->type.ref->type.ref->vreg;
+    if (pend < YASC_TBORROWS_PENDING || pend >= YASC_TBORROWS_PENDING + yasc_tb_npending)
+      continue;
+    YascTbPending *e = &yasc_tb_pending[pend - YASC_TBORROWS_PENDING];
+    code = e->st;
+    for (int n = 0; n < e->nb; n++)
+    {
+      int k = 0;
+      Sym *src;
+      const char *name = get_tok_str(e->names[n], NULL);
+      for (src = sym_first(f); src && (src->v & ~SYM_FIELD) != e->names[n]; src = src->next)
+        k++;
+      if (!src)
+        tcc_error("borrows(%s): no parameter is called '%s'", name, name);
+      if (src == pa)
+        tcc_error("borrows(%s): an out parameter's target does not borrow from the parameter itself", name);
+      if ((src->type.t & (VT_BTYPE | VT_ARRAY)) != VT_PTR && !type_is_slice(&src->type))
+        tcc_error("borrows(%s): '%s' is not a pointer", name, name);
+      if (type_yasc(&src->type) & YASC_OWNED)
+        tcc_error("borrows(%s): an owned parameter is consumed, it is never a source", name);
+      if (k < YASC_BORROWS_MAX)
+        code |= 1 << k;
+    }
+    yasc_set_target_borrows(&pa->type, code);
+    if (--yasc_tb_open == 0)
+      yasc_tb_npending = 0;
+  }
 }
 
 /* F's result is a borrowing struct: what it borrows -- `struct T
@@ -586,6 +919,9 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
   int bnames[YASC_BORROWS_MAX], bnb = -1, bstatic = 0;
   int dealloc = 0; /* owned(fclose): the outermost pointer's deallocator */
   int takes = 0;   /* takes(p) on the outermost pointer: the parameter's name */
+  /* `out T * borrows(s) * view p`: borrows(...) on the pointer an out
+     parameter points to (the first of two) */
+  int tbnames[YASC_BORROWS_MAX], tbnb = -1, tbstatic = 0, nstar = 0;
   /* -fstack-usage: where the declared name is (published at the end, after
      the parameters' own declarators) */
   int su_tok = 0, su_line = 0, su_col = 0;
@@ -608,8 +944,15 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
        regular-C PTR is a regular-C pointer, though the tokens after it are
        yasc again (the marker after the expansion applies with the next one) */
     const int star_yasc = tcc_state->yasc, star_c = pp_in_c();
-    if (bnb >= 0 || bstatic)
+    if ((bnb >= 0 || bstatic) && nstar == 1 && (td & TYPE_PARAM))
+    {
+      memcpy(tbnames, bnames, bnb * sizeof(int));
+      tbnb = bnb, tbstatic = bstatic;
+      bnb = -1, bstatic = 0;
+    }
+    if (bnb >= 0 || bstatic || (tbnb >= 0 && nstar > 1))
       tcc_error("borrows(...) qualifies the outermost pointer");
+    nstar++;
     qualifiers = 0;
   redo:
     next();
@@ -634,6 +977,15 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
       yq |= YASC_VIEW;
       unget_tok(0);
       goto redo;
+    }
+    if (star_yasc && !star_c && tok == TOK_readonly)
+    {
+      /* `T * readonly p` was `const T * view p`; a name of that spelling
+         (`char *readonly;`, `T * view readonly[2]`) is still one */
+      next();
+      if (tok >= TOK_UIDENT || tok == '*')
+        yasc_readonly_gone();
+      unget_tok(TOK_readonly);
     }
     if (tcc_state->yasc && tok >= TOK_owned && tok <= TOK_drop)
     {
@@ -685,6 +1037,9 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
     case TOK_RESTRICT1:
     case TOK_RESTRICT2:
     case TOK_RESTRICT3:
+      /* yasc: an exclusive borrow, checked (S3); regular C drops it */
+      if (star_yasc && !star_c)
+        yq |= YASC_RESTRICT;
       goto redo;
     case TOK_RODATA_REL:
       qualifiers |= rodata_rel_qualifier();
@@ -704,7 +1059,9 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
     {
       /* the caller applies its suffix to this pointer's target, in place */
       mk_private_pointer(type);
-      type->ref->yasc = yq;
+      type->ref->yasc = yq & 0xff;
+      if (yq & YASC_RESTRICT)
+        type->ref->ymod |= YASC_PMOD_RESTRICT;
       if (dealloc)
         type->ref->vreg = dealloc, dealloc = 0;
       if (plain)
@@ -737,6 +1094,9 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
    * the union's payload -- `!char *f(void)` returns `!(char *)` */
   if ((ad->yasc & YASC_ERRUNION) && !(td & TYPE_NESTDECL))
     yasc_errunion_wrap(type);
+  /* yasc `[]T` likewise: `[]char * view argv` is a slice of char * view */
+  if (ad->yslice && !(td & TYPE_NESTDECL))
+    yasc_slice_wrap(type, ad->yslice - 1);
 
   if (tok == '(')
   {
@@ -764,8 +1124,13 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
     if (TCC_SU_WANTED(tcc_state))
       su_tok = tok, su_line = file ? file->line_num : 0, su_col = tcc_stack_usage_name_column(tok);
     /* -Wshadow: a name a system header's macro wrote is none of its business */
-    if (((tcc_state->warn_shadow & WARN_ON) || tcc_state->nb_diag_snaps) && !(td & TYPE_PARAM))
-      shadow_name_sys = tcc_sys_macro_here();
+    if ((tcc_state->warn_shadow & WARN_ON) || tcc_diag_snaps_on(warn_shadow))
+    {
+      if (td & TYPE_PARAM)
+        shadow_param_sys = tcc_sys_macro_here();
+      else
+        shadow_name_sys = tcc_sys_macro_here();
+    }
     /* decl()'s name: declared even if the rest of the declarator is wrong */
     const int recover_name = recover_decl.l && !recover_decl.v && !(td & TYPE_PARAM);
     if (recover_name)
@@ -793,10 +1158,42 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
     *v = 0;
   }
   post_type(post, ad, post != ret ? 0 : storage, td & ~(TYPE_DIRECT | TYPE_ABSTRACT | TYPE_NESTDECL));
+  /* `int (* view a)[maybe]`: the array is pointed to, it never becomes a pointer */
+  if ((td & TYPE_PARAM) && post != type && (post->t & (VT_ARRAY | VT_VLA)) && post->ref && post->ref->yasc)
+  {
+    int q = post->ref->yasc;
+    tcc_error("'%s' in [ ] qualifies a parameter's outermost array only",
+              (q & YASC_OWNED) ? "owned" : (q & YASC_VIEW) ? "view" : "maybe");
+  }
+  if (tbnb >= 0)
+  {
+    if (!(ad->yasc & YASC_OUT))
+      tcc_error("borrows(...) on the pointer a parameter points to needs out: what an in/out parameter hands "
+                "back may be what it read");
+    if (nested || (type->t & (VT_BTYPE | VT_ARRAY)) != VT_PTR ||
+        (type->ref->type.t & (VT_BTYPE | VT_ARRAY)) != VT_PTR)
+      tcc_error("borrows(...) qualifies the outermost pointer");
+    if (!tbnb)
+      yasc_set_target_borrows(type, tbstatic);
+    else
+    {
+      if (yasc_tb_npending == yasc_tb_cap)
+      {
+        yasc_tb_cap = yasc_tb_cap ? 2 * yasc_tb_cap : 8;
+        yasc_tb_pending = tcc_realloc(yasc_tb_pending, yasc_tb_cap * sizeof *yasc_tb_pending);
+      }
+      YascTbPending *e = &yasc_tb_pending[yasc_tb_npending];
+      memcpy(e->names, tbnames, tbnb * sizeof(int));
+      e->nb = tbnb, e->st = tbstatic;
+      yasc_set_target_borrows(type, YASC_TBORROWS_PENDING | yasc_tb_npending++);
+      yasc_tb_open++;
+    }
+  }
   if (takes && !(tcc_state->yasc && (post->t & VT_BTYPE) == VT_FUNC && post->ref))
     tcc_error("takes(%s): only a function's result takes a parameter over", get_tok_str(takes, NULL));
   if (tcc_state->yasc && (post->t & VT_BTYPE) == VT_FUNC && post->ref)
   {
+    yasc_param_target_sources(post->ref);
     yasc_result_sources(post->ref, bnames, bnb, bstatic);
     if (takes)
       yasc_result_takes(post->ref, takes);

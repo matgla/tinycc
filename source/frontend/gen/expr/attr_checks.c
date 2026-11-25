@@ -125,12 +125,35 @@ static void dep_fixit(Sym *s, const char *name, int line, ObjCall *oc)
     }
 }
 
+/* The checks of the calls being parsed (a call in another's arguments is
+ * one more), here rather than in the caller's frame: an error in the middle
+ * of a call leaves its records for attr_checks_recover to free.  Past the
+ * depth a call is not checked (fmt_off: nothing to do). */
+#define FMT_CALL_DEPTH 32
+static FmtCheck fmt_calls[FMT_CALL_DEPTH], fmt_off;
+static int fmt_ncalls;
+
+static void fmt_call_free(FmtCheck *fc)
+{
+  for (int i = 0; i < fc->nfmts; i++)
+    tcc_free(fc->fmts[i]);
+  tcc_free(fc->fmts);
+  tcc_free(fc->args);
+  tcc_free(fc->fa_str);
+  memset(fc, 0, sizeof *fc);
+}
+
+static void fmt_cond_reset(void);
+
 /* error recovery (core/recover.c): no declaration's specifiers are open */
 void attr_checks_recover(void)
 {
   dep_pending_nb = dep_btype_depth = 0;
   attr_deprecated_suppress = 0;
   dep_call.s = NULL;
+  fmt_cond_reset();
+  while (fmt_ncalls)
+    fmt_call_free(&fmt_calls[--fmt_ncalls]);
 }
 
 /* F's declaration is at LINE (0: the current line) of the file read now */
@@ -270,7 +293,22 @@ static struct
   char *fa_pending; /* the literal, until the call's result is pushed */
   SValue *fa_at;
   SValue fa_sv;
+  /* the conditional parsed last (`c ? "%d" : _("%s")`): its arms' literals,
+     for its result (res_at, res_sv) */
+  struct FmtArms
+  {
+    unsigned char n, nonlit; /* nonlit: an arm that is no literal */
+    char *s[8];
+  } res;
+  SValue *res_at;
+  SValue res_sv;
 } fmt_cap;
+typedef struct FmtArms FmtArms;
+#define FMT_ARMS_MAX 8
+#define FMT_COND_DEPTH 16
+/* the conditionals being parsed inside a format argument */
+static FmtArms fmt_arms_pool[FMT_COND_DEPTH];
+static int fmt_arms_depth;
 
 /* ------------------------------------------------------------------------- */
 /* -Wunused-result */
@@ -407,27 +445,34 @@ enum
 };
 
 /* What a format wants of fsym's call, if it says format(printf|scanf) and
- * any of the checks is on */
-void attr_format_begin(FmtCheck *fc, Sym *fsym)
+ * any of the checks is on; attr_format_end ends one that does */
+FmtCheck *attr_format_begin(Sym *fsym)
 {
   const SymLocalFacts *f;
-  memset(fc, 0, sizeof *fc);
+  FmtCheck *fc;
   if (!fsym || !fsym->a.attr_facts || tcc_state->reverse_funcargs)
-    return;
+    return &fmt_off;
   if (!((tcc_state->warn_format | tcc_state->warn_format_security | tcc_state->warn_format_n) & WARN_ON))
-    return;
+    return &fmt_off;
   f = sym_facts_peek(fsym);
-  if (!f)
-    return;
+  if (!f || fmt_ncalls == FMT_CALL_DEPTH)
+    return &fmt_off;
+  fc = &fmt_calls[fmt_ncalls];
+  memset(fc, 0, sizeof *fc);
   if (f->fmt_arg && fmt_cap.armed && f->fmt_arg != f->fmt_idx)
     fc->fa_idx = f->fmt_arg;
-  if (f->fmt_kind != ATTR_FMT_PRINTF && f->fmt_kind != ATTR_FMT_SCANF && f->fmt_kind != ATTR_FMT_STRFTIME &&
-      f->fmt_kind != ATTR_FMT_STRFMON)
-    return;
-  fc->kind = f->fmt_kind;
-  fc->idx = f->fmt_idx;
-  fc->first = f->fmt_first;
-  fc->state = 1;
+  if (f->fmt_kind == ATTR_FMT_PRINTF || f->fmt_kind == ATTR_FMT_SCANF || f->fmt_kind == ATTR_FMT_STRFTIME ||
+      f->fmt_kind == ATTR_FMT_STRFMON)
+  {
+    fc->kind = f->fmt_kind;
+    fc->idx = f->fmt_idx;
+    fc->first = f->fmt_first;
+    fc->state = 1;
+  }
+  if (!(fc->kind | fc->fa_idx))
+    return &fmt_off;
+  fmt_ncalls++;
+  return fc;
 }
 
 /* Argument ARGNO (from 0) is about to be parsed */
@@ -502,7 +547,7 @@ static const char *const strftime_convs[][2] = {
     {"z", "O"},         {"kls", "-_0Ow"},  {"P", ""}};
 
 /* One strftime conversion, P after its '%': past it, NULL at the format's end */
-static const char *fmt_strftime_conv(const char *p)
+static const char *fmt_strftime_conv(const char *p, int line)
 {
   char flags[8];
   const char *allowed = NULL;
@@ -524,196 +569,336 @@ static const char *fmt_strftime_conv(const char *p)
   }
   if (!*p)
   {
-    attr_warn(ATTR_OPT(warn_format), attr_cur_line(), "spurious trailing '%%' in format");
+    attr_warn(ATTR_OPT(warn_format), line, "spurious trailing '%%' in format");
     return NULL;
   }
   if (both)
-    attr_warn(ATTR_OPT(warn_format), attr_cur_line(),
+    attr_warn(ATTR_OPT(warn_format), line,
               "use of 'E' modifier and 'O' modifier together in strftime format");
   for (i = 0; i < sizeof strftime_convs / sizeof strftime_convs[0]; i++)
     if (strchr(strftime_convs[i][0], *p))
       allowed = strftime_convs[i][1];
   if (!allowed)
   {
-    attr_warn(ATTR_OPT(warn_format), attr_cur_line(), "unknown conversion type character '%c' in format", *p);
+    attr_warn(ATTR_OPT(warn_format), line, "unknown conversion type character '%c' in format", *p);
     return p + 1;
   }
   for (i = 0; i < (unsigned)nf; i++)
     if (!strchr(allowed, flags[i]))
-      attr_warn(ATTR_OPT(warn_format), attr_cur_line(), "'%c' flag used with '%%%c' strftime format", flags[i], *p);
+      attr_warn(ATTR_OPT(warn_format), line, "'%c' flag used with '%%%c' strftime format", flags[i], *p);
   if (width && !strchr(allowed, 'w'))
-    attr_warn(ATTR_OPT(warn_format), attr_cur_line(), "field width used with '%%%c' strftime format", *p);
+    attr_warn(ATTR_OPT(warn_format), line, "field width used with '%%%c' strftime format", *p);
   if (mod && !both && !strchr(allowed, mod))
-    attr_warn(ATTR_OPT(warn_format), attr_cur_line(), "'%c' modifier used with '%%%c' strftime format", mod, *p);
+    attr_warn(ATTR_OPT(warn_format), line, "'%c' modifier used with '%%%c' strftime format", mod, *p);
   return p + 1;
 }
 
-/* Parse up to the next argument the format consumes: 1 with fc->cur set
- * (fc->cur_star: a '*' width or precision), 0 at its end */
-static int fmt_next(FmtCheck *fc)
+/* One format checked against the arguments kept (attr_format_end) */
+typedef struct FmtRun
 {
-  const char *p, *start;
-  for (;;)
+  const char *fmt;
+  const FmtArgRec *args;
+  int kind, first, nargs, pos, line, end_line, fmt_line;
+  /* the conversion (or '*') checked now */
+  int cur_start, cur_len, cur_star, cur_conv, cur_cls, cur_lm;
+  /* `%N$` operands: -1 not known yet, 1 every one numbered, 0 none */
+  int dollar, dollar_max, seq;
+  unsigned char *used; /* by number: the arguments a `$` names */
+  int used_cap;
+  unsigned char stop, extra, dollar_extra;
+  int extra_line;
+} FmtRun;
+
+static void fmt_expected(FmtRun *r, char *buf, int size);
+static int fmt_type_ok(FmtRun *r, CType *type);
+
+/* An operand number `N$` at *PP (printf and scanf): N, past it; 0 when
+ * there is none (an error when NEEDED); -1 when the check stops (said) */
+static int fmt_dollar(FmtRun *r, const char **pp, int needed)
+{
+  const char *p = *pp;
+  int n = 0, over = 0;
+  if (r->kind != ATTR_FMT_PRINTF && r->kind != ATTR_FMT_SCANF)
+    return 0;
+  for (; *p >= '0' && *p <= '9'; p++)
+    if (n >= 100000)
+      over = 1;
+    else
+      n = n * 10 + (*p - '0');
+  if (p == *pp || *p != '$')
   {
-    if (fc->stars)
-    {
-      fc->stars--;
-      fc->cur_star = 1;
-      return 1;
-    }
-    if (fc->have_conv)
-    {
-      fc->have_conv = 0;
-      fc->cur_star = 0;
-      return 1;
-    }
-    p = fc->fmt + fc->pos;
-    while (*p && *p != '%')
-      p++;
-    if (!*p)
-    {
-      fc->pos = p - fc->fmt;
+    if (!needed)
       return 0;
-    }
-    start = p++;
-    if (*p == '%')
+    attr_warn(ATTR_OPT(warn_format), r->fmt_line, "missing $ operand number in format");
+    return -1;
+  }
+  *pp = p + 1;
+  if (!r->dollar)
+  {
+    attr_warn(ATTR_OPT(warn_format), r->fmt_line, "'$' operand number used after format without operand number");
+    return -1;
+  }
+  if (over || !n || (r->first && n > r->nargs))
+  {
+    attr_warn(ATTR_OPT(warn_format), r->fmt_line, "operand number out of range in format");
+    return -1;
+  }
+  r->dollar = 1;
+  /* used, whether or not the conversion takes it (gcc) */
+  if (n > r->used_cap)
+  {
+    int cap = n < 16 ? 16 : 2 * n;
+    r->used = tcc_realloc(r->used, cap);
+    memset(r->used + r->used_cap, 0, cap - r->used_cap);
+    r->used_cap = cap;
+  }
+  r->used[n - 1] = 1;
+  if (n > r->dollar_max)
+    r->dollar_max = n;
+  return n;
+}
+
+/* The conversion read last (r->cur_*) takes format argument K (from 1) */
+static void fmt_use(FmtRun *r, int k, int star)
+{
+  char want[64], have[256];
+  const FmtArgRec *a;
+  r->cur_star = star;
+  if (!r->first)
+    return; /* a va_list */
+  if (k > r->nargs)
+  {
+    fmt_expected(r, want, sizeof want);
+    if (star)
+      attr_warn(ATTR_OPT(warn_format), r->end_line, "field width or precision in '%.*s' expects a matching 'int' argument",
+                r->cur_len, r->fmt + r->cur_start);
+    else
+      attr_warn(ATTR_OPT(warn_format), r->end_line, "format '%.*s' expects a matching '%s' argument", r->cur_len,
+                r->fmt + r->cur_start, want);
+    return;
+  }
+  a = &r->args[k - 1];
+  if (fmt_type_ok(r, (CType *)&a->type))
+    return;
+  fmt_expected(r, want, sizeof want);
+  {
+    CType shown = a->type; /* an array argument is its first element's address */
+    shown.t &= ~(VT_ARRAY | VT_VLA | VT_STORAGE);
+    type_to_str(have, sizeof have, &shown, NULL);
+  }
+  if (star)
+    attr_warn(ATTR_OPT(warn_format), a->line,
+              "field width or precision in '%.*s' expects argument of type 'int', but argument %d has type '%s'",
+              r->cur_len, r->fmt + r->cur_start, r->first + k - 1, have);
+  else
+    attr_warn(ATTR_OPT(warn_format), a->line,
+              "format '%.*s' expects argument of type '%s', but argument %d has type '%s'", r->cur_len,
+              r->fmt + r->cur_start, want, r->first + k - 1, have);
+}
+
+/* One directive from r->pos on, its arguments checked: 0 at the format's
+ * end or when the check stops (r->stop) */
+static int fmt_directive(FmtRun *r)
+{
+  const char *p = r->fmt + r->pos, *start;
+  int main_n, nstar = 0, star_n[2], suppress = 0, lm = LM_NONE, cls, i;
+  while (*p && *p != '%')
+    p++;
+  if (!*p)
+  {
+    r->pos = p - r->fmt;
+    return 0;
+  }
+  start = p++;
+  if (*p == '%')
+  {
+    r->pos = p + 1 - r->fmt;
+    return 1;
+  }
+  /* said at the line of the argument it reaches (the call's end past them) */
+  r->line = r->seq < r->nargs ? r->args[r->seq].line : r->end_line;
+  if (r->kind == ATTR_FMT_STRFTIME)
+  {
+    /* no arguments: the conversions alone, every one of them, as gcc */
+    if (!(p = fmt_strftime_conv(p, r->line)))
+      goto stop;
+    r->pos = p - r->fmt;
+    return 1;
+  }
+  if ((main_n = fmt_dollar(r, &p, 0)) < 0)
+    goto stop;
+  if (r->kind == ATTR_FMT_STRFMON)
+  {
+    /* %[=f^+(!-][width][#left][.right][L](i|n) */
+    while (*p && (strchr("^+(!-", *p) || *p == '='))
+      if (*p++ == '=' && *p)
+        p++; /* the fill character */
+    while (*p >= '0' && *p <= '9')
+      p++;
+    if (*p == '#')
+      for (p++; *p >= '0' && *p <= '9'; p++)
+        ;
+    if (*p == '.')
+      for (p++; *p >= '0' && *p <= '9'; p++)
+        ;
+    if (*p == 'L')
+      lm = LM_BIGL, p++;
+  }
+  else if (r->kind == ATTR_FMT_PRINTF)
+  {
+    while (*p && strchr("-+ #0'I", *p))
+      p++;
+    /* the width, then the precision: a number, '*' or '*N$' */
+    for (i = 0; i < 2; i++)
     {
-      fc->pos = p + 1 - fc->fmt;
-      continue;
-    }
-    if (fc->kind == ATTR_FMT_STRFTIME)
-    {
-      /* no arguments: the conversions alone, every one of them, as gcc */
-      if (!(p = fmt_strftime_conv(p)))
+      if (i && *p++ != '.')
       {
-        fc->state = 0;
-        return 0;
+        p--;
+        break;
       }
-      fc->pos = p - fc->fmt;
-      continue;
-    }
-    /* %N$: operands by number are not checked */
-    {
-      const char *q = p;
-      while (*q >= '0' && *q <= '9')
-        q++;
-      if (q != p && *q == '$')
-      {
-        fc->state = 0;
-        return 0;
-      }
-    }
-    int suppress = 0, lm = LM_NONE;
-    if (fc->kind == ATTR_FMT_STRFMON)
-    {
-      /* %[=f^+(!-][width][#left][.right][L](i|n) */
-      while (*p && (strchr("^+(!-", *p) || *p == '='))
-        if (*p++ == '=' && *p)
-          p++; /* the fill character */
-      while (*p >= '0' && *p <= '9')
-        p++;
-      if (*p == '#')
-        for (p++; *p >= '0' && *p <= '9'; p++)
-          ;
-      if (*p == '.')
-        for (p++; *p >= '0' && *p <= '9'; p++)
-          ;
-      if (*p == 'L')
-        lm = LM_BIGL, p++;
-    }
-    else if (fc->kind == ATTR_FMT_PRINTF)
-    {
-      while (*p && strchr("-+ #0'I", *p))
-        p++;
       if (*p == '*')
-        fc->stars++, p++;
+      {
+        int n;
+        p++;
+        if ((n = fmt_dollar(r, &p, r->dollar == 1)) < 0)
+          goto stop;
+        if (!n)
+          r->dollar = 0;
+        star_n[nstar++] = n;
+      }
       else
         while (*p >= '0' && *p <= '9')
           p++;
-      if (*p == '.')
-      {
-        p++;
-        if (*p == '*')
-          fc->stars++, p++;
-        else
-          while (*p >= '0' && *p <= '9')
-            p++;
-      }
     }
-    else
-    {
-      if (*p == '*')
-        suppress = 1, p++;
-      while (*p >= '0' && *p <= '9')
-        p++;
-      if (*p == 'm') /* allocate: char ** */
-        p++;
-    }
-    switch (fc->kind == ATTR_FMT_STRFMON ? 0 : *p)
-    {
-    case 'h':
-      lm = p[1] == 'h' ? (p++, LM_HH) : LM_H;
+  }
+  else
+  {
+    if (*p == '*')
+      suppress = 1, p++;
+    while (*p >= '0' && *p <= '9')
       p++;
-      break;
-    case 'l':
-      lm = p[1] == 'l' ? (p++, LM_LL) : LM_L;
+    if (*p == 'm') /* allocate: char ** */
       p++;
-      break;
-    case 'q':
-      lm = LM_LL, p++;
-      break;
-    case 'L':
-      lm = LM_BIGL, p++;
-      break;
-    case 'j':
-      lm = LM_J, p++;
-      break;
-    case 'z':
-    case 'Z':
-      lm = LM_Z, p++;
-      break;
-    case 't':
-      lm = LM_T, p++;
-      break;
-    }
+  }
+  switch (r->kind == ATTR_FMT_STRFMON ? 0 : *p)
+  {
+  case 'h':
+    lm = p[1] == 'h' ? (p++, LM_HH) : LM_H;
+    p++;
+    break;
+  case 'l':
+    lm = p[1] == 'l' ? (p++, LM_LL) : LM_L;
+    p++;
+    break;
+  case 'q':
+    lm = LM_LL, p++;
+    break;
+  case 'L':
+    lm = LM_BIGL, p++;
+    break;
+  case 'j':
+    lm = LM_J, p++;
+    break;
+  case 'z':
+  case 'Z':
+    lm = LM_Z, p++;
+    break;
+  case 't':
+    lm = LM_T, p++;
+    break;
+  }
+  if (!*p)
+  {
+    attr_warn(ATTR_OPT(warn_format), r->line, "spurious trailing '%%' in format");
+    goto stop;
+  }
+  cls = fmt_conv_class(r->kind, *p);
+  if (!cls)
+  {
+    attr_warn(ATTR_OPT(warn_format), r->line, "unknown conversion type character '%c' in format", *p);
+    goto stop;
+  }
+  if (*p == '[')
+  {
+    p++;
+    if (*p == '^')
+      p++;
+    if (*p == ']')
+      p++;
+    while (*p && *p != ']')
+      p++;
     if (!*p)
     {
-      attr_warn(ATTR_OPT(warn_format), attr_cur_line(), "spurious trailing '%%' in format");
-      fc->state = 0;
-      return 0;
+      attr_warn(ATTR_OPT(warn_format), r->line, "no closing ']' for '%%[' format");
+      goto stop;
     }
-    int cls = fmt_conv_class(fc->kind, *p);
-    if (!cls)
+  }
+  if (cls == 'n' && r->kind == ATTR_FMT_PRINTF)
+    attr_warn(ATTR_OPT(warn_format_n), r->line, "'%%n' in format writes through its argument");
+  r->pos = p + 1 - r->fmt;
+  r->cur_start = start - r->fmt;
+  r->cur_len = p + 1 - start;
+  r->cur_conv = *p;
+  r->cur_cls = cls;
+  r->cur_lm = lm;
+  for (i = 0; i < nstar; i++)
+    fmt_use(r, star_n[i] ? star_n[i] : ++r->seq, 1);
+  if (cls == 'm' || suppress)
+  {
+    /* takes no argument */
+    if (main_n)
+      attr_warn(ATTR_OPT(warn_format), r->fmt_line,
+                suppress ? "operand number specified with suppressed assignment"
+                         : "operand number specified for format taking no argument");
+    return 1;
+  }
+  if (!main_n)
+  {
+    if (r->dollar == 1)
     {
-      attr_warn(ATTR_OPT(warn_format), attr_cur_line(), "unknown conversion type character '%c' in format", *p);
-      fc->state = 0;
-      return 0;
+      attr_warn(ATTR_OPT(warn_format), r->fmt_line, "missing $ operand number in format");
+      goto stop;
     }
-    if (*p == '[')
-    {
-      p++;
-      if (*p == '^')
-        p++;
-      if (*p == ']')
-        p++;
-      while (*p && *p != ']')
-        p++;
-      if (!*p)
+    r->dollar = 0;
+    main_n = ++r->seq;
+  }
+  fmt_use(r, main_n, 0);
+  return 1;
+stop:
+  r->stop = 1;
+  return 0;
+}
+
+/* The whole format R holds: r->extra / r->dollar_extra when it leaves
+ * arguments over (said by the caller, which knows the other arms) */
+static void fmt_run(FmtRun *r)
+{
+  int i, gap = 0;
+  while (fmt_directive(r))
+    ;
+  if (r->stop)
+    return;
+  if (r->dollar == 1)
+  {
+    /* gcc's finish_dollar_format_checking; scanf may skip a pointer */
+    for (i = 0; i < r->dollar_max; i++)
+      if (!r->used[i])
       {
-        attr_warn(ATTR_OPT(warn_format), attr_cur_line(), "no closing ']' for '%%[' format");
-        fc->state = 0;
-        return 0;
+        if (r->kind == ATTR_FMT_SCANF && r->first && i < r->nargs &&
+            (r->args[i].type.t & VT_BTYPE) == VT_PTR)
+          gap = 1;
+        else
+          attr_warn(ATTR_OPT(warn_format), r->fmt_line,
+                    "format argument %d unused before used argument %d in '$'-style format", i + 1,
+                    r->dollar_max);
       }
-    }
-    if (cls == 'n' && fc->kind == ATTR_FMT_PRINTF)
-      attr_warn(ATTR_OPT(warn_format_n), attr_cur_line(), "'%%n' in format writes through its argument");
-    fc->pos = p + 1 - fc->fmt;
-    fc->cur_start = start - fc->fmt;
-    fc->cur_len = p + 1 - start;
-    fc->cur_conv = *p;
-    fc->cur_cls = cls;
-    fc->cur_lm = lm;
-    fc->have_conv = cls != 'm' && !suppress;
+    if (gap || (r->first && r->dollar_max < r->nargs))
+      r->dollar_extra = 1;
+  }
+  else if (r->first && r->seq < r->nargs)
+  {
+    r->extra = 1;
+    r->extra_line = r->args[r->seq].line;
   }
 }
 
@@ -751,7 +936,7 @@ static const char *fmt_int_name(int lm, int is_unsigned)
 }
 
 /* What the current conversion wants, for the message */
-static void fmt_expected(FmtCheck *fc, char *buf, int size)
+static void fmt_expected(FmtRun *fc, char *buf, int size)
 {
   int lm = fc->cur_lm, cls = fc->cur_cls;
   const char *star = fc->kind == ATTR_FMT_SCANF ? " *" : "";
@@ -807,7 +992,7 @@ static int fmt_int_match(int t, int want)
 }
 
 /* Does an argument of type TYPE suit the current conversion? */
-static int fmt_type_ok(FmtCheck *fc, CType *type)
+static int fmt_type_ok(FmtRun *fc, CType *type)
 {
   int t = type->t, bt = t & VT_BTYPE, cls = fc->cur_cls, lm = fc->cur_lm;
   int is_ptr = bt == VT_PTR || bt == VT_FUNC;
@@ -879,22 +1064,100 @@ static int fmt_type_ok(FmtCheck *fc, CType *type)
   return 1;
 }
 
-/* Argument ARGNO (from 0) was parsed: vtop, before its conversion to the
- * parameter */
+/* vtop is the value SV was, at AT */
+static int fmt_vtop_is(const SValue *at, const SValue *sv)
+{
+  return at == vtop && vtop->r == sv->r && vtop->vr == sv->vr && vtop->c.i == sv->c.i && vtop->sym == sv->sym &&
+         vtop->type.t == sv->type.t;
+}
+
 /* vtop is the literal fmt_cap holds: the string itself, or the result of a
  * format_arg call (gettext) given one */
 static int fmt_vtop_literal(void)
 {
-  if (fmt_cap.fa_at == vtop && vtop->r == fmt_cap.fa_sv.r && vtop->vr == fmt_cap.fa_sv.vr &&
-      vtop->c.i == fmt_cap.fa_sv.c.i && vtop->sym == fmt_cap.fa_sv.sym && vtop->type.t == fmt_cap.fa_sv.type.t)
+  if (fmt_cap.fa_at && fmt_vtop_is(fmt_cap.fa_at, &fmt_cap.fa_sv))
     return 1;
   return fmt_cap.sym && vtop->sym == fmt_cap.sym && (vtop->r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM) &&
          vtop->c.i == 0 && !fmt_cap.wide;
 }
 
+/* vtop is the result of the conditional parsed last */
+static int fmt_vtop_cond(void)
+{
+  return fmt_cap.res_at && fmt_vtop_is(fmt_cap.res_at, &fmt_cap.res_sv);
+}
+
+static void fmt_arms_free(FmtArms *a)
+{
+  for (int i = 0; i < a->n; i++)
+    tcc_free(a->s[i]);
+  a->n = a->nonlit = 0;
+}
+
+/* no conditional open (error recovery, a new unit) */
+static void fmt_cond_reset(void)
+{
+  while (fmt_arms_depth)
+    fmt_arms_free(&fmt_arms_pool[--fmt_arms_depth]);
+  fmt_cap.res_at = NULL;
+}
+
+/* A conditional begins inside a format argument (expr/cond.c): its arms
+ * are each a format, as gcc checks them -- a literal, a format_arg call
+ * given one, or another conditional of them */
+void *attr_format_cond_begin(void)
+{
+  FmtArms *a;
+  if (fmt_arms_depth >= FMT_COND_DEPTH)
+    return NULL;
+  a = &fmt_arms_pool[fmt_arms_depth++];
+  a->n = a->nonlit = 0;
+  return a;
+}
+
+/* vtop is an arm of ARMS; not LIVE: the arm a constant condition drops
+ * (folded away, as gcc) */
+void attr_format_cond_arm(void *arms, int live)
+{
+  FmtArms *a = arms;
+  if (!a || !live)
+    return;
+  if (fmt_vtop_cond())
+  {
+    for (int i = 0; i < fmt_cap.res.n; i++)
+      if (a->n < FMT_ARMS_MAX)
+        a->s[a->n++] = fmt_cap.res.s[i];
+      else
+        tcc_free(fmt_cap.res.s[i]), a->nonlit = 1;
+    a->nonlit |= fmt_cap.res.nonlit;
+    fmt_cap.res.n = fmt_cap.res.nonlit = 0;
+    fmt_cap.res_at = NULL;
+  }
+  else if (fmt_vtop_literal() && a->n < FMT_ARMS_MAX)
+    a->s[a->n++] = tcc_strdup(fmt_cap.str.data ? fmt_cap.str.data : "");
+  else
+    a->nonlit = 1;
+  fmt_cap.fa_at = NULL;
+}
+
+/* The conditional ARMS is parsed: vtop is its result */
+void attr_format_cond_end(void *arms)
+{
+  FmtArms *a = arms;
+  if (!a)
+    return;
+  fmt_arms_depth--;
+  fmt_arms_free(&fmt_cap.res);
+  fmt_cap.res = *a;
+  a->n = 0;
+  fmt_cap.res_at = vtop;
+  fmt_cap.res_sv = *vtop;
+}
+
+/* Argument ARGNO (from 0) was parsed: vtop, before its conversion to the
+ * parameter */
 void attr_format_arg(FmtCheck *fc, int argno)
 {
-  char want[64], have[256];
   if (fc->fa_idx == argno + 1)
   {
     if (fmt_vtop_literal())
@@ -905,54 +1168,50 @@ void attr_format_arg(FmtCheck *fc, int argno)
   }
   if (fc->state == 1 && argno + 1 == fc->idx)
   {
-    int literal = fmt_vtop_literal();
     int seen = fmt_cap.seen;
     fmt_cap.armed = fc->saved_armed;
     fmt_cap.seen = fc->saved_seen | seen;
     fc->state = 0;
-    fmt_cap.fa_at = NULL;
-    if (literal)
+    fc->fmt_line = attr_cur_line();
+    if (fmt_vtop_cond())
     {
-      fc->fmt = tcc_strdup(fmt_cap.str.data ? fmt_cap.str.data : "");
-      fc->state = fc->first ? 2 : 3; /* 3: a va_list, the format alone is checked */
+      /* each arm a format; one that is not a literal is not checked */
+      if (fmt_cap.res.n)
+      {
+        fc->fmts = tcc_malloc(fmt_cap.res.n * sizeof *fc->fmts);
+        memcpy(fc->fmts, fmt_cap.res.s, fmt_cap.res.n * sizeof *fc->fmts);
+      }
+      fc->nfmts = fmt_cap.res.n;
+      fc->nonliteral = fmt_cap.res.nonlit;
+      fmt_cap.res.n = fmt_cap.res.nonlit = 0;
+    }
+    else if (fmt_vtop_literal())
+    {
+      fc->fmts = tcc_malloc(sizeof *fc->fmts);
+      fc->fmts[0] = tcc_strdup(fmt_cap.str.data ? fmt_cap.str.data : "");
+      fc->nfmts = 1;
     }
     else if (!seen)
       fc->nonliteral = 1;
+    fmt_cap.fa_at = fmt_cap.res_at = NULL;
+    if (fc->nfmts)
+      fc->state = fc->first ? 2 : 3; /* 3: a va_list, the format alone is checked */
     return;
   }
   if (fc->state != 2 || argno + 1 < fc->first)
     return;
-  if (!fmt_next(fc))
-  {
-    if (fc->state == 2 && !fc->extra_reported)
-    {
-      fc->extra_reported = 1;
-      attr_warn(ATTR_OPT(warn_format), attr_cur_line(), "too many arguments for format");
-    }
-    return;
-  }
-  if (fmt_type_ok(fc, &vtop->type))
-    return;
-  fmt_expected(fc, want, sizeof want);
-  {
-    CType shown = vtop->type; /* an array argument is its first element's address */
-    shown.t &= ~(VT_ARRAY | VT_VLA | VT_STORAGE);
-    type_to_str(have, sizeof have, &shown, NULL);
-  }
-  if (fc->cur_star)
-    attr_warn(ATTR_OPT(warn_format), attr_cur_line(),
-              "field width or precision in '%.*s' expects argument of type 'int', but argument %d has type '%s'",
-              fc->cur_len, fc->fmt + fc->cur_start, argno + 1, have);
-  else
-    attr_warn(ATTR_OPT(warn_format), attr_cur_line(),
-              "format '%.*s' expects argument of type '%s', but argument %d has type '%s'", fc->cur_len,
-              fc->fmt + fc->cur_start, want, argno + 1, have);
+  /* kept for the end of the call: a `%N$` can name any of them */
+  if (!(fc->nargs & 7))
+    fc->args = tcc_realloc(fc->args, (fc->nargs + 8) * sizeof *fc->args);
+  fc->args[fc->nargs].type = vtop->type;
+  fc->args[fc->nargs].line = attr_cur_line();
+  fc->nargs++;
 }
 
 /* The call's arguments are all parsed: NB_ARGS of them */
 void attr_format_end(FmtCheck *fc, int nb_args)
 {
-  char want[64];
+  int i, other = 0, extra = 0, dollar_extra = 0, extra_line = 0, end_line;
   if (fc->fa_idx)
   {
     /* the result, once pushed, stands for the literal (attr_call_result) */
@@ -969,29 +1228,40 @@ void attr_format_end(FmtCheck *fc, int nb_args)
   if (fc->nonliteral && fc->first && nb_args <= fc->idx)
     attr_warn(ATTR_OPT(warn_format_security), attr_cur_line(),
               "format not a string literal and no format arguments");
-  if (fc->state == 3)
+  end_line = attr_cur_line();
+  for (i = 0; i < fc->nfmts; i++)
   {
-    /* a va_list: what the format says alone (%n, unknown conversions) */
-    while (fc->state == 3 && fmt_next(fc))
-      ;
+    FmtRun r;
+    memset(&r, 0, sizeof r);
+    r.fmt = fc->fmts[i];
+    r.args = fc->args;
+    r.nargs = fc->state == 2 ? fc->nargs : 0;
+    r.kind = fc->kind;
+    r.first = fc->state == 2 ? fc->first : 0;
+    r.end_line = end_line;
+    r.fmt_line = fc->fmt_line;
+    r.dollar = -1;
+    fmt_run(&r);
+    tcc_free(r.used);
+    tcc_free(fc->fmts[i]);
+    if (r.extra && !extra_line)
+      extra_line = r.extra_line;
+    extra += r.extra;
+    dollar_extra += r.dollar_extra;
+    other += !r.extra && !r.dollar_extra;
   }
-  else if (fc->state == 2)
+  /* arguments left over by every arm (gcc: none of them non-literal) */
+  if (!other && !fc->nonliteral)
   {
-    while (fc->state == 2 && fmt_next(fc))
-    {
-      fmt_expected(fc, want, sizeof want);
-      if (fc->cur_star)
-        attr_warn(ATTR_OPT(warn_format), attr_cur_line(),
-                  "field width or precision in '%.*s' expects a matching 'int' argument", fc->cur_len,
-                  fc->fmt + fc->cur_start);
-      else
-        attr_warn(ATTR_OPT(warn_format), attr_cur_line(), "format '%.*s' expects a matching '%s' argument",
-                  fc->cur_len, fc->fmt + fc->cur_start, want);
-    }
+    if (extra)
+      attr_warn(ATTR_OPT(warn_format), extra_line, "too many arguments for format");
+    if (dollar_extra)
+      attr_warn(ATTR_OPT(warn_format), fc->fmt_line, "unused arguments in '$'-style format");
   }
-  tcc_free(fc->fmt);
-  fc->fmt = NULL;
-  fc->state = 0;
+  fc->nfmts = 0; /* each freed above */
+  fmt_call_free(fc);
+  if (fmt_ncalls && fc == &fmt_calls[fmt_ncalls - 1])
+    fmt_ncalls--;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1009,6 +1279,10 @@ void attr_checks_reset(void)
   tcc_free(fmt_cap.fa_pending);
   fmt_cap.fa_pending = NULL;
   fmt_cap.fa_at = NULL;
+  fmt_cond_reset();
+  while (fmt_ncalls)
+    fmt_call_free(&fmt_calls[--fmt_ncalls]);
+  fmt_arms_free(&fmt_cap.res);
   cstr_free(&fmt_cap.str);
   memset(&fmt_cap.str, 0, sizeof fmt_cap.str);
 }

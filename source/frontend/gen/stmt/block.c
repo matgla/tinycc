@@ -275,7 +275,7 @@ static void check_switch_enum(struct switch_t *sw, int line)
       tcc_warning_c(warn_switch)("%i:case value '%lld' not in enumerated type%s", cr->line,
                                  (t & VT_UNSIGNED) ? (long long)(uint64_t)cr->v1 : (long long)cr->v1, name);
   }
-  if (sw->def_sym)
+  if (sw->def_sym && !sw->def_unreachable)
     return;
   for (e = en->next; e; e = e->next)
   {
@@ -292,6 +292,38 @@ static void check_switch_enum(struct switch_t *sw, int line)
     if (!handled && tcc_diag_first(tcc_state, line, DIAG_KEY(DIAG_KEY_SWITCH, (unsigned)e->v << 1)))
       tcc_warning_c(warn_switch)("%i:enumeration value '%s' not handled in switch", line, get_tok_str(e->v, NULL));
   }
+}
+
+/* yasc: a switch on a tagged union's tag with no default handles every
+   value its members name (as Zig's switch on a union(enum)); the values
+   that select nothing need no case */
+static void check_switch_tagged(struct switch_t *sw, int line)
+{
+  const YascTagged *y = &yasc_tagged[sw->ytu - 1];
+  const int t = sw->sv.type.t;
+  char missing[256];
+  int n = 0;
+  missing[0] = 0;
+  for (int k = 0; k < y->nvals; k++)
+  {
+    const uint64_t v = value64(y->vals[k], t);
+    int handled = 0;
+    for (int i = 0; i < sw->n && !handled; i++)
+      handled = (t & VT_UNSIGNED) ? (uint64_t)sw->p[i]->v1 <= v && v <= (uint64_t)sw->p[i]->v2
+                                  : sw->p[i]->v1 <= (int64_t)v && (int64_t)v <= sw->p[i]->v2;
+    if (handled)
+      continue;
+    int l = strlen(missing);
+    if (y->vnames[k])
+      snprintf(missing + l, sizeof missing - l, "%s%s", n++ ? ", " : "", get_tok_str(y->vnames[k], NULL));
+    else
+      snprintf(missing + l, sizeof missing - l, "%s%lld", n++ ? ", " : "", (long long)y->vals[k]);
+  }
+  if (n)
+    /* a yasc rule (tcc_yasc_rule), said at the switch's line */
+    _tcc_warning_once(tcc_state->strict_lifetime ? offsetof(TCCState, warn_lifetime) : offsetof(TCCState, warn_none),
+                      line, "a switch on the tag '%s' does not handle %s: add %s, or a default",
+                      get_tok_str(y->tag_tok, NULL), missing, n > 1 ? "their cases" : "its case");
 }
 
 /* -Wempty-body: an `if` or `else` (WHAT) whose body is the `;` at LINE */
@@ -346,8 +378,10 @@ void gen_return_emit(int b, int error_exit)
   leave_scope(root_scope, NULL);
   cleanup_error_exit = saved_error_exit;
 #ifdef CONFIG_TCC_BCHECK
-  /* -b: the locals registered so far die here (the value read first: it may
-     be one of them); an inlined body's locals die with the caller's frame */
+  /* -b: alloca's blocks and the parameters whose address was taken die here
+     (the value read first: it may be one of them); the block-scope locals
+     were dropped by their scopes' cleanup entries just above.  An inlined
+     body's alloca blocks die with the caller's frame. */
   if (tcc_state->do_bounds_check && !tcc_state->in_inline_expansion && tcc_state->ir && tcc_state->ir->bc_locals_n)
   {
     if (b && (func_vt.t & VT_BTYPE) != VT_STRUCT)
@@ -465,6 +499,17 @@ void gen_return_emit(int b, int error_exit)
    its ';', so file->line_num is already the next token's (-Wlifetime). */
 static int gen_return_line;
 
+/* The return just compiled is the body's last statement: does code falling
+   through it reach cleanups of the body still to be compiled? */
+static int return_falls_into_cleanups(void)
+{
+  TCCIRState *ir = tcc_state->ir;
+  if (!ir || !cur_scope->cl.s || cur_scope->cl.s == root_scope->cl.s)
+    return 0;
+  return ir->next_instruction_index > 0 &&
+         ir->compact_instructions[ir->next_instruction_index - 1].op != TCCIR_OP_RETURNVALUE;
+}
+
 /* Jump to the function's epilogue (or past an inlined body). */
 void gen_return_jump(void)
 {
@@ -580,11 +625,17 @@ again:
    * statement (a declaration's initializer, a nested one inside a
    * statement expression) uses it. */
   discarded_call_vtop = NULL;
+  if (yasc_ntagged | yasc_nreg)
+    yasc_stmt_forget();
   t = kind = tok;
   stmt_diverges = 0;
   ft_entry = stmt_ft;
   ft = -1; /* -1: an ordinary statement, see the end */
   line0 = file ? file->line_num : 0;
+  /* yasc unsafe(expr) owns its line (a statement's first instruction for it) */
+  if (yasc_unsafe_expr_line)
+    yasc_unsafe_line_check(line0);
+  yasc_stmt_bol = tok_prev_line < line0;
   code_on0 = !(nocode_wanted & CODE_OFF_BIT);
   dangling = 0;
   /* If the token carries a value, next() might destroy it. Only with
@@ -702,6 +753,8 @@ again:
     // gsym_addr(b, d);
     tcc_ir_backpatch_to_here(tcc_state->ir, a);
     tcc_ir_backpatch(tcc_state->ir, b, d);
+    if (a == -1)
+      nocode_wanted |= CODE_OFF_BIT; /* as for(;;): a non-void function needs no return after it */
     // gsym(a);
     prev_scope_s(&o);
   }
@@ -744,6 +797,10 @@ again:
     {
       const int decl_line = file->line_num;
       attr_fallthrough_seen = 0;
+      /* a declaration is a statement to unsafe(expr)'s line rule too */
+      if (yasc_unsafe_expr_line)
+        yasc_unsafe_line_check(decl_line);
+      yasc_stmt_bol = tok_prev_line < decl_line;
       decl(VT_LOCAL);
       /* `[[fallthrough]];` and `__attribute__((fallthrough));` read as an
          empty declaration */
@@ -766,6 +823,7 @@ again:
     /* the block ends as its last statement; leaving the scope runs defers
        (block() again), which must not count */
     ft = stmt_ft, line0 = stmt_ft_line, dangling = 0;
+    yasc_rbrace_line = file ? file->line_num : 0; /* an unsafe { }'s end */
     compound_depth--;
 
     prev_scope(&o, flags & STMT_EXPR);
@@ -830,8 +888,10 @@ again:
     gen_return_emit(b, 0);
   return_tail:
     skip(';');
-    /* jump unless last stmt in top-level block */
-    if (tok != '}' || local_scope != 1)
+    /* jump unless last stmt in top-level block -- or the body's cleanups,
+       compiled after it (a goto may reach them), would run again on a
+       return that is no RETURNVALUE (void, a value through memory) */
+    if (tok != '}' || local_scope != 1 || return_falls_into_cleanups())
     {
       gen_return_line = return_line;
       gen_return_jump();
@@ -971,6 +1031,9 @@ again:
     check_nonvoid_value();
     skip(')');
     skip(';');
+    /* do ... while (1) with no break: nothing after it is reached */
+    const int forever = (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && !is_float(vtop->type.t) &&
+                        vtop->c.i != 0;
     // c = gvtst(0, 0);
     c = tcc_ir_codegen_test_gen(tcc_state->ir, 0, -1);
 
@@ -978,6 +1041,8 @@ again:
     tcc_ir_backpatch(tcc_state->ir, c, d);
     // gsym(a);
     tcc_ir_backpatch_to_here(tcc_state->ir, a);
+    if (forever && a == -1)
+      nocode_wanted |= CODE_OFF_BIT;
     prev_scope_s(&o);
   }
   else if (t == TOK_SWITCH)
@@ -998,6 +1063,8 @@ again:
     skip(')');
     if (!is_integer_btype(vtop->type.t & VT_BTYPE))
       tcc_error("switch value not an integer");
+    if (yasc_ntagged && tcc_state->yasc)
+      sw->ytu = yasc_tag_switch_of(vtop);
     /* Materialise VT_CMP / VT_JMP* (comparison, !, &&, ||) into a 0/1 value
      * before saving: the dispatch is emitted after the body, where the flags
      * or jump chain are long gone and vr would be an operand's vreg. */
@@ -1016,6 +1083,8 @@ again:
     int switch_exits_all = sw->def_sym && (a == -1) && (nocode_wanted & CODE_OFF_BIT);
     ft = sw->def_sym && a == -1 && stmt_ft == FT_DIVERGES ? FT_DIVERGES : FT_FALLS;
     check_switch_enum(sw, line0);
+    if (sw->ytu && (!sw->def_sym || sw->def_unreachable))
+      check_switch_tagged(sw, line0);
     a = block_jump(a);
     // a = gjmp(a); /* add implicit break */
     /* case lookup */
@@ -1169,6 +1238,10 @@ again:
     stmt_ft = FT_LABEL;
     cur_switch->def_sym = cur_switch->nocode_wanted ? -1 : gind();
     skip(':');
+    /* yasc `default: unreachable`: says every value has its case, so the
+     * missing-case checks still look */
+    if (tcc_state->yasc && tok == TOK_unreachable && !sym_find(TOK_unreachable))
+      cur_switch->def_unreachable = 1;
     goto block_after_label;
   }
   else if (t == TOK_GOTO)
@@ -1260,6 +1333,10 @@ again:
   else if (t == TOK_ASM1 || t == TOK_ASM2 || t == TOK_ASM3)
   {
     asm_instr();
+  }
+  else if (t == TOK_unsafe && tcc_state->yasc && tok == '{' && !sym_find(TOK_unsafe))
+  {
+    yasc_unsafe_block();
   }
   else if (t == TOK_defer && tcc_state->yasc)
   {

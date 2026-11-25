@@ -66,6 +66,56 @@ static int type_has_volatile(CType *t, int depth)
 static void vstore_value(void);
 
 /* store vtop in lvalue pushed on stack */
+/* the register type's w1c fields (each word of it), or a w1c field itself,
+   of the store about to be made (vtop[-1] the destination); or a register
+   struct copied into ordinary memory (vread).  NULL none.  On the heap:
+   vstore is on the parser's recursion (tests/selfhost/test_parser_stack_frames.py) */
+static __attribute__((noinline)) IRW1cNote *vstore_w1c_begin(void)
+{
+  const int dvol = (vtop[-1].type.t & VT_VOLATILE) || vtop[-1].volatile_access;
+  const int svol = (vtop->r & VT_LVAL) && ((vtop->type.t & VT_VOLATILE) || vtop->volatile_access);
+  if ((!dvol && !(svol && (vtop->type.t & VT_BTYPE) == VT_STRUCT)) || !tcc_warn_wanted(warn_register_access))
+    return NULL;
+  IRW1cNote *w = tcc_mallocz(sizeof *w);
+  int a, size = type_size(&vtop[-1].type, &a), any = 0;
+  w->nw = size > 4 * IR_W1C_WORDS ? IR_W1C_WORDS : size <= 4 ? 1 : (size + 3) / 4;
+  for (int k = 0; k < w->nw; k++)
+  {
+    uint32_t fb[8];
+    int ft[8], fn = 0;
+    w->wmask[k] = yasc_reg_w1c_mask(&vtop[-1].type, 4 * k, fb, ft, &fn);
+    for (int f = 0; f < fn && w->nf < IR_W1C_WORDS; f++)
+      w->fword[w->nf] = k, w->fbits[w->nf] = fb[f], w->ftok[w->nf++] = ft[f];
+    any |= w->wmask[k] != 0;
+  }
+  if (dvol)
+  {
+    uint32_t fb[8];
+    int ft[8], fn = 0;
+    uint32_t mb = yasc_w1c_member_of(vtop - 1, fb, ft, &fn);
+    w->wmask[0] |= mb;
+    for (int f = 0; f < fn && w->nf < IR_W1C_WORDS; f++)
+      w->fword[w->nf] = 0, w->fbits[w->nf] = fb[f], w->ftok[w->nf++] = ft[f];
+    any |= mb != 0;
+  }
+  else
+    w->vread = 1; /* a register struct read into a local */
+  if (!any)
+  {
+    tcc_free(w);
+    return NULL;
+  }
+  return w;
+}
+
+static __attribute__((noinline)) void vstore_w1c_end(IRW1cNote *w, int from)
+{
+  TCCIRState *ir = tcc_state->ir;
+  w->from = from, w->to = ir->next_instruction_index, w->line = file ? file->line_num : 0;
+  tcc_ir_note_w1c(ir, w);
+  tcc_free(w);
+}
+
 ST_FUNC void vstore(void)
 {
   /* -Wlifetime: a store into an owned pointer in memory moves what it stores
@@ -73,19 +123,29 @@ ST_FUNC void vstore(void)
   TCCIRState *ir = tcc_state->ir;
   if (yasc_pp_live)
     yasc_pp_store(vtop - 1, vtop); /* a plain pointer parameter kept (plain_param.c) */
+  if (yasc_sentinel_live)
+    yasc_sentinel_store(); /* s[s.len] of a [:0] slice holds its zero (yasc_slices.c) */
+  if (yasc_ntagged && tcc_state->yasc)
+    yasc_tag_store_note(vtop - 1, vtop); /* `enum vkind k = v->k;`: switch (k) is on the tag */
   /* yasc: a borrowing struct stored where it outlives the function (a
      global, through a pointer) must be bound to static storage: another
      global, or a result that borrows(static) */
   if (tcc_state->yasc && yasc_borrowing_struct(&vtop[-1].type) && (vtop[-1].r & VT_LVAL) &&
       (vtop[-1].r & VT_VALMASK) != VT_LOCAL && (vtop[-1].r & VT_VALMASK) != VT_LLOCAL &&
       !((vtop->r & (VT_VALMASK | VT_SYM | VT_LVAL)) == (VT_CONST | VT_SYM | VT_LVAL)) && vtop->sym != &yasc_static_bound)
-    tcc_warning_once_always(
+    tcc_yasc_rule(
         "a 'struct %s' borrows: stored here it outlives the function (it must borrow static storage)",
         get_tok_str(vtop[-1].type.ref->v & ~SYM_STRUCT, NULL));
   int owned_dst = ir && ir->lt_on && (type_yasc(&vtop[-1].type) & YASC_OWNED);
+  /* yasc: a register store with w1c bits -- what it writes back is checked
+     (ir/regaccess.c); out of line, its fields on the heap: vstore is on the
+     parser's recursion (tests/selfhost/test_parser_stack_frames.py) */
+  IRW1cNote *w1c = ir && yasc_nreg && tcc_state->yasc && !nocode_wanted ? vstore_w1c_begin() : NULL;
   int field = ir && ir->lt_on ? type_borrows_field(&vtop[-1].type) : -1;
   int from = ir ? ir->next_instruction_index : 0;
   vstore_value();
+  if (w1c)
+    vstore_w1c_end(w1c, from);
   if (owned_dst)
     tcc_ir_lt_note_owned_store(ir, from, ir->next_instruction_index);
   /* ... and a store into a borrows(member) member, checked against it */
@@ -115,6 +175,10 @@ static __attribute__((noinline)) void vstore_value_1(void)
   int sbt, dbt, ft, r, size, align, bit_size, bit_pos, delayed_cast;
   if (vtop[-1].type.t & VT_RODATA_REL)
     rodata_rel_store_error();
+  /* -fsanitize=null,alignment handlers: the check of the destination's
+     pointer reports a store */
+  if (tcc_state->sanitize & (SAN_NULL | SAN_ALIGN))
+    ubsan_access_kind(&vtop[-1], UBSAN_STORE);
 #ifdef CONFIG_TCC_BCHECK
   /* -b: a scalar's destination and source are checked here (a struct copy
      checks both before it takes their addresses, below) */
@@ -706,6 +770,18 @@ static __attribute__((noinline)) void vstore_value_1(void)
      * pass asking about the call's arguments hears "not volatile". */
     if (tcc_state->ir && (vtop[0].volatile_access || vtop[-1].volatile_access))
       tcc_state->ir->func_has_volatile_access = 1;
+#ifdef CONFIG_TCC_BCHECK
+    /* -b: both sides checked for the whole struct (gbound: __bound_check, or
+       a __bound_ptr_indirN of its size) before any of the copies below */
+    if (vtop->r & VT_MUSTBOUND)
+      gbound();
+    if (vtop[-1].r & VT_MUSTBOUND)
+    {
+      vswap();
+      gbound();
+      vswap();
+    }
+#endif
 
     /* Self-copy elision: source and destination are the same register-deref
      * lvalue (same address vreg, same offset).  This is the post-call copy of
@@ -1377,6 +1453,14 @@ static __attribute__((noinline)) void vstore_value_1(void)
     const int bf_value_from_src =
         !nocode_wanted && ((ft & VT_VOLATILE) || orig_dst.volatile_access ||
                            (orig_dst.sym && (orig_dst.sym->type.t & VT_VOLATILE)));
+    /* yasc: that read-modify-write is the bug of register code -- a W1C
+       flag read as 1 is written back and cleared, a write-only register is
+       read, an interrupt between the two is lost.  Said once it is written
+       out: read the unit into a local, change it there, store it back. */
+    if (bf_value_from_src && tcc_state->yasc && tcc_warn_wanted(warn_volatile_bitfield))
+      tcc_warning_once(warn_volatile_bitfield,
+                       "a bit-field store to volatile memory reads and writes back the whole unit: copy it to a "
+                       "local, change it there, store it back");
     if (bf_value_from_src)
     {
       if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) != VT_CONST)

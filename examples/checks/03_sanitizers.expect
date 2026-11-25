@@ -1,0 +1,16 @@
+step 1
+03_sanitizers.c:55: runtime error: load of null pointer of type 'int'
+load: read
+step 2
+03_sanitizers.c:23: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+add: -2147483648
+step 3
+03_sanitizers.c:28: runtime error: division by zero
+divide: 0
+step 4
+03_sanitizers.c:33: runtime error: shift exponent 33 is too large for 32-bit type 'unsigned int'
+shift: 0
+step 5
+03_sanitizers.c:44: runtime error: index 4 out of bounds for type 'int [4]'
+element: 99
+done

@@ -20,7 +20,7 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 def _run(tmp_path, body, *flags, compat=True):
     src = tmp_path / "t.c"
     src.write_text(body)
-    cmd = [str(TCC)] + (["-ccompat"] if compat else []) + ["-c", *flags, str(src), "-o", str(tmp_path / "t.o")]
+    cmd = [str(TCC), "-Wno-missing-prototypes"] + (["-ccompat"] if compat else []) + ["-c", *flags, str(src), "-o", str(tmp_path / "t.o")]
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
@@ -90,13 +90,11 @@ def test_pragma_extra(tmp_path):
     assert _diags(_run(tmp_path, body, "-Wextra")) == []
 
 
-def test_safe_default_with_extra(tmp_path):
-    # the safe default has -Wall (so -Wextra brings the unused parameters)
-    # and implicit-fallthrough / empty-body already
+def test_safe_default_has_extra(tmp_path):
+    # the safe default has every -Wextra check, -Wno-extra takes them away
     body = BODY.replace("int f(", "int f(")
-    proc = _run(tmp_path, body, "-Wno-lifetime", compat=False)
-    assert [d for d in _diags(proc) if d in (SIGN, LIMITS, PARAM, SETPARAM)] == [], proc.stderr
-    proc = _run(tmp_path, body, "-Wno-lifetime", "-Wextra", compat=False)
-    got = _diags(proc)
+    got = _diags(_run(tmp_path, body, compat=False))
     for d in (SIGN, LIMITS, PARAM, SETPARAM):
-        assert d in got, proc.stderr
+        assert d in got, got
+    proc = _run(tmp_path, body, "-Wno-extra", compat=False)
+    assert [d for d in _diags(proc) if d in (SIGN, LIMITS, PARAM, SETPARAM)] == [], proc.stderr

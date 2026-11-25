@@ -97,7 +97,7 @@ int gjmp_addr_acs(int a)
 int fe_check_on(unsigned char opt)
 {
   BufferedFile *f;
-  if (!(opt & WARN_ON) && !tcc_state->nb_diag_snaps)
+  if (!(opt & WARN_ON) && !tcc_state->nb_diag_pragmas)
     return 0;
   /* not in an #if (its expression goes through the same parser), as gcc */
   if (tcc_state->in_inline_expansion || tcc_state->warn_none || pp_expr)
@@ -114,7 +114,7 @@ int fe_checks_wanted(void)
   TCCState *s1 = tcc_state;
   if (s1->warn_none)
     return 0;
-  return s1->nb_diag_snaps || ((s1->warn_implicit_fallthrough | s1->warn_parentheses | s1->warn_logical_not_parentheses |
+  return s1->nb_diag_pragmas || ((s1->warn_implicit_fallthrough | s1->warn_parentheses | s1->warn_logical_not_parentheses |
                                 s1->warn_dangling_else |
                                 s1->warn_empty_body | s1->warn_switch | s1->warn_shadow) &
                                WARN_ON);

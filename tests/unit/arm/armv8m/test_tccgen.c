@@ -76,6 +76,7 @@
 #include "source/frontend/gen/stmt/cleanup.c"
 #include "source/frontend/gen/stmt/defer.c"
 #include "source/frontend/gen/expr/yasc_errors.c"
+#include "source/frontend/gen/expr/yasc_slices.c"
 #include "source/frontend/gen/stmt/block.c"
 #include "source/frontend/gen/init/initializer.c"
 #include "source/frontend/gen/init/alloc.c"
@@ -163,12 +164,32 @@ void tcc_ir_lt_add_var(TCCIRState *ir, int32_t vreg, Sym *sym)
   (void)sym;
 }
 
+/* -Warray-bounds=2 (ir/bounds.c): sym_push registers a local object */
+void tcc_ir_ab_add_local(TCCIRState *ir, Sym *sym)
+{
+  (void)ir;
+  (void)sym;
+}
+
 /* vstore notes a store into an owned pointer */
 void tcc_ir_lt_note_owned_store(TCCIRState *ir, int from, int to)
 {
   (void)ir;
   (void)from;
   (void)to;
+}
+
+/* vstore notes a register store with w1c bits (ir/regaccess.c) */
+void tcc_ir_note_w1c(TCCIRState *ir, const IRW1cNote *note)
+{
+  (void)ir, (void)note;
+}
+
+/* assign_check notes move(p) handed to a regular-C parameter */
+void tcc_ir_lt_note_moved_temp(TCCIRState *ir, int32_t vreg)
+{
+  (void)ir;
+  (void)vreg;
 }
 
 int tcc_ir_dp_wanted(void)
@@ -405,6 +426,19 @@ void yasc_pp_store(const SValue *dst, const SValue *val)
   (void)val;
 }
 
+/* op/ubsan.c: -fsanitize handlers, a store's kind */
+void ubsan_access_kind(const SValue *lv, int kind)
+{
+  (void)lv;
+  (void)kind;
+}
+
+/* op/ubsan.c: a trap on a condition (yasc slices' checks) */
+void fe_trap_if(void)
+{
+  vpop();
+}
+
 void tcc_fixit_next_alt(const char *word, int where, const char *text)
 {
   (void)word;
@@ -493,6 +527,8 @@ int *tok_str_unspill(TokenString *s)
   abort();
 }
 void tok_str_spill_close(void) {}
+/* tccpp.c: no test reads a regular-C macro expansion inside yasc code. */
+int pp_in_c(void) { return 0; }
 /* symtab.c's parameter-list spill: never active in these tests. */
 int tcc_spill_active(void) { return 0; }
 long tcc_spill_append(const void *p, size_t n)

@@ -626,14 +626,24 @@ void yasc_catch(void)
   else
   {
     expr_cond();
-    if (has_value)
+    if ((vtop->type.t & VT_BTYPE) == VT_VOID && !(saved_nocode_wanted & CODE_OFF_BIT) &&
+        (nocode_wanted & CODE_OFF_BIT))
     {
-      gen_assign_cast(&pt);
-      catch_store(res_vr, &pt);
+      /* `catch unreachable`, `catch abort()`: the arm does not complete, so
+       * it owes the expression no value */
+      vpop();
     }
     else
-      vpop();
-    d = gjmp(-1);
+    {
+      if (has_value)
+      {
+        gen_assign_cast(&pt);
+        catch_store(res_vr, &pt);
+      }
+      else
+        vpop();
+      d = gjmp(-1);
+    }
   }
   if (bind)
   {
@@ -748,6 +758,17 @@ int yasc_unary(void)
   if (tok == TOK_error_from && !sym_find(TOK_error_from))
   {
     error_from();
+    return 1;
+  }
+  if (tok == TOK_unreachable && !sym_find(TOK_unreachable))
+  {
+    /* `unreachable`: a void expression that traps when reached */
+    CType vt;
+    next();
+    gen_unreachable(1);
+    vt.t = VT_VOID;
+    vt.ref = NULL;
+    vpush(&vt);
     return 1;
   }
   if (tok == TOK_error_name && !sym_find(TOK_error_name))

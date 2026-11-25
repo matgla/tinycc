@@ -116,6 +116,8 @@ static const IROptPass propagation_passes[] = {
   PASS_GATED("param_copy_alias", tcc_ir_opt_param_copy_alias, FLAG(opt_store_load_fwd)),
   /* Resolves derefs through single-def &local pointers before the const/forwarding cluster below sees them. */
   PASS_GATED("ptr_local_fwd", tcc_ir_opt_ptr_local_fwd, FLAG(opt_store_load_fwd)),
+  /* -fyasc-facts: `int x; get(&x);` with a no-escape parameter -- x gets a register, its slot is used around the calls. */
+  PASS_GATED("yf_promote", tcc_ir_opt_yf_promote, FLAG(opt_store_load_fwd)),
   /* Must follow dce: its prologue clears stale `addrtaken` flags on VARs whose LEA was just DCE-ed. */
   PASS_GATED("const_var_prop", tcc_ir_opt_const_var_prop, FLAG(opt_const_prop)),
   PASS_GATED("global_init", tcc_ir_opt_global_init_prop, FLAG(opt_const_prop)),

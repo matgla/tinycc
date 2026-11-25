@@ -45,7 +45,7 @@ def _diags(proc, kind="warning"):
 INT_PTR = "assignment makes pointer from integer without a cast"
 PTR_INT = "assignment makes integer from pointer without a cast"
 INCOMPAT = "assignment from incompatible pointer type"
-QUAL = "assignment discards qualifiers from pointer target type"
+QUAL = "assignment to 'char *' from 'const char [2]' discards 'const' qualifier from pointer target type"
 NONNULL = "null passed as argument 1, which is declared nonnull"
 IMPLICIT = "implicit declaration of function 'undeclared'"
 VOID_RET = "void function returns a value"
@@ -120,7 +120,7 @@ def test_safe_default_error_once(tmp_path, level):
     # the safe default: int-conversion is an error -- reported at its line
     body = ("static inline int f(int a) { int * view p = a; return p != 0; }\n"
             "int main(int argc, char * view * view argv) { (void)argv; return f(argc) + f(argc + 1); }\n")
-    proc = _run(tmp_path, body, level, "-Wno-lifetime", compat=False)
+    proc = _run(tmp_path, body, level, compat=False)
     assert proc.returncode != 0
     assert _diags(proc, "error") == [(1, INT_PTR)], proc.stderr
 
@@ -167,7 +167,7 @@ void h(void) { f(); f(); g(); g(); }
 
 @pytest.mark.parametrize("level", LEVELS)
 def test_yasc_type_rules_once(tmp_path, level):
-    proc = _run(tmp_path, YASC, level, "-std=yasc", "-Wno-lifetime", compat=False)
+    proc = _run(tmp_path, YASC, level, "-ccompat", "-std=yasc", "-Wno-lifetime", compat=False)
     assert proc.returncode == 0, proc.stderr
     assert _diags(proc) == [
         (2, "an owned result is discarded: it is never freed"),

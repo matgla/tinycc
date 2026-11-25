@@ -294,6 +294,11 @@ void __attribute__((noinline)) unary_builtin_chk(void)
     next(); /* consume __builtin___*_chk token */
     skip('(');
 
+    /* -Wstringop-overflow, -Wformat-overflow, ...: the checks of the plain
+       function, on its arguments (builtin/objsize.c) -- as if it had been
+       called, so a fortified build warns where a plain one does */
+    ObjCall *oc = objsize_call_begin_named(chk_base_name(desc->base_func));
+
     /* Parse and save ALL arguments on the vstack.
      * Layout: prefix_args..., [varargs...] (dropped args stored separately) */
     int all_args_cap = 32;
@@ -305,7 +310,11 @@ void __attribute__((noinline)) unary_builtin_chk(void)
     {
       if (i > 0)
         skip(',');
+      if (oc)
+        objsize_call_arg_before(oc, i);
       expr_eq();
+      if (oc)
+        objsize_call_arg(oc, i);
       convert_parameter_type(&vtop->type);
       if (!NOEVAL_WANTED)
         tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
@@ -342,7 +351,11 @@ void __attribute__((noinline)) unary_builtin_chk(void)
       while (tok != ')')
       {
         skip(',');
+        if (oc)
+          objsize_call_arg_before(oc, total_args);
         expr_eq();
+        if (oc)
+          objsize_call_arg(oc, total_args);
         convert_parameter_type(&vtop->type);
         if (!NOEVAL_WANTED)
           tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
@@ -358,6 +371,8 @@ void __attribute__((noinline)) unary_builtin_chk(void)
     }
 
     skip(')');
+    if (oc)
+      objsize_call_args_end(oc);
 
     if (NOEVAL_WANTED)
     {
@@ -372,6 +387,8 @@ void __attribute__((noinline)) unary_builtin_chk(void)
       {
         vpushi(0);
       }
+      if (oc)
+        objsize_call_end(oc, 0);
       break;
     }
 
@@ -417,7 +434,7 @@ void __attribute__((noinline)) unary_builtin_chk(void)
           else
           {
             use_chk = 1; /* will overflow — call __*_chk for runtime abort */
-            objsize_chk_overflow(chk_base_name(desc->base_func), n_val, objsize);
+            objsize_chk_overflow(oc, chk_base_name(desc->base_func), n_val, objsize);
           }
         }
         else
@@ -446,7 +463,7 @@ void __attribute__((noinline)) unary_builtin_chk(void)
             int sl;
             use_chk = 1;
             if (try_get_constant_string(&all_args[1], &sl))
-              objsize_chk_overflow(chk_base_name(desc->base_func), (unsigned long long)sl + 1, objsize);
+              objsize_chk_overflow(oc, chk_base_name(desc->base_func), (unsigned long long)sl + 1, objsize);
           }
           break;
 
@@ -602,6 +619,8 @@ void __attribute__((noinline)) unary_builtin_chk(void)
       vtop->r = TREG_R0;
     }
     tcc_free(all_args);
+    if (oc) /* the result is the statement's, dropped at the ';' */
+      objsize_call_end(oc, tok == ';' && discarded_call_vtop != NULL && vtop - 1 == discarded_call_vtop);
     break;
   }
   }

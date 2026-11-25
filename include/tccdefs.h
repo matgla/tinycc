@@ -157,6 +157,11 @@
 
 #elif defined __YasOS__
 #define __GNUC__ 4
+/* With the major alone, newlib's __GNUC_PREREQ (both or 0) took tcc for a
+ * pre-2.7 compiler and sys/cdefs.h made __func__ NULL.  0: `#if` arithmetic
+ * already read the missing minor as 0, so only `defined` checks change. */
+#define __GNUC_MINOR__ 0
+#define __GNUC_PATCHLEVEL__ 0
 /* Note: no `#define __linux__` here — target_os_defs (tccpp.c) already
  * predefines __linux__/__linux for YasOS, and c2str would mangle the line
  * into a bogus `#define TARGETOS_Linux 1` predefine (unreserved name). */

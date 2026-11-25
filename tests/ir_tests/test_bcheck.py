@@ -3,8 +3,12 @@
 The frontend emits ordinary calls through the IR (frontend/gen/op/bcheck.c):
 __bound_ptr_add for pointer arithmetic, turned into __bound_ptr_indirN when
 its result is dereferenced, __bound_new_region / __bound_delete_region for
-local arrays and structs, and a .bounds table of the globals that the linker
-ends and names __bound_globals.  The runtime is lib/bcheck-bm.c (newlib,
+local arrays, structs, VLAs and alloca blocks (__bound_new_scalar for a
+scalar whose address is taken), dropped where their scope ends, and a
+.bounds table of the globals that the linker ends and names
+__bound_globals; main's argv is registered at main's entry
+(__bound_main_arg).  Calls of memcpy, strcpy, ... and longjmp go to the
+runtime's __bound_ wrappers.  The runtime is lib/bcheck-bm.c (newlib,
 bare metal), compiled here without -b and linked in by hand: the harness
 links with -nostdlib.  The device compiler has none of it
 (CONFIG_TCC_BCHECK_CROSS, the cross only).
@@ -44,6 +48,14 @@ OK = {
     "copy_ok": 7,
     "frames_ok": 17,
     "static_ok": 9,
+    "after_return_ok": 1,
+    "scalar_return_ok": 1,
+    "vla_scope_ok": 3,
+    "alloca_ok": 1,
+    "scalar_ok": 15,
+    "lib_ok": 14,
+    "longjmp_ok": 5,
+    "argv_ok": 8,
 }
 OUTSIDE = r"BCHECK: 0x[0-9a-f]+ is outside of the region \(0x[0-9a-f]+\.\.0x[0-9a-f]+\)"
 CAUGHT = {
@@ -60,6 +72,21 @@ CAUGHT = {
     "use_after_free": OUTSIDE + ": use after free, at pc",
     "realloc_old": OUTSIDE + ": use after free, at pc",
     "double_free": r"BCHECK: freeing invalid region, at pc",
+    "vla_write": OUTSIDE + ", at pc",
+    "alloca_write": OUTSIDE + ", at pc",
+    "scalar_write": OUTSIDE + ", at pc",
+    "param_write": OUTSIDE + ", at pc",
+    "memcpy_dst": OUTSIDE + " in memcpy, at pc",
+    "memcpy_src": OUTSIDE + " in memcpy, at pc",
+    "memset_over": OUTSIDE + " in memset, at pc",
+    "strcpy_over": OUTSIDE + " in strcpy, at pc",
+    "strlen_unterm": OUTSIDE + " in strlen, at pc",
+    "strcat_over": OUTSIDE + " in strcat, at pc",
+    "copy_dst": OUTSIDE + ", at pc",
+    "copy_src": OUTSIDE + ", at pc",
+    "argv_past": OUTSIDE + ", at pc",
+    "argv_str_past": OUTSIDE + ", at pc",
+    "argv_strcpy": OUTSIDE + " in strcpy, at pc",
 }
 
 BASE_FLAGS = ["-ccompat", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft", "-fno-pic", "-mno-sb-relative-got"]
@@ -174,6 +201,13 @@ UNDER_B = [
     # an "m" operand's base (the checked pointer) in a register the asm
     # clobbers; an "=r" output homed in a clobbered callee-saved register
     "621_asm_memory_operand_frame.c", "623_asm_spilled_operand.c", "bug_asm_operand_in_clobbered_reg.c",
+    # a by-value struct (a parameter's home, an inlined parameter) right after
+    # a scalar whose address is taken: its address is the scalar's one past
+    # the end, not inside it
+    "468_memmove_fold_named_dst.c", "488_sccp_var_addr_not_slot.c", "493_sccp_var_store_not_slot.c",
+    # a complex local returned while -b's scope entries were pending: settled
+    # into one word, it lost its imaginary part
+    "643_sret_claim_postfix.c",
 ]
 
 

@@ -1620,16 +1620,20 @@ UT_TEST(test_cmp_load_exposed_and_reused_across_branch)
   ssa_add_instr3(&c, TCCIR_OP_XOR, utb_temp(3, I32), utb_lval(utb_temp(2, I32)), utb_imm(7, I32));
   ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I32));
 
-  UT_ASSERT_EQ(ssa_opt_expose_cmp_loads(c.ir), 1);
+  /* both the CMP's and the XOR's folded loads come out (arithmetic too) */
+  UT_ASSERT_EQ(ssa_opt_expose_cmp_loads(c.ir), 2);
   UT_ASSERT_EQ(utb_op(c.ir, 2), TCCIR_OP_LOAD);
   UT_ASSERT_EQ(utb_op(c.ir, 3), TCCIR_OP_CMP);
   UT_ASSERT_EQ(utb_src1(c.ir, 3).is_lval, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, 7), TCCIR_OP_LOAD);
+  UT_ASSERT_EQ(utb_op(c.ir, 8), TCCIR_OP_XOR);
+  UT_ASSERT_EQ(utb_src1(c.ir, 8).is_lval, 0);
   ssa_ctx_build_cfg(&c);
   ssa_ctx_build_ssa_plain(&c);
   ssa_ctx_rebuild(&c);
+  /* the XOR's load is the CMP's, reused across the branch */
   UT_ASSERT(ssa_opt_load_cse(c.ctx) > 0);
-  UT_ASSERT_EQ(utb_src1(c.ir, 7).is_lval, 0);
-  UT_ASSERT_EQ(utb_vreg(utb_src1(c.ir, 7)), utb_vreg(utb_dest(c.ir, 2)));
+  UT_ASSERT(utb_op(c.ir, 7) != TCCIR_OP_LOAD);
   ssa_ctx_free(&c);
   teardown_tcc_state();
   return 0;
@@ -1666,7 +1670,8 @@ UT_TEST(test_cmp_load_exposure_preserves_entry_edges_and_operand_order)
   ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, utb_lval(utb_temp(0, I32)), utb_lval(utb_temp(1, I32)));
   c.ir->compact_instructions[1].is_jump_target = 1;
   c.ir->compact_instructions[1].line_num = 42;
-  ssa_add_instr3(&c, TCCIR_OP_XOR, utb_temp(2, I32), utb_lval(utb_temp(0, I32)), utb_lval(utb_temp(1, I32)));
+  /* a second reader that keeps its loads folded (a shift is not exposed) */
+  ssa_add_instr3(&c, TCCIR_OP_SHL, utb_temp(2, I32), utb_lval(utb_temp(0, I32)), utb_lval(utb_temp(1, I32)));
   ssa_add_instr(&c, TCCIR_OP_JUMP, utb_imm(1, I32), UTB_NONE);
   c.ir->num_switch_tables = 1;
   c.ir->switch_tables = tcc_mallocz(sizeof(TCCIRSwitchTable));
@@ -1714,12 +1719,15 @@ UT_TEST(test_cmp_load_not_reused_after_aliasing_store_or_call)
     else
       ssa_add_instr(&c, TCCIR_OP_STORE, utb_lval(utb_temp(1, I32)), utb_imm(17, I32));
     ssa_add_instr3(&c, TCCIR_OP_XOR, utb_temp(2, I32), utb_lval(utb_temp(0, I32)), utb_imm(7, I32));
-    UT_ASSERT_EQ(ssa_opt_expose_cmp_loads(c.ir), 1);
+    /* the XOR's load comes out too, and stays a load after the store/call */
+    UT_ASSERT_EQ(ssa_opt_expose_cmp_loads(c.ir), 2);
     ssa_ctx_build_cfg(&c);
     ssa_ctx_build_ssa_plain(&c);
     ssa_ctx_rebuild(&c);
     ssa_opt_load_cse(c.ctx);
+    UT_ASSERT_EQ(utb_op(c.ir, 3), TCCIR_OP_LOAD);
     UT_ASSERT_EQ(utb_src1(c.ir, 3).is_lval, 1);
+    UT_ASSERT_EQ(utb_op(c.ir, 4), TCCIR_OP_XOR);
     ssa_ctx_free(&c);
   }
   teardown_tcc_state();

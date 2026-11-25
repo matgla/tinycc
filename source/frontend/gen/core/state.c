@@ -111,6 +111,7 @@ ST_DATA SValue *vtop;
 ST_DATA SValue _vstack[1 + VSTACK_SIZE];
 
 ST_DATA int nocode_wanted; /* no code generation wanted */
+ST_DATA int yasc_decl_undefined; /* yasc: the local being declared said `= undefined` */
 ST_DATA int unevaluated_operand; /* inside an expr_type operand */
 ST_DATA SValue *discarded_call_vtop;
 
@@ -217,6 +218,10 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   nocode_wanted = DATA_ONLY_WANTED; /* no code outside of functions */
   discarded_call_vtop = NULL;
   attr_checks_reset(); /* -Wformat, -Wunused-result, -Wdeprecated-declarations */
+  call_arg_checks_unwind(NULL);
+  objsize_calls_unwind(NULL);
+  fortify_calls_unwind(NULL);
+  decl_list_unwind(NULL);
   /* an error may have left them set mid-'&' */
   unary_addr_operand = 0;
   indir_keep_lvalue = 0;
@@ -248,9 +253,14 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   printf("%s: **** new file\n", file->filename);
 #endif
   unused_unit_begin(s1);
+  s1->diag_anchor = s1->diag_decl_seq = 0;
+  s1->diag_stop = 0;
   parse_flags = PARSE_FLAG_PREPROCESS | PARSE_FLAG_TOK_NUM | PARSE_FLAG_TOK_STR;
   next();
+  s1->diag_in_parse = 1;
   tccgen_decls_recovering(s1); /* decl(VT_CONST), going on after errors */
+  s1->diag_in_parse = 0;
+  s1->diag_anchor = DIAG_ANCHOR_END; /* what follows speaks after every declaration */
   /* yasc modules: check the exports again and write the interface */
   if (s1->yasc_module)
     yasc_module_finish(s1);
@@ -348,6 +358,8 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   check_dropped_statics(s1);
   /* and the inlined ones never generated on their own, by the flow checks */
   check_uncompiled_inline_functions(s1);
+  /* an error in a saved body nothing parsed (tcc_error_stash) */
+  tcc_error_stash_unraised(s1);
   /* -Wtainted-format: the summaries across the unit's functions, the reports */
   tcc_ir_taint_unit_end();
   /* a plain pointer parameter whose body was never parsed (decl/plain_param.c) */
@@ -393,6 +405,8 @@ ST_FUNC void tccgen_finish(TCCState *s1)
      would have freed. */
   inline_release_hidden_label_bindings();
   free_deferred_functions(s1);
+  yasc_tagged_free(); /* their tag Syms die with the unit */
+  yasc_tb_pending_free();
   /* a body save an error cut (decl.c save_body_cut): its entry and message;
      the tokens went with the macro stack */
   if (s1->save_body_deferred)
@@ -414,6 +428,10 @@ ST_FUNC void tccgen_finish(TCCState *s1)
 
   str_lit_pool_free();
   attr_checks_reset();
+  call_arg_checks_unwind(NULL); /* an error out of a call's arguments */
+  objsize_calls_unwind(NULL);
+  fortify_calls_unwind(NULL);
+  decl_list_reset();             /* ... or out of a declaration list */
   gen_op_vector_reset(); /* frees the last function's vector recipes */
 
   /* Release per-TU function write summaries (Sym* keys are about to become
@@ -514,6 +532,10 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   sym_heads_free();
   sym_facts_free_all();
   shadow_free();
+  /* by token number: the next unit numbers its tokens again */
+  tcc_free(s1->sys_globals);
+  s1->sys_globals = NULL;
+  s1->sys_globals_size = 0;
   cstr_free(&initstr);
   dynarray_reset(&stk_data, &nb_stk_data);
   while (cur_switch)

@@ -8,8 +8,9 @@ the rest of the body is checked without code), up to -fmax-errors=N errors
 -fmax-errors=N." as gcc.  The compile still fails: exit status 1, no object,
 no link.  A warning made an error (-Werror, the safe default's errors) and
 "plain pointer in yasc" do not stop the parse at all; #error does not either
-(gcc).  An undeclared name is reported once per function.  Errors inside a
-preprocessor directive, a macro's substitution or inline asm still stop.
+(gcc).  An undeclared name is reported once per function.  A preprocessor
+directive's error still stops (gcc too).  Since 2026-11-23 the diagnostics
+are -O0's, in -O0's order, at every level and with -fsyntax-only.
 """
 
 import re
@@ -426,9 +427,9 @@ int g(void) { return nope; }
 def test_error_in_initializer_braces(tmp_path, opt):
     # the skip leaves the initializer's braces the error was in without
     # taking their '}' for the end of a block (the body went on to the end
-    # of the file, and g was never seen)
+    # of the file, and g was never seen); b, after a's error, is still read
     p = _run(tmp_path, INIT_ERRORS, opt)
-    assert _error_lines(p) == [3, 4, 7], p.stderr
+    assert _error_lines(p) == [3, 3, 4, 7], p.stderr
 
 
 def test_unused_after_skip(tmp_path):
@@ -461,7 +462,7 @@ int proto(char *s);
 struct node { int *next; int v; };
 int use(int * view p, int *q)
 {
-  char *loc = 0;
+  char *loc = nullptr;
   int x;
   (void)loc;
   (void)q;
@@ -480,7 +481,7 @@ def test_yasc_plain_pointer_goes_on(tmp_path):
     # 5) are said at the end of their body, in line order, whose uses decide
     # owned or view (decl/plain_param.c)
     assert plain == [1, 2, 3, 5], p.stderr
-    assert (9, "warning", "'x' is used uninitialized") in d
+    assert (9, "error", "'x' is used uninitialized") in d
     assert (11, "warning", "'unused_fn' defined but not used") in d
     assert (12, "error", "'undecl' undeclared") in d
     # nothing more about the plain pointers themselves
@@ -565,3 +566,345 @@ def test_token_deletion_sweep(tmp_path):
         assert p.returncode in (0, 1), (k, body, p.returncode, p.stderr)
         assert "compiler_error" not in p.stderr, (k, body, p.stderr)
         assert len(_error_lines(p)) <= 8
+
+
+# --- the recovery limits of 2026-11-23 --------------------------------------
+
+LEVELS = ("-O0", "-O1", "-O2", "-Os", "-fsyntax-only")
+
+
+def _same_at_every_level(tmp_path, body, *flags, levels=LEVELS, ccompat=True):
+    """The diagnostics (stderr) of BODY at every level: all the same; the -O0 run."""
+    outs = {}
+    for opt in levels:
+        p = _run(tmp_path, body, opt, *flags, ccompat=ccompat, timeout=30)
+        assert p.returncode in (0, 1), (opt, p.returncode, p.stderr)
+        outs[opt] = p
+    first = outs[levels[0]]
+    for opt in levels[1:]:
+        assert outs[opt].stderr == first.stderr, (opt, first.stderr, outs[opt].stderr)
+        assert outs[opt].returncode == first.returncode
+    return first
+
+
+DECL_LIST = """\
+int f(int x)
+{
+  int a[2] = {1, 2, 3}, b = 4;
+  int c = f(1, +, 3), d = 5;
+  int e = x +, g[1] = {{1, 2}}, h = 6;
+  return b + d + h + nope;
+}
+int g1 = 1, h1[1] = {1, 2}, k1 = 3;
+int p(unk_t a), q(void);
+int m(void) { return k1 + q() + nope2; }
+"""
+
+
+def test_declarator_list_goes_on(tmp_path):
+    # an error in a declarator or its initializer goes on with the list's
+    # next declarator after its ',' (gcc): b, d, h, k1 and q are declared
+    p = _same_at_every_level(tmp_path, DECL_LIST, "-fmax-errors=0", "-Wall")
+    d = _diags(p)
+    assert [l for l, k, _ in d if k == "error"] == [3, 4, 5, 5, 6, 8, 9, 10], p.stderr
+    undeclared = [m for _, _, m in d if "undeclared" in m]
+    assert undeclared == ["'nope' undeclared", "'nope2' undeclared"], p.stderr
+    assert not [m for _, k, m in d if k == "warning"], p.stderr
+
+
+MACRO_ARGS = """\
+#define ADD(a, b) ((a) + (b))
+int f(void) { return ADD(1); }
+int g(void) { return nope1; }
+int h(void) { return ADD(1, (2, 3), 4); }
+int k(void) { int r = ADD(1, 2); return r + nope2; }
+static inline int s(void) { return ADD(1, 2, 3); }
+int u(void) { return s() + nope3; }
+"""
+
+
+def test_macro_wrong_argument_count_goes_on(tmp_path):
+    # report, skip the invocation, go on (gcc): the parse goes on after the
+    # statement, in a body saved as tokens too
+    p = _same_at_every_level(tmp_path, MACRO_ARGS)
+    assert [(l, m) for l, _, m in _diags(p)] == [
+        (2, "macro 'ADD' used with too few args"),
+        (3, "'nope1' undeclared"),
+        (4, "macro 'ADD' used with too many args"),
+        (5, "'nope2' undeclared"),
+        (6, "macro 'ADD' used with too many args"),
+        (7, "'nope3' undeclared"),
+    ], p.stderr
+
+
+def test_macro_error_in_unused_static_inline(tmp_path):
+    # a body nothing parses still says the error of its saved tokens
+    body = "#define A(x) x\nstatic inline int w(void) { return A(1, 2); }\nint f(void) { return 1; }\n"
+    p = _same_at_every_level(tmp_path, body)
+    assert _error_lines(p) == [2], p.stderr
+    assert p.returncode == 1 and not (tmp_path / "t.o").exists()
+
+
+LEXER_ERRORS = """\
+int f(int x)
+{
+  int y = nope1;
+  y += 12abc;
+  y += '';
+  y += \x01;
+  return y + nope2;
+}
+int g(void) { return nope3; }
+static int h(int x)
+{
+  x = nope4;
+  x += 0x1.0p;
+#error in a body
+#warning also in a body
+  return x + nope5;
+}
+int k(void) { return h(1); }
+"""
+
+
+def test_lexer_errors_in_saved_bodies(tmp_path):
+    # a number's error, an empty character constant, an unrecognized
+    # character, #error and #warning: said where the parse reaches them when
+    # the body is saved as tokens (-O1+, a static inline), as at -O0
+    p = _same_at_every_level(tmp_path, LEXER_ERRORS, "-fmax-errors=0")
+    assert [(l, k) for l, k, _ in _diags(p)] == [
+        (3, "error"), (4, "error"), (5, "error"), (6, "error"), (7, "error"), (9, "error"),
+        (12, "error"), (13, "error"), (14, "error"), (15, "warning"), (16, "error"),
+    ], p.stderr
+
+
+ASM_OPERANDS = """\
+int f(int x) { __asm__("mov %0, %1" : "=r"(x) : "q"(x)); return x + nope1; }
+int g(void) { return nope2; }
+int h(int x) { __asm__("mov %0, %5" : "=r"(x) : "r"(x)); return x; }
+int k(int x) { __asm__("add %0, %1" : "=r"(x) : "+r"(x)); return x; }
+int m(void) { return nope3; }
+"""
+
+
+def test_asm_operand_errors_drop_the_statement(tmp_path):
+    # the constraints and the operand references are checked where the asm
+    # statement is parsed: an error drops it, the parse goes on
+    p = _same_at_every_level(tmp_path, ASM_OPERANDS, "-fmax-errors=0")
+    assert [(l, m) for l, _, m in _diags(p)] == [
+        (1, "unknown constraint 'q'"),
+        (1, "'nope1' undeclared"),
+        (2, "'nope2' undeclared"),
+        (3, "invalid operand reference after %"),
+        (4, "'+' modifier can only be applied to outputs"),
+        (5, "'nope3' undeclared"),
+    ], p.stderr
+
+
+def test_asm_text_error_in_code_generation_goes_on(tmp_path):
+    # an error while a function's code is generated (its asm text) is said;
+    # the unit goes on as -fsyntax-only (-fsyntax-only generates nothing,
+    # so says nothing about the text)
+    body = "int m(int x) { __asm__(\"bogus_insn r0\"); return x; }\nint n(void) { return nope; }\n"
+    p = _same_at_every_level(tmp_path, body, levels=("-O0", "-O1", "-O2", "-Os"))
+    assert _error_lines(p) == [1, 2], p.stderr
+    assert not (tmp_path / "t.o").exists()
+    for flags in (["-g"], ["-O2", "-g"], ["-ffunction-sections"]):
+        q = _run(tmp_path, body, *flags)
+        assert q.stderr == p.stderr, (flags, q.stderr)
+
+
+SETUP_ERROR = """\
+struct T { int x; };
+int f(int n, int a[n + sizeof(struct T { int y; })]) { return nope1 + a[0]; }
+int g(void) { return nope2; }
+"""
+
+
+def test_error_while_parameters_are_set_up(tmp_path):
+    # the VLA parameter's size, replayed when the function is set up, says
+    # an error there: the body is then parsed check-only (nope1)
+    p = _same_at_every_level(tmp_path, SETUP_ERROR)
+    assert [(l, m) for l, _, m in _diags(p)] == [
+        (2, "struct/union/enum already defined"),
+        (2, "'nope1' undeclared"),
+        (3, "'nope2' undeclared"),
+    ], p.stderr
+
+
+DEFERRED_ORDER = """\
+int f(void)
+{
+  int a[2] = {1, 2, 3};
+  return a[0] + x1;
+}
+int g = 1, h[1] = {1, 2}, k = 3;
+static inline int sq(int v) { return v * nope; }
+int m(void) { return k + sq(2) + other; }
+static int unused_fn(void) { return 1; }
+int gg = 1.5 + "";
+static int a(int x) { return x + nope1; }
+int b(void) { return a(1) + nope2; }
+static int c(int x) { return x * nope3; }
+int d(void) { return nope4 + c(2); }
+static int unused(void) { return nope5; }
+static int tab[3] = { 1, nope6, 3 };
+int e(void) { return tab[0] + nope7; }
+"""
+
+
+def test_deferred_bodies_in_source_order(tmp_path):
+    # the bodies deferred to the end of the unit (-O1+: a function called
+    # once, a static's initializer, an unused static; a static inline at
+    # every -O) say their errors at their place: -O0's order, gcc's
+    p = _same_at_every_level(tmp_path, DEFERRED_ORDER, "-fmax-errors=0", "-Wall")
+    lines = _error_lines(p)
+    assert lines == sorted(lines), p.stderr
+    assert lines == [3, 4, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17], p.stderr
+
+
+@pytest.mark.parametrize("n", ["1", "2", "3", "5", "8", "0"])
+def test_deferred_bodies_and_the_cap(tmp_path, n):
+    # -fmax-errors=N counts in that order: the same N errors at every level
+    p = _same_at_every_level(tmp_path, DEFERRED_ORDER, f"-fmax-errors={n}")
+    lines = _error_lines(p)
+    if n != "0":
+        assert len(lines) == min(int(n), 13), p.stderr
+        assert p.stderr.rstrip().endswith(TERMINATED + n + "."), p.stderr
+    assert lines == sorted(lines), p.stderr
+
+
+@pytest.mark.parametrize("fmt", ["json", "sarif"])
+def test_deferred_order_machine_readable(tmp_path, fmt):
+    p = _same_at_every_level(tmp_path, DEFERRED_ORDER, f"-fdiagnostics-format={fmt}", "-fmax-errors=4")
+    assert TERMINATED + "4." in p.stderr
+
+
+def test_warnings_in_source_order(tmp_path):
+    body = (
+        "int f(void) { int u; return 0; }\nint g = 1;\nstatic int s(void) { int w; return 3; }\n"
+        "int *p = 3;\nint z(void) { return s(); }\n"
+    )
+    p = _same_at_every_level(tmp_path, body, "-Wall")
+    assert [l for l, _, _ in _diags(p, "warning")] == [1, 3, 4], p.stderr
+    assert p.returncode == 0
+
+
+def test_fatal_error_after_deferred_body(tmp_path):
+    # a missing include stops the compile; a body deferred before it still
+    # says its error first, as at -O0
+    body = "int f(void) { return x; }\n#include \"nope_not_here.h\"\nint g(void) { return y; }\n"
+    p = _same_at_every_level(tmp_path, body)
+    assert _error_lines(p) == [1, 2], p.stderr
+    body = "int f(void)\n{\n  int a = x;\n#include \"nope_not_here.h\"\n  return a;\n}\nint g(void) { return y; }\n"
+    p = _same_at_every_level(tmp_path, body)
+    assert _error_lines(p) == [3, 4], p.stderr
+
+
+RECOVER_SWEEP = """\
+#define ADD(a, b) ((a) + (b))
+struct P { int x, y; };
+static inline int sq(int v) { return v * v; }
+static int tab[3] = { 1, 2, 3 };
+int g1 = 1, g2[2] = { 3, 4 }, g3 = 5;
+int f(int n, struct P *p)
+{
+  int s = ADD(n, 1), t[2] = { 1, 2 }, u = 3;
+  __asm__("mov %0, %1" : "=r"(s) : "r"(s));
+  for (int i = 0; i < n; i++)
+    s += sq(i) + tab[i % 3];
+  return s + t[0] + u + p->x + g2[1];
+}
+int k(void) { return 12 + 'a'; }
+"""
+
+
+def test_token_deletion_sweep_limits(tmp_path):
+    # every token of a source using what the recovery now goes on after
+    # (declaration lists, macros, asm, saved bodies) removed in turn: no
+    # hang, no crash, every level says the same -- but for a brace: a body
+    # saved as tokens (-O1+) ends at its braces' balance, which a stray one
+    # moves, where -O0's parse may read it as an initializer's
+    toks = re.findall(r"[A-Za-z_]\w*|\d+|'[^']*'|\"[^\"]*\"|->|\+\+|--|\+=|&&|[^\s\w]", RECOVER_SWEEP)
+    spans = []
+    pos = 0
+    for t in toks:
+        i = RECOVER_SWEEP.index(t, pos)
+        spans.append((i, i + len(t)))
+        pos = i + len(t)
+    for k, (a, b) in enumerate(spans):
+        body = RECOVER_SWEEP[:a] + " " + RECOVER_SWEEP[b:]
+        outs = []
+        for opt in LEVELS:
+            p = _run(tmp_path, body, opt, "-fmax-errors=0", timeout=20)
+            assert p.returncode in (0, 1), (k, opt, body, p.returncode, p.stderr)
+            assert "compiler_error" not in p.stderr, (k, opt, body, p.stderr)
+            outs.append(p.stderr)
+        if RECOVER_SWEEP[a:b] not in ("{", "}"):
+            assert len(set(outs)) == 1, (k, body, outs)
+
+
+def test_valid_code_the_new_checks_accept(tmp_path):
+    # a struct body in a static's initializer (its ';' is no missing '}'),
+    # gcc's '#' / '*' constraint hints, an asm statement in dead code (never
+    # generated, never checked): no error at any level (gcc torture
+    # 920928-4, 20000922-1)
+    body = (
+        "static unsigned long off[] = { 0, sizeof(struct { long n; char s[4]; }), 2 };\n"
+        "void doit(int);\n"
+        "void q(int x) { if (0) __asm__ volatile(\"%0\" : : \"i#*X\"(x)); else doit(x); }\n"
+        "int r(int x) { __asm__(\"mov %0, %1\" : \"=r\"(x) : \"r\"(x)); return x + (int)off[1]; }\n"
+    )
+    p = _same_at_every_level(tmp_path, body)
+    assert p.returncode == 0 and not p.stderr, p.stderr
+
+
+CALL_ARGS = """\
+typedef unsigned int size_t;
+void *memcpy(void *d, const void *s, size_t n);
+int printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void f(char *d, const char *s)
+{
+  memcpy(d, s + nope1, sizeof d);
+  printf("%d %s\\n", nope2, s);
+  memcpy(d, s, sizeof(printf("%d", nope3)));
+  int a = 1, b = nope4, c = 3;
+  printf("%d\\n", a + b + c);
+}
+int g = 1, h = nope5, k = 2;
+"""
+
+CALL_ARGS_INLINE = """\
+typedef unsigned int size_t;
+void *memcpy(void *d, const void *s, size_t n);
+int printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static inline int bad(int x) { return x + nope1; }
+void f(char *d, const char *s)
+{
+  memcpy(d, s, bad(4));
+  printf("%d %s\\n", bad(2), s);
+  int a = bad(1), b = 2;
+  printf("%d\\n", a + b);
+}
+"""
+
+
+@pytest.mark.parametrize(
+    "case,lines", [("args", [6, 7, 8, 9, 12]), ("inline", [4])], ids=["args", "inline"]
+)
+def test_errors_in_call_arguments_and_declaration_lists(tmp_path, case, lines):
+    # an error in a call's arguments while its -Wformat / -Wsizeof-pointer-
+    # memaccess checks are on (builtin/call.c CallArgChecks, on the heap), or
+    # in a declaration list (decl.c's RecoverDeclList, from a free list), and
+    # at -O1+ in an inline expansion replayed inside the arguments: the
+    # recovery gives back what the frames it left held -- an ASan build
+    # reports a leak otherwise
+    body = CALL_ARGS if case == "args" else CALL_ARGS_INLINE
+    outs = set()
+    for opt in ("-O0", "-O1", "-O2", "-fsyntax-only"):
+        p = _run(tmp_path, body, "-Wall", opt)
+        assert p.returncode == 1, (opt, p.stderr)
+        assert "Sanitizer" not in p.stderr, (opt, p.stderr)
+        assert _error_lines(p) == lines, (opt, p.stderr)
+        outs.add(p.stderr)
+    assert len(outs) == 1, outs

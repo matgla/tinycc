@@ -33,7 +33,7 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 def _run(tmp_path, body, *flags, ccompat=True, name="t.c"):
     src = tmp_path / name
     src.write_text(body)
-    cmd = [str(TCC), *INCLUDE_FLAGS] + (["-ccompat"] if ccompat else []) + ["-c", *flags, str(src), "-o", str(tmp_path / "t.o")]
+    cmd = [str(TCC), "-Wno-missing-prototypes", *INCLUDE_FLAGS] + (["-ccompat"] if ccompat else []) + ["-c", *flags, str(src), "-o", str(tmp_path / "t.o")]
     return subprocess.run(cmd, capture_output=True, text=True, cwd=tmp_path)
 
 
@@ -94,7 +94,9 @@ def test_options(tmp_path, case):
 def test_parameters_are_outside_wall(tmp_path):
     body = "int f(int a,\n      int b)\n{\n  a = 2;\n  return 0;\n}\n"
     assert not _run(tmp_path, body, "-Wall").stderr
-    assert not _run(tmp_path, body, ccompat=False).stderr
+    # the safe default has them (-Wextra's)
+    assert _diags(_run(tmp_path, body, ccompat=False)) == [(1, "parameter 'a' set but not used"),
+                                                            (2, "unused parameter 'b'")]
     assert _diags(_run(tmp_path, body, "-Wunused-parameter")) == [(2, "unused parameter 'b'")]
     assert _diags(_run(tmp_path, body, "-Wunused-but-set-parameter")) == [(1, "parameter 'a' set but not used")]
 

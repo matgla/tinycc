@@ -143,14 +143,15 @@ ST_FUNC int exact_log2p1(unsigned int i)
 }
 
 /* -Wignored-attributes: attributes that promise a check -- a reader takes
- * `access(write_only, 1)` for one -- which tcc does not make yet.  Reported once per
+ * `counted_by(n)` for one -- which tcc does not make yet.  Reported once per
  * attribute in a unit, and not in system headers.  fallthrough marks a
  * statement (-Wimplicit-fallthrough), and maybe_unused only silences warnings
  * tcc does not give, so ignoring it loses nothing.  format, nonnull, returns_nonnull, malloc, alloc_size,
- * warn_unused_result, nodiscard and deprecated are checked, stack_protect and
+ * warn_unused_result, nodiscard, deprecated, access and
+ * null_terminated_string_arg (-ffortify) are checked, stack_protect and
  * no_stack_protector applied (-fstack-protector*), in either
  * spelling (parse_checked_attribute). */
-static const char *const unchecked_attributes[] = {"access", NULL};
+static const char *const unchecked_attributes[] = {"counted_by", NULL};
 
 static void warn_unchecked_attribute(const char *name)
 {
@@ -276,9 +277,63 @@ static int parse_checked_attribute(AttributeDef *ad, int t)
       ad->attr_alloc_a = a, ad->attr_alloc_b = b;
     return 1;
   }
+  /* -ffortify's (builtin/fortify.c): the calls are checked against what the
+     pointer arguments point to */
+  if (attr_named(t, "null_terminated_string_arg"))
+  {
+    skip('(');
+    n = expr_const();
+    skip(')');
+    if (n >= 1 && n <= 32)
+      ad->attr_cstr_args |= 1u << (n - 1);
+    else
+      tcc_warning_c(warn_ignored_attributes)("null_terminated_string_arg: argument %d out of range: ignored", n);
+    return 1;
+  }
+  if (attr_named(t, "access"))
+  {
+    /* access(read_only | write_only | read_write | none, ref[, size]) */
+    static const char *const modes[] = {"none", "read_only", "write_only", "read_write"};
+    int mode = -1, ref, size = 0;
+    skip('(');
+    for (int i = 0; i < 4; i++)
+      if (tok >= TOK_UIDENT && attr_named(tok, modes[i]))
+        mode = i;
+    if (mode < 0)
+      expect("read_only, write_only, read_write or none");
+    next();
+    skip(',');
+    ref = expr_const();
+    if (tok == ',')
+    {
+      next();
+      size = expr_const();
+    }
+    skip(')');
+    if (ref < 1 || ref > 255 || size < 0 || size > 255)
+      tcc_warning_c(warn_ignored_attributes)("access: argument out of range: ignored");
+    else if (ad->attr_access_n < FORTIFY_MAX_ACCESS)
+    {
+      unsigned char *a = ad->attr_access[ad->attr_access_n++];
+      a[0] = mode, a[1] = ref, a[2] = size;
+    }
+    return 1;
+  }
   if (attr_named(t, "returns_nonnull"))
   {
     ad->attr_returns_nonnull = 1;
+    return 1;
+  }
+  /* a struct member's pointer from regular C is `view` / `view maybe`
+     (attr_apply_member_facts): what sys/_attrs.h's __yl_view says */
+  if (attr_named(t, "yasc_view"))
+  {
+    ad->attr_yasc_ptr |= YASC_VIEW;
+    return 1;
+  }
+  if (attr_named(t, "yasc_maybe"))
+  {
+    ad->attr_yasc_ptr |= YASC_MAYBE;
     return 1;
   }
   /* -Wtainted-format's sources (ir/taint.c): the result, or what argument n
@@ -521,7 +576,8 @@ ST_FUNC int tcc_attribute_supported(int t)
              attr_named(t, "returns_nonnull") || attr_named(t, "format") || attr_named(t, "format_arg") ||
              attr_named(t, "deprecated") || attr_named(t, "tainted_result") || attr_named(t, "tainted_arg") ||
              attr_named(t, "warn_unused_result") || attr_named(t, "fallthrough") ||
-             attr_named(t, "stack_protect") || attr_named(t, "no_stack_protector");
+             attr_named(t, "stack_protect") || attr_named(t, "no_stack_protector") || attr_named(t, "yasc_view") ||
+             attr_named(t, "yasc_maybe");
     return 0;
   }
 }
@@ -665,6 +721,10 @@ redo:
     case TOK_NOINSTRUMENT1:
     case TOK_NOINSTRUMENT2:
       ad->f.func_no_instrument = 1;
+      break;
+    case TOK_LEAF1:
+    case TOK_LEAF2:
+      ad->f.func_leaf = 1;
       break;
     case TOK_PURE1:
     case TOK_PURE2:
@@ -836,6 +896,32 @@ static void attr_requalify(CType *ptr, int add)
   ptr->ref = sym_pointer_node_q(&ptr->ref->type, (type_yasc(ptr) & ~YASC_UNCHECKED) | add);
 }
 
+/* A struct member V of TYPE was declared with AD: yasc_view makes its pointer
+ * `view`, with yasc_maybe `view maybe` -- in a unit with yasc in it, and only
+ * a pointer written in regular C, which says nothing itself: a C header that
+ * says what its struct holds is believed, as malloc is
+ * (attr_apply_pointer_facts).  The outer pointer only: `T **p` is a view of
+ * unchecked pointers. */
+void attr_apply_member_facts(CType *type, AttributeDef *ad, int v)
+{
+  const int q = ad->attr_yasc_ptr;
+  const char *name = v ? get_tok_str(v, NULL) : "";
+  if (!q)
+    return;
+  if ((type->t & (VT_BTYPE | VT_ARRAY)) != VT_PTR)
+  {
+    tcc_warning_c(warn_ignored_attributes)("yasc_view on '%s', which is not a pointer: ignored", name);
+    return;
+  }
+  if (!(q & YASC_VIEW))
+  {
+    tcc_warning_c(warn_ignored_attributes)("yasc_maybe on '%s' without yasc_view: ignored", name);
+    return;
+  }
+  if (tcc_yasc_unit(tcc_state) && (type_yasc(type) & YASC_UNCHECKED))
+    attr_requalify(type, q);
+}
+
 /* A function declarator TYPE was parsed with AD: what its GCC attributes say
  * about pointers goes into the types.
  * - nonnull marks the parameters, for -Wnonnull at calls;
@@ -900,7 +986,8 @@ void attr_apply_decl_facts_at(Sym *s, AttributeDef *ad, int line)
 {
   SymLocalFacts *f;
   if (!s || !(ad->attr_deprecated | ad->attr_unused_result | ad->attr_fmt_kind | ad->attr_fmt_arg | ad->attr_alloc_a |
-               ad->attr_malloc | ad->attr_tainted_result | ad->attr_tainted_args | ad->attr_ssp))
+               ad->attr_malloc | ad->attr_tainted_result | ad->attr_tainted_args | ad->attr_ssp | ad->attr_cstr_args |
+               ad->attr_access_n))
     return;
   f = sym_facts(s);
   s->a.attr_facts = 1;
@@ -933,6 +1020,8 @@ void attr_apply_decl_facts_at(Sym *s, AttributeDef *ad, int line)
     f->fmt_arg = ad->attr_fmt_arg;
   f->tainted_result |= ad->attr_tainted_result;
   f->tainted_args |= ad->attr_tainted_args;
+  if ((ad->attr_cstr_args || ad->attr_access_n) && (s->type.t & VT_BTYPE) == VT_FUNC)
+    fortify_apply_attrs(s, f, ad);
   if (ad->attr_fmt_kind)
   {
     f->fmt_kind = ad->attr_fmt_kind;

@@ -1,0 +1,23 @@
+01_find_the_bugs.c:22: warning: format '%d' expects argument of type 'int', but argument 2 has type 'long'
+01_find_the_bugs.c:28: warning: format not a string literal and no format arguments
+01_find_the_bugs.c:34: warning: suggest parentheses around assignment used as truth value
+01_find_the_bugs.c:46: warning: this statement may fall through
+01_find_the_bugs.c:47: note: here
+01_find_the_bugs.c:59: warning: enumeration value 'BLUE' not handled in switch
+01_find_the_bugs.c:72: warning: comparison of integer expressions of different signedness: 'int' and 'unsigned int'
+01_find_the_bugs.c:78: warning: comparison of unsigned expression in '< 0' is always false
+01_find_the_bugs.c:84: warning: left shift count >= width of type
+01_find_the_bugs.c:90: warning: unused variable 'total'
+01_find_the_bugs.c:98: warning: array subscript 4 is above array bounds of 'int[4]'
+01_find_the_bugs.c:107: warning: array subscript 4 is above array bounds of 'int[4]'
+01_find_the_bugs.c:114: warning: argument to 'sizeof' in 'memset' call is the same expression as the destination; did you mean to provide an explicit length?
+01_find_the_bugs.c:121: warning: 'strcpy' writing 14 bytes into a region of size 8 overflows the destination
+01_find_the_bugs.c:121: note: use strlcpy(buf, src, sizeof buf), which bounds the copy
+01_find_the_bugs.c:129: warning: 'sprintf' writing at least 7 bytes into a region of size 6 overflows the destination
+01_find_the_bugs.c:129: note: use snprintf(buf, sizeof buf, ...), which bounds the output
+01_find_the_bugs.c:139: warning: 'x' may be used uninitialized
+01_find_the_bugs.c:147: warning: 'make_greeting' returns the address of a local variable
+01_find_the_bugs.c:154: warning: the address of a local variable is stored through 'slot', which outlives 'remember'
+01_find_the_bugs.c:161: warning: 'free' called on unallocated object 'n'
+01_find_the_bugs.c:167: warning: self-comparison always evaluates to true
+01_find_the_bugs.c:174: warning: a null pointer is dereferenced

@@ -67,6 +67,8 @@ typedef struct UbsanSite
   int mismatch; /* type_mismatch_v1: log2(alignment) + 1 */
   CType types[2];
   SValue args[2];
+  int nrec;         /* type_mismatch_v1: the records ubsan_call wrote ... */
+  addr_t recs[2];   /* ... at these .data offsets (their kind patched later) */
 } UbsanSite;
 
 static void ubsan_site(UbsanSite *u, const char *handler, int bit, int t)
@@ -148,7 +150,8 @@ static Sym *ubsan_type_desc(CType *type)
 
 /* the check's record in .data (written by the handler: its column marks a
    place already reported): {file, line, column 0}, the type descriptors,
-   type_mismatch_v1's {log2(alignment), 0 = load} */
+   type_mismatch_v1's {log2(alignment), kind}: 0 = load until the access
+   turns out to be a store or a member access (ubsan_access_kind) */
 static Sym *ubsan_record(UbsanSite *u)
 {
   const char *fname = file ? file->filename : "<unknown>";
@@ -167,6 +170,8 @@ static Sym *ubsan_record(UbsanSite *u)
   greloc(data_section, fsym, off, R_DATA_PTR);
   for (i = 0; i < u->nt; i++)
     greloc(data_section, ts[i], off + 12 + 4 * i, R_DATA_PTR);
+  if (u->mismatch && u->nrec < 2)
+    u->recs[u->nrec++] = off;
   return get_sym_ref(&char_type, data_section, off, size);
 }
 
@@ -257,6 +262,44 @@ static void ubsan_trap_if(UbsanSite *u)
     tcc_ir_put(ir, TCCIR_OP_TRAP, NULL, NULL, NULL);
   tcc_ir_backpatch_to_here(ir, skip);
   nocode_wanted = saved_nocode;
+}
+
+/* A point control never reaches: yasc's `unreachable` (CHECKED = 1) and
+ * __builtin_unreachable() (checked under -fsanitize=unreachable, as clang's).
+ *
+ * Checked, it is a TRAP that runs (`udf #254`, as every check here), after
+ * __ubsan_handle_builtin_unreachable(&{file, line}) when -fsanitize=unreachable
+ * is in handler mode, which reports the place and aborts.  The branches that lead to it stay: they are
+ * the check.  Unchecked, it is a marked TRAP with no code, and a path that can
+ * only end there is assumed never taken (tcc_ir_opt_unreachable_fold).
+ *
+ * Either way the code after it is off, as after a return: a non-void function
+ * that ends in one needs no return after it (check_func_return). */
+void gen_unreachable(int checked)
+{
+  TCCIRState *ir = tcc_state->ir;
+  if (ir && !nocode_wanted)
+  {
+    int before;
+    if (checked && (tcc_state->sanitize & SAN_UNREACHABLE) && ubsan_handler_on(SAN_UNREACHABLE))
+    {
+      UbsanSite u;
+      SValue rec;
+      ubsan_site(&u, "builtin_unreachable", SAN_UNREACHABLE, 0);
+      svalue_init(&rec);
+      rec.type = char_pointer_type;
+      rec.r = VT_CONST | VT_SYM;
+      rec.sym = ubsan_record(&u);
+      rec.c.i = 0;
+      /* no _abort variant: the handler never returns */
+      gen_ir_void_call_args(&rec, 1, tok_alloc_const("__ubsan_handle_builtin_unreachable"));
+    }
+    before = ir->next_instruction_index;
+    tcc_ir_put(ir, TCCIR_OP_TRAP, NULL, NULL, NULL);
+    if (!checked && ir->next_instruction_index > before && ir->compact_instructions[before].op == TCCIR_OP_TRAP)
+      ir->compact_instructions[before].unreachable = 1;
+  }
+  CODE_OFF();
 }
 
 static void ubsan_cast(int t)
@@ -692,6 +735,59 @@ int ubsan_gen_neg(void)
   return r;
 }
 
+/* Handler mode: the type_mismatch_v1 records of the latest dereferences,
+ * keyed by the pointer's vreg (indir() gives each dereference a fresh one),
+ * until the access through it is known.  ubsan_deref writes them as a load
+ * (clang's kind 0); a store through the lvalue (vstore, so also compound
+ * assignment and ++/--) makes them kind 1, a member access ('.', '->') kind
+ * 3, as clang reports them.  A load leaves them as they are. */
+#define UBSAN_PENDING 8
+static struct UbsanPending
+{
+  int vr, nrec;
+  addr_t recs[2];
+} ubsan_pending[UBSAN_PENDING];
+static int ubsan_npending;
+
+/* LV, an lvalue about to be stored to (UBSAN_STORE) or to have a member
+   named (UBSAN_MEMBER): the records of the check of its pointer, if any,
+   say so */
+void ubsan_access_kind(const SValue *lv, int kind)
+{
+  int i, j;
+  if (!ubsan_npending || !(lv->r & VT_LVAL) || lv->vr < 0)
+    return;
+  for (i = ubsan_npending - 1; i >= 0; i--)
+    if (ubsan_pending[i].vr == lv->vr)
+      break;
+  if (i < 0)
+    return;
+  for (j = 0; j < ubsan_pending[i].nrec; j++)
+  {
+    /* after {file, line, column}, the type and log2(alignment) */
+    addr_t off = ubsan_pending[i].recs[j] + 12 + 4 + 1;
+    if (off >= data_section->data_base && off < data_section->data_offset)
+      data_section->data[off - data_section->data_base] = kind;
+  }
+  memmove(&ubsan_pending[i], &ubsan_pending[i + 1], (ubsan_npending - i - 1) * sizeof ubsan_pending[0]);
+  ubsan_npending--;
+}
+
+static void ubsan_note_pending(const UbsanSite *u, int vr)
+{
+  if (!u->nrec)
+    return;
+  if (ubsan_npending == UBSAN_PENDING)
+  {
+    memmove(&ubsan_pending[0], &ubsan_pending[1], (UBSAN_PENDING - 1) * sizeof ubsan_pending[0]);
+    ubsan_npending--;
+  }
+  ubsan_pending[ubsan_npending].vr = vr;
+  ubsan_pending[ubsan_npending].nrec = u->nrec;
+  memcpy(ubsan_pending[ubsan_npending].recs, u->recs, sizeof u->recs);
+  ubsan_npending++;
+}
+
 /* indir(): vtop, a pointer value about to name the object it points to.
  * -fsanitize=null: not a null pointer; =alignment: aligned for that type.
  * A constant address, a symbol's and a frame address are known good (or
@@ -701,9 +797,10 @@ void ubsan_deref(void)
   CType *pt;
   int align, size;
   /* a value in a vreg only: not a VT_PARAM address (a by-value parameter's
-     home, which only a LEA turns into a pointer) */
+     home, which only a LEA turns into a pointer).  Its c.i means nothing: a
+     pointer variable indir() loaded into a temp keeps its frame offset there */
   if (!ubsan_on(SAN_NULL | SAN_ALIGN) || (vtop->type.t & VT_BTYPE) != VT_PTR ||
-      (vtop->r & (VT_VALMASK | VT_LVAL | VT_PARAM)) != 0 || vtop->vr < 0 || vtop->c.i != 0)
+      (vtop->r & (VT_VALMASK | VT_LVAL | VT_PARAM)) != 0 || vtop->vr < 0)
     return;
   pt = pointed_type(&vtop->type);
   if ((pt->t & (VT_ARRAY | VT_VLA)) || (pt->t & VT_BTYPE) == VT_FUNC || (pt->t & VT_BTYPE) == VT_VOID)
@@ -752,11 +849,250 @@ void ubsan_deref(void)
     site.bit = SAN_ALIGN;
     ubsan_trap_if(&site);
   }
+  ubsan_note_pending(&site, p.vr);
+}
+
+/* vtop: a condition -> popped, and a trap on its true side (yasc slices'
+   checks, which are always on): nothing in code nobody runs */
+void fe_trap_if(void)
+{
+  if (nocode_wanted || !tcc_state->ir)
+  {
+    vpop();
+    return;
+  }
+  ubsan_trap_if(NULL);
+}
+
+/* ---- -fsanitize=bounds through an array parameter ----------------------
+ * A parameter declared as an array of N elements (`char s[16]`,
+ * `int p[n]`: C99's syntax, which C itself ignores -- the parameter is a
+ * pointer) promises N elements from where it points on entry, as clang's
+ * __counted_by does.  gen_function keeps that start and N in anonymous
+ * locals (SSA promotes them to registers, a constant N stays a constant);
+ * a subscript of a pointer of that parameter's type is then checked as
+ * `(base - start) + i < N`, which folds to `i < N` while the parameter
+ * keeps its value, and still holds after `p++`.  `[static N]` (at least N)
+ * and `[]` / `[*]` say nothing of an end: not checked. */
+#define UBSAN_PARAM_BOUNDS 16
+typedef struct
+{
+  Sym *ref; /* the parameter's type.ref: the array's element Sym */
+  SValue start, n;
+  int param_vr; /* the parameter's own vreg */
+} UbsanParamBound;
+static UbsanParamBound ubsan_param_bounds[UBSAN_PARAM_BOUNDS];
+static int ubsan_nparam_bounds;
+
+/* an inline expansion's parameters come and go with its body */
+int ubsan_param_bounds_mark(void)
+{
+  return ubsan_nparam_bounds;
+}
+
+void ubsan_param_bounds_release(int mark)
+{
+  if (mark < ubsan_nparam_bounds)
+    ubsan_nparam_bounds = mark;
+}
+
+/* an anonymous 32-bit local of type T (declared as a C local is, so SSA
+   promotes it), its lvalue in *SV */
+static int ubsan_local(SValue *sv, const CType *t)
+{
+  int vr = tcc_ir_get_vreg_var(tcc_state->ir);
+  if (vr < 0)
+    return 0;
+  loc = tcc_ir_frame_alloc(loc, 4, -4);
+  tcc_ir_assign_physical_register(tcc_state->ir, vr, loc, -1, -1);
+  tcc_ir_set_original_offset(tcc_state->ir, vr, loc);
+  svalue_init(sv);
+  sv->type = *t;
+  sv->r = VT_LOCAL | VT_LVAL;
+  sv->vr = vr;
+  sv->c.i = loc;
+  return 1;
+}
+
+/* the value on top of the stack into the new local *SV of type T: popped */
+static int ubsan_keep(SValue *sv, const CType *t)
+{
+  if (!ubsan_local(sv, t))
+  {
+    vpop();
+    return 0;
+  }
+  vpushv(sv);
+  vswap();
+  fe_conv_quiet++; /* the compiler's own store */
+  vstore();
+  fe_conv_quiet--;
+  vpop();
+  return 1;
+}
+
+/* Does the parameter ARG (the prototype's, with its declared type) promise
+ * an end?  It was declared an array, not `[static N]`; DYNAMIC: its size is
+ * an expression the declarator saved (a VLA, which param_array does not
+ * mark), else the constant ref->c of an array. */
+int ubsan_param_bound_wanted(Sym *arg, int dynamic)
+{
+  int align;
+  Sym *ref = arg->type.ref;
+  if (!ubsan_on(SAN_BOUNDS) || (!dynamic && !arg->a.param_array) || !ref ||
+      (arg->type.t & VT_BTYPE) != VT_PTR || sym_flag(ref, SYMF_PARAM_MIN) ||
+      ubsan_nparam_bounds == UBSAN_PARAM_BOUNDS)
+    return 0;
+  if (type_size(&ref->type, &align) <= 0)
+    return 0;
+  return dynamic || ref->c > 0;
+}
+
+/* stack: [the size, DYNAMIC] the parameter's value -> both popped and kept
+ * for the subscripts of ARG's type (ubsan_param_bound_wanted said yes) */
+void ubsan_param_bound(Sym *arg, int dynamic)
+{
+  UbsanParamBound *pb = &ubsan_param_bounds[ubsan_nparam_bounds];
+  CType ut;
+  ut.t = VT_INT | VT_UNSIGNED;
+  ut.ref = NULL;
+  pb->ref = arg->type.ref;
+  pb->param_vr = vtop->vr;
+  if (!ubsan_keep(&pb->start, &arg->type))
+  {
+    if (dynamic)
+      vpop();
+    return;
+  }
+  if (dynamic)
+  {
+    gen_cast(&ut);
+    if (!ubsan_keep(&pb->n, &ut))
+      return;
+  }
+  else
+  {
+    svalue_init(&pb->n);
+    pb->n.type = ut;
+    pb->n.r = VT_CONST;
+    pb->n.c.i = pb->ref->c;
+  }
+  ubsan_nparam_bounds++;
+}
+
+/* Does an instruction of IR define VR (not store through it)? */
+static int ubsan_ir_defines(TCCIRState *ir, int32_t vr)
+{
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest || q->op == TCCIR_OP_FUNCPARAMVAL ||
+        q->op == TCCIR_OP_FUNCPARAMVOID)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC || (q->op == TCCIR_OP_STORE && d.is_lval))
+      continue;
+    if (irop_get_vreg(d) == vr)
+      return 1;
+  }
+  return 0;
+}
+
+/* The body is parsed: a parameter nothing writes and nothing takes the
+ * address of still points where it did on entry, so each `p - start` of its
+ * checks is 0 -- written so now, before any pass, so that the check of p[i]
+ * is `i < n` already for the loop passes (flat ssa:bounds_iv), not only once
+ * SSA has seen through the copy. */
+void ubsan_param_bounds_finish(TCCIRState *ir)
+{
+  for (int b = 0; b < ubsan_nparam_bounds; b++)
+  {
+    UbsanParamBound *pb = &ubsan_param_bounds[b];
+    const int32_t pvr = pb->param_vr, svr = pb->start.vr;
+    if (pvr < 0 || svr < 0 || TCCIR_DECODE_VREG_TYPE(pvr) != TCCIR_VREG_TYPE_PARAM)
+      continue;
+    IRLiveInterval *li = tcc_ir_try_get_live_interval(ir, pvr);
+    if (!li || li->addrtaken || ubsan_ir_defines(ir, pvr))
+      continue;
+    for (int i = 0; i < ir->next_instruction_index; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op != TCCIR_OP_SUB || tcc_ir_barrel_shift_at(ir, q))
+        continue;
+      IROperand a = tcc_ir_op_get_src1(ir, q), c = tcc_ir_op_get_src2(ir, q);
+      if (irop_get_vreg(a) != pvr || irop_get_vreg(c) != svr || irop_is_llocal(a) || irop_is_llocal(c) ||
+          irop_is_64bit(tcc_ir_op_get_dest(ir, q)) || (a.is_lval && !irop_is_local(a)) ||
+          (c.is_lval && !irop_is_local(c)))
+        continue;
+      q->op = TCCIR_OP_ASSIGN;
+      tcc_ir_op_set_src1(ir, q, irop_make_imm32(-1, 0, IROP_BTYPE_INT32));
+      tcc_ir_op_set_src2_none(ir, q);
+    }
+  }
+}
+
+/* base[ix] on the stack, BASE a pointer: checked when it has an array
+   parameter's type */
+static void ubsan_param_subscript(SValue *base, SValue *ix, int addr_ok)
+{
+  UbsanParamBound *pb = NULL;
+  int it, i;
+  if (!base->type.ref)
+    return;
+  /* the innermost: an inlined body's parameters are pushed after its
+     caller's (the same function's, when it inlines into itself) */
+  for (i = ubsan_nparam_bounds - 1; i >= 0 && !pb; i--)
+    if (ubsan_param_bounds[i].ref == base->type.ref)
+      pb = &ubsan_param_bounds[i];
+  if (!pb)
+    return;
+  it = ubsan_promoted(&ix->type);
+  if (!it)
+    return;
+  UbsanSite site;
+  ubsan_site(&site, "out_of_bounds", SAN_BOUNDS, 0);
+  ubsan_site_type(&site, &base->type);
+  site.types[1].t = it;
+  site.nt = 2;
+  if (ix == vtop)
+  {
+    ubsan_cast(it);
+    ubsan_fix(it);
+  }
+  else
+  {
+    vswap();
+    ubsan_cast(it);
+    ubsan_fix(it);
+    vswap();
+  }
+  base = ix == vtop ? vtop - 1 : vtop;
+  ix = ix == vtop ? vtop : vtop - 1;
+  ubsan_site_arg(&site, ix);
+  /* (base - start) + ix, in elements, unsigned: below start is huge */
+  vpushv(base);
+  vpushv(&pb->start);
+  gen_op('-');
+  ubsan_cast(it | VT_UNSIGNED);
+  vpushv(ix);
+  ubsan_cast(it | VT_UNSIGNED);
+  gen_op('+');
+  vpushv(&pb->n);
+  ubsan_cast(it | VT_UNSIGNED);
+  if (addr_ok)
+  {
+    vpushi(1);
+    ubsan_cast(it | VT_UNSIGNED);
+    gen_op('+');
+  }
+  gen_op(TOK_UGE);
+  ubsan_trap_if(&site);
 }
 
 /* base[index] (or index[base]) on the stack, before the addition:
- * -fsanitize=bounds for an array of known size.  ADDR_OK: the element is
- * only addressed (`&a[i]`), so one past the end is still in bounds. */
+ * -fsanitize=bounds for an array of known size, or through an array
+ * parameter (above).  ADDR_OK: the element is only addressed (`&a[i]`), so
+ * one past the end is still in bounds. */
 void ubsan_subscript(int addr_ok)
 {
   SValue *base = vtop - 1, *ix = vtop;
@@ -765,6 +1101,14 @@ void ubsan_subscript(int addr_ok)
     return;
   if (!(base->type.t & VT_ARRAY) && (ix->type.t & VT_ARRAY))
     base = vtop, ix = vtop - 1;
+  if (!(base->type.t & VT_ARRAY) && !(ix->type.t & VT_ARRAY))
+  {
+    if ((base->type.t & VT_BTYPE) != VT_PTR && (ix->type.t & VT_BTYPE) == VT_PTR)
+      base = vtop, ix = vtop - 1;
+    if ((base->type.t & VT_BTYPE) == VT_PTR)
+      ubsan_param_subscript(base, ix, addr_ok);
+    return;
+  }
   if (!(base->type.t & VT_ARRAY) || (base->type.t & VT_VLA) || !base->type.ref || base->type.ref->c < 0 ||
       base->union_member)
     return;
@@ -847,6 +1191,9 @@ static int ssp_has_array(const CType *type)
 void ssp_begin_function(TCCIRState *ir, Sym *sym)
 {
   int mode = tcc_state->stack_protector;
+  ubsan_npending = 0; /* the vregs of the function before */
+  ubsan_nparam_bounds = 0; /* and its array parameters */
+  yasc_sentinel_reset();   /* and the [:0] element yasc_slices.c noted */
   ir->ssp = 0;
   ir->ssp_off = 0;
   if (!mode)

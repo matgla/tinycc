@@ -13,6 +13,7 @@
 #include "ssa_opt.h"
 #include "opt_ssa_domwalk.h"
 #include "opt/ssa/cmp_eq.h"
+#include "opt/ssa/ssa_opt_helpers.h"
 
 #define TOK_EQ 0x94
 #define TOK_NE 0x95
@@ -30,7 +31,8 @@ typedef struct CmpFact
   uint8_t equal;    /* 1 = A==B known, 0 = A!=B known */
 } CmpFact;
 
-/* One side of an equality compare: a TEMP vreg, or (b only) a constant. */
+/* One side of an equality compare: a TEMP vreg or a stable PARAM, or (b
+ * only) a constant. */
 typedef struct CmpEqOperands
 {
   int32_t a_vr;
@@ -87,6 +89,55 @@ static int fact_lookup(CmpEqState *st, const CmpEqOperands *o)
   return -1;
 }
 
+/* PARAMs no instruction writes and whose address is not taken: the value
+ * they arrived with everywhere, so a fact about one holds as about an SSA
+ * TEMP (ssa:cprop forwards them into compares).  Filled for one run of the
+ * pass; NULL: none. */
+static uint8_t *ce_param_stable;
+static int ce_nparams;
+
+static void ce_params_scan(TCCIRState *ir)
+{
+  ce_nparams = ir->parameters_count > 0 ? ir->parameters_count : 0;
+  ce_param_stable = ce_nparams ? tcc_malloc(ce_nparams) : NULL;
+  if (!ce_param_stable)
+    return;
+  memset(ce_param_stable, 1, ce_nparams);
+  for (int k = 0; k < ir->next_instruction_index; k++)
+  {
+    IRQuadCompact *kq = &ir->compact_instructions[k];
+    if (kq->op == TCCIR_OP_NOP)
+      continue;
+    if (ssa_op_is_asm_operand(kq->op))
+    {
+      memset(ce_param_stable, 0, ce_nparams);
+      return;
+    }
+    if (!irop_config[kq->op].has_dest || kq->op == TCCIR_OP_FUNCPARAMVAL || kq->op == TCCIR_OP_FUNCPARAMVOID)
+      continue;
+    IROperand kd = tcc_ir_op_get_dest(ir, kq);
+    if (kq->op == TCCIR_OP_STORE_INDEXED || kq->op == TCCIR_OP_STORE_POSTINC ||
+        (kq->op == TCCIR_OP_STORE && kd.is_lval))
+      continue; /* a store through the value, not a def of it */
+    int32_t vr = irop_get_vreg(kd);
+    if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_PARAM &&
+        TCCIR_DECODE_VREG_POSITION(vr) < ce_nparams)
+      ce_param_stable[TCCIR_DECODE_VREG_POSITION(vr)] = 0;
+  }
+  for (int p = 0; p < ce_nparams; p++)
+  {
+    IRLiveInterval *li = ce_param_stable[p] ? tcc_ir_vreg_live_interval(ir, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_PARAM, p)) : NULL;
+    if (ce_param_stable[p] && (!li || li->addrtaken))
+      ce_param_stable[p] = 0;
+  }
+}
+
+static int ce_stable_param(int32_t vr)
+{
+  int pos = TCCIR_DECODE_VREG_POSITION(vr);
+  return ce_param_stable && pos < ce_nparams && ce_param_stable[pos];
+}
+
 static int extract_eq_operand(IROperand op, int32_t *out_vr)
 {
   if (op.is_lval || irop_is_local(op) || irop_is_llocal(op) || irop_is_sym(op))
@@ -94,7 +145,8 @@ static int extract_eq_operand(IROperand op, int32_t *out_vr)
   if (op.tag != IROP_TAG_VREG)
     return 0;
   int32_t vr = irop_get_vreg(op);
-  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+  if (vr < 0 || (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP &&
+                 !(TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_PARAM && ce_stable_param(vr))))
     return 0;
   *out_vr = vr;
   return 1;
@@ -108,7 +160,7 @@ static int extract_eq_imm(IROperand op, int32_t *out)
   return 1;
 }
 
-/* The operands of an equality compare: two TEMPs, or a TEMP and a constant
+/* The operands of an equality compare: two vregs, or a vreg and a constant
  * on either side (32-bit only: an I64 constant names a register pair). */
 static int extract_eq_operands(TCCIRState *ir, IRQuadCompact *cq, CmpEqOperands *o)
 {
@@ -320,7 +372,10 @@ int ssa_opt_cmp_eq_prop(IRSSAOptCtx *ctx)
     .visit = cmp_eq_visit,
   };
 
+  ce_params_scan(ctx->ir);
   int changes = opt_ssa_domwalk(ctx, &walk);
   tcc_free(st.stack);
+  tcc_free(ce_param_stable);
+  ce_param_stable = NULL;
   return changes;
 }

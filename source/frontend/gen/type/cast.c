@@ -305,6 +305,16 @@ void gen_cast(CType *type)
     yasc_errunion_misuse();
   }
 
+  /* a slice is only ever cast to itself, or to void (yasc_slice_assign
+     converted what an assignment may) */
+  if ((MAYBE_ERRUNION(&vtop->type) || MAYBE_ERRUNION(type)) && (type_is_slice(&vtop->type) || type_is_slice(type)) &&
+      vtop->type.ref != type->ref && (type->t & VT_BTYPE) != VT_VOID)
+  {
+    if (!type_is_slice(&vtop->type))
+      tcc_error("a cast to a slice: assign an array or a slice, or slice it, p[0:n]");
+    yasc_slice_misuse();
+  }
+
   if (type->t & VT_RODATA_REL)
     rodata_rel_store_error();
 

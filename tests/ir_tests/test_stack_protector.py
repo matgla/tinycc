@@ -72,7 +72,7 @@ def _disasm(tmp_path, body, *flags):
     src = tmp_path / "t.c"
     src.write_text(body)
     obj = tmp_path / "t.o"
-    proc = subprocess.run([str(TCC), "-ccompat", "-c", *flags, str(src), "-o", str(obj)], capture_output=True,
+    proc = subprocess.run([str(TCC), "-Wno-missing-prototypes", "-ccompat", "-c", *flags, str(src), "-o", str(obj)], capture_output=True,
                           text=True)
     assert proc.returncode == 0, proc.stderr
     nm = subprocess.run(["arm-none-eabi-nm", "-S", "--defined-only", str(obj)], capture_output=True, text=True).stdout
@@ -131,7 +131,7 @@ def test_off_means_no_change(tmp_path, opt):
         outs = []
         for flags in [[], ["-fstack-protector-all", "-fno-stack-protector"]]:
             obj = tmp_path / f"{src.stem}{len(flags)}.o"
-            proc = subprocess.run([str(TCC), *INCLUDE_FLAGS, "-ccompat", "-c", opt, *flags, str(src), "-o", str(obj)],
+            proc = subprocess.run([str(TCC), "-Wno-missing-prototypes", *INCLUDE_FLAGS, "-ccompat", "-c", opt, *flags, str(src), "-o", str(obj)],
                                   capture_output=True, text=True)
             assert proc.returncode == 0, proc.stderr
             outs.append(obj.read_bytes())
@@ -148,7 +148,7 @@ def test_predefined_macros(tmp_path):
     src.write_text("int a = __SSP__; int b = __SSP_STRONG__; int c = __SSP_ALL__;\n")
     for flag, ok in [("-fstack-protector", "__SSP__"), ("-fstack-protector-strong", "__SSP_STRONG__"),
                      ("-fstack-protector-all", "__SSP_ALL__"), ("-fstack-protector-explicit", "__SSP_EXPLICIT__")]:
-        proc = subprocess.run([str(TCC), "-ccompat", "-E", "-dM", flag, str(src)], capture_output=True, text=True)
+        proc = subprocess.run([str(TCC), "-Wno-missing-prototypes", "-ccompat", "-E", "-dM", flag, str(src)], capture_output=True, text=True)
         defined = set(re.findall(r"#define (__SSP\w*__) (\d)", proc.stdout))
         assert {d[0] for d in defined} == {ok}, proc.stdout[-300:]
 
@@ -218,7 +218,7 @@ def test_explicit_leaves_others_unchanged(tmp_path, opt):
         outs = []
         for flags in [[], ["-fstack-protector-explicit"]]:
             obj = tmp_path / f"{src.stem}{len(flags)}.o"
-            proc = subprocess.run([str(TCC), *INCLUDE_FLAGS, "-ccompat", "-c", opt, *flags, str(src), "-o", str(obj)],
+            proc = subprocess.run([str(TCC), "-Wno-missing-prototypes", *INCLUDE_FLAGS, "-ccompat", "-c", opt, *flags, str(src), "-o", str(obj)],
                                   capture_output=True, text=True)
             assert proc.returncode == 0, proc.stderr
             outs.append(obj.read_bytes())
@@ -239,7 +239,7 @@ __attribute__((no_stack_protector)) int g(void) { return 2; }
 [[gnu::no_stack_protector]] int k(void) { return 4; }
 """)
     for flags in [[], ["-fstack-protector-strong"]]:
-        proc = subprocess.run([str(TCC), "-Wall", "-Wignored-attributes", "-Wunsupported", "-c", *flags, str(src),
+        proc = subprocess.run([str(TCC), "-Wno-missing-prototypes", "-Wall", "-Wignored-attributes", "-Wunsupported", "-c", *flags, str(src),
                                "-o", str(tmp_path / "t.o")], capture_output=True, text=True)
         assert proc.returncode == 0, proc.stderr
         assert "attribute" not in proc.stderr, proc.stderr
@@ -253,7 +253,7 @@ def test_conflicting_attributes(tmp_path):
             "__attribute__((stack_protect)) int later(void) { char b[16]; use(b); return b[1]; }\n")
     src = tmp_path / "c.c"
     src.write_text(body)
-    proc = subprocess.run([str(TCC), "-ccompat", "-Wignored-attributes", "-c", "-fstack-protector-all", str(src),
+    proc = subprocess.run([str(TCC), "-Wno-missing-prototypes", "-ccompat", "-Wignored-attributes", "-c", "-fstack-protector-all", str(src),
                            "-o", str(tmp_path / "c.o")], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
     assert proc.stderr.count("conflicts with 'no_stack_protector'") == 2, proc.stderr

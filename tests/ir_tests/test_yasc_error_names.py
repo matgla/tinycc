@@ -95,3 +95,19 @@ def test_error_name_outside_yasc_is_an_identifier(tmp_path):
     src.write_text("int error_name = 3;\nint f(void) { return error_name; }\n")
     proc = subprocess.run([str(TCC), "-ccompat", "-c", str(src), "-o", str(tmp_path / "t.o")], capture_output=True, text=True)
     assert proc.returncode == 0 and not proc.stderr, proc.stderr
+
+
+@pytest.mark.skipif(READELF is None, reason="needs arm-none-eabi-readelf")
+def test_error_name_reads_only_errno_macros(tmp_path):
+    # error_name() records the E[A-Z0-9]+ macros: it must not evaluate the
+    # others (UINT64_MAX-like constants warned "integer constant overflow")
+    src = tmp_path / "t.c"
+    src.write_text(
+        "#pragma yasc\n#define TOO_BIG 0x1ffffffffffffffff\n#define SMALL 7\n#define EZORK 77\n"
+        "const char * borrows(static) maybe g(int e)\n{\n  return error_name(e);\n}\n"
+    )
+    obj = tmp_path / "t.o"
+    proc = subprocess.run([str(TCC), "-ccompat", "-Wall", "-c", str(src), "-o", str(obj)], capture_output=True, text=True)
+    assert proc.returncode == 0 and not proc.stderr, proc.stderr
+    data = subprocess.run([READELF, "-x", "yasc_errname", str(obj)], capture_output=True, text=True).stdout
+    assert "EZORK" in data and "SMALL" not in data, data

@@ -1,0 +1,4 @@
+sub_imm 4291
+cmp_imm 1
+sub_reg 47
+g 7

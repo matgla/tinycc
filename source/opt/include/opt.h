@@ -180,6 +180,19 @@ int tcc_ir_opt_sl_forward(struct TCCIRState *ir);
 
 /* Rewrites derefs through single-def entry-block `P = &V` pointer VARs (and their TEMP copies) to direct V accesses. */
 int tcc_ir_opt_ptr_local_fwd(struct TCCIRState *ir);
+/* -fyasc-facts (O4): which vregs derive from an exclusive parameter
+   (`T * restrict view`, `T * owned`; load_cse.c).  NULL when there is none. */
+struct YfAlias;
+struct IRSSAState;
+struct YfAlias *tcc_ir_yf_alias_new(struct TCCIRState *ir, struct IRSSAState *ssa); /* ssa: its phis, NULL flat */
+void tcc_ir_yf_alias_delete(struct YfAlias *a);
+int tcc_ir_yf_alias_excl(const struct YfAlias *a, int32_t vr);
+int tcc_ir_yf_alias_may(const struct YfAlias *a, int excl, int32_t vr);
+/* can memory through bases X and Y not be the same (one derived from an
+   exclusive parameter or a fresh owned result, the other not)? */
+int tcc_ir_yf_alias_apart(const struct YfAlias *a, int32_t x, int32_t y);
+/* -fyasc-facts: an addrtaken scalar whose address only goes to no-escape parameters gets a register VAR. */
+int tcc_ir_opt_yf_promote(struct TCCIRState *ir);
 int tcc_ir_opt_param_copy_alias(struct TCCIRState *ir);
 /* Small by-value struct args built from word stores in a slot become one scalar PARAM per word (ra:struct_arg_split). */
 int tcc_ir_opt_struct_arg_split(struct TCCIRState *ir);

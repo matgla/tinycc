@@ -59,7 +59,7 @@ static void free_all(drop struct name * owned maybe list)
 int main(void)
 {
   const char * view words[] = {"ada", "grace", "barbara"};
-  struct name * owned maybe list = 0;
+  struct name * owned maybe list = nullptr;
   int chars;
 
   for (int i = 0; i < 3; i++)

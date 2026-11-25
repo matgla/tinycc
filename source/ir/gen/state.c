@@ -191,6 +191,11 @@ void tcc_ir_free(TCCIRState *ir)
   }
   tcc_free(ir->sret_calls_empty);
   ir->sret_calls_empty = NULL;
+  tcc_free(ir->yf_calls);
+  ir->yf_calls = NULL;
+  ir->yf_nb_calls = 0;
+  ir->yf_nb_excl = 0;
+  ir->yf_promoted = 0;
   if (ir->call_dyn_extra)
   {
     tcc_free(ir->call_dyn_extra);
@@ -319,6 +324,8 @@ void tcc_ir_free(TCCIRState *ir)
   ir->codegen_dry_pool_entries = NULL;
   tcc_free(ir->codegen_branch_target_reset);
   ir->codegen_branch_target_reset = NULL;
+  tcc_free(ir->codegen_temp_uses);
+  ir->codegen_temp_uses = NULL;
   tcc_ir_vreg_index_close(ir, 1); /* a compile error can longjmp out of a pass */
 
   if (ir->stack_layout.slots != NULL)

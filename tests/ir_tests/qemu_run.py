@@ -359,6 +359,7 @@ class CompileConfig:
     float_abi: Optional[str] = None
     fpu: Optional[str] = None
     extra_objs: Optional[list] = None  # prebuilt objects linked in (e.g. gcc-built, for ABI interop)
+    ccompat: bool = True  # False: tcc's safe default (yasc, strict lifetimes) instead of -ccompat
 
     def __post_init__(self):
         if self.compiler is None:
@@ -415,7 +416,7 @@ def get_test_output_file(test_name, output_dir=None, prefix="", suffix=""):
     return output_dir / f"{prefix}{Path(primary).stem}{suffix}.elf"
 
 
-def build_make_command(test_file, machine, compiler, output_dir=None, cflags=None, defines=None, cc_wrapper=None, two_phase=False, output_prefix="", output_suffix="", float_abi=None, fpu=None, extra_objs=None):
+def build_make_command(test_file, machine, compiler, output_dir=None, cflags=None, defines=None, cc_wrapper=None, two_phase=False, output_prefix="", output_suffix="", float_abi=None, fpu=None, extra_objs=None, ccompat=True):
     """Build the make command for compiling a test case."""
     make_dir = CURRENT_DIR / 'qemu' / machine
     test_files = [str(f) for f in _as_file_list(test_file)]
@@ -454,6 +455,8 @@ def build_make_command(test_file, machine, compiler, output_dir=None, cflags=Non
         cmd.append(f"FPU={fpu}")
     if extra_objs:
         cmd.append(f"EXTRA_OBJS={' '.join(str(o) for o in extra_objs)}")
+    if not ccompat:
+        cmd.append("CCOMPAT=")
     return cmd
 
 
@@ -797,6 +800,7 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
         float_abi=config.float_abi or DEFAULT_FLOAT_ABI,
         fpu=config.fpu or DEFAULT_FPU,
         extra_objs=config.extra_objs,
+        ccompat=config.ccompat,
     )
 
     # Clean if needed

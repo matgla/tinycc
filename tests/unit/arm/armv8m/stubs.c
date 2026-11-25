@@ -438,6 +438,7 @@ typedef struct CType
 
 /* From tccgen.c / tccpp.c — global state touched by tcc_ir_put(). */
 int nocode_wanted = 0;
+int yasc_nreg; /* yasc register types in the unit: none */
 struct BufferedFile *file = NULL;
 CType func_old_type;
 
@@ -699,12 +700,20 @@ void tcc_recover_release(void *s1)
 {
   (void)s1;
 }
+void tcc_recover_stop(void *s1)
+{
+  (void)s1;
+}
 /* a body being saved as tokens (decl.c) and system-header macros (tccpp.c) */
 void save_body_error(void *s1, int line, const char *msg)
 {
   (void)s1, (void)line, (void)msg;
 }
 int tcc_sys_macro_here(void)
+{
+  return 0;
+}
+int tcc_sys_macro_prev(void)
 {
   return 0;
 }

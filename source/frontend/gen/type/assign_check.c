@@ -129,6 +129,19 @@ ST_FUNC void type_yasc_strip(CType *type)
     type->ref = sym_pointer_node_q(&type->ref->type, 0);
 }
 
+/* `p + n`: points into what p points to and owns nothing itself.  What p
+   is to the checks stays: a view stays a view (it may be shared), a restrict
+   pointer restrict (based on it), a regular-C pointer unchecked; ownership
+   and the rest go. */
+ST_FUNC void type_yasc_derive(CType *type)
+{
+  int q = type_yasc(type);
+  if (type_is_handle(type))
+    type->ref = NULL; /* fd + 1: an int */
+  else if (q)
+    type->ref = sym_pointer_node_q(&type->ref->type, q & (YASC_VIEW | YASC_RESTRICT | YASC_UNCHECKED));
+}
+
 /* The same pointer or int handle with qualifiers YASC, keeping what its
    node says beside them (borrows(...), the deallocator). */
 ST_FUNC void yasc_requalify(CType *type, int yasc)
@@ -171,6 +184,19 @@ void cast_error(CType *st, CType *dt)
 
 /* gen_assign_cast is converting a return statement's value, an argument */
 int yasc_returning, yasc_argument;
+int yasc_stmt_bol, yasc_unsafe_expr_line, yasc_rbrace_line;
+
+static BufferedFile *yasc_unsafe_expr_file;
+
+/* a statement begins at LINE (block.c): on the line of the last unsafe(expr)
+   of this file it is an error; past it the line is forgotten */
+__attribute__((noinline)) void yasc_unsafe_line_check(int line)
+{
+  int same = file == yasc_unsafe_expr_file && line == yasc_unsafe_expr_line;
+  yasc_unsafe_expr_line = 0;
+  if (same)
+    tcc_error_noabort("unsafe(...) takes its whole line: put this statement on a line of its own");
+}
 
 /* The variable vtop is, as a whole -- not a member of it, not something
    reached through it: primary.c leaves the identifier's Sym in vtop->sym,
@@ -212,6 +238,93 @@ static void yasc_verify_move(int dq, int sq)
     tcc_warning_once(warn_implicit_move, "ownership moves out of a member or through a pointer here: write move(...)");
 }
 
+/* yasc: an owned value given to a regular-C parameter (yasc_verify_assign).
+   The C side says nothing about ownership, so the code says it: borrow(p)
+   lends it, move(p) hands it over (the flow check follows p as moved where
+   the call takes it); a plain owned variable is -Wimplicit-move's. */
+static void yasc_owned_to_unchecked(int sq)
+{
+  Sym *s;
+  if (sq & YASC_FRESH)
+  {
+    if (!(vtop->r & VT_LVAL) && tcc_state->ir && vtop->vr >= 0)
+      tcc_ir_lt_note_moved_temp(tcc_state->ir, vtop->vr);
+    return;
+  }
+  if ((s = yasc_vtop_var()))
+  {
+    const char *name = get_tok_str(s->v, NULL);
+    tcc_warning_once(warn_implicit_move,
+                     "'%s' is owned and goes to a regular-C parameter: write borrow(%s) or move(%s)", name, name, name);
+    tcc_fixit(0, name, FIXIT_BEFORE, "borrow(");
+    tcc_fixit(0, name, FIXIT_AFTER, ")");
+  }
+}
+
+/* yasc unsafe: the region's end (tcc_unsafe_end), the first line after it:
+   the line of the token read after it, or the line after its first one when
+   that token is on it (`unsafe(f(p));`: the whole line) */
+static int yasc_unsafe_end_line(int begin)
+{
+  int l = file ? file->line_num : 0;
+  return l > begin ? l : begin + 1;
+}
+
+static const char *yasc_file_now(void)
+{
+  BufferedFile *f;
+  return tcc_diag_file(&f);
+}
+
+/* `unsafe { ... }` (block.c, after `unsafe`, at the '{'): the statements
+   inside pass strict lifetimes.  Out of line: block() is recursive. */
+__attribute__((noinline)) void yasc_unsafe_block(void)
+{
+  const char *fn = yasc_file_now();
+  const int begin = file ? file->line_num : 0;
+  /* unsafe works by lines: the region has its lines to itself */
+  if (!yasc_stmt_bol)
+    tcc_error_noabort("unsafe { } must begin its line: put what comes before it on the line above");
+  tcc_unsafe_begin(tcc_state, fn, begin);
+  block(0);
+  /* it ends with its '}', which must end its line */
+  const int rb = yasc_rbrace_line >= begin ? yasc_rbrace_line : begin;
+  int end = rb + 1;
+  if (file && file->line_num == rb && tok != TOK_EOF)
+    tcc_error_noabort("unsafe { } must end its line: put what follows its '}' on the next line");
+  tcc_unsafe_end(tcc_state, fn, end);
+}
+
+/* `unsafe(expr)`: one expression passes strict lifetimes.  0 when tok
+   names a variable or function instead. */
+__attribute__((noinline)) int yasc_unsafe_expr(void)
+{
+  const char *fn;
+  int begin;
+  if (sym_find(TOK_unsafe))
+    return 0;
+  next();
+  if (tok != '(')
+  {
+    unget_tok(TOK_unsafe);
+    return 0;
+  }
+  fn = yasc_file_now();
+  begin = file ? file->line_num : 0;
+  /* unsafe(expr) takes its whole line: its statement begins it */
+  if (!yasc_stmt_bol)
+    tcc_error_noabort("unsafe(...) takes its whole line: put what comes before its statement on the line above");
+  tcc_unsafe_begin(tcc_state, fn, begin);
+  next();
+  expr_eq();
+  skip(')');
+  tcc_unsafe_end(tcc_state, fn, yasc_unsafe_end_line(begin));
+  /* ... and no statement follows it there (block.c) */
+  yasc_unsafe_expr_line = yasc_unsafe_end_line(begin) - 1;
+  yasc_unsafe_expr_file = file;
+  return 1;
+}
+
 /* yasc: move(p) hands p's ownership on -- an owned result, as a call's is;
    borrow(p) lends it -- a view of the same memory.  Both take an owned
    pointer.  Returns 0 when tok names a variable or function instead. */
@@ -250,6 +363,23 @@ int yasc_move_borrow(void)
   return 1;
 }
 
+/* yasc `restrict` (S3): an exclusive borrow is made from what nothing else
+   reaches -- an owned pointer, another restrict pointer, a local's address or
+   a local array.  A view may be shared (as Rust's &T never becomes &mut T);
+   a global's address is reachable by name from anywhere.  -Wlifetime. */
+static __attribute__((noinline)) void yasc_verify_restrict(int sq)
+{
+  if (is_null_pointer(vtop) || ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && vtop->c.i == 0) ||
+      (sq & (YASC_RESTRICT | YASC_OWNED)))
+    return;
+  if ((vtop->r & VT_SYM) && !(vtop->r & VT_LVAL) && (vtop->r & VT_VALMASK) == VT_CONST)
+    tcc_warning_once(warn_lifetime,
+                     "a restrict pointer to a global or static: the code can reach it by name too: write unsafe(...)");
+  else if (sq & YASC_VIEW)
+    tcc_warning_once(warn_lifetime, "a view may be shared: a restrict pointer needs an owned pointer, a local's "
+                                    "address or another restrict pointer");
+}
+
 /* yasc: what the types alone say about storing vtop in 'dt' -- an
    assignment, an initializer, an argument or a return.  A variable handed
    to an owned pointer moves (checked by the flow analysis); a call's owned
@@ -264,22 +394,34 @@ static void yasc_verify_assign(CType *dt)
     if ((dq | sq) & YASC_UNCHECKED)
       return;
     if ((dq & YASC_OWNED) && !(sq & YASC_OWNED) && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) != VT_CONST)
-      tcc_warning_once_always("an int that owns nothing is stored in an owned handle");
+      tcc_yasc_rule("an int that owns nothing is stored in an owned handle");
     else if (!(dq & YASC_OWNED) && (sq & YASC_FRESH) && !(vtop->r & VT_LVAL))
-      tcc_warning_once_always("an owned result is stored in an int that owns nothing: it is never released");
+      tcc_yasc_rule("an owned result is stored in an int that owns nothing: it is never released");
     yasc_verify_move(dq, sq);
     return;
   }
   if ((dt->t & VT_BTYPE) != VT_PTR || (vtop->type.t & VT_BTYPE) != VT_PTR)
     return;
-  /* regular C on either side: it says nothing about ownership, so nothing is
-     checked here -- checks start at the yasc variable the pointer lands in */
+  /* an owned pointer handed to a regular-C parameter: borrow(p) or move(p) */
+  if (yasc_argument && (dq & YASC_UNCHECKED) && !(sq & YASC_UNCHECKED) && (sq & YASC_OWNED))
+    yasc_owned_to_unchecked(sq);
+  /* a regular-C pointer becomes an owned / view / borrows one: the code
+     vouches for it with unsafe(...) (S2; -Wunchecked, an error in the safe
+     default, off under -ccompat).  Null (C's NULL too) is fine. */
+  if ((sq & YASC_UNCHECKED) && !(dq & YASC_UNCHECKED) && (dq & (YASC_OWNED | YASC_VIEW)) && !is_null_pointer(vtop) &&
+      !((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && vtop->c.i == 0)) /* `(T *)0` */
+    tcc_warning_once(warn_unchecked, "a pointer from regular C becomes %s here: write unsafe(...)",
+                     (dq & YASC_OWNED) ? "owned" : type_borrows(dt) ? "a borrow" : "a view");
+  /* regular C on either side: it says nothing about ownership, so nothing
+     more is checked here -- checks start at the yasc variable it lands in */
   if ((dq | sq) & YASC_UNCHECKED)
     return;
+  if (dq & YASC_RESTRICT)
+    yasc_verify_restrict(sq);
   if ((dq & YASC_OWNED) && !(sq & YASC_OWNED) && !is_null_pointer(vtop))
-    tcc_warning_once_always("a pointer that owns nothing is stored in an owned pointer");
+    tcc_yasc_rule("a pointer that owns nothing is stored in an owned pointer");
   else if (!(dq & YASC_OWNED) && (sq & YASC_FRESH) && !(vtop->r & VT_LVAL))
-    tcc_warning_once_always("an owned result is stored in a pointer that owns nothing: it is never freed");
+    tcc_yasc_rule("an owned result is stored in a pointer that owns nothing: it is never freed");
   yasc_verify_move(dq, sq);
 }
 
@@ -294,7 +436,7 @@ ST_FUNC void yasc_verify_discard(void)
   if (type_is_errunion(&vtop->type))
     yasc_errunion_discarded();
   if ((type_yasc(&vtop->type) & YASC_FRESH) && !(vtop->r & VT_LVAL))
-    tcc_warning_once_always("%s", type_is_handle(&vtop->type) ? "an owned result is discarded: it is never released"
+    tcc_yasc_rule("%s", type_is_handle(&vtop->type) ? "an owned result is discarded: it is never released"
                                                               : "an owned result is discarded: it is never freed");
 }
 
@@ -389,13 +531,118 @@ static void cast_align_check(CType *dt, CType *st)
     tcc_warning_once(warn_cast_align, "cast increases required alignment of target type");
 }
 
+/* yasc: `*p`, `p->m`, `p[i]` with p a regular-C (unchecked) pointer: what
+   it points to is vouched for with unsafe (S2, -Wunchecked).  Calls through
+   a function pointer are not memory. */
+__attribute__((noinline)) void yasc_unchecked_deref(void)
+{
+  if ((pointed_type(&vtop->type)->t & VT_BTYPE) == VT_FUNC)
+    return;
+  tcc_warning_once(warn_unchecked, "a pointer from regular C is dereferenced: write unsafe { } around it");
+}
+
+/* yasc: whether T holds an owned / view / borrows pointer or int handle --
+   itself, in a member or in an element (not behind a pointer).  OWNED_ONLY:
+   an owned one. */
+int yasc_type_holds_annotated(CType *t, int owned_only, int depth)
+{
+  const int want = owned_only ? YASC_OWNED : (YASC_OWNED | YASC_VIEW);
+  int q;
+  if (depth > 64)
+    return 0;
+  if (t->t & VT_ARRAY)
+    return t->ref && yasc_type_holds_annotated(&t->ref->type, owned_only, depth + 1);
+  q = type_yasc(t);
+  if ((q & want) && !(q & YASC_UNCHECKED))
+    return 1;
+  if ((t->t & VT_BTYPE) == VT_STRUCT && t->ref)
+    for (Sym *f = sym_first(t->ref); f; f = f->next)
+      if (yasc_type_holds_annotated(&f->type, owned_only, depth + 1))
+        return 1;
+  return 0;
+}
+
+/* yasc (S2, U2): the member (or element) on vtop was reached through a
+   union -- `u.s`, `x.u.st.p`, `u.arr[i]` -- so it may have been written as
+   another member, and what it holds is not known.  tok is the token after
+   it.  An owned / view / borrows pointer (or handle) member read reads as
+   regular C: held, compared and passed to C freely, used as owned / view /
+   memory only in unsafe -- the -Wunchecked rules.  A store to it (`u.s = p`)
+   is checked as its type says.  Its address, or an aggregate member that
+   holds such pointers used whole (copied, passed, returned, its address
+   taken), would hand the annotated type on unchecked: -Wunchecked too.
+   Member and element accesses below an aggregate come here themselves. */
+void yasc_union_member_end(int addr_operand)
+{
+  CType *t = &vtop->type;
+  int q = type_yasc(t);
+  if ((q & (YASC_OWNED | YASC_VIEW)) && !(q & YASC_UNCHECKED))
+  {
+    if (addr_operand && tok != '[' && tok != TOK_ARROW)
+    {
+      if (tcc_warn_wanted(warn_unchecked))
+        tcc_warning_once(warn_unchecked,
+                         "the address of a union member that holds a yasc pointer is taken: write unsafe(...)");
+      return;
+    }
+    if (tok == '=')
+      return;
+    if (type_is_handle(t))
+      t->ref = NULL; /* an int: the handle's qualifiers are not known either */
+    else
+      t->ref = sym_pointer_node_q(&t->ref->type, YASC_UNCHECKED);
+    return;
+  }
+  if (tok == '.' || tok == '[' || (tok == '=' && !addr_operand) || nocode_wanted ||
+      !yasc_type_holds_annotated(t, 0, 0) || !tcc_warn_wanted(warn_unchecked))
+    return;
+  tcc_warning_once(warn_unchecked, "a union member that holds yasc pointers is %s: write unsafe(...)",
+                   addr_operand ? "addressed" : "used whole");
+}
+
+/* yasc: an explicit cast to an owned / view / borrows pointer says what
+   the types cannot check, so outside unsafe it is -Wunchecked's (strict):
+   from regular C, from an integer (MMIO, flash offsets), dropping maybe,
+   making a borrowed pointer owned (or an owned one a view), dropping const. */
+static __attribute__((noinline)) void yasc_cast_check(CType *dt)
+{
+  CType *st = &vtop->type;
+  int dq = type_yasc(dt), sq, null = is_null_pointer(vtop) ||
+                                      ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && vtop->c.i == 0);
+  const char *what;
+  if (!(dq & (YASC_OWNED | YASC_VIEW)) || (dq & YASC_UNCHECKED) || null || type_is_handle(dt))
+    return;
+  if ((st->t & VT_BTYPE) != VT_PTR)
+  {
+    if (is_integer_btype(st->t & VT_BTYPE))
+      tcc_warning_once(warn_unchecked, "a cast makes an integer a pointer: write unsafe(...)");
+    return;
+  }
+  sq = type_yasc(st);
+  what = (dq & YASC_OWNED) ? "owned" : type_borrows(dt) ? "a borrow" : "a view";
+  if (sq & YASC_UNCHECKED)
+    tcc_warning_once(warn_unchecked, "a pointer from regular C becomes %s here: write unsafe(...)", what);
+  else if ((sq & YASC_MAYBE) && !(dq & YASC_MAYBE))
+    tcc_warning_once(warn_unchecked, "a cast drops maybe: test the pointer, or write unsafe(...)");
+  else if ((dq & YASC_OWNED) && !(sq & YASC_OWNED))
+    tcc_warning_once(warn_unchecked, "a cast makes a pointer that owns nothing owned: write unsafe(...)");
+  else if (!(dq & YASC_OWNED) && (sq & YASC_OWNED))
+    tcc_warning_once(warn_unchecked, "a cast makes an owned pointer a view: write borrow(...)");
+  else if ((pointed_type(st)->t & VT_CONSTANT) && !(pointed_type(dt)->t & VT_CONSTANT))
+    tcc_warning_once(warn_unchecked, "a cast drops const: write unsafe(...)");
+}
+
 /* The checks of an explicit cast of vtop to the pointer type DT. */
 void explicit_cast_checks(CType *dt)
 {
   CType *st = &vtop->type;
+  yasc_null_spelling(vtop); /* (T *)0 */
+  if (tcc_state->yasc && tcc_warn_wanted(warn_unchecked))
+    yasc_cast_check(dt);
   if ((st->t & VT_BTYPE) == VT_PTR)
   {
-    if (tcc_warn_wanted(warn_cast_qual))
+    /* yasc: dropping const needs unsafe(...), which says it was meant */
+    if (tcc_warn_wanted(warn_cast_qual) && !(tcc_state->yasc && tcc_state->unsafe_depth))
       cast_qual_check(dt, st);
     if (tcc_warn_wanted(warn_cast_align))
       cast_align_check(dt, st);
@@ -590,6 +837,7 @@ void verify_assign_cast(CType *dt)
 
   if (tcc_state->yasc)
   {
+    yasc_slice_assign(dt);
     yasc_verify_errors_assign(dt);
     yasc_verify_assign(dt);
   }
@@ -598,7 +846,11 @@ void verify_assign_cast(CType *dt)
     rodata_rel_store_error();
   dbt = dt->t & VT_BTYPE;
   sbt = st->t & VT_BTYPE;
-  if (dt->t & VT_CONSTANT)
+  /* yasc: a view parameter's target is read-only unless it says inout or
+     out -- writing it anyway is the contract broken, not a style matter */
+  if ((dt->t & VT_CONSTANT) && tcc_state->yasc && !pp_in_c())
+    tcc_error("assignment of read-only location (a view parameter's target is written only when it says inout or out)");
+  else if (dt->t & VT_CONSTANT)
     tcc_warning_once_always("assignment of read-only location");
   switch (dbt)
   {
@@ -610,9 +862,12 @@ void verify_assign_cast(CType *dt)
     if (tcc_warn_wanted(warn_address_of_packed_member))
       packed_conversion_check(dt);
     /* special cases for pointers */
-    /* '0' can also be a pointer */
+    /* '0' can also be a pointer -- yasc writes nullptr */
     if (is_null_pointer(vtop))
+    {
+      yasc_null_spelling(vtop);
       break;
+    }
     /* accept implicit pointer to integer cast with warning */
     if (is_integer_btype(sbt))
     {
@@ -631,9 +886,7 @@ void verify_assign_cast(CType *dt)
       break;
     for (qualwarn = lvl = 0;; ++lvl)
     {
-      if (((type2->t & VT_CONSTANT) && !(type1->t & VT_CONSTANT)) ||
-          ((type2->t & VT_VOLATILE) && !(type1->t & VT_VOLATILE)))
-        qualwarn = 1;
+      qualwarn |= type2->t & ~type1->t & (VT_CONSTANT | VT_VOLATILE);
       dbt = type1->t & (VT_BTYPE | VT_LONG);
       sbt = type2->t & (VT_BTYPE | VT_LONG);
       if (dbt != VT_PTR || sbt != VT_PTR)
@@ -662,7 +915,19 @@ void verify_assign_cast(CType *dt)
       }
     }
     if (qualwarn)
-      tcc_warning_once(warn_discarded_qualifiers, "assignment discards qualifiers from pointer target type");
+    {
+      /* name what is lost and where, as clang does: `const char *view` to
+         `char *view` drops the target's const, which the bare message hid */
+      char b1[256], b2[256];
+      CType t1 = *dt, t2 = *st;
+      t1.t &= ~VT_STORAGE;
+      t2.t &= ~VT_STORAGE;
+      type_to_str(b1, sizeof b1, &t1, NULL);
+      type_to_str(b2, sizeof b2, &t2, NULL);
+      tcc_warning_once(warn_discarded_qualifiers,
+                       "assignment to '%s' from '%s' discards '%s' qualifier from pointer target type", b1, b2,
+                       qualifier_names(qualwarn));
+    }
     break;
   case VT_BYTE:
   case VT_SHORT:

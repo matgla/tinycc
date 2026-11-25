@@ -2,13 +2,14 @@
 builds of code using an unchecked attribute would stop): an attribute that
 promises a check tcc does not make.
 
-access reads as checked to whoever reads the code; tcc ignores it, and says so -- once per attribute in a unit, in either syntax
+counted_by reads as checked to whoever reads the code; tcc ignores it, and says so -- once per attribute in a unit, in either syntax
 (__attribute__((x)), __x__, [[gnu::x]]), never for a system header.
 fallthrough and maybe_unused only silence warnings tcc does not give.  Other
 unknown attributes stay under -Wunsupported.  The checked ones are not
 reported, in either spelling: malloc, nonnull and returns_nonnull (-Wnonnull,
 the yasc ownership of a malloc result), alloc_size (__builtin_object_size and
-the object-size checks), format (-Wformat), warn_unused_result
+the object-size checks), access and null_terminated_string_arg (-ffortify),
+format (-Wformat), warn_unused_result
 and nodiscard (-Wunused-result), deprecated (-Wdeprecated-declarations).
 """
 
@@ -40,7 +41,7 @@ def _named(proc):
 
 
 CASES = {
-    "access": "void w(char *d) __attribute__((access(write_only, 1)));",
+    "counted_by": "struct cb { int n; char d[] __attribute__((counted_by(n))); };",
 }
 
 
@@ -61,6 +62,9 @@ APPLIED = {
                            "[[gnu::warn_unused_result]] int r(void);"),
     "nodiscard": ("[[nodiscard]] int nd(void);", "[[nodiscard(\"why\")]] int nd(void);"),
     "deprecated": ("int old(void) __attribute__((deprecated));", "[[deprecated(\"use new\")]] void old(void);"),
+    "access": ("void w(char *d) __attribute__((access(write_only, 1)));", "[[gnu::access(read_write, 1, 2)]] void w(char *d, int n);"),
+    "null_terminated_string_arg": ("void s(const char *p) __attribute__((null_terminated_string_arg(1)));",
+                                   "[[gnu::null_terminated_string_arg(1)]] void s(const char *p);"),
 }
 
 
@@ -89,12 +93,12 @@ def test_gnu_spelling_of_malloc_applies_in_yasc(tmp_path):
 
 def test_once_per_unit_in_any_spelling(tmp_path):
     body = (
-        "void a(char *d) __attribute__((access(write_only, 1)));\n"
-        "void b(char *d) __attribute__((__access__(write_only, 1)));\n"
-        "[[gnu::access(write_only, 1)]] void c(char *d);\n"
+        "struct a { int n; char d[] __attribute__((counted_by(n))); };\n"
+        "struct b { int n; char d[] __attribute__((__counted_by__(n))); };\n"
+        "struct c { int n; char d[] [[gnu::counted_by(n)]]; };\n"
     )
     proc = _run(tmp_path, body, "-Wignored-attributes")
-    assert _named(proc) == ["access"] and "t.c:1:" in proc.stderr, proc.stderr
+    assert _named(proc) == ["counted_by"] and "t.c:1:" in proc.stderr, proc.stderr
 
 
 def test_silent_ones(tmp_path):
@@ -106,31 +110,31 @@ def test_silent_ones(tmp_path):
 def test_not_in_a_system_header(tmp_path):
     inc = tmp_path / "sys"
     inc.mkdir()
-    (inc / "s.h").write_text(CASES["access"].replace("w(", "w2(") + "\n" + '#include "near.h"\n')
-    (inc / "near.h").write_text(CASES["access"].replace("w(", "w3(") + "\n")
-    proc = _run(tmp_path, '#include <s.h>\n' + CASES["access"] + "\n", "-Wignored-attributes", "-isystem", str(inc))
-    assert _named(proc) == ["access"] and "t.c:2:" in proc.stderr, proc.stderr
+    (inc / "s.h").write_text(CASES["counted_by"].replace("cb ", "cb2 ") + "\n" + '#include "near.h"\n')
+    (inc / "near.h").write_text(CASES["counted_by"].replace("cb ", "cb3 ") + "\n")
+    proc = _run(tmp_path, '#include <s.h>\n' + CASES["counted_by"] + "\n", "-Wignored-attributes", "-isystem", str(inc))
+    assert _named(proc) == ["counted_by"] and "t.c:2:" in proc.stderr, proc.stderr
 
 
 def test_user_header_is_reported(tmp_path):
-    (tmp_path / "u.h").write_text(CASES["access"] + "\n")
+    (tmp_path / "u.h").write_text(CASES["counted_by"] + "\n")
     proc = _run(tmp_path, '#include "u.h"\n', "-Wignored-attributes")
-    assert _named(proc) == ["access"], proc.stderr
+    assert _named(proc) == ["counted_by"], proc.stderr
 
 
 def test_switches(tmp_path):
-    body = CASES["access"] + "\n"
+    body = CASES["counted_by"] + "\n"
     assert _named(_run(tmp_path, body)) == []
     assert _named(_run(tmp_path, body, "-Wall")) == []
     assert _named(_run(tmp_path, body, "-Wignored-attributes", "-Wno-ignored-attributes")) == []
-    assert _named(_run(tmp_path, body, "-Wignored-attributes")) == ["access"]
+    assert _named(_run(tmp_path, body, "-Wignored-attributes")) == ["counted_by"]
 
 
 def test_safe_default(tmp_path):
     src = tmp_path / "t.c"
-    src.write_text("void w(char * view d) __attribute__((access(write_only, 1)));\n")
+    src.write_text("struct cb { int n; char d[] __attribute__((counted_by(n))); };\n")
     proc = subprocess.run([str(TCC), "-c", str(src), "-o", str(tmp_path / "t.o")], capture_output=True, text=True)
-    assert proc.returncode == 0 and _named(proc) == ["access"], proc.stderr
+    assert proc.returncode == 0 and _named(proc) == ["counted_by"], proc.stderr
 
 
 def test_other_unknown_attributes(tmp_path):

@@ -63,6 +63,7 @@ typedef struct FloatingPointConfig
   uint32_t has_ftol : 1;
   uint32_t has_fneg : 1;
   uint32_t has_dneg : 1;
+  uint32_t has_fminmax : 1; /* float fmin/fmax inline (vminnm/vmaxnm.f32) */
   uint8_t double_impl; /* FpDoubleImpl; only meaningful when a has_d* bit is set */
   uint64_t fpu_feat;
 } FloatingPointConfig;

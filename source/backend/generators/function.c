@@ -708,8 +708,173 @@ static void knr_params_receive(KnrConv *conv, int n)
 }
 
 static void gen_function_body(Sym *sym);
+static void gen_function_check_only_1(Sym *sym);
 void gen_function_check_only(Sym *sym);
 void tcc_check_scratch_begin(TCCState *s);
+
+/* An error in a function's compile outside its body's parse -- while its
+ * parameters are set up, or its code generated (an inline asm statement's
+ * text, a constraint no register satisfies) -- is reported and the unit goes
+ * on (core/recover.c RECOVER_FUNC): what the compile had started is put back
+ * here.  Set up there: the function is parsed check-only; generated: the
+ * parse goes on after its '}'. */
+typedef struct FuncRecover
+{
+  struct FuncRecover *outer;
+  Sym *sym;
+  Sym *lstk, *gls_start;
+  Section *saved_text;
+  LabelDiffFixup *fixups_start;
+  int nested_start, outlived_mark;
+  unsigned char check;     /* gen_function_check_only's */
+  unsigned char started;   /* the labels and nested functions are this function's from here */
+  unsigned char depth_inc; /* gen_function_depth counts it */
+  unsigned char check_inc; /* check_only counts it */
+  unsigned char phase;     /* 0: setting up, 1: the body parsed, 2: past its '}' */
+  /* the token stream at the body's '{', where a setup's error goes back to
+     (it read only replays: the VLA parameters' sizes) */
+  TokenString *mstack;
+  const int *mptr;
+  const unsigned char *buf_ptr;
+  int tok, line;
+  CValue tokc;
+} FuncRecover;
+static FuncRecover *func_recover;
+static int func_check_no_setup; /* a setup failed: the check-only parse goes without */
+
+static void gen_function_recovered(FuncRecover *fr)
+{
+  TCCState *s1 = tcc_state;
+  Sym *sym = fr->sym;
+  s1->check_only++; /* nothing of it reaches the object */
+  sym_pop(&local_stack, fr->lstk, 0);
+  if (fr->started)
+  {
+    /* a label the error left undefined is no error of its own */
+    for (Sym *l = global_label_stack; l && l != fr->gls_start; l = l->prev)
+      if (l->r == LABEL_FORWARD)
+        l->r = LABEL_DEFINED;
+    label_pop(&global_label_stack, fr->gls_start, 0);
+    while (s1->label_diff_fixups && s1->label_diff_fixups != fr->fixups_start)
+    {
+      LabelDiffFixup *next = s1->label_diff_fixups->next;
+      tcc_free(s1->label_diff_fixups);
+      s1->label_diff_fixups = next;
+    }
+    for (int i = fr->nested_start; i < s1->nb_nested_funcs; i++)
+      if (s1->nested_funcs[i]->func_str)
+      {
+        tok_str_free(s1->nested_funcs[i]->func_str);
+        s1->nested_funcs[i]->func_str = NULL;
+      }
+    if (s1->nb_nested_funcs > fr->nested_start)
+      s1->nb_nested_funcs = fr->nested_start;
+  }
+  s1->check_only--; /* recover_restore put back the rest (check_inc's too) */
+  if (sym->type.ref)
+  {
+    sym->type.ref->f.func_noinline = 1;
+    sym->type.ref->f.func_auto_inline = 0;
+    sym->type.ref->f.func_eval_only_inline = 0;
+    sym->type.ref->f.func_small_leaf = 0;
+    sym->type.ref->f.func_compiled = 1;
+  }
+  local_scope = 0;
+  cur_text_section = fr->check ? fr->saved_text : NULL;
+  funcname = "";
+  func_vt.t = VT_VOID;
+  func_var = 0;
+  ind = 0;
+  func_ind = -1;
+  s1->split_func_start = -1;
+  s1->cur_func_sym = NULL;
+  nocode_wanted = DATA_ONLY_WANTED;
+  if (s1->ir)
+  {
+    tcc_ir_free(s1->ir);
+    s1->ir = NULL;
+  }
+  if (fr->depth_inc)
+  {
+    if (!--gen_function_depth)
+      funcname_copies_free();
+    sym_free_outlived_locals(fr->outlived_mark);
+  }
+  if (s1->diag_stop)
+    return; /* the parse stops (core/recover.c tcc_recover_stop) */
+  if (fr->phase == 0 && file && file->buf_ptr == fr->buf_ptr)
+  {
+    /* back to the '{' (what the setup's replays left is dropped) */
+    while (tok_macro_stack() && tok_macro_stack() != fr->mstack)
+      end_macro();
+    if (tok_macro_stack() == fr->mstack)
+    {
+      tok_macro_restore(fr->mstack, fr->mptr);
+      tok = fr->tok;
+      tokc = fr->tokc;
+      file->line_num = fr->line;
+    }
+  }
+  if (fr->phase == 1)
+    next(); /* past the body's '}' */
+  else if (fr->phase == 0 && tok == '{')
+  {
+    if (!func_check_no_setup)
+    {
+      /* the body is still checked, without what failed */
+      if (!fr->check)
+        tcc_check_scratch_begin(s1);
+      func_check_no_setup = 1;
+      gen_function_check_only(sym);
+      func_check_no_setup = 0;
+    }
+    else
+    {
+      /* the setup failed again: past the body */
+      int depth = 0;
+      do
+      {
+        depth += (tok == '{') - (tok == '}');
+        next();
+      } while (depth > 0 && tok != TOK_EOF);
+    }
+  }
+}
+
+static void gen_function_body_cb(void *sym)
+{
+  gen_function_body((Sym *)sym);
+}
+
+static void gen_function_check_only_cb(void *sym)
+{
+  gen_function_check_only_1((Sym *)sym);
+}
+
+/* gen_function_body or gen_function_check_only_1 (CHECK), going on after an
+   error outside the body's parse */
+static void gen_function_recovering(Sym *sym, int check)
+{
+  FuncRecover fr;
+  memset(&fr, 0, sizeof fr);
+  fr.outer = func_recover;
+  fr.sym = sym;
+  fr.check = check;
+  fr.lstk = local_stack;
+  fr.mstack = tok_macro_stack();
+  fr.mptr = macro_ptr;
+  fr.buf_ptr = file ? file->buf_ptr : NULL;
+  fr.tok = tok;
+  fr.tokc = tokc;
+  fr.line = file ? file->line_num : 0;
+  func_recover = &fr;
+  if (recover_call(check ? gen_function_check_only_cb : gen_function_body_cb, sym, RECOVER_CALL_FUNC))
+  {
+    func_recover = &fr; /* the frames the error left set theirs */
+    gen_function_recovered(&fr);
+  }
+  func_recover = fr.outer;
+}
 
 /* The tracing cross marks each function's compile in its allocation trace
  * (scripts/alloc_trace: which blocks die before their function is done). */
@@ -727,7 +892,7 @@ void gen_function(Sym *sym)
   }
   tcc_alloc_trace_mark(1);
   const unsigned diag_parse = tcc_diag_parse_enter(tcc_state);
-  gen_function_body(sym);
+  gen_function_recovering(sym, 0);
   tcc_diag_parse_leave(tcc_state, diag_parse);
   tcc_alloc_trace_mark(2);
 }
@@ -784,6 +949,7 @@ static void gen_function_errored_end(Sym *sym, Sym *global_label_stack_start, in
   check_vstack();
   tcc_state->recover = outer_recover;
   next();
+  func_recover->phase = 2;
   tcc_ir_free(ir);
   tcc_state->ir = NULL;
   sym_free_outlived_locals(outlived_mark);
@@ -793,11 +959,11 @@ static void gen_function_body(Sym *sym)
 {
   struct scope f = {0};
   TCCIRState *ir;
-  /* no error recovery while the parameters are set up nor while the code is
-   * generated: only the parse of the body goes on after an error */
+  /* an error while the parameters are set up or the code is generated:
+   * gen_function_recovering's point */
   struct TCCRecover *const outer_recover = tcc_state->recover;
   const int nested_start = tcc_state->nb_nested_funcs;
-  tcc_state->recover = NULL;
+  FuncRecover *const fr = func_recover;
   Sym *global_label_stack_start; /* save global label stack at function start */
   unsigned phase_start = 0;
   const int outlived_mark = sym_outlived_locals_mark();
@@ -814,6 +980,11 @@ static void gen_function_body(Sym *sym)
   tcc_state->ir_post_float_narrow = 0;
 
   global_label_stack_start = global_label_stack;
+  fr->gls_start = global_label_stack_start;
+  fr->fixups_start = tcc_state->label_diff_fixups;
+  fr->nested_start = nested_start;
+  fr->outlived_mark = outlived_mark;
+  fr->started = 1;
 
   if (sym->a.aligned)
   {
@@ -857,6 +1028,7 @@ static void gen_function_body(Sym *sym)
   func_has_label_addr = 0;
   tcc_state->cur_func_sym = sym;
   gen_function_depth++; /* see gen_function_depth: no spill, frees deferred to the outlived list */
+  fr->depth_inc = 1;
   if (!tcc_state->current_nested_func)
     nested_names_reset(); /* a file-scope function binds no nested function yet */
   /* Per-caller budget: see CONST_LOOP_INLINE_BUDGET in gen/builtin/call.c. */
@@ -955,6 +1127,11 @@ static void gen_function_body(Sym *sym)
     gen_instrument_call(sym, "__cyg_profile_func_enter");
   }
 
+#ifdef CONFIG_TCC_BCHECK
+  /* -b: main's argv is regions before the body reads it */
+  if (tcc_state->do_bounds_check)
+    bcheck_main_entry(sym);
+#endif
   func_vla_arg(sym);
   if (tcc_state->do_bench)
     phase_start = tcc_getclock_us();
@@ -969,6 +1146,7 @@ static void gen_function_body(Sym *sym)
     gen_function_errored_end(sym, global_label_stack_start, nested_start, outlived_mark, outer_recover);
     return;
   }
+  fr->phase = 1; /* parsed: its code is generated now */
   /* the body's closing brace (the outermost block reads no token after it):
      where gcc puts -Wframe-larger-than= and -Wstack-usage= */
   const int su_end_line = file ? file->line_num : su_line;
@@ -1147,6 +1325,9 @@ static void gen_function_body(Sym *sym)
    * kernel's largest function) go before the passes size tables by them. */
   if (TCC_OPT(tcc_state, optimize) > 0)
     tcc_ir_compact_temps(ir);
+  /* -fsanitize=bounds: an unchanged array parameter's `p - start` is 0 (op/ubsan.c) */
+  if (TCC_OPT(tcc_state, optimize) > 0 && (tcc_state->sanitize & SAN_BOUNDS))
+    ubsan_param_bounds_finish(ir);
   tcc_ir_opt_run_function_pipeline(ir, sym, func_var, &nonstatic_global_copier);
 
   tcc_ir_backend_fold_pure_forward(ir, sym);
@@ -1667,6 +1848,7 @@ static void gen_function_body(Sym *sym)
 
   /* do this after funcend debug info */
   next();
+  fr->phase = 2;
   tcc_ir_free(ir);
   tcc_state->ir = NULL;
   sym_free_outlived_locals(outlived_mark);
@@ -1689,6 +1871,12 @@ static void gen_function_body(Sym *sym)
  * and generated only by codegen, so they are not checked. */
 void gen_function_check_only(Sym *sym)
 {
+  gen_function_recovering(sym, 1);
+}
+
+static void gen_function_check_only_1(Sym *sym)
+{
+  FuncRecover *const fr = func_recover;
   struct scope f = {0};
   Sym *global_label_stack_start = global_label_stack;
   LabelDiffFixup *fixups_start = tcc_state->label_diff_fixups;
@@ -1697,9 +1885,15 @@ void gen_function_check_only(Sym *sym)
   const int outlived_mark = sym_outlived_locals_mark();
   struct TCCRecover *const outer_recover = tcc_state->recover; /* see gen_function_body */
 
-  tcc_state->recover = NULL;
+  fr->saved_text = saved_text;
+  fr->gls_start = global_label_stack_start;
+  fr->fixups_start = fixups_start;
+  fr->nested_start = nested_start;
+  fr->outlived_mark = outlived_mark;
+  fr->started = 1;
   const unsigned diag_parse = tcc_diag_parse_enter(tcc_state);
   tcc_state->check_only++;
+  fr->check_inc = 1;
   nested_names_reset();
   cur_scope = root_scope = &f;
   nocode_wanted = 0;
@@ -1712,6 +1906,7 @@ void gen_function_check_only(Sym *sym)
   func_has_label_addr = 0;
   tcc_state->cur_func_sym = sym;
   gen_function_depth++; /* see gen_function_depth: no spill, frees deferred to the outlived list */
+  fr->depth_inc = 1;
   tcc_state->const_loop_inline_used = 0;
 
   sym_push2(&local_stack, SYM_FIELD, 0, 0);
@@ -1734,7 +1929,12 @@ void gen_function_check_only(Sym *sym)
   nb_temp_local_vars = 0;
   local_scope = 0;
   rsym = -1;
+  /* the VLA parameters' sizes, evaluated as gen_function_body does: the
+     same diagnostics */
+  if (!func_check_no_setup)
+    func_vla_arg(sym);
   const int errored = gen_body_recovering();
+  fr->phase = 1;
   yasc_pp_body_end(pp_mark);
 
   /* the flow checks, as gen_function runs them: the body is checked even
@@ -1787,10 +1987,12 @@ void gen_function_check_only(Sym *sym)
   nocode_wanted = DATA_ONLY_WANTED;
   check_vstack();
   next();
+  fr->phase = 2;
   tcc_ir_free(ir);
   tcc_state->ir = NULL;
   sym_free_outlived_locals(outlived_mark);
   tcc_state->check_only--;
+  fr->check_inc = 0;
   tcc_diag_parse_leave(tcc_state, diag_parse);
   tcc_state->recover = outer_recover;
 }
@@ -1889,12 +2091,34 @@ void vla_param_exprs_free(TCCState *s1)
   s1->nb_vla_param_exprs = 0;
 }
 
+/* -fsanitize=bounds: ARG's value as the body sees it, on the stack (and the
+   size under it, DYNAMIC) -> kept for its subscripts (op/ubsan.c) */
+static void func_param_bound(Sym *arg, int dynamic)
+{
+  Sym *local = (arg->v & ~SYM_FIELD) >= TOK_UIDENT ? sym_find(arg->v & ~SYM_FIELD) : NULL;
+  int r;
+  if (!local || local->type.ref != arg->type.ref)
+  {
+    if (dynamic)
+      vpop();
+    return;
+  }
+  r = local->r;
+  if ((r & VT_VALMASK) < VT_CONST && !(r & VT_PARAM))
+    r = (r & ~VT_VALMASK) | VT_LOCAL;
+  vset(&local->type, r, local->c);
+  vtop->sym = local;
+  vtop->vr = local->vreg;
+  ubsan_param_bound(arg, dynamic);
+}
+
 static void func_vla_arg(Sym *sym)
 {
   Sym *arg;
 
   for (arg = sym_first(sym->type.ref); arg; arg = arg->next)
   {
+    int dynamic = 0;
     if ((arg->type.t & VT_BTYPE) != VT_PTR)
       continue;
     if (arg->type.ref->type.t & VT_VLA)
@@ -1912,10 +2136,16 @@ static void func_vla_arg(Sym *sym)
         gexpr();
         end_macro();
         next();
-        vpop(); /* discard result, only side effects matter */
+        dynamic = 1;
+        if (ubsan_param_bound_wanted(arg, 1))
+          func_param_bound(arg, 1); /* `int p[n]`: n is p's end */
+        else
+          vpop(); /* discard result, only side effects matter */
         break;
       }
     }
+    if (!dynamic && ubsan_param_bound_wanted(arg, 0))
+      func_param_bound(arg, 0); /* `char s[16]` */
   }
   vla_param_exprs_free(tcc_state);
 }

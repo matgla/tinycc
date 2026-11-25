@@ -3,8 +3,8 @@
  * 09_settings.txt is built into the program with C23 #embed and parsed into
  * a list that owns its entries.  A bad line is an error value (chapter 5),
  * cleanup is defer and errdefer (chapter 4), the list is a struct with
- * methods (chapter 7), and #pragma tcc diagnostic silences one warning for
- * one declaration.
+ * methods (chapter 7), and #pragma tcc diagnostic makes format mistakes in
+ * say() calls errors.
  * Build: tcc 09_config.c mem.o -o config */
 #pragma yasc
 #include <errno.h>
@@ -19,13 +19,11 @@ static const char settings[] = {
 
 error ConfigError { NoEquals, EmptyKey, BadNumber, NotFound };
 
-/* tcc does not check printf formats yet, and says so about a format
-   attribute (-Wignored-attributes).  The attribute stays for other
-   compilers; the warning is turned off for this declaration only. */
-#pragma tcc diagnostic push
-#pragma tcc diagnostic ignored "-Wignored-attributes"
+/* The format attribute makes every call of say() checked as printf's are
+   (-Wformat): a %d given a string is a warning.  From here on this file
+   makes it an error instead, whatever the command line says. */
+#pragma tcc diagnostic error "-Wformat"
 static void say(const char * view fmt, ...) __attribute__((format(printf, 1, 2)));
-#pragma tcc diagnostic pop
 
 static void say(const char * view fmt, ...)
 {
@@ -38,7 +36,7 @@ static void say(const char * view fmt, ...)
 /* s[0..n) as a new string */
 static !char * owned copy(const char * view s, int n)
 {
-  char * owned maybe buf = mem_new(n + 1);
+  char * owned maybe buf = mem_new((size_t)n + 1);
   if (!buf)
     return error.ENOMEM;
   for (int i = 0; i < n; i++)
@@ -67,7 +65,7 @@ struct config
   int count;
 
   /* one "key = value" line, s[0..n) */
-  !int add(struct config * view self, const char * view s, int n)
+  !int add(inout struct config * view self, const char * view s, int n)
   {
     int eq = 0;
     while (eq < n && s[eq] != '=')
@@ -98,7 +96,7 @@ struct config
   }
 
   /* every line of text; a bad one is reported and skipped */
-  int parse(struct config * view self, const char * view text)
+  int parse(inout struct config * view self, const char * view text)
   {
     int line = 0;
     for (const char * view p = text; *p;)
@@ -121,7 +119,7 @@ struct config
     for (const struct entry * view maybe e = self->first; e; e = e->next)
       if (same(e->key, key))
         return e->value;
-    return NULL;
+    return nullptr;
   }
 
   !int number(const struct config * view self, const char * view key)
@@ -139,7 +137,7 @@ struct config
     return v;
   }
 
-  void clear(struct config * view self)
+  void clear(drop struct config * view self)
   {
     while (self->first)
     {
@@ -162,7 +160,7 @@ static !int area(const struct config * view cfg)
 int main(void)
 {
   {
-    struct config cfg = {0};
+    struct config cfg = {};
     defer cfg.clear(); /* the entries are freed when this block ends */
 
     say("%d settings\n", cfg.parse(settings));

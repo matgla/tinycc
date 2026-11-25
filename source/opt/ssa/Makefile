@@ -17,6 +17,7 @@ SSA_OPT_INC = -I$(TOP)/source/opt/ssa -I$(TOP)/source/opt/ssa/include \
 SSA_OPT_SRC = \
 	source/opt/ssa/string/const_string_fold.c \
 	source/opt/ssa/string/str_strlen.c \
+	source/opt/ssa/string/str_fortify.c \
 	source/opt/ssa/string/str_strcmp.c \
 	source/opt/ssa/string/str_strcpy.c \
 	source/opt/ssa/string/str_strspn.c \

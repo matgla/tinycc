@@ -11,7 +11,7 @@ struct vec
 
   int len2(const struct vec * view self) { return self->x * self->x + self->y * self->y; }
 
-  void scale(struct vec * view self, int k)
+  void scale(inout struct vec * view self, int k)
   {
     self->x *= k;
     self->y *= k;
@@ -56,7 +56,7 @@ union num
 struct counter
 {
   int n;
-  struct counter * view bump(struct counter * view self)
+  struct counter * view bump(inout struct counter * view self)
   {
     self->n++;
     return self;

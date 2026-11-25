@@ -161,6 +161,8 @@ __attribute__((noinline)) void expr_cond_ternary(void)
 
   c = condition_3way();
   g = (tok == ':' && gnu_ext);
+  /* -Wformat: inside a format argument each arm is a format (attr_checks.c) */
+  void *fmt_arms = attr_format_capturing() ? attr_format_cond_begin() : NULL;
   tt = -1; /* -1 = no chain */
   if (!g)
   {
@@ -188,6 +190,8 @@ __attribute__((noinline)) void expr_cond_ternary(void)
 
   if ((vtop->type.t & VT_BTYPE) == VT_FUNC)
     mk_pointer(&vtop->type);
+  if (fmt_arms)
+    attr_format_cond_arm(fmt_arms, c != 0);
   sv = *vtop; /* save value to handle it later */
   /* builtin/objsize.c: what each arm points into, for a store of the result */
   ObjHeap os_true, os_false;
@@ -213,12 +217,16 @@ __attribute__((noinline)) void expr_cond_ternary(void)
     nocode_wanted++;
   skip(':');
   expr_cond();
+  if (fmt_arms)
+    attr_format_cond_arm(fmt_arms, c != 1);
   fe_narrow_pend_begin(&sv); /* -Wconversion: both arms, as gcc */
 
   if ((vtop->type.t & VT_BTYPE) == VT_FUNC)
     mk_pointer(&vtop->type);
   const int os_false_known = os_true_known && objsize_value_heap(vtop, &os_false);
 
+  if (tcc_state->yasc)
+    yasc_null_pair(&sv, vtop); /* `c ? p : 0`: nullptr */
   /* cast operands to correct type according to ISOC rules */
   if (!combine_types(&type, &sv, vtop, '?'))
     type_incompatibility_error(&sv.type, &vtop->type, "type mismatch in conditional expression (have '%s' and '%s')");
@@ -237,6 +245,7 @@ __attribute__((noinline)) void expr_cond_ternary(void)
     gvtst_set(1, t2);
     gen_cast(&type);
     //  tcc_warning("two conditions expr_cond");
+    attr_format_cond_end(fmt_arms);
     return;
   }
 
@@ -402,4 +411,5 @@ __attribute__((noinline)) void expr_cond_ternary(void)
     }
   }
   fe_narrow_pend_end();
+  attr_format_cond_end(fmt_arms);
 }

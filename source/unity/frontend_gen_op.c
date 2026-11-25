@@ -22,6 +22,8 @@
 #include "../frontend/gen/op/op.c"
 #undef FE_NARROW_N
 #include "../frontend/gen/op/ubsan.c"
+#undef UBSAN_PARAM_BOUNDS
+#undef UBSAN_PENDING
 #include "../frontend/gen/op/vector.c"
 #undef VEC_EMIT_RANGE_MAX
 #undef VEC_RECIPE_MAX

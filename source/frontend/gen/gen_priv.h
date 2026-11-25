@@ -197,6 +197,8 @@ struct switch_t
   struct switch_t *prev;
   SValue sv;
   int body_depth; /* the compound statement depth of its body (stmt/block.c) */
+  int ytu;        /* yasc: a switch on tagged union yasc_tagged[ytu - 1]'s tag, 0 none */
+  int def_unreachable; /* yasc: `default: unreachable` -- the case checks run as with no default */
 };
 
 /* list of temporary local variables on the stack in the current function
@@ -369,8 +371,13 @@ void gen_op_checked(int op);
 int ubsan_gen_op(int op);
 int ubsan_gen_neg(void);
 void ubsan_deref(void);
+/* the access through a checked lvalue, as clang's type_mismatch kinds */
+#define UBSAN_STORE 1
+#define UBSAN_MEMBER 3
+void ubsan_access_kind(const SValue *lv, int kind);
 void ubsan_subscript(int addr_ok);
 void ubsan_vla_bound(void);
+void gen_unreachable(int checked);
 void ssp_note_local(const CType *type);
 void ssp_note_frame_use(int alloca_);
 void fe_check_neg(void);
@@ -404,6 +411,17 @@ void gen_ir_void_call_args(SValue *args, int argc, int func_tok);
 void nop_or_rollback_call_params(int call_id, int ir_idx_before_first_param, int ir_idx_before_args);
 int redirect_call_to_tcc_helper(SValue *saved_args, int nargs, const char *helper_name, CType *result_type, int call_id, int ir_idx_before_first_param, int ir_idx_before_args);
 void unary_funcall(void);
+
+/* --- builtin/fortify.c --- */
+typedef struct FortifyCall FortifyCall;
+extern FortifyCall *fortify_cur_call; /* unary_funcall -> unary_funcall_body */
+FortifyCall *fortify_call_begin(Sym *fsym);
+void fortify_arg_before(FortifyCall *fc, int i);
+void fortify_arg(FortifyCall *fc, int i);
+void fortify_arg_emit(FortifyCall *fc, int i);
+void fortify_call_end(FortifyCall *fc);
+void fortify_calls_unwind(void *mark);
+void *fortify_calls_mark(void);
 
 /* --- builtin/chk.c --- */
 void unary_builtin_chk(void);
@@ -467,17 +485,21 @@ void objsize_info(SValue *sv, ObjInfo *oi);
 unsigned long long objsize_result(const ObjInfo *oi, int type);
 int objsize_push_dynamic(const ObjInfo *oi, int type);
 void objsize_apply_alloc_attrs(Sym *s, SymLocalFacts *f, AttributeDef *ad);
+void fortify_apply_attrs(Sym *s, SymLocalFacts *f, AttributeDef *ad); /* builtin/fortify.c */
 ObjCall *objsize_call_begin(Sym *fsym);
+ObjCall *objsize_call_begin_named(const char *name);
 void objsize_call_arg_before(ObjCall *oc, int i);
 void objsize_call_arg(ObjCall *oc, int i);
 void objsize_call_args_end(ObjCall *oc);
+void *objsize_calls_mark(void);        /* error recovery: the calls begun */
+void objsize_calls_unwind(void *mark); /* to MARK, NULL: all */
 void objsize_call_end(ObjCall *oc, int discarded);
 int objsize_value_heap(SValue *sv, ObjHeap *h);
 void objsize_rhs_begin(ObjRec *saved);
 void objsize_rhs_end(const ObjRec *saved);
 void objsize_cond_result(const ObjHeap *t, const ObjHeap *f);
 void objsize_alloca_result(SValue *size);
-void objsize_chk_overflow(const char *name, unsigned long long n, unsigned long long size);
+void objsize_chk_overflow(ObjCall *oc, const char *name, unsigned long long n, unsigned long long size);
 int objsize_bound_fixit(ObjCall *oc, int line);
 
 typedef struct AbSub
@@ -511,6 +533,7 @@ void unary_builtin_modf(void);
 
 /* --- builtin/fp2.c --- */
 void unary_builtin_fp2(void);
+void unary_at_builtin(void);
 void gen_bswap(int size);
 
 /* --- builtin/misc.c --- */
@@ -620,6 +643,7 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg);
 void init_putz(init_params *p, unsigned long c, int size);
 void parse_init_elem(int expr_type);
 void skip_or_save_block(TokenString **str);
+extern int skip_save_stop_semicolon; /* skip_or_save_block: a ';' ends the block (a static's initializer) */
 
 /* --- inline/analysis.c --- */
 int auto_inline_nonstatic_struct_body_ok(Sym *func_sym, TokenString *func_str);
@@ -652,9 +676,42 @@ typedef struct RecoverDecl
   CType type;
 } RecoverDecl;
 extern RecoverDecl recover_decl;
+/* the declaration list decl() is reading (VT_CONST or VT_LOCAL): an error in
+   one of its declarators goes on with the next one after the ',' (`int
+   a[1] = {1, 2}, b;` still declares b), as gcc.  Pointers into decl()'s
+   frame, read by the error while that frame is there. */
+typedef struct RecoverDeclList
+{
+  struct RecoverDeclList *outer;
+  CType *btype;
+  AttributeDef *adbase;
+  struct scope *scope; /* cur_scope when it began */
+  int l, oldint, exported, struct_depth;
+  int active;          /* in a declarator or its initializer */
+  int init_base;       /* init_brace_depth when the declarator began */
+} RecoverDeclList;
+/* the initializer braces decl_initializer is in (an error leaves it up:
+   the recovery reads how many it was in, then puts it back) */
+extern int init_brace_depth;
+extern RecoverDeclList *recover_decl_list;
+void decl_list_unwind(RecoverDeclList *mark); /* decl.c: back to a recovery point's list */
+void decl_list_reset(void);                   /* the end of the unit */
+/* set by the recovery for the next decl(L): the list goes on with its next
+   declarator, of this base type */
+typedef struct RecoverDeclResume
+{
+  int on, l, oldint, exported;
+  CType btype;
+  AttributeDef adbase;
+} RecoverDeclResume;
+extern RecoverDeclResume recover_decl_resume;
 extern int shadow_name_sys; /* sym/symtab.c: -Wshadow, the name came from a system header's macro */
+extern int shadow_param_sys; /* the same for the parameter type_decl read last */
 void attr_checks_recover(void);
+void *call_arg_checks_mark(void);        /* builtin/call.c */
+void call_arg_checks_unwind(void *mark); /* to MARK, NULL: all */
 int yasc_methods_depth(int set);
+void decl_param_names(int set, int *nb, int *base);
 void yasc_plain_reset(void);
 /* decl/plain_param.c */
 extern int yasc_pp_live;
@@ -785,20 +842,27 @@ void try_call_scope_cleanup(Sym *stop);
 
 /* --- decl/attribute.c: pointer facts from GCC attributes --- */
 void attr_apply_pointer_facts(CType *type, AttributeDef *ad, int own_functype);
+void attr_apply_member_facts(CType *type, AttributeDef *ad, int v);
 void attr_apply_decl_facts(Sym *s, AttributeDef *ad);
 void attr_apply_decl_facts_at(Sym *s, AttributeDef *ad, int line);
 void attr_decl_place(SymLocalFacts *f, int line);
 
 /* --- expr/attr_checks.c --- */
-/* A format(printf|scanf) call being parsed (builtin/call.c) */
+/* A format(printf|scanf) call being parsed (builtin/call.c): the formats
+   and the arguments after them are kept and checked at the call's end */
+typedef struct FmtArgRec
+{
+  CType type; /* before the conversion to the parameter */
+  int line;
+} FmtArgRec;
 typedef struct FmtCheck
 {
   unsigned char kind, idx, first; /* ATTR_FMT_*, the format's argument, the first formatted (from 1) */
   unsigned char state;            /* 0 off, 1 before the format, 2 checking arguments, 3 a va_list */
-  unsigned char saved_armed, saved_seen, nonliteral, extra_reported;
-  unsigned char have_conv, cur_star, cur_conv, cur_cls, cur_lm;
-  int stars, pos, cur_start, cur_len;
-  char *fmt; /* the literal */
+  unsigned char saved_armed, saved_seen, nonliteral, nfmts;
+  char **fmts;     /* the literal, or each arm of a conditional (`c ? "%d" : _("%s")`) */
+  FmtArgRec *args; /* the arguments from `first` on */
+  int nargs, fmt_line;
   /* format_arg(n) (gettext) inside another call's format argument: the
      literal argument n is, for the result */
   unsigned char fa_idx, fa_saved_seen;
@@ -816,10 +880,13 @@ void attr_call_result(Sym *fsym);
 void attr_check_discard(void);
 void attr_format_capture(Sym *lit, int wide);
 int attr_format_capturing(void);
-void attr_format_begin(FmtCheck *fc, Sym *fsym);
+FmtCheck *attr_format_begin(Sym *fsym);
 void attr_format_before(FmtCheck *fc, int argno);
 void attr_format_arg(FmtCheck *fc, int argno);
 void attr_format_end(FmtCheck *fc, int nb_args);
+void *attr_format_cond_begin(void);
+void attr_format_cond_arm(void *arms, int live);
+void attr_format_cond_end(void *arms);
 void attr_checks_reset(void);
 
 /* --- decl/module.c --- */
@@ -876,6 +943,7 @@ void explicit_cast_checks(CType *dt);
  * number of times it was replayed in vreg. */
 #define CLEANUP_DEFER 1
 #define CLEANUP_ERRDEFER 2 /* runs only when the function returns an error */
+#define CLEANUP_BCHECK 3   /* -b: drops a local's region (op/bcheck.c, bcheck_cleanup) */
 int defer_body_active(void);
 void defer_stmt(int kind);
 void defer_replay(Sym *cls);
@@ -907,6 +975,16 @@ int type_is_errset(CType *type);
 const char *yasc_errset_name(CType *type);
 void yasc_error_type(CType *type);
 void yasc_errunion_wrap(CType *type);
+/* --- expr/yasc_slices.c --- */
+void yasc_slice_wrap(CType *type, int sentinel);
+int yasc_slice_to_str(char *buf, int buf_size, CType *type, const char *varstr);
+void yasc_slice_assign(CType *dt);
+void yasc_slice_member(void);
+int yasc_subscript(void);
+extern int yasc_sentinel_live;  /* a [:0] slice's element is noted: vstore checks a store into it */
+void yasc_sentinel_store(void); /* vstore: no non-zero over the sentinel */
+void yasc_sentinel_reset(void); /* a function's start */
+void fe_trap_if(void); /* op/ubsan.c: vtop a condition -> popped, a trap on its true side */
 void yasc_errunion_discarded(void);
 void yasc_verify_errors_assign(CType *dt);
 void yasc_try(void);
@@ -979,8 +1057,20 @@ int is_compatible_unqualified_types(CType *type1, CType *type2);
 int mark_value_bytes(CType *type, int base, unsigned char *map, int map_size);
 void verify_assign_cast(CType *dt);
 extern int yasc_returning, yasc_argument;
+extern int yasc_stmt_bol, yasc_unsafe_expr_line; /* the statement read now begins its line; unsafe(expr)'s line */
+extern int yasc_rbrace_line;                     /* the line of the last compound statement's '}' */
+void yasc_unsafe_line_check(int line);
 Sym *yasc_vtop_var(void);
 int yasc_move_borrow(void);
+int yasc_unsafe_expr(void);
+void yasc_unchecked_deref(void);
+int yasc_type_holds_annotated(CType *t, int owned_only, int depth);
+void yasc_union_member_end(int addr_operand);
+int yasc_tag_switch_of(const SValue *sv);
+void yasc_tag_store_note(const SValue *dst, const SValue *src);
+void yasc_stmt_forget(void);
+uint32_t yasc_w1c_member_of(const SValue *dst, uint32_t *fbits, int *ftok, int *nf);
+void yasc_unsafe_block(void);
 
 /* --- type/cast.c --- */
 void force_charshort_cast(void);
@@ -993,6 +1083,8 @@ int compare_types(CType *type1, CType *type2, int unqualified);
 int compare_types_structural(CType *type1, CType *type2);
 CType *find_assignable_transparent_union_member(CType *type);
 int is_null_pointer(SValue *p);
+void yasc_null_spelling(SValue *p);
+void yasc_null_pair(SValue *a, SValue *b);
 int is_transparent_union_type(CType *type);
 int pointed_size(CType *type);
 void type_incompatibility_error(CType *st, CType *dt, const char *fmt);
@@ -1008,6 +1100,11 @@ int adjust_bf(SValue *sv, int bit_pos, int bit_size);
 void gbound(void);
 void gen_bounded_ptr_add(void);
 void bcheck_local_decl(Sym *sym);
+void bcheck_vla(Sym *sym, CType *type, int slot);
+void bcheck_alloca(int slot, SValue *size);
+void bcheck_addr_taken(Sym *sym);
+void bcheck_cleanup(Sym *cls);
+void bcheck_redirect_call(void);
 int get_temp_local_var(int size, int align, int *vr_out);
 extern unsigned pending_call_temp_slots;
 void pin_call_arg_temp_slot(const SValue *sv);

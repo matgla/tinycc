@@ -653,7 +653,6 @@ int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
   ElfW(Phdr) *ph = NULL;
   int i, f, n, phnum, phfill;
   int file_offset;
-  int elf_header_offset = 0;
 
   /* compute number of program headers */
   phnum = sort_sections(s1, sec_order, d);
@@ -726,14 +725,16 @@ int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
   }
   /* compute address after headers */
   // addr += file_offset;
-  elf_header_offset = file_offset;
 
   /* Track per-memory-region address counters for linker script placement.
      cur_mr is -1 while placing an output section at an explicit address:
      it belongs to no region and must not move any region's counter. */
   addr_t mr_addr[LD_MAX_MEMORY_REGIONS];
   int cur_mr = 0;
-  int first_at_base = 0; /* the first PT_LOAD was stretched down to `base` */
+  /* file offset after the current PT_LOAD's last section with file contents:
+     its p_filesz ends there, not after the padding before a NOBITS section
+     (a page-aligned .bss made 8 bytes of .data 0x1000 bytes of file) */
+  addr_t ph_file_end = 0;
   int explicit_started[LD_MAX_OUTPUT_SECTIONS] = {0};
   if (s1->ld_script && s1->ld_script->nb_memory_regions > 0)
   {
@@ -876,8 +877,8 @@ int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
            between and took its LMA with it. */
         // ph->p_offset = 0;
         ph->p_vaddr = base;
-        first_at_base = 1;
       }
+      ph_file_end = ph->p_offset;
       ph->p_paddr = ph->p_vaddr;
       ++n;
     }
@@ -896,16 +897,18 @@ int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
 
     addr += s->sh_size;
     if (s->sh_type != SHT_NOBITS)
+    {
       file_offset += s->sh_size;
+      ph_file_end = file_offset;
+    }
 
     if (ph)
     {
-      ph->p_filesz = file_offset - ph->p_offset;
+      /* The headers are not in the first PT_LOAD (p_offset stays at its
+         first section), so its p_memsz takes no header size either: that
+         was a zero fill over the segment loaded after it. */
+      ph->p_filesz = ph_file_end - ph->p_offset;
       ph->p_memsz = addr - ph->p_vaddr;
-      if (n == 1 && first_at_base)
-      {
-        ph->p_memsz += elf_header_offset;
-      }
     }
   }
 

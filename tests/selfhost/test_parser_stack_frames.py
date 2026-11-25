@@ -10,7 +10,7 @@ proxy of the same check is tests/ir_tests/test_parse_stack_depth.py.
 
 Inline expansions recurse through the statement parser: a call whose callee
 is expanded replays the body inside unary_funcall_body() --
-replay_body_recovering() -> replay_recovering() -> replay_block() -> block()
+replay_body_recovering() -> recover_call() -> replay_block() -> block()
 -> block() -> gexpr() ... unary() -> unary_funcall() -> unary_funcall_body()
 -- up to INLINE_NEST_MAX (32) levels, and Zig's C nests that deep.  A call
 initializing a local adds decl() and the initializer.  At c35ae0af90 a level
@@ -34,12 +34,12 @@ CYCLES = {
     "operand": (["expr_infix_l", "unary", "unary_paren", "gexpr", "expr_eq", "expr_cond", "expr_unary_infix"], 288),
     "cast": (["unary", "unary_paren"], 128),
     "subscript": (["unary", "unary_subscript", "gexpr", "expr_eq", "expr_cond", "expr_unary_infix"], 288),
-    # 2260 bytes at c35ae0af90, 1196 since
+    # 2260 bytes at c35ae0af90, 1196 at ff9b93d136, 1204 since (recover_call: its kind)
     "inline": (
         [
             "unary_funcall_body",
             "replay_body_recovering",
-            "replay_recovering",
+            "recover_call",
             "replay_block",
             "block",
             "block",
@@ -52,12 +52,12 @@ CYCLES = {
         ],
         1280,
     ),
-    # 3600 at c35ae0af90 (about 2420 at 471ab721f5), 2408 since
+    # 3600 at c35ae0af90 (about 2420 at 471ab721f5), 2408 at ff9b93d136, 2416 since
     "inline_decl": (
         [
             "unary_funcall_body",
             "replay_body_recovering",
-            "replay_recovering",
+            "recover_call",
             "replay_block",
             "block",
             "decl",

@@ -3,8 +3,8 @@
 `return &x;`, `return buf;`, `return &s.m;`, `return &a[2];`, the address of
 a parameter, a compound literal: all gone once the function returns.  Read
 from the raw IR (the frontend has already put &x into a temp), so the same
-at every -O level.  A pointer variable that holds such an address is not
-followed yet.
+at every -O level.  In yasc, also through a call whose result borrows from
+the argument the address went to (`return f(buf);`).
 """
 
 import subprocess
@@ -43,7 +43,7 @@ def _run(tmp_path, body, *flags, obj="t.o"):
     src = tmp_path / "t.c"
     src.write_text(PRELUDE + body)
     return subprocess.run(
-        [str(TCC), "-ccompat", "-c", *flags, str(src), "-o", str(tmp_path / obj)], capture_output=True, text=True
+        [str(TCC), "-Wno-missing-prototypes", "-Wno-write-strings", "-ccompat", "-c", *flags, str(src), "-o", str(tmp_path / obj)], capture_output=True, text=True
     )
 
 
@@ -92,3 +92,82 @@ def test_code_unchanged(tmp_path, opt):
     _run(tmp_path, corpus, opt, obj="plain.o")
     _run(tmp_path, corpus, "-Wall", opt, obj="checked.o")
     assert (tmp_path / "plain.o").read_bytes() == (tmp_path / "checked.o").read_bytes()
+
+
+# yasc: a call's result that borrows from an argument (borrows(...), or the
+# elision) points into that argument, a frame address too
+YASC_PRELUDE = (
+    "char * borrows(p) f(char * view maybe p);\n"
+    "char * borrows(static, p) fs(char * view maybe p);\n"
+    "char * view v(char * view p);\n"
+    "char * borrows(a) two(char * view a, char * view b);\n"
+)
+
+YASC_BAD = {
+    "call": ("char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return f(buf);\n}\n", "f"),
+    "static_or_param": ("char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return fs(buf);\n}\n", "fs"),
+    "elision": ("char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return v(buf);\n}\n", "v"),
+    "nested": ("char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return f(f(buf));\n}\n", "f"),
+    "offset": ("char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return f(buf) + 1;\n}\n", "f"),
+    "element": ("char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return f(&buf[1]);\n}\n", "f"),
+    "borrowed_one": (
+        "char * borrows(p) g(char * view p)\n{\n  char buf[4] = \"ab\";\n  return two(buf, p);\n}\n",
+        "two",
+    ),
+}
+
+YASC_CLEAN = {
+    "static": "char * borrows(static) g(void)\n{\n  static char sb[4];\n  return f(sb);\n}\n",
+    "literal": "char * borrows(static) g(void)\n{\n  return f(\"lit\");\n}\n",
+    "parameter": "char * borrows(p) g(char * view p)\n{\n  return f(p);\n}\n",
+    "not_borrowed": "char * borrows(p) g(char * view p)\n{\n  char buf[4] = \"ab\";\n  return two(p, buf);\n}\n",
+    "used_inside": "int g(void)\n{\n  char buf[4] = \"ab\";\n  char * view r = f(buf);\n  return *r;\n}\n",
+}
+
+
+def _run_yasc(tmp_path, body, *flags):
+    src = tmp_path / "t.c"
+    src.write_text(YASC_PRELUDE + body)
+    return subprocess.run(
+        [str(TCC), "-Wno-missing-prototypes", "-Wno-write-strings", "-c", *flags, str(src), "-o", str(tmp_path / "t.o")], capture_output=True, text=True
+    )
+
+
+def _yasc_diags(proc):
+    out = []
+    for line in proc.stderr.splitlines():
+        parts = line.split(": ", 2)
+        if len(parts) == 3 and parts[1] in ("warning", "error"):
+            out.append((int(parts[0].rsplit(":", 1)[1]) - YASC_PRELUDE.count("\n"), parts[2]))
+    return out
+
+
+@pytest.mark.parametrize("name", sorted(YASC_BAD))
+@pytest.mark.parametrize("opt", LEVELS)
+def test_yasc_through_call(tmp_path, name, opt):
+    body, callee = YASC_BAD[name]
+    line = body.count("\n") - 1
+    assert _yasc_diags(_run_yasc(tmp_path, body, "-Wall", opt)) == [
+        (line, f"'g' returns the address of a local variable (through the result of '{callee}')")
+    ]
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_yasc_through_call_held(tmp_path, opt):
+    body = "char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  char * view r = f(buf);\n  return r;\n}\n"
+    assert _yasc_diags(_run_yasc(tmp_path, body, "-Wall", opt)) == [
+        (5, "'g' may return the address of a local variable (held in 'r')")
+    ]
+
+
+@pytest.mark.parametrize("name", sorted(YASC_CLEAN))
+@pytest.mark.parametrize("opt", LEVELS)
+def test_yasc_clean(tmp_path, name, opt):
+    proc = _run_yasc(tmp_path, YASC_CLEAN[name], "-Wall", opt)
+    assert proc.returncode == 0 and not proc.stderr, proc.stderr
+
+
+def test_yasc_through_call_unsafe(tmp_path):
+    body = "char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  unsafe { return f(buf); }\n}\n"
+    proc = _run_yasc(tmp_path, body, "-Wall")
+    assert proc.returncode == 0 and not proc.stderr, proc.stderr

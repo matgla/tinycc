@@ -203,9 +203,13 @@ in geom rebuilds geom.o only, a changed signature rebuilds its importers
   flow checks (-Wlifetime) take it as neither maybe nor null -- checks start at
   the yasc variable it lands in. So `char * owned p = c_name();` and handing an
   owned result to a C function (`c_take(make())`) are silent, while the same
-  with a pointer declared in yasc still warns. A C function's parameter is a
-  borrow: an owned pointer passed to it is still owned. Replaces the earlier
-  "reads as `view maybe`" rule, which would have flagged every C call.
+  with a pointer declared in yasc still warns. An owned variable passed to a
+  C function's parameter says what happens to it (2026-11-23):
+  `c_use(borrow(p))` lends it (p is still owned), `c_keep(move(p))` hands it
+  over (p is moved there); a plain `c_use(p)` is -Wimplicit-move's "'p' is
+  owned and goes to a regular-C parameter: write borrow(p) or move(p)" (a
+  fix-it adds borrow). A call's owned result needs neither. Replaces the
+  earlier "reads as `view maybe`" rule, which would have flagged every C call.
 - The arguments written inside a regular-C macro are regular C too, and so is
   a yasc macro used inside one (its expansion is inside the markers): with
   tcc's function-like `va_arg`, `va_arg(ap, char *)`. A regular-C macro inside
@@ -215,7 +219,12 @@ in geom rebuilds geom.o only, a changed signature rebuilds its importers
 - `tcc -E` keeps the dialects for the compile of its output: the line markers'
   flags 1/2 say where a header starts (regular C) and returns (the dialect of
   the file it returns to), and an `-iyasc` header gets its `#pragma yasc`. A
-  regular-C macro's expansion in yasc code is not marked in the output.
+  regular-C macro's expansion in yasc code is written between
+  `_Pragma("tcc c_begin")` and `_Pragma("tcc c_end")`, inline (the lines
+  stay); compiling the output, `#pragma tcc c_begin` / `c_end` (also through
+  `_Pragma`) turn the dialect off and on as the markers do, kept in a saved
+  body as those markers, so the output compiles to the source's object with
+  its diagnostics (test_yasc_c_macros.py).
 - The pointers a regular-C macro writes inside yasc code (`NULL`, `offsetof`, a
   header's `((char *)p)`) are unchecked too. `pp_in_c()` (tccpp.c) answers "is
   the token just read regular C, in a unit with yasc in it?"
@@ -245,6 +254,18 @@ in geom rebuilds geom.o only, a changed signature rebuilds its importers
     allocators (`malloc`..`strdup` with `free`, `fopen` with `fclose`, `opendir`
     with `closedir`, `popen` with `pclose`) and `nonnull` on the functions that
     read a whole string. `__has_attribute` reports the three.
+  - `yasc_view` / `yasc_maybe` on a struct member (`attr_apply_member_facts`,
+    tcc only): its pointer is `view`, with `yasc_maybe` `view maybe`, so yasc
+    code dereferences it without `unsafe` and the flow checks see what is stored
+    in it.  A struct has one definition, so a yasc copy of it in a side header
+    (as `sys/yasc/*.h` redeclares functions) is not possible; the attribute
+    keeps it in the C header.  The outer pointer only, after the member's
+    declarator (or in the specifiers, for every declarator); on a member that is
+    not a pointer, or `yasc_maybe` alone, a warning.  yasos libc spells them
+    `__yl_view` / `__yl_view_maybe` (empty where `__has_attribute` says no), on
+    the syscall contexts (`sys/syscall.h`): `view` where libc points the member
+    at its own object, `view maybe` where it passes on its caller's pointer.
+    test_yasc_member_view.py.
 - Not yet: `access(write_only, n)` as `out`, `warn_unused_result`, and side
   files of annotations for C libraries we cannot edit.
 - **Headers a module includes**: their declarations are needed by the exported
