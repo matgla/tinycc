@@ -668,6 +668,26 @@ static addr_t tcc_yaff_data_region_offset(TCCState *s1, addr_t address)
   return address - rodata_section->sh_addr;
 }
 
+/* RELRO: emit the reserved rodata anchor slot (GOT index 3) so the loader
+ * fills it with the runtime base of .rodata. Code addresses shared .rodata
+ * symbols as anchor + R_ARM_RODATA_OFF(sym). Phase 2a points the anchor at
+ * the per-process rodata (offset 0 of the data segment, where .rodata still
+ * lives) — behaviour-preserving while the new codegen path is validated;
+ * Phase 2b retargets it to YAFF_SECTION_RODATA (the shared XIP segment).
+ * A GOT with no relocations (a module that imports nothing) needs it too. */
+static int tcc_yaff_write_rodata_anchor(TCCState *s1, FILE *f)
+{
+  uint32_t anchor_words[2];
+
+  if (!s1->share_rodata || !s1->got)
+    return 0;
+  anchor_words[0] = ((uint32_t)YAFF_SECTION_DATA & 0x3u) | ((uint32_t)YAFF_RODATA_ANCHOR_GOT_INDEX << 2);
+  anchor_words[1] = 0; /* .rodata is at offset 0 of the data segment */
+  fwrite(anchor_words, 1, sizeof(anchor_words), f);
+  LOG_YAFF("emitted rodata anchor local reloc: got index %d -> DATA off 0", YAFF_RODATA_ANCHOR_GOT_INDEX);
+  return 1;
+}
+
 /* Write local relocations for GOT entries that reference local symbols.
  *
  * When a local (STB_LOCAL) symbol's address is taken, put_got_entry()
@@ -692,7 +712,7 @@ static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
   if (!s1->got || !s1->got->reloc)
   {
     LOG_YAFF("no GOT or no GOT relocs (got=%p, reloc=%p)", s1->got, s1->got ? s1->got->reloc : NULL);
-    return 0;
+    return tcc_yaff_write_rodata_anchor(s1, f);
   }
 
   LOG_YAFF("scanning .rel.got: got->sh_addr=0x%x, text=0x%x..0x%x, rodata=0x%x..0x%x",
@@ -779,24 +799,7 @@ static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
     ++count;
   }
 
-  /* RELRO: emit the reserved rodata anchor slot (GOT index 3) so the loader
-   * fills it with the runtime base of .rodata. Code addresses shared .rodata
-   * symbols as anchor + R_ARM_RODATA_OFF(sym). Phase 2a points the anchor at
-   * the per-process rodata (offset 0 of the data segment, where .rodata still
-   * lives) — behaviour-preserving while the new codegen path is validated;
-   * Phase 2b retargets it to YAFF_SECTION_RODATA (the shared XIP segment). */
-  if (s1->share_rodata && s1->got)
-  {
-    uint32_t anchor_words[2];
-    anchor_words[0] =
-        ((uint32_t)YAFF_SECTION_DATA & 0x3u) | ((uint32_t)YAFF_RODATA_ANCHOR_GOT_INDEX << 2);
-    anchor_words[1] = 0; /* .rodata is at offset 0 of the data segment */
-    fwrite(anchor_words, 1, sizeof(anchor_words), f);
-    ++count;
-    LOG_YAFF("emitted rodata anchor local reloc: got index %d -> DATA off 0",
-             YAFF_RODATA_ANCHOR_GOT_INDEX);
-  }
-
+  count += tcc_yaff_write_rodata_anchor(s1, f);
   LOG_YAFF("total local relocations: %d", count);
   return count;
 }
