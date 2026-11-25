@@ -86,6 +86,9 @@ def test_off_by_default_in_ccompat(tmp_path):
 def test_safe_default(tmp_path):
     body = BODY.replace("char *p", "char * view p").replace("char *p =", "char * view p =")
     body = body.replace("char * view p = __builtin_alloca(n)", "char * view p = (char * view)__builtin_alloca(n)")
+    body = body.replace("int a[n]", "inout int a[n]")  # an array parameter written through
+    body = body.replace("char b[n];", "char b[n] = undefined;").replace("int m[n][4];", "int m[n][4] = undefined;")
+    body = body.replace("char b[16];", "char b[16] = undefined;")
     proc = _run(tmp_path, body, ccompat=False)
     assert proc.returncode == 0, proc.stderr
     assert sorted((l, m) for l, k, m in _hits(proc)) == sorted(EXPECTED), proc.stderr

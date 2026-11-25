@@ -167,7 +167,8 @@ def test_yasc_and_c_agree(tmp_path):
     use = '#include "api.h"\nchar *first(void) { return dup_name("a"); }\n'
     defs = (
         "#include <stdlib.h>\n"
-        "char * owned dup_name(const char * view s) { char * owned p = malloc(2); p[0] = s[0]; p[1] = 0; return p; }\n"
+        "char * owned dup_name(const char * view s)\n{\n  char * owned p = unsafe(malloc(2));\n  p[0] = s[0];\n"
+        "  p[1] = 0;\n  return p;\n}\n"
     )
     _setup(tmp_path, defs, use=use, header=header)
     (tmp_path / "a.c").write_text(use)
@@ -331,3 +332,83 @@ def test_layout_one_command_archive_and_r(tmp_path):
     assert _tcc(tmp_path, "-ccompat", "-Wcross-tu", "-r", "a.o", "b.o", "-o", "r.o").returncode == 0
     proc = _link(tmp_path, "-Wcross-tu", inputs=("r.o", "st.o"))
     assert _warnings(proc) == ["tcc: warning: " + msg]
+
+
+# ---------------------------------------------------------------------------
+# units of one name: each unit's records carry its identity (file name,
+# absolute path, an id of the compile; the link adds the object's path), so
+# x/u.c and y/u.c compiled in their directories, or one file compiled twice,
+# are compared and the reports say which is which
+
+U_DEF = "struct s { int a; };\nint use(struct s *p) { return p->a; }\nlong g(int x) { return x; }\n"
+U_USE = "struct s { long long a; };\nint use(struct s *);\nint g(int);\nint f(void) { return use(0) + g(1); }\n"
+U_MSGS = [
+    "tcc: warning: 'g' declared as 'int (int)' at u.c:3 (y/u.c), defined as 'long (int)' at u.c:3 (x/u.c)",
+    "tcc: warning: 'struct s' has different layouts at u.c:1 (x/u.c) and at u.c:1 (y/u.c) ('use' uses it): "
+    "member 'a' is 'int' at offset 0 in u.c (x/u.c), 'long long' at offset 0 in u.c (y/u.c)",
+]
+
+
+def test_same_name_units_in_two_directories(tmp_path):
+    for d, src in (("x", U_DEF), ("y", U_USE)):
+        (tmp_path / d).mkdir()
+        (tmp_path / d / "u.c").write_text(src)
+        proc = _tcc(tmp_path / d, "-ccompat", "-Wcross-tu", "-c", "u.c", "-o", "u.o")
+        assert proc.returncode == 0, proc.stderr
+    (tmp_path / "st.c").write_text(START)
+    assert _tcc(tmp_path, "-ccompat", "-c", "st.c", "-o", "st.o").returncode == 0
+    proc = _link(tmp_path, "-Wcross-tu", inputs=("x/u.o", "y/u.o", "st.o"))
+    assert _warnings(proc) == U_MSGS
+    # merged by -r: the units stay apart
+    assert _tcc(tmp_path, "-ccompat", "-Wcross-tu", "-r", "x/u.o", "y/u.o", "-o", "r.o").returncode == 0
+    proc = _link(tmp_path, "-Wcross-tu", inputs=("r.o", "st.o"))
+    assert _warnings(proc) == U_MSGS
+    # in an archive
+    assert _tcc(tmp_path, "-ar", "rcs", "libx.a", "x/u.o").returncode == 0
+    proc = _link(tmp_path, "-Wcross-tu", inputs=("y/u.o", "st.o", "libx.a"))
+    assert _warnings(proc) == U_MSGS
+    # one command: the names as given already differ
+    proc = _tcc(tmp_path, "-ccompat", "-Wcross-tu", "x/u.c", "y/u.c", "st.c", "-nostdlib", "-o", "out")
+    assert _warnings(proc) == [m.replace("u.c:3 (y/u.c)", "y/u.c:3").replace("u.c:3 (x/u.c)", "x/u.c:3")
+                               .replace("u.c:1 (x/u.c)", "x/u.c:1").replace("u.c:1 (y/u.c)", "y/u.c:1")
+                               .replace("in u.c (x/u.c)", "in x/u.c").replace("in u.c (y/u.c)", "in y/u.c")
+                               for m in U_MSGS]
+
+
+def test_one_file_compiled_twice(tmp_path):
+    (tmp_path / "d.c").write_text(
+        "#ifdef DEF\nstruct s { int a; };\nint use(struct s *p) { return p->a; }\n"
+        "#else\nstruct s { char a; };\nint use(struct s *p);\nint f(void) { return use(0); }\n#endif\n"
+    )
+    (tmp_path / "st.c").write_text(START)
+    assert _tcc(tmp_path, "-ccompat", "-Wcross-tu", "-DDEF", "-c", "d.c", "-o", "d1.o").returncode == 0
+    assert _tcc(tmp_path, "-ccompat", "-Wcross-tu", "-c", "d.c", "-o", "d2.o").returncode == 0
+    assert _tcc(tmp_path, "-ccompat", "-c", "st.c", "-o", "st.o").returncode == 0
+    proc = _link(tmp_path, "-Wcross-tu", inputs=("d1.o", "d2.o", "st.o"))
+    assert _warnings(proc) == [
+        "tcc: warning: 'struct s' has different layouts at d.c:2 (d1.o) and at d.c:5 (d2.o) ('use' uses it): "
+        "member 'a' is 'int' at offset 0 in d.c (d1.o), 'char' at offset 0 in d.c (d2.o)"
+    ]
+
+
+def test_run_links_in_memory(tmp_path):
+    """-run links in memory (this cross has nothing to run it on): compared as a link"""
+    _setup(tmp_path, DEF_OK.replace("int f(const int x)", "long f(int x)"))
+    (tmp_path / "m.c").write_text("int use(void);\nint main(void) { return use(); }\n")
+    # bare metal as the other links here: a cross configured for another
+    # target has no crt1.o / libc to link with
+    proc = _tcc(tmp_path, "-ccompat", "-Wcross-tu", "-nostdlib", "-run", "m.c", "a.c", "b.c", "st.c")
+    assert proc.returncode == 0 and _warnings(proc) == [
+        "tcc: warning: 'f' declared as 'int (int)' at api.h:1 in a.c, defined as 'long (int)' at b.c:2"
+    ]
+
+
+def test_object_does_not_depend_on_its_name(tmp_path):
+    """the signatures name the source, not the output: one compile to x.o
+    and to y.o is the same object (reproducible, and -O2 -finline-limit=N
+    vs -finline-limit=N -O2 compare equal)"""
+    (tmp_path / "s.c").write_text("int g(int a);\nint g(int a) { return a + 1; }\n")
+    for out in ("x.o", "y.o"):
+        proc = _tcc(tmp_path, "-ccompat", "-Wcross-tu", "-c", "s.c", "-o", out)
+        assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "x.o").read_bytes() == (tmp_path / "y.o").read_bytes()

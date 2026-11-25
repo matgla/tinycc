@@ -463,6 +463,54 @@ static int cprop_copy_redef_scan(TCCIRState *ir, int idx, int max_use_idx,
   return 1;
 }
 
+/* PARAMs written anywhere in the function (or every one, when inline asm
+ * could write any): cprop_copy_param's whole-function case, filled by
+ * ssa_opt_cprop for the duration of one run.  NULL: none known. */
+static uint8_t *cprop_param_written;
+static int cprop_nparams;
+
+static void cprop_params_scan(TCCIRState *ir)
+{
+  cprop_nparams = ir->parameters_count > 0 ? ir->parameters_count : 0;
+  cprop_param_written = cprop_nparams ? tcc_mallocz(cprop_nparams) : NULL;
+  if (!cprop_param_written)
+    return;
+  for (int k = 0; k < ir->next_instruction_index; k++) {
+    IRQuadCompact *kq = &ir->compact_instructions[k];
+    if (kq->op == TCCIR_OP_NOP)
+      continue;
+    if (ssa_op_is_asm_operand(kq->op)) {
+      memset(cprop_param_written, 1, cprop_nparams);
+      return;
+    }
+    if (!irop_config[kq->op].has_dest || kq->op == TCCIR_OP_FUNCPARAMVAL || kq->op == TCCIR_OP_FUNCPARAMVOID)
+      continue;
+    IROperand kd = tcc_ir_op_get_dest(ir, kq);
+    if (kq->op == TCCIR_OP_STORE_INDEXED || kq->op == TCCIR_OP_STORE_POSTINC ||
+        (kq->op == TCCIR_OP_STORE && kd.is_lval))
+      continue; /* a store through the value, not a def of it */
+    int32_t vr = irop_get_vreg(kd);
+    if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_PARAM) {
+      int pos = TCCIR_DECODE_VREG_POSITION(vr);
+      if (pos < cprop_nparams)
+        cprop_param_written[pos] = 1;
+    }
+  }
+}
+
+/* A PARAM no instruction writes, whose address is not taken: the value it
+ * arrived with, everywhere in the function */
+static int cprop_param_constant(TCCIRState *ir, int32_t src_vr)
+{
+  int pos = TCCIR_DECODE_VREG_POSITION(src_vr);
+  IRLiveInterval *li;
+  if (TCCIR_DECODE_VREG_TYPE(src_vr) != TCCIR_VREG_TYPE_PARAM || !cprop_param_written || pos >= cprop_nparams ||
+      cprop_param_written[pos])
+    return 0;
+  li = tcc_ir_vreg_live_interval(ir, src_vr);
+  return li && !li->addrtaken;
+}
+
 /* Copy of a register-resident PARAM/VAR into a single-def TEMP: forward src
  * into all uses of the TEMP and nop the copy, when every use is same-block after
  * the copy and no redef/barrier intervenes.  cprop_assign refuses PARAM/VAR
@@ -519,12 +567,20 @@ static int ssa_gen_cprop_copy_param(IRSSAOptCtx *ctx, int idx)
   IRLiveInterval *src_li = tcc_ir_vreg_live_interval(ir, src_vr);
   int src_addrtaken = (src_li && src_li->addrtaken);
 
-  /* All uses must be same-block and after the copy. */
+  /* All uses must be same-block and after the copy -- or src is a PARAM
+   * that never changes, the same value at every use (each one dominated by
+   * the copy, SSA's TEMP).  A phi's operand stays a copy (lost-copy problem,
+   * cprop_assign). */
   int max_use_idx;
   if (!cprop_copy_uses_after_in_block(ctx, dvi, idx, copy_blk, &max_use_idx))
-    return 0;
-
-  if (!cprop_copy_redef_scan(ir, idx, max_use_idx, src_vr, src_addrtaken))
+  {
+    if (!cprop_param_constant(ir, src_vr))
+      return 0;
+    for (int u = 0; u < dvi->use_count; u++)
+      if (dvi->uses[u].kind != SSA_USE_INSTR)
+        return 0;
+  }
+  else if (!cprop_copy_redef_scan(ir, idx, max_use_idx, src_vr, src_addrtaken))
     return 0;
 
   int replaced = ssa_opt_replace_all_uses(ctx, dest_vr, src_vr);
@@ -836,8 +892,11 @@ int ssa_opt_symref_operand_cse(IRSSAOptCtx *ctx)
 
 int ssa_opt_cprop(IRSSAOptCtx *ctx)
 {
+  cprop_params_scan(ctx->ir);
   int changes = ssa_opt_run_gens(ctx, cprop_gens,
                                   sizeof(cprop_gens) / sizeof(cprop_gens[0]));
+  tcc_free(cprop_param_written);
+  cprop_param_written = NULL;
   changes += ssa_opt_symref_operand_cse(ctx);
   return changes;
 }

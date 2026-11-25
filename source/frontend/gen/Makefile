@@ -14,6 +14,7 @@ GEN_INC = -I$(TOP)/source/frontend/gen
 GEN_SRC = \
 	source/frontend/gen/builtin/call.c \
 	source/frontend/gen/builtin/chk.c \
+	source/frontend/gen/builtin/fortify.c \
 	source/frontend/gen/builtin/fp.c \
 	source/frontend/gen/builtin/fp2.c \
 	source/frontend/gen/builtin/misc.c \
@@ -44,6 +45,7 @@ GEN_SRC = \
 	source/frontend/gen/expr/primary.c \
 	source/frontend/gen/expr/unary.c \
 	source/frontend/gen/expr/yasc_errors.c \
+	source/frontend/gen/expr/yasc_slices.c \
 	source/frontend/gen/init/alloc.c \
 	source/frontend/gen/init/initializer.c \
 	source/frontend/gen/inline/analysis.c \

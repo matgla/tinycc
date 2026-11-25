@@ -78,6 +78,9 @@
 #define PP_MAYBEARG 0x20  /* passed to a maybe parameter */
 #define PP_MAYBESRC 0x80  /* a local given null or a maybe value */
 #define PP_MAYBE (PP_NULLTEST | PP_MAYBEARG | PP_MAYBESRC)
+/* a local given a pointer whose target is const (an `in` parameter):
+   `const * view`, not `* view`, keeps it */
+#define PP_CONSTSRC 0x100
 /* what an alias's use says of what it aliases */
 #define PP_CARRIED (PP_FREED | PP_OWNPARAM | PP_STORED | PP_RETURNED | PP_NULLTEST | PP_MAYBEARG)
 
@@ -97,7 +100,8 @@ typedef struct PlainParam
   Sym *local; /* PPS_BODY, PPS_ALIAS: the variable in the body */
   int local_vr, local_c; /* its vreg, else frame offset (a popped Sym may be reused) */
   int alias_of; /* the id of the entry it copies, 0: none */
-  unsigned char state, flags, is_local;
+  unsigned char state, is_local;
+  unsigned short flags;
   unsigned char own_why, maybe_why; /* the first PP_OWN / PP_MAYBE seen */
   int own_line, maybe_line;
   int own_via, maybe_via; /* through this alias (a token), 0: itself */
@@ -139,18 +143,21 @@ static char pp_alt_word[80], pp_alt_text[96];
 
 /* the fix-its of the pointer of entry I: after its '*', else `*name`
    rewritten, else before the name */
-static void pp_fixits(int i, const char *name, const char *kw, const char *note)
+/* CNST: the target becomes const too, `char const * view p` (C lets the
+   const stand right before the '*') */
+static void pp_fixits(int i, const char *name, const char *kw, const char *note, int cnst)
 {
   static char fix[32], before[32];
-  snprintf(fix, sizeof fix, " %s ", kw);
+  snprintf(fix, sizeof fix, cnst ? "const * %s " : " %s ", kw);
   snprintf(before, sizeof before, "%s ", kw);
-  tcc_fixit_next(pp[i].line, "*", FIXIT_AFTER, fix, note);
+  tcc_fixit_next(pp[i].line, "*", cnst ? FIXIT_REPLACE_FIRST : FIXIT_AFTER, fix, note);
   if (!name)
     return;
   snprintf(pp_alt_word, sizeof pp_alt_word, "*%s", name);
-  snprintf(pp_alt_text, sizeof pp_alt_text, "* %s %s", kw, name);
-  tcc_fixit_next_alt(pp_alt_word, FIXIT_REPLACE, pp_alt_text);
-  tcc_fixit_next_alt(name, FIXIT_BEFORE, before);
+  snprintf(pp_alt_text, sizeof pp_alt_text, cnst ? "const * %s %s" : "* %s %s", kw, name);
+  tcc_fixit_next_alt(pp_alt_word, cnst ? FIXIT_REPLACE_FIRST : FIXIT_REPLACE, pp_alt_text);
+  if (!cnst)
+    tcc_fixit_next_alt(name, FIXIT_BEFORE, before);
 }
 
 static void pp_report(int i)
@@ -165,7 +172,7 @@ static void pp_report(int i)
   else if (pp[i].state == PPS_HELD || !name)
   {
     pp_fixits(i, name, "view",
-              "a parameter the function does not free only borrows: write '* view' ('* owned' when it frees it)");
+              "a parameter the function does not free only borrows: write '* view' ('* owned' when it frees it)", 0);
   }
   else
   {
@@ -174,6 +181,7 @@ static void pp_report(int i)
                                            "gives '%s' an owned value"};
     static const char *const kws[] = {"view", "view maybe", "owned", "owned maybe"};
     int k = ((f & PP_OWN) ? 2 : 0) | ((f & PP_MAYBE) ? 1 : 0);
+    const int cnst = !(k & 2) && (f & PP_CONSTSRC);
     kw = k & 2 ? "owned" : "view";
     if (f & PP_OWN)
     {
@@ -210,8 +218,8 @@ static void pp_report(int i)
         n += snprintf(pp_note + n, sizeof pp_note - n, " (line %d)", pp[i].maybe_line);
     }
     if (n < (int)sizeof pp_note)
-      snprintf(pp_note + n, sizeof pp_note - n, ": write '* %s%s'", kw, k & 1 ? " maybe" : "");
-    pp_fixits(i, name, kws[k], pp_note);
+      snprintf(pp_note + n, sizeof pp_note - n, ": write '%s* %s%s'", cnst ? "const " : "", kw, k & 1 ? " maybe" : "");
+    pp_fixits(i, name, kws[k], pp_note, cnst);
   }
   if (name)
     tcc_error_noabort("%i:plain pointer in yasc: say owned or view for '%s'", pp[i].line, name);
@@ -562,10 +570,16 @@ void yasc_pp_store(const SValue *dst, const SValue *val)
     /* a followed variable given a value: a copy of another (an alias, until
        it is given something else), or what the value says */
     pp[d].alias_of = i >= 0 && i != d ? pp[i].id : 0;
+    /* a copy of a parameter that becomes a view: an `in` one, a const target */
+    if (i >= 0 && i != d && pp[d].is_local && !pp[i].is_local)
+      pp[d].flags |= PP_CONSTSRC;
     if (i < 0 && pp[d].is_local && (type_yasc(&val->type) & YASC_OWNED))
       pp_set(d, PP_OWNSRC);
     if (i < 0 && pp[d].is_local && ((type_yasc(&val->type) & YASC_MAYBE) || pp_null(val)))
       pp_set(d, PP_MAYBESRC);
+    if (i < 0 && pp[d].is_local && (val->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && val->type.ref &&
+        (val->type.ref->type.t & VT_CONSTANT) && !(dst->type.ref && (dst->type.ref->type.t & VT_CONSTANT)))
+      pp[d].flags |= PP_CONSTSRC;
     return;
   }
   if (i < 0)

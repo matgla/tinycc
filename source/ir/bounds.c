@@ -59,10 +59,12 @@
 #include "cfg.h"
 
 #define AB_MAX_SITES 512
+#define AB_MAX_DEREFS 2048 /* accesses through pointers checked per function */
+#define AB_MAX_OBJS 1024   /* the frame's objects recorded per function */
 #define AB_MAX_TRACK 128
 #define AB_MAX_BLOCKS 8192
 #define AB_MAX_LOOPS 512
-#define AB_MAX_CELLS (1 << 20) /* blocks x followed vregs */
+#define AB_MAX_STATE (8 << 20) /* bytes of blocks x followed vregs states */
 #define AB_UNROLL 4096         /* iterations of one loop, unrolled */
 #define AB_BUDGET (1 << 21)    /* instructions visited per function */
 
@@ -76,18 +78,31 @@ typedef struct IRAbSite
   char type[64]; /* gcc's 'int[10]' */
 } IRAbSite;
 
+/* a local object of the frame (an array, a struct, a scalar whose address
+   is taken), for the accesses through pointers into it */
+typedef struct IRAbObj
+{
+  int off, size, tok, line;
+  int32_t vreg; /* a scalar in a vreg, whose address `&x` may be taken; -1 */
+  char type[48]; /* gcc's 'int[4]' */
+} IRAbObj;
+
 int tcc_ir_ab_active(void)
 {
   TCCState *s1 = tcc_state;
-  return s1->array_bounds_level >= 2 && ((s1->warn_array_bounds & WARN_ON) || s1->nb_diag_snaps) && !s1->warn_none;
+  return s1->array_bounds_level >= 2 && ((s1->warn_array_bounds & WARN_ON) || s1->diag_snaps_or[offsetof(TCCState, warn_array_bounds) - offsetof(TCCState, warn_none)]) && !s1->warn_none;
 }
 
 void tcc_ir_ab_begin(TCCIRState *ir)
 {
+  TCCState *s1 = tcc_state;
   ir->ab_on = tcc_ir_ab_active();
+  /* yasc's -Wlifetime follows owned pointers itself */
+  ir->ab_uaf = ((s1->warn_use_after_free & WARN_ON) || s1->nb_diag_snaps) && !s1->warn_none && !ir->lt_on;
   ir->ab_nb_sites = 0;
   ir->ab_nb_inl = 0;
   ir->ab_nb_said = 0;
+  ir->ab_nb_objs = 0;
 }
 
 void tcc_ir_ab_free(TCCIRState *ir)
@@ -101,6 +116,38 @@ void tcc_ir_ab_free(TCCIRState *ir)
   tcc_free(ir->ab_said);
   ir->ab_said = NULL;
   ir->ab_nb_said = 0;
+  tcc_free(ir->ab_objs);
+  ir->ab_objs = NULL;
+  ir->ab_nb_objs = 0;
+}
+
+void tcc_ir_ab_add_local(TCCIRState *ir, Sym *sym)
+{
+  int align, size = type_size(&sym->type, &align);
+  CType ct = sym->type;
+  if (size <= 0 || ir->ab_nb_objs >= AB_MAX_OBJS || (sym->type.t & VT_VLA))
+    return;
+  /* a parameter: only its name (one on the stack is no object we know) */
+  if ((sym->r & VT_PARAM) && sym->vreg < 0)
+    return;
+  /* -Wuse-after-free alone: the pointers' names */
+  if (!ir->ab_on && (sym->vreg < 0 || (sym->type.t & (VT_BTYPE | VT_ARRAY)) != VT_PTR))
+    return;
+  if (!(ir->ab_nb_objs & (ir->ab_nb_objs - 1)))
+    ir->ab_objs = tcc_realloc(ir->ab_objs, (ir->ab_nb_objs ? 2 * ir->ab_nb_objs : 4) * sizeof(IRAbObj));
+  IRAbObj *o = &ir->ab_objs[ir->ab_nb_objs++];
+  o->off = (int)sym->c;
+  o->size = size;
+  o->vreg = sym->vreg;
+  o->tok = (sym->v & ~SYM_STRUCT) < SYM_FIRST_ANOM ? sym->v & ~SYM_STRUCT : 0;
+  o->line = file ? file->line_num : 0;
+  o->type[0] = 0;
+  if (!ir->ab_on)
+    return;
+  ct.t &= ~(VT_STORAGE | VT_CONSTANT | VT_VOLATILE);
+  type_to_str(o->type, sizeof o->type, &ct, NULL);
+  for (char *p = o->type; (p = strstr(p, " [")) != NULL;)
+    memmove(p, p + 1, strlen(p));
 }
 
 /* the frontend's loop pattern (objsize.c) reported subscript idx at line */
@@ -169,12 +216,26 @@ void tcc_ir_ab_inline_mark(TCCIRState *ir, int begin)
 
 /* ------------------------------------------------------------------------ */
 
+/* A followed vreg's value: an integer interval [lo, hi]; or, for a pointer
+   into an object (obj != 0), its offset from the object's start in [lo, hi]
+   and the bytes left from it to the object's end in [rlo, rhi].  The two
+   intervals are kept apart because the object's size may be an interval of
+   its own (malloc(n)); a proof reads only them, so obj -- which object, 1 +
+   its index in AbCtx.objs, -1 a pointer into one of several -- only names
+   the object in the report.  An integer has obj 0 and [rlo, rhi] unknown. */
 typedef struct AbIv
 {
   int32_t lo, hi;
+  int32_t rlo, rhi;
+  int32_t obj;
+  uint8_t wide; /* over-approximated: a loop's widening, or a path that may not run */
+  uint8_t var;  /* a pointer that went through a variable or got a variable index:
+                   one the frontend's constant checks (level 1) never saw */
+  uint8_t freed; /* a deallocator released it, on every path here */
 } AbIv;
 
-#define AB_TOP ((AbIv){INT32_MIN, INT32_MAX})
+#define AB_IV(l, h) ((AbIv){(l), (h), INT32_MIN, INT32_MAX, 0, 0, 0, 0})
+#define AB_TOP AB_IV(INT32_MIN, INT32_MAX)
 
 typedef struct AbLoop
 {
@@ -186,6 +247,48 @@ typedef struct AbLoop
   uint8_t active, quiet, has_exit, back_reach;
   AbIv *back; /* what its latches send to the header */
 } AbLoop;
+
+/* an object a pointer points into, for the report */
+enum
+{
+  AB_OBJ_FRAME, /* ir->ab_objs[idx] */
+  AB_OBJ_GLOBAL,
+  AB_OBJ_ALLOC, /* the allocator's call at instruction idx */
+};
+
+typedef struct AbObjRef
+{
+  uint8_t kind;
+  int idx, line;
+  Sym *sym;
+  int64_t slo, shi; /* an allocation's size: every one seen */
+} AbObjRef;
+
+/* an access through a pointer vreg: `*p`, `p[k]` once p + k is computed */
+typedef struct AbDeref
+{
+  int at, line;
+  int32_t vreg;
+  uint8_t width;
+} AbDeref;
+
+/* what an access through a pointer was proven to do */
+typedef struct AbDHit
+{
+  uint8_t side, ranges; /* side: 1 past the end, 2 before the start */
+  uint8_t partial;      /* an access past the end that starts inside */
+  uint8_t freed;        /* -Wuse-after-free: through a pointer released on every path */
+  int obj;              /* the object, -1 several */
+  int64_t first, lo, hi; /* the offsets: the first proven, all of them */
+} AbDHit;
+
+/* a deallocator's call: the FUNCPARAMVAL of what it releases at param,
+   the vreg it passes (a temp or a variable) and the variable it copies */
+typedef struct AbFree
+{
+  int at, param, line;
+  int32_t vreg, var;
+} AbFree;
 
 /* what a subscript was proven to be */
 typedef struct AbHit
@@ -200,11 +303,11 @@ typedef struct AbCtx
 {
   TCCIRState *ir;
   IRCFG *cfg;
-  int n, nb, nt;
+  int n, nb, nt, ns; /* ns: nt + the state's flags slot (index nt) */
   int *map[4], mapn[4]; /* by vreg type, position -> slot, -1 not followed */
   AbIv *in;             /* nb x nt */
   uint8_t *reach;
-  AbIv *cur, *tmp;
+  AbIv *cur, *tmp, *tmp2;
   uint8_t *inl; /* per instruction: in an inlined body */
   int *inner;   /* per block: the innermost loop, -1 none */
   int *head_loop;
@@ -219,7 +322,19 @@ typedef struct AbCtx
   AbHit *hits;
   int act[AB_MAX_LOOPS], nact;
   int checking, abort;
+  int uaf_ok; /* -Wuse-after-free may check: every enclosing loop is in its
+                 final pass or a decided trip (its states are a fixpoint) */
   long visits;
+  AbObjRef *objs;
+  int nobjs;
+  AbDeref *derefs;
+  int nderefs;
+  int *deref_first; /* per block */
+  AbDHit *dhits;
+  AbFree *frees; /* -Wuse-after-free: the deallocators' calls */
+  int nfrees;
+  int *free_first; /* per block */
+  uint8_t *free_hit; /* per free: released twice */
 } AbCtx;
 
 static int ab_in_loop(AbCtx *c, int l, int b)
@@ -343,6 +458,8 @@ static int ab_cond(AbCtx *c, IRBasicBlock *bb, int *cond)
   return last - 1;
 }
 
+static int ab_alloc_call(AbCtx *c, int from, int at, int p[2]);
+
 /* is v followed, or computed from a followed vreg (rel) */
 static int ab_related(AbCtx *c, uint8_t **rel, int32_t v)
 {
@@ -364,8 +481,18 @@ static void ab_slice(AbCtx *c)
   uint8_t *rel[4] = {0};
   for (int t = TCCIR_VREG_TYPE_VAR; t <= TCCIR_VREG_TYPE_PARAM; t++)
     rel[t] = tcc_mallocz(c->mapn[t] + 1);
+  /* what is released first: a deref of it is only checked once it is */
+  for (int s = 0; s < c->nfrees; s++)
+  {
+    ab_follow(c, c->frees[s].vreg);
+    ab_follow(c, c->frees[s].var);
+  }
   for (int s = 0; s < c->nsites; s++)
     ab_follow(c, c->sites[s].vreg);
+  /* -Wuse-after-free alone follows only what comes from a released
+     pointer, forwards (below) */
+  for (int s = 0; ir->ab_on && s < c->nderefs; s++)
+    ab_follow(c, c->derefs[s].vreg);
   for (int pass = 0, changed = 1; changed && pass < 8; pass++)
   {
     changed = 0;
@@ -385,9 +512,18 @@ static void ab_slice(AbCtx *c)
         s2 = ab_value_vreg(tcc_ir_op_get_src2(ir, q));
         if (ab_slot(c, dv) >= 0)
         {
+          int p[2];
           changed |= ab_follow(c, s1);
           changed |= ab_follow(c, s2);
+          if (q->op == TCCIR_OP_FUNCCALLVAL && ab_alloc_call(c, bb->start_idx, i, p))
+            for (int k = 0; k < 2; k++)
+              if (p[k] >= 0)
+                changed |= ab_follow(c, ab_value_vreg(tcc_ir_op_get_src1(ir, &ir->compact_instructions[p[k]])));
         }
+        else if (!ir->ab_on && (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_STORE ||
+                                q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) &&
+                 ((s1 >= 0 && ab_slot(c, s1) >= 0) || (s2 >= 0 && ab_slot(c, s2) >= 0)))
+          changed |= ab_follow(c, dv);
         else if (!rel[TCCIR_DECODE_VREG_TYPE(dv)][TCCIR_DECODE_VREG_POSITION(dv)] &&
                  (ab_related(c, rel, s1) || ab_related(c, rel, s2)))
           rel[TCCIR_DECODE_VREG_TYPE(dv)][TCCIR_DECODE_VREG_POSITION(dv)] = 1, changed = 1;
@@ -399,7 +535,11 @@ static void ab_slice(AbCtx *c)
       int32_t x = ab_value_vreg(tcc_ir_op_get_src1(ir, tq));
       int32_t y = tq->op == TCCIR_OP_CMP ? ab_value_vreg(tcc_ir_op_get_src2(ir, tq)) : -1;
       int32_t xv = ab_copy_of(c, bb->start_idx, ci, x), yv = ab_copy_of(c, bb->start_idx, ci, y);
-      if (ab_related(c, rel, x) || ab_related(c, rel, xv) || ab_related(c, rel, y) || ab_related(c, rel, yv))
+      /* in a loop with a check in it, what decides its trips too: the
+         iterations are unrolled only while they are decided (`*p++` counted
+         by i) */
+      if ((c->inner[b] >= 0 && c->loops[c->inner[b]].has_site) || ab_related(c, rel, x) || ab_related(c, rel, xv) ||
+          ab_related(c, rel, y) || ab_related(c, rel, yv))
       {
         changed |= ab_follow(c, x);
         changed |= ab_follow(c, xv);
@@ -418,7 +558,7 @@ static AbIv ab_fit(int64_t lo, int64_t hi)
 {
   if (lo < INT32_MIN || hi > INT32_MAX || lo > hi)
     return AB_TOP;
-  return (AbIv){(int32_t)lo, (int32_t)hi};
+  return AB_IV((int32_t)lo, (int32_t)hi);
 }
 
 /* what an operand holds, in state st */
@@ -429,7 +569,7 @@ static AbIv ab_val(AbCtx *c, const AbIv *st, IROperand op)
   if (irop_is_immediate(op) && !op.is_lval)
   {
     int32_t k = (int32_t)(uint32_t)irop_get_imm64_ex(c->ir, op);
-    return (AbIv){k, k};
+    return AB_IV(k, k);
   }
   int s = ab_slot(c, ab_value_vreg(op));
   return s >= 0 ? st[s] : AB_TOP;
@@ -447,9 +587,9 @@ static AbIv ab_type_range(IROperand d)
   switch (irop_get_btype(d))
   {
   case IROP_BTYPE_INT8:
-    return d.is_unsigned ? (AbIv){0, 255} : (AbIv){-128, 127};
+    return d.is_unsigned ? AB_IV(0, 255) : AB_IV(-128, 127);
   case IROP_BTYPE_INT16:
-    return d.is_unsigned ? (AbIv){0, 65535} : (AbIv){-32768, 32767};
+    return d.is_unsigned ? AB_IV(0, 65535) : AB_IV(-32768, 32767);
   default:
     return AB_TOP;
   }
@@ -461,6 +601,264 @@ static int64_t ab_smear(int64_t v)
   while (m < v)
     m = 2 * m + 1;
   return m;
+}
+
+/* ---- pointers ----------------------------------------------------------- */
+
+/* the bytes an access of btype bt reads or writes; 0 not followed */
+static int ab_width(int bt)
+{
+  switch (bt)
+  {
+  case IROP_BTYPE_INT8:
+    return 1;
+  case IROP_BTYPE_INT16:
+    return 2;
+  case IROP_BTYPE_INT32:
+  case IROP_BTYPE_FLOAT32:
+    return 4;
+  case IROP_BTYPE_INT64:
+  case IROP_BTYPE_FLOAT64:
+    return 8;
+  default:
+    return 0;
+  }
+}
+
+
+/* the object ref (kind, idx, sym), 1 + its index; -1 when the table is full */
+static int ab_obj_ref(AbCtx *c, int kind, int idx, Sym *sym, int line)
+{
+  for (int k = 0; k < c->nobjs; k++)
+    if (c->objs[k].kind == kind && c->objs[k].idx == idx && c->objs[k].sym == sym)
+      return k + 1;
+  if (c->nobjs >= 256)
+    return -1;
+  if (!(c->nobjs & (c->nobjs - 1)))
+    c->objs = tcc_realloc(c->objs, (c->nobjs ? 2 * c->nobjs : 4) * sizeof(AbObjRef));
+  AbObjRef *o = &c->objs[c->nobjs++];
+  o->kind = kind, o->idx = idx, o->sym = sym, o->line = line;
+  o->slo = INT64_MAX, o->shi = INT64_MIN;
+  return c->nobjs;
+}
+
+/* a pointer OFF bytes into object OBJ, whose size is in [slo, shi] */
+static AbIv ab_ptr(int obj, int64_t off, int64_t slo, int64_t shi)
+{
+  AbIv v = AB_TOP;
+  v.obj = obj;
+  if (off < INT32_MIN || off > INT32_MAX)
+    return v;
+  v.lo = v.hi = (int32_t)off;
+  if (slo >= 0 && shi >= slo && shi - off <= INT32_MAX && slo - off >= INT32_MIN)
+    v.rlo = (int32_t)(slo - off), v.rhi = (int32_t)(shi - off);
+  return v;
+}
+
+/* a struct whose last member is a flexible array: an initializer may give
+   it more than its size */
+static int ab_has_flex(CType *t)
+{
+  Sym *f, *last = NULL;
+  if ((t->t & VT_BTYPE) != VT_STRUCT || !t->ref)
+    return 0;
+  for (f = t->ref->next; f; f = f->next)
+    last = f;
+  return last && (last->type.t & VT_ARRAY) && last->type.ref && last->type.ref->c <= 1;
+}
+
+/* op names a known object (a local, a global, a string literal), or a
+   place in one: *v a pointer to it */
+static int ab_object(AbCtx *c, IROperand op, AbIv *v)
+{
+  TCCIRState *ir = c->ir;
+  int tag = irop_get_tag(op);
+  if (op.is_complex)
+    return 0;
+  if (tag == IROP_TAG_STACKOFF && irop_get_vreg(op) < 0 && !op.is_param)
+  {
+    int off = irop_get_stack_offset(op), n = 0, idx = -1;
+    int64_t start = INT64_MAX, end = INT64_MIN;
+    for (int k = 0; k < ir->ab_nb_objs; k++)
+    {
+      IRAbObj *o = &ir->ab_objs[k];
+      if (o->vreg >= 0 || off < o->off || off >= o->off + o->size)
+        continue;
+      n++, idx = k;
+      if (o->off < start)
+        start = o->off;
+      if (o->off + o->size > end)
+        end = o->off + o->size;
+    }
+    if (!n)
+      return 0;
+    /* slots that scopes share: the hull of their objects, none named */
+    *v = ab_ptr(n == 1 ? ab_obj_ref(c, AB_OBJ_FRAME, idx, NULL, ir->ab_objs[idx].line) : -1, off - start,
+                end - start, end - start);
+    return 1;
+  }
+  if (tag == IROP_TAG_SYMREF)
+  {
+    IRPoolSymref *r = irop_get_symref_ex(ir, op);
+    Sym *sym = r ? r->sym : NULL;
+    int align, size;
+    /* not an extern scalar: a linker's symbol (`extern uint32_t _sdata`)
+       marks where memory starts, not an object of its type's size */
+    if (!sym || (sym->type.t & VT_BTYPE) == VT_FUNC || ab_has_flex(&sym->type) ||
+        ((sym->type.t & VT_ARRAY) && sym->type.ref && sym->type.ref->c < 0) ||
+        ((sym->type.t & VT_EXTERN) && !(sym->type.t & VT_ARRAY)))
+      return 0;
+    if ((size = type_size(&sym->type, &align)) <= 0)
+      return 0;
+    *v = ab_ptr(ab_obj_ref(c, AB_OBJ_GLOBAL, 0, sym, 0), r->addend, size, size);
+    return 1;
+  }
+  return 0;
+}
+
+/* op is the address of a known object: *v the pointer it is */
+static int ab_addr(AbCtx *c, IROperand op, AbIv *v)
+{
+  return !op.is_lval && ab_object(c, op, v);
+}
+
+/* `&x` (LEA): a struct's or array's place in the frame, a global, or a
+   scalar variable whose address is taken */
+static int ab_lea(AbCtx *c, IROperand op, AbIv *v)
+{
+  TCCIRState *ir = c->ir;
+  int32_t vr = irop_get_vreg(op);
+  int w;
+  if (vr < 0 || irop_get_tag(op) == IROP_TAG_SYMREF)
+    return ab_object(c, op, v);
+  if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR || op.is_complex || !(w = ab_width(irop_get_btype(op))))
+    return 0;
+  for (int k = 0; k < ir->ab_nb_objs; k++)
+    if (ir->ab_objs[k].vreg == vr)
+    {
+      *v = ab_ptr(ab_obj_ref(c, AB_OBJ_FRAME, k, NULL, ir->ab_objs[k].line), 0, ir->ab_objs[k].size,
+                  ir->ab_objs[k].size);
+      return 1;
+    }
+  *v = ab_ptr(-1, 0, w, w);
+  return 1;
+}
+
+/* what op holds: a known object's address, or a followed value */
+static AbIv ab_pval(AbCtx *c, IROperand op)
+{
+  AbIv v;
+  if (ab_addr(c, op, &v))
+    return v;
+  return ab_val(c, c->cur, op);
+}
+
+/* x + y (sign -1: x - y) of a pointer and an integer */
+static AbIv ab_ptr_add(AbIv p, AbIv i, int sign)
+{
+  AbIv v = AB_TOP;
+  int64_t lo = sign > 0 ? i.lo : -(int64_t)i.hi, hi = sign > 0 ? i.hi : -(int64_t)i.lo;
+  v.obj = p.obj;
+  if (i.lo == INT32_MIN || i.hi == INT32_MAX)
+    return v;
+  if (p.lo != INT32_MIN && p.hi != INT32_MAX && (int64_t)p.lo + lo >= INT32_MIN && (int64_t)p.hi + hi <= INT32_MAX)
+    v.lo = (int32_t)(p.lo + lo), v.hi = (int32_t)(p.hi + hi);
+  if (p.rlo != INT32_MIN && p.rhi != INT32_MAX && (int64_t)p.rlo - hi >= INT32_MIN && (int64_t)p.rhi - lo <= INT32_MAX)
+    v.rlo = (int32_t)(p.rlo - hi), v.rhi = (int32_t)(p.rhi - lo);
+  return v;
+}
+
+/* FUNCPARAMVAL instruction at (from at's block start) of argument idx
+   (from 0) of call call_id, whose value is unchanged up to at; -1 none */
+static int ab_param_at(AbCtx *c, int from, int at, int call_id, int idx)
+{
+  TCCIRState *ir = c->ir;
+  for (int j = at - 1; j >= from && j >= at - 64; j--)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[j];
+    if (q->op != TCCIR_OP_FUNCPARAMVAL)
+      continue;
+    int64_t e = irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+    if (TCCIR_DECODE_CALL_ID(e) != call_id || TCCIR_DECODE_PARAM_IDX(e) != idx)
+      continue;
+    int32_t v = ab_value_vreg(tcc_ir_op_get_src1(ir, q));
+    for (int k = j + 1; v >= 0 && k < at; k++)
+    {
+      IRQuadCompact *w = &ir->compact_instructions[k];
+      if (irop_config[w->op].has_dest)
+      {
+        IROperand wd = tcc_ir_op_get_dest(ir, w);
+        if (!irop_is_none(wd) && irop_dest_defines_vreg(wd) && irop_get_vreg(wd) == v)
+          return -1;
+      }
+    }
+    return j;
+  }
+  return -1;
+}
+
+/* the call at instruction at is of an allocator with a size: the
+   FUNCPARAMVAL instructions of its size arguments in p[0], p[1] (-1: none,
+   or not found), 1; 0 not an allocator */
+static int ab_alloc_call(AbCtx *c, int from, int at, int p[2])
+{
+  TCCIRState *ir = c->ir;
+  IRQuadCompact *q = &ir->compact_instructions[at];
+  IROperand f = tcc_ir_op_get_src1(ir, q);
+  int a, b;
+  p[0] = p[1] = -1;
+  if (q->op != TCCIR_OP_FUNCCALLVAL || !irop_is_sym(f) || f.is_lval)
+    return 0;
+  IRPoolSymref *r = irop_get_symref_ex(ir, f);
+  if (!r || r->addend || !objsize_alloc_size_args(r->sym, &a, &b))
+    return 0;
+  int call_id = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+  p[0] = ab_param_at(c, from, at, call_id, a - 1);
+  if (b)
+  {
+    p[1] = ab_param_at(c, from, at, call_id, b - 1);
+    if (p[1] < 0)
+      p[0] = -1;
+  }
+  return 1;
+}
+
+/* the allocator's call at instruction at: a pointer to the start of an
+   object of the size its arguments say */
+static AbIv ab_alloc(AbCtx *c, int at)
+{
+  TCCIRState *ir = c->ir;
+  IRQuadCompact *q = &ir->compact_instructions[at];
+  int p[2];
+  int from = c->cfg->blocks[c->cfg->instr_to_block[at]].start_idx;
+  if (!ab_alloc_call(c, from, at, p))
+    return AB_TOP;
+  int obj = ab_obj_ref(c, AB_OBJ_ALLOC, at, NULL, q->line_num);
+  int64_t lo = -1, hi = -1;
+  if (p[0] >= 0)
+  {
+    AbIv a = ab_val(c, c->cur, tcc_ir_op_get_src1(ir, &ir->compact_instructions[p[0]]));
+    lo = a.lo, hi = a.hi;
+    if (p[1] >= 0)
+    {
+      AbIv b = ab_val(c, c->cur, tcc_ir_op_get_src1(ir, &ir->compact_instructions[p[1]]));
+      if (a.lo >= 0 && b.lo >= 0 && a.hi != INT32_MAX && b.hi != INT32_MAX)
+        lo = (int64_t)a.lo * b.lo, hi = (int64_t)a.hi * b.hi;
+      else
+        lo = hi = -1;
+    }
+    if (lo < 0 || hi == INT32_MAX || hi > INT32_MAX)
+      lo = hi = -1;
+  }
+  if (obj > 0 && lo >= 0)
+  {
+    AbObjRef *o = &c->objs[obj - 1];
+    if (lo < o->slo)
+      o->slo = lo;
+    if (hi > o->shi)
+      o->shi = hi;
+  }
+  return ab_ptr(obj, 0, lo, hi);
 }
 
 /* the value instruction q computes, in the current state */
@@ -475,7 +873,10 @@ static AbIv ab_eval(AbCtx *c, IRQuadCompact *q, IROperand d)
   {
   case TCCIR_OP_ASSIGN:
   case TCCIR_OP_LOAD:
-    return ab_val(c, c->cur, s1);
+  case TCCIR_OP_STORE: /* into a vreg: a parameter's new value */
+    return ab_pval(c, s1);
+  case TCCIR_OP_LEA:
+    return ab_lea(c, s1, &a) ? a : AB_TOP;
   case TCCIR_OP_ZEXT:
   {
     int w = 32;
@@ -492,7 +893,7 @@ static AbIv ab_eval(AbCtx *c, IRQuadCompact *q, IROperand d)
       return a;
     if (a.lo >= 0 && a.hi < (1 << w))
       return a;
-    return (AbIv){0, (1 << w) - 1};
+    return AB_IV(0, (1 << w) - 1);
   }
   case TCCIR_OP_ADD:
   case TCCIR_OP_SUB:
@@ -512,7 +913,26 @@ static AbIv ab_eval(AbCtx *c, IRQuadCompact *q, IROperand d)
   default:
     return AB_TOP;
   }
-  a = ab_val(c, c->cur, s1), b = ab_val(c, c->cur, s2);
+  if (q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB)
+  {
+    a = ab_pval(c, s1), b = ab_pval(c, s2);
+    if (a.obj && !b.obj)
+    {
+      AbIv r = ab_ptr_add(a, b, q->op == TCCIR_OP_ADD ? 1 : -1);
+      r.var = a.var || b.lo != b.hi || ab_slot(c, ab_value_vreg(s2)) >= 0;
+      return r;
+    }
+    if (b.obj && !a.obj && q->op == TCCIR_OP_ADD)
+    {
+      AbIv r = ab_ptr_add(b, a, 1);
+      r.var = b.var || a.lo != a.hi || ab_slot(c, ab_value_vreg(s1)) >= 0;
+      return r;
+    }
+    if (a.obj || b.obj)
+      return AB_TOP; /* p - q */
+  }
+  else
+    a = ab_val(c, c->cur, s1), b = ab_val(c, c->cur, s2);
   switch (q->op)
   {
   case TCCIR_OP_ADD:
@@ -532,24 +952,24 @@ static AbIv ab_eval(AbCtx *c, IRQuadCompact *q, IROperand d)
   case TCCIR_OP_SAR:
     if (!ab_const(b, &k) || k < 0 || k > 31)
       return AB_TOP;
-    return (AbIv){a.lo >> k, a.hi >> k};
+    return AB_IV(a.lo >> k, a.hi >> k);
   case TCCIR_OP_SHR:
     if (!ab_const(b, &k) || k < 0 || k > 31)
       return AB_TOP;
     if (k == 0)
       return a;
     if (a.lo >= 0)
-      return (AbIv){a.lo >> k, a.hi >> k};
+      return AB_IV(a.lo >> k, a.hi >> k);
     if (a.hi < 0)
-      return (AbIv){(int32_t)((uint32_t)a.lo >> k), (int32_t)((uint32_t)a.hi >> k)};
-    return (AbIv){0, (int32_t)(0xffffffffu >> k)};
+      return AB_IV((int32_t)((uint32_t)a.lo >> k), (int32_t)((uint32_t)a.hi >> k));
+    return AB_IV(0, (int32_t)(0xffffffffu >> k));
   case TCCIR_OP_AND:
     if (a.lo >= 0 && b.lo >= 0)
-      return (AbIv){0, a.hi < b.hi ? a.hi : b.hi};
+      return AB_IV(0, a.hi < b.hi ? a.hi : b.hi);
     if (a.lo >= 0)
-      return (AbIv){0, a.hi};
+      return AB_IV(0, a.hi);
     if (b.lo >= 0)
-      return (AbIv){0, b.hi};
+      return AB_IV(0, b.hi);
     return AB_TOP;
   case TCCIR_OP_OR:
   case TCCIR_OP_XOR:
@@ -569,10 +989,10 @@ static AbIv ab_eval(AbCtx *c, IRQuadCompact *q, IROperand d)
     if (!ab_const(b, &k) || k <= 0)
       return AB_TOP;
     if (a.lo >= 0)
-      return (AbIv){a.lo / k, a.hi / k};
+      return AB_IV(a.lo / k, a.hi / k);
     if (k == 1)
       return a;
-    return (AbIv){0, (int32_t)(0xffffffffu / (uint32_t)k)};
+    return AB_IV(0, (int32_t)(0xffffffffu / (uint32_t)k));
   case TCCIR_OP_IMOD:
   {
     int64_t m;
@@ -592,8 +1012,8 @@ static AbIv ab_eval(AbCtx *c, IRQuadCompact *q, IROperand d)
     if (b.lo <= 0)
       return a.lo >= 0 && b.hi < 0 ? a : AB_TOP;
     if (a.lo >= 0)
-      return (AbIv){0, a.hi < b.hi - 1 ? a.hi : b.hi - 1};
-    return (AbIv){0, b.hi - 1};
+      return AB_IV(0, a.hi < b.hi - 1 ? a.hi : b.hi - 1);
+    return AB_IV(0, b.hi - 1);
   default:
     return AB_TOP;
   }
@@ -612,10 +1032,58 @@ static void ab_instr(AbCtx *c, int i)
   int s = ab_slot(c, irop_get_vreg(d));
   if (s < 0)
     return;
-  AbIv r = c->inl[i] || !ab_int_op(d) ? AB_TOP : ab_eval(c, q, d);
+  AbIv r;
+  if (c->inl[i] || !ab_int_op(d))
+    r = AB_TOP;
+  else if (!ir->ab_on)
+  {
+    /* -Wuse-after-free alone: no ranges, a released pointer through
+       copies and p + k */
+    int s1 = ab_slot(c, ab_value_vreg(tcc_ir_op_get_src1(ir, q)));
+    int s2 = irop_config[q->op].has_src2 ? ab_slot(c, ab_value_vreg(tcc_ir_op_get_src2(ir, q))) : -1;
+    r = AB_TOP;
+    if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_ADD ||
+        q->op == TCCIR_OP_SUB)
+      r.freed = (s1 >= 0 && c->cur[s1].freed) || (s2 >= 0 && c->cur[s2].freed);
+    c->cur[s] = r;
+    return;
+  }
+  else if (q->op == TCCIR_OP_FUNCCALLVAL)
+    r = ab_alloc(c, i);
+  else
+  {
+    r = ab_eval(c, q, d);
+    /* a pointer survives copies and + / - of an integer only */
+    if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LOAD && q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_ADD &&
+        q->op != TCCIR_OP_SUB && q->op != TCCIR_OP_LEA)
+      r.rlo = INT32_MIN, r.rhi = INT32_MAX, r.obj = 0;
+  }
   AbIv t = ab_type_range(d);
   if (r.lo < t.lo || r.hi > t.hi)
     r = t;
+  /* over-approximated when what it is computed from is, or on a path that
+     may not run */
+  {
+    int s1 = ab_slot(c, ab_value_vreg(tcc_ir_op_get_src1(ir, q)));
+    int s2 = irop_config[q->op].has_src2 ? ab_slot(c, ab_value_vreg(tcc_ir_op_get_src2(ir, q))) : -1;
+    r.wide = (s1 >= 0 && c->cur[s1].wide) || (s2 >= 0 && c->cur[s2].wide) || c->cur[c->nt].lo;
+    if (q->op == TCCIR_OP_FUNCCALLVAL)
+      r.wide |= c->cur[c->nt].lo;
+  }
+  {
+    int vt = TCCIR_DECODE_VREG_TYPE(irop_get_vreg(d));
+    if (r.obj && (vt == TCCIR_VREG_TYPE_VAR || vt == TCCIR_VREG_TYPE_PARAM))
+      r.var = 1;
+  }
+  /* a released pointer stays one through p + k (`p->next`) */
+  if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) && !c->inl[i])
+  {
+    int s1 = ab_slot(c, ab_value_vreg(tcc_ir_op_get_src1(ir, q)));
+    int s2 = ab_slot(c, ab_value_vreg(tcc_ir_op_get_src2(ir, q)));
+    r.freed = (s1 >= 0 && c->cur[s1].freed) || (s2 >= 0 && c->cur[s2].freed);
+  }
+  else if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LOAD && q->op != TCCIR_OP_STORE)
+    r.freed = 0;
   c->cur[s] = r;
 }
 
@@ -709,6 +1177,9 @@ static int ab_narrow(AbCtx *c, AbIv *st, int from, int ci, int cond)
   IROperand xo = tcc_ir_op_get_src1(ir, tq);
   IROperand yo = tq->op == TCCIR_OP_CMP ? tcc_ir_op_get_src2(ir, tq) : irop_make_imm32(-1, 0, IROP_BTYPE_INT32);
   AbIv x = ab_val(c, st, xo), y = ab_val(c, st, yo);
+  /* pointers: offsets compare only within one object */
+  if ((x.obj || y.obj) && !(x.obj == y.obj && x.obj > 0))
+    return 1;
   if (!ab_constrain(&x, cond, &y))
     return 0;
   for (int k = 0; k < 2; k++)
@@ -735,6 +1206,24 @@ static int ab_narrow(AbCtx *c, AbIv *st, int from, int ci, int cond)
 
 /* ---- the walk ----------------------------------------------------------- */
 
+/* *d grows to hold *v too */
+static void ab_hull(AbIv *d, const AbIv *v)
+{
+  if (v->lo < d->lo)
+    d->lo = v->lo;
+  if (v->hi > d->hi)
+    d->hi = v->hi;
+  if (v->rlo < d->rlo)
+    d->rlo = v->rlo;
+  if (v->rhi > d->rhi)
+    d->rhi = v->rhi;
+  if (v->obj != d->obj)
+    d->obj = -1;
+  d->wide |= v->wide;
+  d->var |= v->var;
+  d->freed &= v->freed;
+}
+
 static void ab_join(AbIv *dst, uint8_t *reached, const AbIv *src, int nt)
 {
   if (!*reached)
@@ -744,12 +1233,19 @@ static void ab_join(AbIv *dst, uint8_t *reached, const AbIv *src, int nt)
     return;
   }
   for (int s = 0; s < nt; s++)
-  {
-    if (src[s].lo < dst[s].lo)
-      dst[s].lo = src[s].lo;
-    if (src[s].hi > dst[s].hi)
-      dst[s].hi = src[s].hi;
-  }
+    ab_hull(&dst[s], &src[s]);
+}
+
+/* the widening of one bound after two plain joins: to 0 / -1 when the sign
+   holds, else to the type's end */
+static int32_t ab_widen_lo(int32_t h, int32_t n, int k)
+{
+  return k < 2 ? n : n >= 0 && h >= 0 ? 0 : INT32_MIN;
+}
+
+static int32_t ab_widen_hi(int32_t h, int32_t n, int k)
+{
+  return k < 2 ? n : n < 0 && h < 0 ? -1 : INT32_MAX;
 }
 
 /* state st leaves along an edge to block `to` (-1: out of the function) */
@@ -762,7 +1258,7 @@ static void ab_edge(AbCtx *c, int to, const AbIv *st)
     if (to >= 0 && to == l->head)
     {
       if (!drop)
-        ab_join(l->back, &l->back_reach, st, c->nt);
+        ab_join(l->back, &l->back_reach, st, c->ns);
       return;
     }
     if (to >= 0 && ab_in_loop(c, c->act[k], to))
@@ -772,7 +1268,7 @@ static void ab_edge(AbCtx *c, int to, const AbIv *st)
       drop = 1;
   }
   if (!drop && to >= 0)
-    ab_join(&c->in[(size_t)to * c->nt], &c->reach[to], st, c->nt);
+    ab_join(&c->in[(size_t)to * c->ns], &c->reach[to], st, c->ns);
 }
 
 /* subscript s, in the current state */
@@ -784,6 +1280,8 @@ static void ab_check(AbCtx *c, int si)
   AbIv v = slot >= 0 ? c->cur[slot] : AB_TOP;
   int64_t lo = v.lo, hi = v.hi, max = (int64_t)s->n - 1 + s->one_past;
   int side;
+  if (c->cur[c->nt].lo)
+    return; /* the path may not run */
   if (s->is_unsigned)
   {
     if (v.hi < 0)
@@ -814,22 +1312,103 @@ static void ab_check(AbCtx *c, int si)
     h->ranges = 1;
 }
 
+/* access di through a pointer, in the current state */
+static void ab_dcheck(AbCtx *c, int di)
+{
+  AbDeref *d = &c->derefs[di];
+  AbDHit *h = &c->dhits[di];
+  int slot = ab_slot(c, d->vreg), side;
+  if (slot < 0 || c->cur[c->nt].lo)
+    return;
+  AbIv v = c->cur[slot];
+  if (v.freed && c->ir->ab_uaf && c->uaf_ok)
+    h->freed = 1;
+  if (!c->checking || !c->ir->ab_on || !v.obj || !v.var)
+    return;
+  /* proven: every offset it may have is past the end, or before the start */
+  if (v.rhi != INT32_MAX && (int64_t)v.rhi < d->width)
+    side = 1;
+  else if (v.hi < 0)
+    side = 2;
+  else
+    return;
+  if (v.lo == INT32_MIN || v.hi == INT32_MAX)
+    return; /* the offset itself is unknown: say nothing that would need it */
+  if (!h->side)
+  {
+    h->side = side, h->lo = v.lo, h->hi = v.hi, h->first = v.lo, h->obj = v.obj;
+  }
+  else if (h->side == side)
+  {
+    if (v.lo < h->lo)
+      h->lo = v.lo;
+    if (v.hi > h->hi)
+      h->hi = v.hi;
+    if (v.obj != h->obj)
+      h->obj = -1;
+  }
+  else
+    return;
+  if (v.lo != v.hi)
+    h->ranges = 1;
+  if (side == 1 && v.rhi > 0)
+    h->partial = 1;
+}
+
+/* free fi runs: what it releases was released on every path already (a
+   second free), and is released from here on */
+static void ab_free(AbCtx *c, int fi)
+{
+  AbFree *f = &c->frees[fi];
+  int s = ab_slot(c, f->vreg), sv = ab_slot(c, f->var);
+  if (c->uaf_ok && !c->cur[c->nt].lo && ((s >= 0 && c->cur[s].freed) || (sv >= 0 && c->cur[sv].freed)))
+    c->free_hit[fi] = 1;
+  if (s >= 0)
+    c->cur[s].freed = 1;
+  if (sv >= 0)
+    c->cur[sv].freed = 1;
+}
+
+/* is the comparison at ci on an over-approximated value */
+static int ab_cond_wide(AbCtx *c, int from, int ci)
+{
+  TCCIRState *ir = c->ir;
+  IRQuadCompact *tq = &ir->compact_instructions[ci];
+  for (int k = 0; k < 2; k++)
+  {
+    if (k && tq->op != TCCIR_OP_CMP)
+      break;
+    int32_t r = ab_value_vreg(k ? tcc_ir_op_get_src2(ir, tq) : tcc_ir_op_get_src1(ir, tq));
+    int s = ab_slot(c, r), sv = ab_slot(c, ab_copy_of(c, from, ci, r));
+    if ((s >= 0 && c->cur[s].wide) || (sv >= 0 && c->cur[sv].wide))
+      return 1;
+  }
+  return 0;
+}
+
 static void ab_block(AbCtx *c, int b)
 {
   TCCIRState *ir = c->ir;
   IRBasicBlock *bb = &c->cfg->blocks[b];
-  int si = c->site_first[b], last = bb->end_idx - 1, cond, ci;
-  if ((c->visits += bb->end_idx - bb->start_idx) > AB_BUDGET)
+  int si = c->site_first[b], di = c->deref_first[b], fi = c->free_first[b], last = bb->end_idx - 1, cond, ci;
+  /* the budget is time: a block's instructions, and its state copied in
+     (and out on each edge), which grows with what is followed */
+  if ((c->visits += bb->end_idx - bb->start_idx + (c->ns >> 3)) > AB_BUDGET)
   {
     c->abort = 1;
     return;
   }
-  memcpy(c->cur, &c->in[(size_t)b * c->nt], c->nt * sizeof(AbIv));
+  memcpy(c->cur, &c->in[(size_t)b * c->ns], c->ns * sizeof(AbIv));
   for (int i = bb->start_idx; i < bb->end_idx; i++)
   {
     for (; si < c->nsites && c->sites[si].start == i; si++)
       if (c->checking)
         ab_check(c, si);
+    for (; di < c->nderefs && c->derefs[di].at == i; di++)
+      if (c->checking || c->uaf_ok)
+        ab_dcheck(c, di);
+    for (; fi < c->nfrees && c->frees[fi].at == i; fi++)
+      ab_free(c, fi);
     ab_instr(c, i);
   }
   IRQuadCompact *lq = &ir->compact_instructions[last];
@@ -843,18 +1422,30 @@ static void ab_block(AbCtx *c, int b)
   {
     int t = (int)tcc_ir_op_dest_imm(ir, lq);
     int tb = t >= 0 && t < c->n ? c->cfg->instr_to_block[t] : -1;
-    if ((ci = ab_cond(c, bb, &cond)) < 0)
+    if (!ir->ab_on || (ci = ab_cond(c, bb, &cond)) < 0)
     {
       ab_edge(c, tb, c->cur);
       ab_edge(c, next, c->cur);
       return;
     }
-    memcpy(c->tmp, c->cur, c->nt * sizeof(AbIv));
-    if (ab_narrow(c, c->tmp, bb->start_idx, ci, cond))
+    memcpy(c->tmp, c->cur, c->ns * sizeof(AbIv));
+    memcpy(c->tmp2, c->cur, c->ns * sizeof(AbIv));
+    int ok1 = ab_narrow(c, c->tmp, bb->start_idx, ci, cond);
+    int ok2 = ab_narrow(c, c->tmp2, bb->start_idx, ci, ab_negate(cond));
+    /* undecided on an over-approximated value: the edge may never be
+       taken -- unless it leaves the loop, which it does once it ends */
+    if (ok1 && ok2 && ab_cond_wide(c, bb->start_idx, ci))
+    {
+      int l = c->inner[b];
+      if (l < 0 || (tb >= 0 && ab_in_loop(c, l, tb)))
+        c->tmp[c->nt].lo = 1;
+      if (l < 0 || (next >= 0 && ab_in_loop(c, l, next)))
+        c->tmp2[c->nt].lo = 1;
+    }
+    if (ok1)
       ab_edge(c, tb, c->tmp);
-    memcpy(c->tmp, c->cur, c->nt * sizeof(AbIv));
-    if (ab_narrow(c, c->tmp, bb->start_idx, ci, ab_negate(cond)))
-      ab_edge(c, next, c->tmp);
+    if (ok2)
+      ab_edge(c, next, c->tmp2);
   }
   else if (lq->op == TCCIR_OP_RETURNVALUE || lq->op == TCCIR_OP_RETURNVOID)
     ab_edge(c, -1, c->cur);
@@ -893,7 +1484,7 @@ static void ab_pass(AbCtx *c, AbLoop *l, const AbIv *h)
 {
   for (int k = 0; k < l->nbody; k++)
     c->reach[l->body[k]] = 0;
-  memcpy(&c->in[(size_t)l->head * c->nt], h, c->nt * sizeof(AbIv));
+  memcpy(&c->in[(size_t)l->head * c->ns], h, c->ns * sizeof(AbIv));
   c->reach[l->head] = 1;
   l->back_reach = 0;
   l->has_exit = 0;
@@ -903,7 +1494,8 @@ static void ab_pass(AbCtx *c, AbLoop *l, const AbIv *h)
 static int ab_leq(const AbIv *a, const AbIv *b, int nt)
 {
   for (int s = 0; s < nt; s++)
-    if (a[s].lo < b[s].lo || a[s].hi > b[s].hi)
+    if (a[s].lo < b[s].lo || a[s].hi > b[s].hi || a[s].rlo < b[s].rlo || a[s].rhi > b[s].rhi ||
+        (a[s].obj != b[s].obj && b[s].obj != -1) || a[s].freed < b[s].freed)
       return 0;
   return 1;
 }
@@ -911,7 +1503,7 @@ static int ab_leq(const AbIv *a, const AbIv *b, int nt)
 static void ab_loop(AbCtx *c, int li)
 {
   AbLoop *l = &c->loops[li];
-  const int nt = c->nt;
+  const int nt = c->ns;
   const size_t sz = nt * sizeof(AbIv);
   AbIv *h = tcc_malloc(3 * sz), *h0 = h + nt, *nh = h + 2 * nt;
   memcpy(h, &c->in[(size_t)l->head * nt], sz);
@@ -937,9 +1529,10 @@ static void ab_loop(AbCtx *c, int li)
 
   /* the rest: widen to a post-fixpoint, narrow, then the final pass */
   {
-    const int saved_checking = c->checking;
+    const int saved_checking = c->checking, saved_uaf = c->uaf_ok;
     memcpy(h0, h, sz);
     c->checking = 0;
+    c->uaf_ok = 0;
     l->quiet = 1;
     for (int k = 0; !c->abort; k++)
     {
@@ -947,47 +1540,53 @@ static void ab_loop(AbCtx *c, int li)
       memcpy(nh, h0, sz);
       if (l->back_reach)
         for (int s = 0; s < nt; s++)
-        {
-          if (l->back[s].lo < nh[s].lo)
-            nh[s].lo = l->back[s].lo;
-          if (l->back[s].hi > nh[s].hi)
-            nh[s].hi = l->back[s].hi;
-        }
+          ab_hull(&nh[s], &l->back[s]);
       if (ab_leq(nh, h, nt))
         break;
       for (int s = 0; s < nt; s++)
       {
         if (nh[s].lo < h[s].lo)
-          h[s].lo = k < 2 ? nh[s].lo : nh[s].lo >= 0 && h[s].lo >= 0 ? 0 : INT32_MIN;
+          h[s].lo = ab_widen_lo(h[s].lo, nh[s].lo, k);
         if (nh[s].hi > h[s].hi)
-          h[s].hi = k < 2 ? nh[s].hi : nh[s].hi < 0 && h[s].hi < 0 ? -1 : INT32_MAX;
+          h[s].hi = ab_widen_hi(h[s].hi, nh[s].hi, k);
+        if (nh[s].rlo < h[s].rlo)
+          h[s].rlo = ab_widen_lo(h[s].rlo, nh[s].rlo, k);
+        if (nh[s].rhi > h[s].rhi)
+          h[s].rhi = ab_widen_hi(h[s].rhi, nh[s].rhi, k);
+        if (nh[s].obj != h[s].obj)
+          h[s].obj = -1;
+        h[s].freed &= nh[s].freed;
       }
     }
-    for (int k = 0; k < 2 && !c->abort; k++)
+    for (int k = 0; k < 2 && !c->abort && c->ir->ab_on; k++)
     {
       ab_pass(c, l, h);
       memcpy(nh, h0, sz);
       if (l->back_reach)
         for (int s = 0; s < nt; s++)
-        {
-          if (l->back[s].lo < nh[s].lo)
-            nh[s].lo = l->back[s].lo;
-          if (l->back[s].hi > nh[s].hi)
-            nh[s].hi = l->back[s].hi;
-        }
+          ab_hull(&nh[s], &l->back[s]);
       for (int s = 0; s < nt; s++)
       {
         if (nh[s].lo > h[s].lo)
           h[s].lo = nh[s].lo;
         if (nh[s].hi < h[s].hi)
           h[s].hi = nh[s].hi;
+        if (nh[s].rlo > h[s].rlo)
+          h[s].rlo = nh[s].rlo;
+        if (nh[s].rhi < h[s].rhi)
+          h[s].rhi = nh[s].rhi;
       }
     }
+    /* what the loop carries is over-approximated from here on */
+    for (int s = 0; s < c->nt; s++)
+      if (h[s].lo != h0[s].lo || h[s].hi != h0[s].hi || h[s].rlo != h0[s].rlo || h[s].rhi != h0[s].rhi)
+        h[s].wide = 1;
     /* the final pass lets states out, and checks nothing: the trips it
        stands for happen only for some values of what is unknown (`j < n`
        past the trips the header decided), so even a range entirely out of
        bounds there is not proven on a path that is known to run */
     l->quiet = 0;
+    c->uaf_ok = saved_uaf; /* the released bits are a fixpoint now */
     if (!c->abort)
       ab_pass(c, l, h);
     c->checking = saved_checking;
@@ -1161,6 +1760,227 @@ static void ab_report(AbCtx *c)
   }
 }
 
+/* the accesses through pointer vregs, in order: not in an inlined body, not
+   on a line whose subscript the index check follows (`a[i]` is both) */
+static void ab_collect_derefs(AbCtx *c)
+{
+  TCCIRState *ir = c->ir;
+  for (int i = 0; i < c->n && c->nderefs < AB_MAX_DEREFS; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (c->inl[i] || q->op == TCCIR_OP_NOP)
+      continue;
+    for (int role = 0; role < 3; role++)
+    {
+      IROperand op;
+      if (role == 0 && irop_config[q->op].has_dest)
+        op = tcc_ir_op_get_dest(ir, q);
+      else if (role == 1 && irop_config[q->op].has_src1)
+        op = tcc_ir_op_get_src1(ir, q);
+      else if (role == 2 && irop_config[q->op].has_src2)
+        op = tcc_ir_op_get_src2(ir, q);
+      else
+        continue;
+      int32_t v;
+      int w, line = q->line_num, dup = 0;
+      if (irop_is_none(op) || irop_get_tag(op) != IROP_TAG_VREG || !op.is_lval || op.is_complex ||
+          (v = irop_get_vreg(op)) < 0 || !(w = ab_width(irop_get_btype(op))))
+        continue;
+      for (int k = 0; k < c->nsites && !dup; k++)
+        dup = c->sites[k].line == line;
+      for (int k = c->nderefs - 1; k >= 0 && c->derefs[k].at == i && !dup; k--)
+        dup = c->derefs[k].vreg == v;
+      if (dup)
+        continue;
+      if (!(c->nderefs & (c->nderefs - 1)))
+        c->derefs = tcc_realloc(c->derefs, (c->nderefs ? 2 * c->nderefs : 4) * sizeof(AbDeref));
+      AbDeref *d = &c->derefs[c->nderefs++];
+      d->at = i, d->line = line, d->vreg = v, d->width = (uint8_t)w;
+    }
+  }
+}
+
+/* the call at instruction at releases its argument: the argument's index
+   (from 0), the call's id; -1 not a deallocator */
+static int ab_dealloc_call(TCCIRState *ir, int at, int *call_id)
+{
+  IRQuadCompact *q = &ir->compact_instructions[at];
+  IROperand f;
+  int k;
+  if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
+    return -1;
+  f = tcc_ir_op_get_src1(ir, q);
+  if (!irop_is_sym(f) || f.is_lval)
+    return -1;
+  IRPoolSymref *r = irop_get_symref_ex(ir, f);
+  if (!r || r->addend || !(k = objsize_dealloc_arg(r->sym)))
+    return -1;
+  *call_id = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+  return k - 1;
+}
+
+/* the deallocators' calls, in order (not in an inlined body) */
+static void ab_collect_frees(AbCtx *c)
+{
+  TCCIRState *ir = c->ir;
+  for (int i = 0; i < c->n && c->nfrees < AB_MAX_DEREFS; i++)
+  {
+    int call_id, k = c->inl[i] ? -1 : ab_dealloc_call(ir, i, &call_id);
+    if (k < 0)
+      continue;
+    int from = c->cfg->blocks[c->cfg->instr_to_block[i]].start_idx;
+    int j = ab_param_at(c, from, i, call_id, k);
+    int32_t v = j >= 0 ? ab_value_vreg(tcc_ir_op_get_src1(ir, &ir->compact_instructions[j])) : -1;
+    if (v < 0)
+      continue;
+    if (!(c->nfrees & (c->nfrees - 1)))
+      c->frees = tcc_realloc(c->frees, (c->nfrees ? 2 * c->nfrees : 4) * sizeof(AbFree));
+    AbFree *f = &c->frees[c->nfrees++];
+    f->at = i, f->param = j, f->line = ir->compact_instructions[i].line_num, f->vreg = v;
+    f->var = TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_TEMP ? ab_copy_of(c, from, j, v) : v;
+  }
+}
+
+/* the name of the variable vreg v is, or copies or offsets (`p->next`) at
+   instruction at; NULL */
+static const char *ab_var_name(AbCtx *c, int at, int32_t v)
+{
+  TCCIRState *ir = c->ir;
+  const int from = c->cfg->blocks[c->cfg->instr_to_block[at]].start_idx;
+  for (int depth = 0; v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_TEMP && depth < 4; depth++)
+  {
+    int32_t w = -1;
+    for (int j = at - 1; j >= from && j >= at - 16 && w < 0; j--)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[j];
+      if (!irop_config[q->op].has_dest)
+        continue;
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      if (irop_is_none(d) || !irop_dest_defines_vreg(d) || irop_get_vreg(d) != v)
+        continue;
+      if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB)
+        w = ab_value_vreg(tcc_ir_op_get_src1(ir, q));
+      if (w < 0 && (q->op == TCCIR_OP_ADD))
+        w = ab_value_vreg(tcc_ir_op_get_src2(ir, q));
+      at = j;
+      break;
+    }
+    v = w;
+  }
+  for (int k = 0; v >= 0 && k < ir->ab_nb_objs; k++)
+    if (ir->ab_objs[k].vreg == v && ir->ab_objs[k].tok)
+      return get_tok_str(ir->ab_objs[k].tok, NULL);
+  return NULL;
+}
+
+/* -Wuse-after-free's reports */
+static void ab_freport(AbCtx *c)
+{
+  for (int i = 0; i < c->nderefs; i++)
+  {
+    AbDeref *d = &c->derefs[i];
+    const char *name;
+    if (!c->dhits[i].freed)
+      continue;
+    name = ab_var_name(c, d->at, d->vreg);
+    if (name)
+      tcc_warning_once_at(warn_use_after_free, d->line, "'%s' is used after it was freed", name);
+    else
+      tcc_warning_once_at(warn_use_after_free, d->line, "a pointer is used after it was freed");
+  }
+  for (int i = 0; i < c->nfrees; i++)
+  {
+    AbFree *f = &c->frees[i];
+    const char *name;
+    if (!c->free_hit[i])
+      continue;
+    name = ab_var_name(c, f->param, f->vreg);
+    if (name)
+      tcc_warning_once_at(warn_use_after_free, f->line, "'%s' is freed twice", name);
+    else
+      tcc_warning_once_at(warn_use_after_free, f->line, "a pointer is freed twice");
+  }
+}
+
+static void ab_dreport(AbCtx *c)
+{
+  TCCIRState *ir = c->ir;
+  for (int i = 0; i < c->nderefs; i++)
+  {
+    AbDeref *d = &c->derefs[i];
+    AbDHit *h = &c->dhits[i];
+    AbObjRef *o = h->obj > 0 ? &c->objs[h->obj - 1] : NULL;
+    const char *name = NULL;
+    char type[64] = "", size[48] = "";
+    int w = d->width, decl = 0, bytes = -1;
+    const int aligned = h->lo % w == 0 && h->hi % w == 0 && !h->partial;
+    if (!h->side)
+      continue;
+    if (o && o->kind == AB_OBJ_FRAME)
+    {
+      IRAbObj *fo = &ir->ab_objs[o->idx];
+      name = fo->tok ? get_tok_str(fo->tok, NULL) : NULL;
+      pstrcpy(type, sizeof type, fo->type);
+      decl = fo->line, bytes = fo->size;
+    }
+    else if (o && o->kind == AB_OBJ_GLOBAL)
+    {
+      CType ct = o->sym->type;
+      int align;
+      name = (o->sym->v & ~SYM_STRUCT) < SYM_FIRST_ANOM ? get_tok_str(o->sym->v, NULL) : NULL;
+      bytes = type_size(&o->sym->type, &align);
+      ct.t &= ~(VT_STORAGE | VT_CONSTANT | VT_VOLATILE);
+      type_to_str(type, sizeof type - 4, &ct, NULL);
+      for (char *p = type; (p = strstr(p, " [")) != NULL;)
+        memmove(p, p + 1, strlen(p));
+    }
+    else if (o && o->kind == AB_OBJ_ALLOC && o->slo <= o->shi)
+    {
+      if (o->slo == o->shi)
+        snprintf(size, sizeof size, "%lld bytes", (long long)o->shi);
+      else
+        snprintf(size, sizeof size, "%lld to %lld bytes", (long long)o->slo, (long long)o->shi);
+    }
+    if (type[0] && !strchr(type, '['))
+      pstrcat(type, sizeof type, "[1]");
+    if (aligned && type[0] && h->ranges)
+      tcc_warning_once_at(warn_array_bounds, d->line, "array subscript [%lld, %lld] is outside array bounds of '%s'",
+                          (long long)(h->lo / w), (long long)(h->hi / w), type);
+    else if (aligned && type[0])
+      tcc_warning_once_at(warn_array_bounds, d->line, "array subscript %lld is outside array bounds of '%s'",
+                          (long long)(h->first / w), type);
+    else if (aligned && size[0] && h->ranges)
+      tcc_warning_once_at(warn_array_bounds, d->line, "array subscript [%lld, %lld] is outside the %s allocated",
+                          (long long)(h->lo / w), (long long)(h->hi / w), size);
+    else if (aligned && size[0])
+      tcc_warning_once_at(warn_array_bounds, d->line, "array subscript %lld is outside the %s allocated",
+                          (long long)(h->first / w), size);
+    else if (name && bytes > 0)
+      tcc_warning_once_at(warn_array_bounds, d->line, "access of %d bytes at offset %lld is outside '%s' (%d bytes)", w,
+                          (long long)h->first, name, bytes);
+    else if (size[0])
+      tcc_warning_once_at(warn_array_bounds, d->line, "access of %d bytes at offset %lld is outside the %s allocated", w,
+                          (long long)h->first, size);
+    else
+      tcc_warning_once_at(warn_array_bounds, d->line, "access of %d bytes at offset %lld is %s the object it points into",
+                          w, (long long)h->first, h->side == 1 ? "past the end of" : "before the start of");
+    if (name && decl)
+      tcc_note("%i:'%s' declared here", decl, name);
+    else if (o && o->kind == AB_OBJ_ALLOC && o->line)
+      tcc_note("%i:allocated here", o->line);
+    if (aligned && h->lo == h->hi)
+      tcc_note("%i:the subscript is %lld on a path that reaches it", d->line, (long long)(h->lo / w));
+    else if (aligned)
+      tcc_note("%i:the subscript is in [%lld, %lld] on the paths that reach it", d->line, (long long)(h->lo / w),
+               (long long)(h->hi / w));
+    else if (h->lo == h->hi)
+      tcc_note("%i:the offset is %lld bytes on a path that reaches it", d->line, (long long)h->lo);
+    else
+      tcc_note("%i:the offset is in [%lld, %lld] bytes on the paths that reach it", d->line, (long long)h->lo,
+               (long long)h->hi);
+  }
+}
+
 void tcc_ir_ab_check(TCCIRState *ir)
 {
   AbCtx c;
@@ -1169,8 +1989,14 @@ void tcc_ir_ab_check(TCCIRState *ir)
   c.ir = ir;
   c.n = n;
   c.sites = ir->ab_sites;
-  c.nsites = ir->ab_nb_sites;
-  if (!c.nsites || !n)
+  c.nsites = ir->ab_on ? ir->ab_nb_sites : 0;
+  if (!n)
+    goto out;
+  /* -Wuse-after-free: only a function that releases something */
+  int any_free = 0;
+  for (int i = 0, call_id; ir->ab_uaf && i < n && !any_free; i++)
+    any_free = ab_dealloc_call(ir, i, &call_id) >= 0;
+  if (!ir->ab_on && !any_free)
     goto out;
   for (int i = 0; i < n; i++)
   {
@@ -1189,12 +2015,16 @@ void tcc_ir_ab_check(TCCIRState *ir)
   for (int i = 0; i < c.nsites; i++)
     if (ab_site_valid(&c, &c.sites[i]))
       c.sites[ns++] = c.sites[i];
-  if (!(c.nsites = ns))
+  c.nsites = ns;
+  ab_collect_derefs(&c);
+  if (!c.nsites && !c.nderefs && !any_free)
     goto out;
 
   c.cfg = tcc_ir_cfg_build(ir);
   if (!c.cfg || (c.nb = c.cfg->num_blocks) > AB_MAX_BLOCKS)
     goto out;
+  if (any_free)
+    ab_collect_frees(&c);
   tcc_ir_cfg_compute_dominators(c.cfg);
   if (ab_find_loops(&c) < 0)
     goto out;
@@ -1208,14 +2038,24 @@ void tcc_ir_ab_check(TCCIRState *ir)
     for (int p = 0; p < c.mapn[t]; p++)
       c.map[t][p] = -1;
   }
+  /* loops with a bounds check are unrolled while their trips are decided
+     (-Wuse-after-free needs no trip of its own) */
+  for (int i = 0; ir->ab_on && i < c.nsites + c.nderefs; i++)
+  {
+    int b = c.cfg->instr_to_block[i < c.nsites ? c.sites[i].start : c.derefs[i - c.nsites].at];
+    for (int l = c.inner[b]; l >= 0; l = c.loops[l].parent)
+      c.loops[l].has_site = 1;
+  }
   ab_slice(&c);
-  if (!c.nt || (size_t)c.nt * c.nb > AB_MAX_CELLS)
+  c.ns = c.nt + 1;
+  if (!c.nt || (size_t)c.ns * c.nb * sizeof(AbIv) > AB_MAX_STATE)
     goto out;
 
-  c.in = tcc_malloc((size_t)c.nb * c.nt * sizeof(AbIv));
+  c.in = tcc_malloc((size_t)c.nb * c.ns * sizeof(AbIv));
   c.reach = tcc_mallocz(c.nb);
-  c.cur = tcc_malloc(2 * c.nt * sizeof(AbIv));
-  c.tmp = c.cur + c.nt;
+  c.cur = tcc_malloc(3 * c.ns * sizeof(AbIv));
+  c.tmp = c.cur + c.ns;
+  c.tmp2 = c.tmp + c.ns;
   c.hits = tcc_mallocz(c.nsites * sizeof(AbHit));
   c.site_first = tcc_malloc(c.nb * sizeof(int));
   for (int b = 0, si = 0; b < c.nb; b++)
@@ -1224,18 +2064,35 @@ void tcc_ir_ab_check(TCCIRState *ir)
       si++;
     c.site_first[b] = si;
   }
-  for (int i = 0; i < c.nsites; i++)
+  c.dhits = tcc_mallocz((c.nderefs + 1) * sizeof(AbDHit));
+  c.deref_first = tcc_malloc(c.nb * sizeof(int));
+  for (int b = 0, di = 0; b < c.nb; b++)
   {
-    int b = c.cfg->instr_to_block[c.sites[i].start];
-    for (int l = c.inner[b]; l >= 0; l = c.loops[l].parent)
-      c.loops[l].has_site = 1;
+    while (di < c.nderefs && c.derefs[di].at < c.cfg->blocks[b].start_idx)
+      di++;
+    c.deref_first[b] = di;
   }
+  c.free_hit = tcc_mallocz(c.nfrees + 1);
+  c.free_first = tcc_malloc(c.nb * sizeof(int));
+  for (int b = 0, fi = 0; b < c.nb; b++)
+  {
+    while (fi < c.nfrees && c.frees[fi].at < c.cfg->blocks[b].start_idx)
+      fi++;
+    c.free_first[b] = fi;
+  }
+
   for (int s = 0; s < c.nt; s++)
     c.in[s] = AB_TOP;
+  c.in[c.nt] = AB_IV(0, 0); /* the entry: certainly reached */
   c.reach[0] = 1;
   c.checking = 1;
+  c.uaf_ok = 1;
   ab_walk(&c, -1);
   ab_report(&c);
+  if (ir->ab_on)
+    ab_dreport(&c);
+  if (ir->ab_uaf)
+    ab_freport(&c);
 
 out:
   tcc_free(c.inl);
@@ -1256,6 +2113,13 @@ out:
   tcc_free(c.cur);
   tcc_free(c.hits);
   tcc_free(c.site_first);
+  tcc_free(c.objs);
+  tcc_free(c.derefs);
+  tcc_free(c.deref_first);
+  tcc_free(c.dhits);
+  tcc_free(c.frees);
+  tcc_free(c.free_first);
+  tcc_free(c.free_hit);
   if (c.cfg)
     tcc_ir_cfg_free(c.cfg);
   tcc_ir_ab_free(ir);

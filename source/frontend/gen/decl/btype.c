@@ -331,6 +331,46 @@ static int parse_btype_body(CType *type, AttributeDef *ad, int ignore_label)
       /* C23 [[ ... ]] standard attribute */
       if (parse_c23_attribute(ad))
         continue;
+      if (typespec_found)
+        goto the_end;
+      /* yasc: `[]T`, `[:0]T`, a slice; the declarator wraps it (type_decl).
+         `[[` is a C23 attribute, anything else after '[' not a type */
+      if (tcc_state->yasc && tok == '[')
+      {
+        AttributeDef ad1;
+        int sentinel = 0;
+        next();
+        if (tok == ':')
+        {
+          next();
+          if (tok != TOK_CINT || tokc.i != 0)
+            expect("0: [:0]T is a slice ending in a zero");
+          next();
+          sentinel = 1;
+          if (tok != ']')
+            expect("']' of [:0]");
+        }
+        if (tok != ']')
+        {
+          unget_tok('[');
+          goto the_end;
+        }
+        next();
+        if (!parse_btype(&type1, &ad1, 0))
+          expect("a slice's element type after []");
+        if (type1.t & VT_STORAGE)
+          tcc_error("a storage class after []");
+        if (ad1.yslice) /* `[][]T`: the inner one now */
+          yasc_slice_wrap(&type1, ad1.yslice - 1);
+        ad->yslice = 1 + sentinel;
+        type->t = type1.t;
+        type->ref = type1.ref;
+        t = type->t;
+        typespec_found = 1;
+        st = bt = -2;
+        break;
+      }
+
       goto the_end;
       /* GNUC typeof */
     case TOK_TYPEOF1:
@@ -400,10 +440,26 @@ static int parse_btype_body(CType *type, AttributeDef *ad, int ignore_label)
             yasc_keyword_as_name(n);
           tcc_error("'%s' qualifies a pointer: write it after the '*'", get_tok_str(n, NULL));
         }
-        ad->yasc |= tok == TOK_out ? YASC_OUT : YASC_DROP;
+        {
+          int w = tok == TOK_out ? YASC_OUT : tok == TOK_inout ? YASC_INOUT : YASC_DROP;
+          if ((w & (YASC_OUT | YASC_INOUT)) && (ad->yasc & (YASC_OUT | YASC_INOUT | YASC_IN)))
+            tcc_error("a parameter is in, inout or out: one of them");
+          ad->yasc |= w;
+        }
         next();
         if (typespec_found && YASC_NAME_FOLLOWS(tok))
           yasc_keyword_as_name(n);
+        break;
+      }
+
+      /* yasc `in`, the default: only where a parameter's declaration starts
+         (a name everywhere else, `int in` included) */
+      if (tcc_state->yasc && tok == TOK_in && !typespec_found && func_param_decl_depth > 0 && !pp_in_c())
+      {
+        if (ad->yasc & (YASC_OUT | YASC_INOUT))
+          tcc_error("a parameter is in, inout or out: one of them");
+        ad->yasc |= YASC_IN;
+        next();
         break;
       }
 
@@ -436,7 +492,8 @@ static int parse_btype_body(CType *type, AttributeDef *ad, int ignore_label)
         if (type1.t & VT_STORAGE)
           tcc_error("a storage class after '!'");
         ad->yasc |= YASC_ERRUNION;
-        type->t = type1.t;
+        /* the storage class before the '!' stays: `static !int f(void)` */
+        type->t = type1.t | (t & VT_STORAGE);
         type->ref = type1.ref;
         t = type->t;
         typespec_found = 1;
@@ -444,7 +501,7 @@ static int parse_btype_body(CType *type, AttributeDef *ad, int ignore_label)
         break;
       }
 
-      if (tcc_state->cversion > 201710 && tok_is_ident(tok, "bool", 4))
+      if ((tcc_state->cversion > 201710 || tcc_state->yasc) && tok_is_ident(tok, "bool", 4))
       {
         u = VT_BOOL;
         next();

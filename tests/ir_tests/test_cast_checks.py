@@ -34,7 +34,7 @@ LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 def _run(tmp_path, body, *flags, compat=True, out="t.o"):
     src = tmp_path / "t.c"
     src.write_text(body)
-    cmd = [str(TCC)] + (["-ccompat"] if compat else []) + ["-c", *flags, str(src), "-o", str(tmp_path / out)]
+    cmd = [str(TCC), "-Wno-missing-prototypes"] + (["-ccompat"] if compat else []) + ["-c", *flags, str(src), "-o", str(tmp_path / out)]
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
@@ -134,12 +134,14 @@ def test_pragma(tmp_path):
         assert [d[0] for d in _diags(_run(tmp_path, body, "-Wcast-align", opt))] == [1, 6]
 
 
-def test_safe_default_is_off(tmp_path):
-    body = "char * view f(const char * view s) { return (char * view)s; }\n"
+def test_safe_default(tmp_path):
+    # on in the safe default; in yasc, dropping const needs unsafe(...), which
+    # says it was meant: no -Wcast-qual inside it
+    body = "char * view f(const char * view s)\n{\n  return unsafe((char * view)s);\n}\n"
     proc = _run(tmp_path, body, compat=False)
     assert proc.returncode == 0 and _diags(proc) == [], proc.stderr
-    proc = _run(tmp_path, body, "-Wcast-qual", compat=False)
-    assert _diags(proc) == [(1, DISCARD % "const")], proc.stderr
+    proc = _run(tmp_path, body, "-Wno-cast-qual", compat=False)
+    assert proc.returncode == 0 and _diags(proc) == [], proc.stderr
 
 
 def test_not_in_a_system_header(tmp_path):

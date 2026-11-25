@@ -492,6 +492,9 @@ tok_next:
     }
     break;
 
+  case '@': /* @min, @max (builtin/misc.c) */
+    unary_at_builtin();
+    break;
   case TOK_builtin_expect:
     /* __builtin_expect is a no-op for now */
     parse_builtin_params(0, "ee");
@@ -666,19 +669,11 @@ tok_next:
     break;
   case TOK_builtin_unreachable:
     parse_builtin_params(0, ""); /* just skip '()' */
-    /* A marked TRAP: control never gets here, and saying so in the IR lets
-     * the branches that lead here go (tcc_ir_opt_unreachable_fold). */
-    if (tcc_state->ir && !nocode_wanted)
-    {
-      const int before = tcc_state->ir->next_instruction_index;
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_TRAP, NULL, NULL, NULL);
-      if (tcc_state->ir->next_instruction_index > before &&
-          tcc_state->ir->compact_instructions[before].op == TCCIR_OP_TRAP)
-        tcc_state->ir->compact_instructions[before].unreachable = 1;
-    }
+    /* control never gets here: unchecked, saying so in the IR lets the
+     * branches that lead here go; -fsanitize=unreachable traps instead */
+    gen_unreachable((tcc_state->sanitize & SAN_UNREACHABLE) != 0);
     type.t = VT_VOID;
     vpush(&type);
-    CODE_OFF();
     break;
   case TOK_builtin_trap:
     parse_builtin_params(0, ""); /* just skip '()' */
@@ -686,6 +681,7 @@ tok_next:
     tcc_ir_put(tcc_state->ir, TCCIR_OP_TRAP, NULL, NULL, NULL);
     type.t = VT_VOID;
     vpush(&type);
+    CODE_OFF(); /* it does not return: nothing after it is reached */
     break;
   case TOK_builtin_clear_padding:
   {
@@ -1799,6 +1795,31 @@ tok_next:
   case TOK___INF__:
     n = 0x7f800000;
     goto special_math_val;
+
+  case TOK_true:
+  case TOK_false:
+    /* C23: constants of type bool; identifiers before */
+    if (!TCC_C23(tcc_state))
+      goto tok_identifier;
+    vpushi(tok == TOK_true);
+    vtop->type.t = VT_BOOL;
+    next();
+    break;
+  case TOK_nullptr:
+    /* C23: the null pointer constant (nullptr_t taken as void *); yasc's
+       only spelling of it, in a yasc file under -ccompat too */
+    if (!TCC_C23(tcc_state))
+      goto tok_identifier;
+    {
+      CType pt;
+      pt.t = VT_VOID;
+      pt.ref = NULL;
+      mk_pointer(&pt);
+      vpushi(0);
+      vtop->type = pt;
+    }
+    next();
+    break;
 
   default:
   tok_identifier:

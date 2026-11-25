@@ -208,6 +208,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/ir/lifetime.c \
 	$(TOP)/source/ir/bounds.c \
 	$(TOP)/source/ir/taint.c \
+	$(TOP)/source/ir/regaccess.c \
 	$(TOP)/source/opt/flat/loop/loop_ir_mutate.c \
 	$(TOP)/source/opt/flat/loop/iv_analysis.c \
 	$(TOP)/source/opt/flat/loop/iv_strength_reduction.c \
@@ -217,6 +218,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/loop/loop_rotate.c \
 	$(TOP)/source/opt/flat/loop/loop_relayout.c \
 	$(TOP)/source/opt/flat/loop/seq_guard_elim.c \
+	$(TOP)/source/opt/flat/loop/bounds_iv.c \
 	$(TOP)/source/opt/flat/loop/decrement_to_zero.c \
 	$(TOP)/source/opt/flat/loop/decrement_carry.c \
 	$(TOP)/source/opt/flat/loop/reroll.c \
@@ -423,6 +425,7 @@ UT_COVERAGE_ONLY_SRCS := \
 	$(TOP)/source/frontend/gen/expr/primary.c \
 	$(TOP)/source/frontend/gen/expr/unary.c \
 	$(TOP)/source/frontend/gen/expr/yasc_errors.c \
+	$(TOP)/source/frontend/gen/expr/yasc_slices.c \
 	$(TOP)/source/frontend/gen/init/alloc.c \
 	$(TOP)/source/frontend/gen/init/initializer.c \
 	$(TOP)/source/frontend/gen/inline/analysis.c \
@@ -1519,6 +1522,7 @@ UT11_MODULE_SRCS := \
 	$(TOP)/source/opt/ssa/loop/dead_loop.c \
 	$(TOP)/source/opt/ssa/string/const_string_fold.c \
 	$(TOP)/source/opt/ssa/string/str_strlen.c \
+	$(TOP)/source/opt/ssa/string/str_fortify.c \
 	$(TOP)/source/opt/ssa/string/str_strcmp.c \
 	$(TOP)/source/opt/ssa/string/str_strcpy.c \
 	$(TOP)/source/opt/ssa/string/str_strspn.c \

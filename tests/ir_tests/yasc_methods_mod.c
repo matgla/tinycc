@@ -14,7 +14,7 @@ export struct rect
   /* importers get the body: they may inline it */
   inline int perimeter(const struct rect * view self) { return 2 * (self->w + self->h); }
   static inline int is_square(const struct rect * view self) { return self->w == self->h; }
-  void grow(struct rect * view self, int by)
+  void grow(inout struct rect * view self, int by)
   {
     self->w += by;
     self->h += by;
@@ -25,7 +25,7 @@ export struct rect
 struct tally
 {
   int n;
-  void add(struct tally * view self, int k) { self->n += k; }
+  void add(inout struct tally * view self, int k) { self->n += k; }
 };
 
 static struct tally total;

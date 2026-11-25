@@ -66,6 +66,148 @@ static struct
   int call_line, call_name, call_name_len, call_arg_end;
 } dout;
 
+/* ---- the unit's diagnostics in -O0's order -----------------------------
+ *
+ * Each diagnostic has an anchor (tcc_state->diag_anchor): the file-scope
+ * declaration it belongs to in source order.  A body parsed away from its
+ * place speaks with its definition's anchor -- a function deferred to the
+ * end of the unit (-O1+), a static's saved initializer, a static inline
+ * (at every -O), an inline expansion.  From the first body saved for later on
+ * (tcc_diag_queue_begin), what would be written is held here, and written at
+ * the end of the unit (tcc_diag_queue_flush) sorted by anchor, in the order
+ * written within one: the order -O0 gives, at every -O and with
+ * -fsyntax-only.  The text lines, the JSON / SARIF results and their fix-its
+ * are held alike; a note stays with its diagnostic.  -fmax-errors=N counts
+ * in that order: the Nth error is the last written, then "compilation
+ * terminated". */
+enum
+{
+  DQ_TEXT,   /* a line of text (diag_text_out) */
+  DQ_RESULT, /* a JSON / SARIF result or note (diag_out_result) */
+  DQ_FIXIT,  /* a JSON / SARIF fix-it of the result before it */
+};
+
+typedef struct DiagQueued
+{
+  int anchor, seq;
+  unsigned char op;
+  unsigned char head; /* a diagnostic starts here: 1 an error, 2 a warning */
+  int kind, line, col, end;
+  char *a, *b, *c;
+} DiagQueued;
+
+static struct
+{
+  DiagQueued *q;
+  int n, cap, seq;
+  unsigned char head_next; /* error1: what the next entry starts */
+  unsigned char writing;   /* the flush: written, not held */
+} dq;
+
+static int dq_on(TCCState *s1)
+{
+  return s1->diag_queue_on && !dq.writing && !s1->fe_speculative; /* a speculation says nothing */
+}
+
+static char *dq_dup(const char *s)
+{
+  return s ? tcc_strdup(s) : NULL;
+}
+
+static DiagQueued *dq_add(TCCState *s1, int op)
+{
+  DiagQueued *e;
+  if (dq.n == dq.cap)
+  {
+    dq.cap = dq.cap ? 2 * dq.cap : 32;
+    dq.q = tcc_realloc(dq.q, dq.cap * sizeof *dq.q);
+  }
+  e = &dq.q[dq.n++];
+  memset(e, 0, sizeof *e);
+  e->anchor = s1->diag_anchor;
+  e->seq = dq.seq++;
+  e->op = op;
+  e->head = dq.head_next;
+  dq.head_next = 0;
+  return e;
+}
+
+/* a body is saved to be parsed later: from here on the diagnostics wait */
+ST_FUNC void tcc_diag_queue_begin(TCCState *s1)
+{
+  if (s1->diag_queue_on || !s1->error_set_jmp_enabled)
+    return;
+  s1->diag_queue_on = 1;
+  s1->diag_queue_base_errors = s1->nb_errors;
+}
+
+static int dq_cmp(const void *pa, const void *pb)
+{
+  const DiagQueued *a = pa, *b = pb;
+  if (a->anchor != b->anchor)
+    return a->anchor < b->anchor ? -1 : 1;
+  return a->seq < b->seq ? -1 : a->seq > b->seq;
+}
+
+static void diag_text_out(TCCState *s1, const char *line);
+static void diag_out_result(int kind, const char *option, const char *file, int line, const char *msg);
+static void diag_out_place(const char *file, int line);
+static void fixit_emit(TCCState *s1, int line, int col, int end, const char *text);
+static void diag_terminated(TCCState *s1);
+
+/* The end of the unit (or of its compile, by an error): what was held, in
+   anchor order, cut after the Nth error (-fmax-errors=N) and, after a fatal
+   error that stopped the parse, after it (what -O0 never got to). */
+ST_FUNC void tcc_diag_queue_flush(TCCState *s1)
+{
+  int errors = s1->diag_queue_base_errors, cut = 0;
+  if (!s1->diag_queue_on)
+    return;
+  s1->diag_queue_on = 0;
+  if (dq.n > 1)
+    tcc_qsort(dq.q, dq.n, sizeof *dq.q, dq_cmp);
+  dq.writing = 1;
+  for (int i = 0; i < dq.n; i++)
+  {
+    DiagQueued *e = &dq.q[i];
+    if (s1->diag_stop == 1 &&
+        (e->anchor > s1->diag_stop_anchor || (e->anchor == s1->diag_stop_anchor && e->seq > s1->diag_stop_seq)))
+      continue;
+    if (e->head && s1->max_errors > 0 && errors >= s1->max_errors)
+    {
+      cut = 1;
+      break;
+    }
+    if (e->head == 1)
+      errors++;
+    if (e->op == DQ_TEXT)
+      diag_text_out(s1, e->a);
+    else if (e->op == DQ_RESULT)
+    {
+      if (e->kind != 2)
+        diag_out_place(e->b, e->line);
+      diag_out_result(e->kind, e->a, e->b, e->line, e->c);
+    }
+    else
+    {
+      pstrcpy(dout.file, sizeof dout.file, e->b ? e->b : "");
+      fixit_emit(s1, e->line, e->col, e->end, e->a);
+    }
+  }
+  if (cut || (s1->max_errors > 0 && errors >= s1->max_errors && errors > s1->diag_queue_base_errors))
+    diag_terminated(s1);
+  dq.writing = 0;
+  for (int i = 0; i < dq.n; i++)
+  {
+    tcc_free(dq.q[i].a);
+    tcc_free(dq.q[i].b);
+    tcc_free(dq.q[i].c);
+  }
+  dq.n = 0;
+  dq.seq = 0;
+  dq.head_next = 0;
+}
+
 /* SRC's bytes onto CS (cstr_cat takes a length of 0 as "with the NUL") */
 static void diag_cat(CString *cs, const CString *src)
 {
@@ -273,6 +415,16 @@ static void diag_out_result(int kind, const char *option, const char *file, int 
 {
   static const char *const kinds[] = {"warning", "error", "note"};
   CString *cs;
+  if (dq_on(tcc_state))
+  {
+    DiagQueued *e = dq_add(tcc_state, DQ_RESULT);
+    e->kind = kind;
+    e->line = line;
+    e->a = dq_dup(option);
+    e->b = dq_dup(file);
+    e->c = dq_dup(msg);
+    return;
+  }
   if (kind == 2)
   {
     if (!dout.pending)
@@ -438,14 +590,23 @@ static int fixit_find_in(char *text, const char *word)
   return col;
 }
 
-/* WORD on LINE of FNAME, exactly once: its column, else 0 */
-static int fixit_find(const char *fname, int line, const char *word)
+/* WORD on LINE of FNAME, exactly once: its column, else 0.  FIRST: not
+   after a ',' (spaces between) */
+static int fixit_find(const char *fname, int line, const char *word, int first)
 {
   CString text;
   int col = 0;
   cstr_new(&text);
   if (fixit_line(fname, line, &text))
     col = fixit_find_in(text.data, word);
+  if (col && first)
+  {
+    int i = col - 2;
+    while (i >= 0 && (text.data[i] == ' ' || text.data[i] == '\t'))
+      i--;
+    if (i >= 0 && text.data[i] == ',')
+      col = 0;
+  }
   cstr_free(&text);
   return col;
 }
@@ -455,6 +616,16 @@ static void diag_text_out(TCCState *s1, const char *line);
 /* the fix-it: columns COL..END (half-open) of LINE replaced by TEXT */
 static void fixit_emit(TCCState *s1, int line, int col, int end, const char *text)
 {
+  if (diag_out_on(s1) && dq_on(s1))
+  {
+    DiagQueued *e = dq_add(s1, DQ_FIXIT);
+    e->line = line;
+    e->col = col;
+    e->end = end;
+    e->a = dq_dup(text);
+    e->b = dq_dup(dout.file);
+    return;
+  }
   if (diag_out_on(s1))
   {
     CString *cs = &dout.fixits;
@@ -503,10 +674,10 @@ PUB_FUNC int tcc_fixit(int line, const char *word, int where, const char *text)
     return 0;
   if (!line)
     line = dout.line;
-  if (!(col = fixit_find(dout.file, line, word)))
+  if (!(col = fixit_find(dout.file, line, word, where == FIXIT_REPLACE_FIRST)))
     return 0;
   end = col;
-  if (where == FIXIT_REPLACE)
+  if (where == FIXIT_REPLACE || where == FIXIT_REPLACE_FIRST)
     end = col + strlen(word);
   else if (where == FIXIT_AFTER)
     col = end = col + strlen(word);

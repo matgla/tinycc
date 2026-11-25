@@ -76,6 +76,7 @@ void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, i
     {
       skip('{');
       no_oblock = 0;
+      init_brace_depth++;
     }
 
     s = type->ref;
@@ -274,7 +275,10 @@ void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, i
       }
     }
     if (!no_oblock)
+    {
       skip('}');
+      init_brace_depth--;
+    }
   }
   else if ((flags & DIF_HAVE_ELEM)
            /* Use i_c_parameter_t, to strip toplevel qualifiers.
@@ -314,6 +318,7 @@ void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, i
     {
       skip('{');
       no_oblock = 0;
+      init_brace_depth++;
     }
     s = type->ref;
     f = sym_first(s);
@@ -326,8 +331,10 @@ void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, i
     if (flags & DIF_HAVE_ELEM)
       skip(';');
     next();
+    init_brace_depth++;
     decl_initializer(p, type, c, flags & ~DIF_HAVE_ELEM, vreg);
     skip('}');
+    init_brace_depth--;
   }
   else
   one_elem:
@@ -360,7 +367,11 @@ void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, i
           && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && vtop->c.i == 0 &&
           btype_size(type->t & VT_BTYPE) /* not for fp constants */
       )
+      {
+        if ((type->t & VT_BTYPE) == VT_PTR)
+          yasc_null_spelling(vtop); /* `= {0}`: nullptr, or `= {}` */
         vpop();
+      }
       else
       {
         int align;
@@ -484,7 +495,7 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
   Section *sec;
   Sym *flexible_array;
   Sym *union_flex = NULL;
-  Sym *sym;
+  Sym *sym = NULL;
   int saved_nocode_wanted = nocode_wanted;
 #ifdef CONFIG_TCC_BCHECK
   int bcheck = tcc_state->do_bounds_check && !NODATA_WANTED;
@@ -699,6 +710,23 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
       /* -W[maybe-]uninitialized: declared here with no value */
       if (!has_init && vreg >= 0 && tcc_ir_un_wanted())
         tcc_ir_un_add_var(tcc_state->ir, vreg, sym);
+      /* yasc enforces initialization: the flow check follows a scalar
+         (lifetime.c, un_check), not what is stored in an array, a struct or
+         a complex value later -- those need a value here, or `= undefined` */
+      else if (!has_init && vreg < 0 && !yasc_decl_undefined && tcc_state->yasc && tcc_ir_lt_active())
+      {
+        const char *what = (type->t & VT_VLA)                      ? "a variable length array"
+                           : (type->t & VT_ARRAY)                  ? "an array"
+                           : (type->t & VT_BTYPE) == VT_STRUCT     ? (IS_UNION(type->t) ? "a union" : "a struct")
+                                                                   : "this object";
+        if (type->t & VT_VLA)
+          tcc_warning_once(warn_lifetime, "'%s' has no value: yasc does not follow what is stored in %s later: write '= undefined'",
+                           get_tok_str(v, NULL), what);
+        else
+          tcc_warning_once(warn_lifetime,
+                           "'%s' has no value: yasc does not follow what is stored in %s later: initialize it, or write '= undefined'",
+                           get_tok_str(v, NULL), what);
+      }
 #ifdef CONFIG_TCC_ASM
       /* `register T x __asm("rN")`: x is an ordinary local whose value is
        * placed in rN only where it is an asm operand.  Record rN in sym->r
@@ -946,6 +974,15 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
     }
 
     vpush_type_size(type, &a);
+#ifdef CONFIG_TCC_BCHECK
+    /* -b: a byte more, so the VLA's one-past-the-end address is not the next
+       object's (bcheck_vla registers its own size) */
+    if (bcheck && v)
+    {
+      vpushi(1);
+      gen_op('+');
+    }
+#endif
     if (tcc_state->ir)
     {
       /* vtop holds the runtime allocation size (bytes). Emit an IR op that
@@ -972,6 +1009,10 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
     {
       gen_vla_sp_save(addr);
     }
+#ifdef CONFIG_TCC_BCHECK
+    if (bcheck && v)
+      bcheck_vla(sym, type, addr);
+#endif
     cur_scope->vla.loc = addr;
     cur_scope->vla.num++;
   }
@@ -1009,6 +1050,13 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
 
     /* Compute total runtime struct size: fixed_component + sum of VLA sizes */
     vpush_type_size(type, &a);
+#ifdef CONFIG_TCC_BCHECK
+    if (bcheck && v)
+    {
+      vpushi(1);
+      gen_op('+');
+    }
+#endif
 
     if (tcc_state->ir)
     {
@@ -1032,6 +1080,10 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
     {
       gen_vla_sp_save(addr);
     }
+#ifdef CONFIG_TCC_BCHECK
+    if (bcheck && v)
+      bcheck_vla(sym, type, addr);
+#endif
     cur_scope->vla.loc = addr;
     cur_scope->vla.num++;
   }

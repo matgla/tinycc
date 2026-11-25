@@ -32,7 +32,7 @@ def _compile(tmp_path, body, *flags):
     src = tmp_path / "t.c"
     src.write_text(body)
     return subprocess.run(
-        [str(TCC), "-c", *flags, str(src), "-o", str(tmp_path / "t.o")], capture_output=True, text=True
+        [str(TCC), "-Wno-missing-prototypes", "-c", *flags, str(src), "-o", str(tmp_path / "t.o")], capture_output=True, text=True
     )
 
 

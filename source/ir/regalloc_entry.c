@@ -2026,6 +2026,12 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   RA_FLAT_PASS(ra_ch, "ssa:loop_guard_elim", TCC_OPT(tcc_state, optimize) >= 1,
                tcc_ir_opt_loop_guard_elim(ir));
 
+  /* ssa:bounds_iv -- a compare (-fsanitize=bounds' `i <u n`) its loop's own
+   * counter decides, folded in the rotated shape before const_sim, unrolling
+   * and IV strength reduction look at the loop (ssa:vrp knows the same, but
+   * after them).  Gated -O1+ like rotation; TCC_DISABLE_PASS=ssa:bounds_iv. */
+  RA_FLAT_PASS(ra_ch, "ssa:bounds_iv", TCC_OPT(tcc_state, optimize) >= 1, tcc_ir_opt_bounds_iv(ir));
+
   /* First-iteration-exit peeling (ssa:first_iter_exit): eliminate top-tested
    * loops whose header exit test is provably true on first entry, on flat IR
    * after rotation (rotation declines these shapes; a rotated loop's guard is

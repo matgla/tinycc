@@ -88,7 +88,7 @@ def _write(tmp_path, name, src):
 
 
 def _tcc(tmp_path, *args):
-    return subprocess.run([str(TCC), *INCLUDE_FLAGS, *map(str, args)], capture_output=True, text=True, cwd=tmp_path)
+    return subprocess.run([str(TCC), "-Wno-missing-prototypes", *INCLUDE_FLAGS, *map(str, args)], capture_output=True, text=True, cwd=tmp_path)
 
 
 def _json(tmp_path, src, *flags, name="t.c"):
@@ -291,7 +291,7 @@ void freeit(char *s)
 {
   free(s);
 }
-void put(struct box * view b, char *s)
+void put(inout struct box * view b, char *s)
 {
   b->p = s;
 }
@@ -315,7 +315,7 @@ void mb(char *s)
 }
 void both(char *s)
 {
-  if (s != 0)
+  if (s != nullptr)
     free(s);
 }
 int proto(char *s);
@@ -349,7 +349,10 @@ YASC_NOTES = {
 
 def test_plain_param_decided_by_body(tmp_path):
     proc, diags = _json(tmp_path, YASC_SRC)
-    errs = [d for d in diags if d["kind"] == "error"]
+    # only the plain-pointer errors: in safe mode -Wlifetime and
+    # -Wimplicit-move are errors too (strict lifetimes); the moves' fix-its
+    # come in the second round
+    errs = [d for d in diags if d["kind"] == "error" and d["message"].startswith("plain pointer in yasc")]
     assert all(d["message"] == "plain pointer in yasc: say owned or view for 's'" for d in errs), errs
     assert len(errs) == len(YASC_NOTES)
     by_line = {d["locations"][0]["caret"]["line"]: d for d in errs}
@@ -365,8 +368,8 @@ def test_plain_param_decided_by_body(tmp_path):
     # an owned parameter stored or handed on is a move: -Wimplicit-move says
     # so with its own fix-its, applied in turn
     proc, diags = _json(tmp_path, fixed, "-Wall", name="fixed.c")
-    assert proc.returncode == 0, proc.stderr
-    assert [d.get("option") for d in diags] == ["-Wimplicit-move", "-Wimplicit-move"], diags
+    assert proc.returncode != 0, proc.stderr
+    assert [(d.get("option"), d["kind"]) for d in diags] == [("-Wimplicit-move", "error")] * 2, diags
     fixed = _apply(fixed, _all_fixits(diags))
     assert "  b->p = move(s);\n" in fixed and "  take(move(s));\n" in fixed
     _write(tmp_path, "fixed2.c", fixed)
@@ -382,7 +385,7 @@ def test_plain_param_error_order(tmp_path):
     src = """\
 int f(char *s)
 {
-  int z = (char *)0 == 0;
+  int z = (char *)nullptr == nullptr;
   char *loc = s;
   return loc[0] + z;
 }
@@ -395,8 +398,8 @@ int f(char *s)
         "t.c:1: note: the function only borrows 's': write '* view'",
         'fix-it:"t.c":{1:13-1:13}:" view "',
         "t.c:4: error: plain pointer in yasc: say owned or view for 'loc'",
-        "t.c:4: note: the function only borrows through 'loc': write '* view'",
-        'fix-it:"t.c":{4:9-4:9}:" view "',
+        "t.c:4: note: the function only borrows through 'loc': write 'const * view'",
+        'fix-it:"t.c":{4:8-4:9}:"const * view "',
     ]
     assert proc.returncode == 1
 
@@ -470,7 +473,7 @@ int found(char * view s)
 int tested(char * view s)
 {
   char *p = s;
-  if (p == 0)
+  if (p == nullptr)
     return 0;
   return p[1];
 }
@@ -493,12 +496,14 @@ int alias_maybe(char *s)
   return q[0];
 }
 int two(char *a, char *b) { return a[0] + b[0]; }
-int twoloc(char * view s) { char *a = s, *b = s + 1; return a[0] + b[0]; }
+int twoloc(inout char * view s) { char *a = s, *b = s + 1; return a[0] + b[0]; }
 """
 
 LOCAL_NOTES = [
     # (line of, name, note, the line once fixed)
-    ("  char *p = s;\n", 7, "p", "the function only borrows through 'p': write '* view'", "  char * view p = s;"),
+    # given an `in` parameter's value (a const target): const * view, not * view
+    ("  char *p = s;\n", 7, "p", "the function only borrows through 'p': write 'const * view'",
+     "  char const * view p = s;"),
     ("  char *p = malloc(4);", 12, "p",
      "the function gives 'p' an owned value that may be null (line 12): write '* owned maybe'",
      "  char * owned maybe p = malloc(4);"),
@@ -509,8 +514,8 @@ LOCAL_NOTES = [
      "the function only borrows through 'hit' and gives it null or a maybe value (line 22): write '* view maybe'",
      "  char * view maybe hit = find(s);"),
     ("  char *p = s;\n  if", 27, "p",
-     "the function only borrows through 'p' and tests it for null (line 28): write '* view maybe'",
-     "  char * view maybe p = s;"),
+     "the function only borrows through 'p' and tests it for null (line 28): write 'const * view maybe'",
+     "  char const * view maybe p = s;"),
     ("void hand", 34, "p", "the function gives 'p' an owned value (line 34): write '* owned'", "  char * owned p = s;"),
     # an alias carries its uses to what it copies
     ("void alias(", 37, "s", "the function frees 's' through 'q' (line 41): write '* owned'",
@@ -520,14 +525,14 @@ LOCAL_NOTES = [
      "the function only borrows 's' and tests it for null through 'q' (line 46): write '* view maybe'",
      "int alias_maybe(char * view maybe s)"),
     ("  char *q = s;\n  if (!q)", 45, "q",
-     "the function only borrows through 'q' and tests it for null (line 46): write '* view maybe'",
-     "  char * view maybe q = s;"),
+     "the function only borrows through 'q' and tests it for null (line 46): write 'const * view maybe'",
+     "  char const * view maybe q = s;"),
 ]
 
 
 def test_plain_local_and_alias_decided(tmp_path):
     proc, diags = _json(tmp_path, LOCAL_SRC)
-    errs = [d for d in diags if d["kind"] == "error"]
+    errs = [d for d in diags if d["kind"] == "error" and d["message"].startswith("plain pointer in yasc")]
     by = {(d["locations"][0]["caret"]["line"], d["message"]): d for d in errs}
     for _, ln, name, note, written in LOCAL_NOTES:
         d = by[(ln, f"plain pointer in yasc: say owned or view for '{name}'")]
@@ -539,7 +544,7 @@ def test_plain_local_and_alias_decided(tmp_path):
     assert "int two(char * view a, char * view b) {" in fixed
     assert "{ char * view a = s, * view b = s + 1;" in fixed
     proc, diags = _json(tmp_path, fixed, "-Wall", name="fixed.c")
-    assert proc.returncode == 0, proc.stderr
+    assert proc.returncode != 0, proc.stderr
     assert {d.get("option") for d in diags} == {"-Wimplicit-move"}, diags
     fixed = _apply(fixed, _all_fixits(diags))
     _write(tmp_path, "fixed2.c", fixed)
@@ -584,12 +589,12 @@ void f(char *s, char * owned o)
 def test_plain_local_not_decided(tmp_path):
     # an inner level, a static, a typedef: said at once, no note
     src = """\
-void f(char * view * view v)
+void f(inout char * view * view v)
 {
   char **pp = v;
   static char *keep;
   typedef char *str;
-  str t = 0;
+  str t = nullptr;
   (void)pp;
   (void)keep;
   (void)t;
@@ -625,4 +630,19 @@ def test_plain_local_same_at_every_level(tmp_path):
     for o in ("-O0", "-O2"):
         proc = _tcc(tmp_path, o, "-c", "s.c", "-o", "s.o")
         assert proc.stderr.count("plain pointer") == 1, proc.stderr
-        assert "s.c:1: note: the function only borrows through 'q': write '* view'" in proc.stderr
+        assert "s.c:1: note: the function only borrows through 'q': write 'const * view'" in proc.stderr
+
+
+def test_plain_local_const_target_in_a_list(tmp_path):
+    """given an `in` parameter's value, a local is `char const * view`: the
+    const goes before its '*', which only the declaration's first declarator
+    can take (`char *a = s, const * view b` is no C) -- the second one is
+    said without a fix-it"""
+    src = "#pragma yasc\nint f(char * view s) { char *a = s, *b = s + 1; return a[0] + b[0]; }\n"
+    _write(tmp_path, "t.c", src)
+    proc = _tcc(tmp_path, "-fmax-errors=0", "-fdiagnostics-parseable-fixits", "-c", "t.c", "-o", "t.o")
+    lines = proc.stderr.splitlines()
+    assert "t.c:2: note: the function only borrows through 'a': write 'const * view'" in lines, lines
+    assert "t.c:2: note: the function only borrows through 'b': write 'const * view'" in lines, lines
+    fixits = [line for line in lines if line.startswith("fix-it:")]
+    assert fixits == ['fix-it:"t.c":{2:29-2:31}:"const * view a"'], lines

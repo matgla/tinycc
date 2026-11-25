@@ -655,6 +655,8 @@ static void thumb_emit_vfp_arith_mop(MachineOperand src1, MachineOperand src2, M
     case TCCIR_OP_FSUB: ot_check(th_vsub_f((uint16_t)sd, (uint16_t)sn, (uint16_t)sm, 0)); break;
     case TCCIR_OP_FMUL: ot_check(th_vmul_f((uint16_t)sd, (uint16_t)sn, (uint16_t)sm, 0)); break;
     case TCCIR_OP_FDIV: ot_check(th_vdiv_f((uint16_t)sd, (uint16_t)sn, (uint16_t)sm, 0)); break;
+    case TCCIR_OP_FMIN: ot_check(th_vminmaxnm_f32((uint16_t)sd, (uint16_t)sn, (uint16_t)sm, 0)); break;
+    case TCCIR_OP_FMAX: ot_check(th_vminmaxnm_f32((uint16_t)sd, (uint16_t)sn, (uint16_t)sm, 1)); break;
     default: tcc_ice("thumb_emit_vfp_arith_mop: unhandled op %d", (int)op); break;
     }
     if (dest.kind != MACH_OP_VFP_REG)
@@ -691,6 +693,12 @@ static void thumb_emit_vfp_arith_mop(MachineOperand src1, MachineOperand src2, M
     break;
   case TCCIR_OP_FDIV:
     ot_check(th_vdiv_f(0, 0, 1, 0));
+    break;
+  case TCCIR_OP_FMIN:
+    ot_check(th_vminmaxnm_f32(0, 0, 1, 0));
+    break;
+  case TCCIR_OP_FMAX:
+    ot_check(th_vminmaxnm_f32(0, 0, 1, 1));
     break;
   default:
     tcc_ice("thumb_emit_vfp_arith_mop: unhandled op %d", (int)op);
@@ -1300,7 +1308,8 @@ ST_FUNC void tcc_gen_machine_fp_mop(MachineOperand src1, MachineOperand src2, Ma
     if (!is_double && fpu && tcc_state && tcc_state->float_abi != ARM_SOFT_FLOAT)
     {
       if ((op == TCCIR_OP_FADD && fpu->has_fadd) || (op == TCCIR_OP_FSUB && fpu->has_fsub) ||
-          (op == TCCIR_OP_FMUL && fpu->has_fmul) || (op == TCCIR_OP_FDIV && fpu->has_fdiv))
+          (op == TCCIR_OP_FMUL && fpu->has_fmul) || (op == TCCIR_OP_FDIV && fpu->has_fdiv) ||
+          ((op == TCCIR_OP_FMIN || op == TCCIR_OP_FMAX) && fpu->has_fminmax))
         return thumb_emit_vfp_arith_mop(src1, src2, dest, op);
     }
   }

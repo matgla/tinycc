@@ -860,7 +860,17 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
         {
           int32_t off = irop_get_stack_offset(ops[j]);
           int32_t chain_off;
-          if (off < min_local_offset && tcc_ir_capture_lookup(ir, off, &chain_off) < 0)
+          if (tcc_ir_capture_lookup(ir, off, &chain_off) >= 0)
+            continue;
+          /* The offset may be inside a frontend object (`arr[7]`) or one past
+             its end (`num + sizeof num`, the byte above num): keep the object
+             holding it and the one ending at it, whole. */
+          int lo, hi;
+          if (tcc_ir_frame_object_at(ir, off, &lo, &hi) && lo < off)
+            off = lo;
+          if (tcc_ir_frame_object_at(ir, irop_get_stack_offset(ops[j]) - 1, &lo, &hi) && lo < off)
+            off = lo;
+          if (off < min_local_offset)
             min_local_offset = off;
         }
       }

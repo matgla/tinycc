@@ -254,9 +254,11 @@ static int ms_feed(MemberScan *m, int t, int *name_now)
       if (m->prev != TOK_ATTRIBUTE1 && m->prev != TOK_ATTRIBUTE2)
         m->tag_waits = 0;
       /* `T * borrows(buf) key`: the qualifier, unless a pointer kind came
-         first (`T * view borrows(...)` is a method of that name) */
+         first (`T * view borrows(...)` is a method of that name);
+         `int owned(close) fd`, `FILE * owned(fclose) f`: always the
+         qualifier (owned is a keyword, never a method's name) */
       int qualifier = (m->prev == TOK_borrows && m->prev2 != TOK_view && m->prev2 != TOK_owned) ||
-                      (m->prev == TOK_takes && m->prev2 != TOK_view);
+                      (m->prev == TOK_takes && m->prev2 != TOK_view) || m->prev == TOK_owned;
       if (!m->no_name && !m->name && !qualifier && m->prev >= TOK_UIDENT && m->prev2 != TOK_STRUCT &&
           m->prev2 != TOK_UNION && m->prev2 != TOK_ENUM && !ms_typedef_name(m->prev))
       {

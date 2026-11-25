@@ -95,6 +95,7 @@ FLAT_OPT_SRC = \
 	source/opt/flat/loop/loop_rotate.c \
 	source/opt/flat/loop/loop_relayout.c \
 	source/opt/flat/loop/seq_guard_elim.c \
+	source/opt/flat/loop/bounds_iv.c \
 	source/opt/flat/loop/decrement_to_zero.c \
 	source/opt/flat/loop/decrement_carry.c \
 	source/opt/flat/loop/const_sim.c \

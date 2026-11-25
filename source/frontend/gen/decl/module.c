@@ -482,6 +482,32 @@ static int yasc_ptr_qual(int t)
          t == TOK__Atomic;
 }
 
+/* A yasc parameter's target is read-only unless it says inout / out / drop
+   (`in`, the default): in the C header the `*` at P of a parameter's
+   outermost pointer is `const *` when its qualifiers say view (not
+   owned), and an array parameter's name at P is
+   `T const a[]`. */
+static int yasc_c_in(int t, const int *p, const int *stop)
+{
+  int n, view = 0;
+  if (t == '*')
+  {
+    while ((n = yasc_peek(p, stop, &p)) != TOK_EOF && yasc_ptr_qual(n))
+    {
+      if (n == TOK_owned)
+        return 0;
+      view |= n == TOK_view;
+    }
+    /* another '*' after it: not the outermost; '(' : a function's; the
+       name and '[': the array is (`char * view a[]` is `char * const a[]`) */
+    if (n >= TOK_UIDENT && yasc_peek(p, stop, NULL) == '[')
+      return 0;
+    return view && n != '*' && n != '(';
+  }
+  /* `a[owned]`: the array a parameter becomes is owned, its elements free */
+  return t >= TOK_UIDENT && yasc_peek(p, stop, &p) == '[' && yasc_peek(p, stop, NULL) != TOK_owned;
+}
+
 /* T, read after PREV (and PREV2) with P at the token after it: a yasc
    qualifier whose (...) follows -- `* borrows(x)`, `* takes(p)`,
    `struct T borrows(x)`, owned(fclose) -- as the parser reads them. */
@@ -510,7 +536,7 @@ static void yasc_export_finish(void)
   int level = 0, prev = 0, t, has_extern = 0, has_static = 0, c_proto;
   /* the C header leaves out a yasc qualifier's (...): armed by the
      qualifier, then the depth inside them */
-  int prev2 = 0, ptr_quals = 0, c_arm = 0, c_skip = 0;
+  int prev2 = 0, ptr_quals = 0, c_arm = 0, c_skip = 0, c_const = 0, c_prev = 0;
   CValue cv;
 
   yasc_pending = NULL;
@@ -564,6 +590,11 @@ static void yasc_export_finish(void)
   /* C callers of a plain `export inline` call the module's definition */
   c_proto = yasc_pending_end == YASC_END_INLINE && !has_static;
 
+  /* the parameter lists open at each level (yasc_c_in): the '(' after a
+     name or a ')' opens one; where the current parameter started, whether
+     it says inout / out / drop / in, and whether it has had a '*' */
+  uint32_t plist = 0;
+  int pstart = 0, paccess = 0;
   for (p = start; p < stop;)
   {
     const int in_body = yasc_pending_body_at >= 0 && p - start >= yasc_pending_body_at;
@@ -601,6 +632,20 @@ static void yasc_export_finish(void)
       }
       continue;
     }
+    const int at_plist = !in_body && level > 0 && level < 32 && ((plist >> level) & 1);
+    const int was_pstart = pstart;
+    if (t == '(' && !in_body && level + 1 < 32)
+    {
+      plist = (plist & ~(1u << (level + 1))) | ((prev >= TOK_UIDENT || prev == ')') ? 1u << (level + 1) : 0);
+      if ((plist >> (level + 1)) & 1)
+        pstart = 1, paccess = 0;
+    }
+    else if (t == ',' && at_plist)
+      pstart = 1, paccess = 0;
+    else if (at_plist && (t == TOK_out || t == TOK_inout || t == TOK_drop || (t == TOK_in && was_pstart)))
+      paccess = 1;
+    else
+      pstart = 0;
     if (t == '{' || t == '(' || t == '[')
       level++;
     else if (t == '}' || t == ')' || t == ']')
@@ -625,7 +670,7 @@ static void yasc_export_finish(void)
       ptr_quals = t == '*' || (ptr_quals && yasc_ptr_qual(t));
     prev2 = prev_c;
     if (yasc_cheader && !c_drop && !(c_proto && (in_body || yasc_is_inline_kw(t))) &&
-        !(t >= TOK_owned && t <= TOK_drop))
+        !(t >= TOK_owned && t <= TOK_drop) && !(t == TOK_in && was_pstart && at_plist))
     {
       if (in_body && (t == TOK_defer || t == TOK_errdefer))
         tcc_error("-fmodule-header: an exported static inline function uses '%s', which C does not have",
@@ -634,7 +679,16 @@ static void yasc_export_finish(void)
         tcc_error("-fmodule-header: an exported static inline function calls the method '%s': C has no method "
                   "calls, call the function TAG__%s",
                   get_tok_str(t, NULL), get_tok_str(t, NULL));
+      /* a const already there (`const char * view s`): not twice */
+      if (!c_const && at_plist && !paccess && c_prev != '(' && yasc_c_in(t, p, stop))
+        tok_str_add(yasc_cheader, TOK_CONST1);
       tok_str_add2(yasc_cheader, t, &cv);
+      if (t >= TOK_CONST1 && t <= TOK_CONST3)
+        c_const = 1;
+      else if (t == '*' || t == ',' || t == ';' || t == '(' || t == ')' || t == '[' || t == ']' || t == '{' ||
+               t == '}' || t == '=')
+        c_const = 0;
+      c_prev = t;
     }
   }
   if (yasc_pending_end == YASC_END_HEAD)

@@ -1,0 +1,4 @@
+named: [named]
+main: [main] [main]
+sizeof: 5 strlen: 4
+gnuc: both

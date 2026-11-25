@@ -134,6 +134,8 @@ int try_relayout_loop(struct TCCIRState *ir, struct IRLoop *loop);
  * enters as the previous loop's exit value can drop its `CMP/JUMPIF` guard.
  * Returns the number of guards removed. */
 int tcc_ir_opt_loop_guard_elim(struct TCCIRState *ir);
+/* -fsanitize=bounds checks of a[i] its loop's counter decides, before the loop passes (bounds_iv.c) */
+int tcc_ir_opt_bounds_iv(struct TCCIRState *ir);
 
 /* Query side of the same walker: constant value of `vreg` on entry to
  * instruction `at_idx`, carried across preceding counted loops.  1 on success.

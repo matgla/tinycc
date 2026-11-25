@@ -100,6 +100,13 @@ int ir_put_soft_call_fpu_if_needed(TCCIRState *ir, TccIrOp op, SValue *src1, SVa
     else if (!is64bit && fpu->has_fneg)
       return 0;
     break;
+  case TCCIR_OP_FMIN:
+  case TCCIR_OP_FMAX:
+    /* single precision only: vminnm.f64 needs a double-precision FPU, and
+     * on the RP2350 doubles are the DCP's.  -mfloat-abi=soft: no FPU code */
+    if (!is64bit && fpu->has_fminmax && tcc_state->float_abi != ARM_SOFT_FLOAT)
+      return 0;
+    break;
   case TCCIR_OP_FCMP:
     if (is64bit && fpu->has_dcmp)
       return 0;

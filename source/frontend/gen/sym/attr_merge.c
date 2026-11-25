@@ -68,6 +68,10 @@ void merge_funcattr(struct FuncAttr *fa, struct FuncAttr *fa1)
     fa->func_dtor = 1;
   if (fa1->func_pure)
     fa->func_pure = 1;
+  if (fa1->func_leaf)
+    fa->func_leaf = 1;
+  if (fa1->func_sys_decl)
+    fa->func_sys_decl = 1;
   if (fa1->func_const)
     fa->func_const = 1;
   if (fa1->func_noinline)
@@ -133,6 +137,77 @@ static void param_nonnull_merge(Sym *old_ref, Sym *new_ref)
     param_nonnull_or(old_ref, new_ref);
 }
 
+/* yasc: how one pointer level (or int handle) of two declarations differs
+   in what it says -- NULL when it does not, or when either says nothing:
+   written in regular C (a header's prototype before the yasc one), or a
+   plain pointer in yasc, an error of its own (`T *restrict p` too) */
+static const char *yasc_level_diff(CType *a, CType *b)
+{
+  const int words = YASC_OWNED | YASC_VIEW | YASC_MAYBE | YASC_OUT | YASC_DROP | YASC_TAKEN | YASC_RESTRICT;
+  int qa = type_yasc(a), qb = type_yasc(b), d;
+  if (!(qa & (YASC_OWNED | YASC_VIEW)) || !(qb & (YASC_OWNED | YASC_VIEW)) || ((qa | qb) & YASC_UNCHECKED))
+    return NULL;
+  d = (qa ^ qb) & words;
+  if (d & (YASC_OWNED | YASC_VIEW))
+    return "owned / view";
+  if (d & YASC_MAYBE)
+    return "maybe";
+  if (d & YASC_OUT)
+    return "out";
+  /* in (the default: a const target) or inout */
+  if ((qa & YASC_VIEW) && (a->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && (b->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR &&
+      ((a->ref->type.t ^ b->ref->type.t) & VT_CONSTANT))
+    return "in / inout (whether its target is written)";
+  if (d & YASC_DROP)
+    return "drop";
+  if (d & YASC_TAKEN)
+    return "takes(...)";
+  if (d & YASC_RESTRICT)
+    return "restrict";
+  /* where a view points: borrows(...), the elision, static */
+  if ((qa & YASC_VIEW) && type_borrows(a) != type_borrows(b))
+    return "borrows(...)";
+  return NULL;
+}
+
+/* ... at every pointer level of a declared type */
+static const char *yasc_contract_diff(CType *a, CType *b)
+{
+  for (int depth = 0; depth < 8; depth++)
+  {
+    const char *w = yasc_level_diff(a, b);
+    if (w)
+      return w;
+    if ((a->t & (VT_BTYPE | VT_ARRAY)) != VT_PTR || (b->t & (VT_BTYPE | VT_ARRAY)) != VT_PTR || !a->ref || !b->ref)
+      return NULL;
+    a = &a->ref->type, b = &b->ref->type;
+  }
+  return NULL;
+}
+
+/* A function declared again (or defined) in yasc says what it does with its
+   pointers as the declaration before it did: callers that saw only that one
+   are checked against it.  C's compatibility leaves the yasc words out. */
+static void yasc_redecl_check(Sym *sym, CType *type)
+{
+  Sym *o = sym->type.ref, *n = type->ref, *po, *pn;
+  const char *w, *name = get_tok_str(sym->v, NULL);
+  int i = 1;
+  if (!o || !n || o == n)
+    return;
+  if ((w = yasc_contract_diff(&o->type, &n->type)))
+    tcc_error("'%s' is declared again with another yasc contract: the result differs in %s", name, w);
+  for (po = sym_first(o), pn = sym_first(n); po && pn; po = po->next, pn = pn->next, i++)
+    if ((w = yasc_contract_diff(&po->type, &pn->type)))
+    {
+      int v = pn->v & ~SYM_FIELD;
+      if (v >= TOK_UIDENT)
+        tcc_error("'%s' is declared again with another yasc contract: parameter %d ('%s') differs in %s", name, i,
+                  get_tok_str(v, NULL), w);
+      tcc_error("'%s' is declared again with another yasc contract: parameter %d differs in %s", name, i, w);
+    }
+}
+
 /* Merge some type attributes.  */
 static void patch_type(Sym *sym, CType *type)
 {
@@ -173,6 +248,9 @@ static void patch_type(Sym *sym, CType *type)
       sym->r |= VT_LVAL;
   }
 
+  /* first: a yasc difference also makes the C types differ (in / out) */
+  if ((sym->type.t & VT_BTYPE) == VT_FUNC && (type->t & VT_BTYPE) == VT_FUNC)
+    yasc_redecl_check(sym, type);
   if (!is_compatible_types(&sym->type, type))
   {
     tcc_error("incompatible types for redefinition of '%s'", get_tok_str(sym->v, NULL));
@@ -362,6 +440,26 @@ Sym *external_sym(int v, CType *type, int r, AttributeDef *ad)
   while (s && s->sym_scope)
     s = s->prev_tok;
 
+  /* a global variable a system header declares (errno, stdout): what a
+     libc call may still write (-Wlifetime) */
+  if ((type->t & VT_BTYPE) != VT_FUNC && v < SYM_FIRST_ANOM)
+  {
+    BufferedFile *f = file;
+    while (f && f->filename[0] == ':' && f->prev)
+      f = f->prev;
+    if (f && f->sys)
+    {
+      TCCState *s1 = tcc_state;
+      if ((v >> 3) >= s1->sys_globals_size)
+      {
+        int n = (v >> 3) + 256;
+        s1->sys_globals = tcc_realloc(s1->sys_globals, n);
+        memset(s1->sys_globals + s1->sys_globals_size, 0, n - s1->sys_globals_size);
+        s1->sys_globals_size = n;
+      }
+      s1->sys_globals[v >> 3] |= 1 << (v & 7);
+    }
+  }
   if (!s)
   {
     /* push forward reference */

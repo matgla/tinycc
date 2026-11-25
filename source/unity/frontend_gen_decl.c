@@ -14,6 +14,7 @@
 #undef YASC_END_INLINE
 #include "../frontend/gen/decl/plain_param.c"
 #undef PP_CARRIED
+#undef PP_CONSTSRC
 #undef PP_FREED
 #undef PP_MAYBE
 #undef PP_MAYBEARG
@@ -29,4 +30,5 @@
 #undef PP_PREFIX
 #undef PP_PREFIX_LEN
 #include "../frontend/gen/decl/struct.c"
+#undef STRUCT_BODY_AT_MAX
 #include "../frontend/gen/decl/typesig.c"

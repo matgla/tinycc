@@ -26,11 +26,16 @@ int pp_expr;
 /* error recovery (tccpp.c, frontend/gen/core/recover.c), read by error1 */
 int parse_flags;
 int pp_subst_depth;
+unsigned char fe_tokfp_on;
 void tcc_recover_jump(struct TCCState *s1)
 {
   (void)s1;
 }
 void tcc_recover_release(struct TCCState *s1)
+{
+  (void)s1;
+}
+void tcc_recover_stop(struct TCCState *s1)
 {
   (void)s1;
 }
@@ -42,6 +47,16 @@ void save_body_error(struct TCCState *s1, int line, const char *msg)
 int tcc_sys_macro_here(void)
 {
   return 0;
+}
+int tcc_sys_macro_prev(void)
+{
+  return 0;
+}
+
+/* the held diagnostics' sort (diag_out.c): a unit compiles no body here */
+void tcc_qsort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *))
+{
+  (void)base, (void)n, (void)size, (void)cmp;
 }
 const int *macro_ptr;
 struct BufferedFile *file;
@@ -226,6 +241,12 @@ void tcc_typesig_free(TCCState *s1)
 /* -Wcross-tu's location table (frontend/gen/decl/typesig.c) */
 void tcc_typesig_reset(void)
 {
+}
+
+/* -Wtainted-format's records for the link (ir/taint.c) */
+void tcc_taint_link_free(TCCState *s1)
+{
+  (void)s1;
 }
 
 void tcc_stack_usage_free(TCCState *s1)

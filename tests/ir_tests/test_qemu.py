@@ -77,6 +77,7 @@ TEST_FILES = [
     ("bug_memset_small_clear.c", 0),
     ("bug_kernel_validator_overwritten_zeroing.c", 0),
     ("bug_addrof_local_copy_reload.c", 0),
+    ("bug_o0_frame_floor_end_pointer.c", 0),
     ("bug_narrow_store_addr_wide_read.c", 0),
     ("bug_clt_one_past_end_escape.c", 0),
     ("bug_derived_iv_memory_base.c", 0),
@@ -119,6 +120,11 @@ TEST_FILES = [
     # CBE's syscall dispatcher indexes a relocated image instead of copying the
     # table per call; the escape/rewrite shapes must keep the stack copy.
     ("909_const_local_table_symref_indexed.c", 0),
+    # the compiler runtime's own entry points, called by name: libgcc's bit
+    # helpers in libtcc1 and complex division in the FP runtime (both were the
+    # YasOS libc's); 912 under softfp too, in test_complex_div_runtime_abi
+    ("911_libgcc_bit_helpers.c", 0),
+    ("912_complex_div_runtime.c", 0),
     ("bug_const_local_table_direct_frame_reads.c", 0),
     ("bug_const_local_table_var_dest.c", 0),
     ("bug_const_local_table_join_store.c", 0),
@@ -203,6 +209,8 @@ TEST_FILES = [
     # ("bug_ternary_string.c", 0),  # Nested ternary with string literals
     # ("bug_return_else_string.c", 0),  # Return string from else block
     ("test_cleanup_double.c", 0),
+    # a last `return` with no RETURNVALUE fell into the body's cleanups: run twice
+    ("bug_last_return_cleanup_twice.c", 0),
     ("91_const_propagation.c", 0),
     ("92_loop_invariant.c", 0),
     ("93_chained_arithmetic.c", 0),
@@ -373,6 +381,7 @@ TEST_FILES = [
     ("bug_ra_reload_elim_switch_apply_longjmp.c", 0),
     ("bug_entry_store_asm_mem_output.c", 0),
     ("bug_entry_store_retargeted_ptr_store.c", 0),
+    ("bug_entry_store_folded_read_imm_src1.c", 0),
     ("bug_strlen_fold_const_pointer_var.c", 0),
     ("bug_var_tmp_fwd_lea_var0.c", 0),
     ("bug_object_size_loaded_pointer.c", 0),
@@ -1047,6 +1056,7 @@ TEST_FILES = [
     # a variadic nested function keeps its chain slot
     ("bug_nested_variadic_chain_slot.c", 0),
     ("sl_forward_load_redefines_var.c", 0),
+    ("bug_sl_fwd_widened_frame_address.c", 0),
     ("466_alive_share_boundary_coholder.c", 0),
     ("nested_direct_call_args.c", 0),
     ("nested_struct_return.c", 0),
@@ -1657,6 +1667,8 @@ TEST_FILES = [
     ("478_inline_atomic_load_store.c", 0),
     # __ATOMIC_RELAXED..__ATOMIC_SEQ_CST are predefined, as in gcc and clang
     ("bug_atomic_memory_order_predefined.c", 0),
+    # __GNUC_MINOR__ beside __GNUC__: newlib's sys/cdefs.h no longer makes __func__ NULL
+    ("bug_func_null_gnuc_minor.c", 0),
     # Seq_cst loads/stores as LDA/STL, RMW by order, and the inline CAS's
     # failure-path CLREX: every order and width still moves the same values
     # (test_atomic_cas_seqcst_codegen.py checks the shapes).
@@ -2400,6 +2412,8 @@ TEST_FILES = [
     ("882_struct_arg_word_split.c", 0),
     # yasc dialect: defer (docs/plans/yasc_errors.md)
     ("yasc_defer.c", 0),
+    # a defer with a _Complex result: settled into a scalar temp (8 of 16 bytes)
+    ("bug_yasc_defer_complex_return.c", 0),
     # yasc error unions: !T, error sets, try/catch/errdefer; +abi.c is plain C
     (["yasc_errors.c", "yasc_errors+abi.c"], 0),
     # yasc error_name, <yasc.h>; the names come from both files
@@ -2733,7 +2747,7 @@ def _whole_line(pattern):
 
 
 def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_level="-O0", output_dir=None, timeout=10,
-                   float_abi=None, extra_objs=None):
+                   float_abi=None, extra_objs=None, ccompat=True):
     expected_lines, expect_exit = load_expect_file(test_file)
     if expect_exit is not None:
         expected_exit_code = expect_exit
@@ -2741,7 +2755,7 @@ def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_l
     if float_abi:
         opt_suffix += f"_{float_abi}"
     config = CompileConfig(extra_cflags=opt_level, output_suffix=opt_suffix, output_dir=output_dir,
-                           float_abi=float_abi, extra_objs=extra_objs)
+                           float_abi=float_abi, extra_objs=extra_objs, ccompat=ccompat)
     sut, loglines = run_test(test_file, MACHINE, args, defines=defines, config=config)
     expected_lines = _strip_compiler_output(expected_lines, loglines)
     try:
@@ -3019,6 +3033,15 @@ def test_complex_float_abi(float_abi, opt_level, tmp_path):
                    float_abi=float_abi)
 
 
+# __divsc3/__divdc3 of the FP runtime (lib/fp/soft/divc3.c) by name, under the
+# base-PCS ABIs it serves; a hard-float image takes libgcc's.
+@pytest.mark.parametrize("float_abi,opt_level", _COMPLEX_ABI_PARAMS,
+                         ids=[f"divc3_runtime_{a}{o}" for a, o in _COMPLEX_ABI_PARAMS])
+def test_complex_div_runtime_abi(float_abi, opt_level, tmp_path):
+    _run_qemu_test("912_complex_div_runtime.c", 0, opt_level=opt_level, output_dir=tmp_path,
+                   float_abi=float_abi)
+
+
 # AAPCS32 interop with gcc-built code: abi_mix_b.c is compiled by
 # arm-none-eabi-gcc, main and abi_mix_a.c by tcc, and each side calls the
 # other with structs of 17-36 bytes in registers, split and on the stack
@@ -3224,6 +3247,7 @@ YASC_TUTORIAL = [
     ("06_c_library", ["counter.c"]),
     ("07_methods", ["mem.c"]),
     ("09_config", ["mem.c"]),
+    ("10_arrays", ["mem.c", "slots.c"]),
 ]
 _YASC_TUTORIAL_PARAMS = [(ex, extra, opt) for ex, extra in YASC_TUTORIAL for opt in OPT_LEVELS]
 
@@ -3287,6 +3311,10 @@ FP_MATRIX_TESTS = [
     "504_sra_wide_doubleword_fields.c",
     "858_hex_float_leading_zeros.c",
     "fp_libm_exec.c",
+    # @min / @max: once-evaluated operands, integer cmp/it/mov, float
+    # vminnm/vmaxnm.f32, double fmin/fmax (doubles: not in the default run,
+    # whose rp2350 DCP code QEMU cannot execute)
+    "910_at_min_max.c",
 ]
 
 
@@ -3517,6 +3545,31 @@ def test_no_function_sections_bugs(test_file, expected_exit_code, opt_level, tmp
 
     cflags = f"{opt_level} -fno-function-sections"
     _run_qemu_test(test_file, expected_exit_code, opt_level=cflags, output_dir=tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# -fyasc-facts: yasc programs in the safe default (strict lifetimes), where
+# the optimizer takes the facts the checked parameter types give
+# ---------------------------------------------------------------------------
+
+YASC_FACTS_TEST_FILES = [
+    ("bug_yf_promote_call_result.c", 0),
+    ("bug_yf_alias_phi_operand.c", 0),
+    ("bug_yf_licm_nested_call_arg.c", 0),
+    ("bug_yf_copy_fwd_arg_other_block.c", 0),
+    ("bug_yf_call_id_wrap.c", 0),
+]
+
+
+_YASC_FACTS_PARAMS = [(f, e, o) for f, e in YASC_FACTS_TEST_FILES for o in OPT_LEVELS]
+_YASC_FACTS_IDS = [f"{_test_id(f)}{o}" for f, _, o in _YASC_FACTS_PARAMS]
+
+
+@pytest.mark.parametrize("test_file,expected_exit_code,opt_level", _YASC_FACTS_PARAMS, ids=_YASC_FACTS_IDS)
+def test_yasc_facts_execution(test_file, expected_exit_code, opt_level, tmp_path):
+    """No -ccompat: the facts are taken only with strict lifetimes, at -O1+."""
+    _run_qemu_test(test_file, expected_exit_code, opt_level=f"{opt_level} -fyasc-facts", output_dir=tmp_path,
+                   ccompat=False)
 
 
 # ---------------------------------------------------------------------------

@@ -1,18 +1,22 @@
-03_mistakes.c:16: warning: 's' leaks: it still owns memory at the end of its scope
-03_mistakes.c:22: warning: 's' is freed twice
+03_mistakes.c:16: error: 's' leaks: it still owns memory at the end of its scope
+03_mistakes.c:22: error: 's' is freed twice
 03_mistakes.c:21: note: 's' was freed here
-03_mistakes.c:29: warning: 's' is used after it was freed
+03_mistakes.c:29: error: 's' is used after it was freed
 03_mistakes.c:28: note: 's' was freed here
-03_mistakes.c:35: warning: 's' may be null where it is dereferenced
-03_mistakes.c:42: warning: an owned result is discarded: it is never freed
-03_mistakes.c:47: warning: a pointer that owns nothing is stored in an owned pointer
-03_mistakes.c:52: warning: '*n' is read before it is written
-03_mistakes.c:60: warning: 'x' may be used uninitialized
-03_mistakes.c:66: warning: 'local_address' returns the address of a local variable
+03_mistakes.c:35: error: 's' may be null where it is dereferenced
+03_mistakes.c:42: error: an owned result is discarded: it is never freed
+03_mistakes.c:47: error: a pointer that owns nothing is stored in an owned pointer
+03_mistakes.c:52: error: '*n' is read before it is written
+03_mistakes.c:60: error: 'x' may be used uninitialized: yasc wants a value on every path
+03_mistakes.c:66: error: 'local_address' returns the address of a local variable
 03_mistakes.c:71: warning: null passed as argument 1, which is declared nonnull
-03_mistakes.c:86: warning: 'q->next' may be null where it is dereferenced
-03_mistakes.c:99: warning: a pointer that may be null is passed as argument 1 of 'length', which is not maybe
-03_mistakes.c:109: warning: 'tail' is used after 's', which it borrows from, was freed
+03_mistakes.c:86: error: 'q->next' may be null where it is dereferenced
+03_mistakes.c:99: error: a pointer that may be null is passed as argument 1 of 'length', which is not maybe
+03_mistakes.c:109: error: 'tail' is used after 's', which it borrows from, was freed
 03_mistakes.c:108: note: 's' was freed here
-03_mistakes.c:115: warning: the address of a local variable is stored through 'slot', which outlives 'dangling'
+03_mistakes.c:115: error: the address of a local variable is stored through 'slot', which outlives 'dangling'
 03_mistakes.c:125: warning: a null pointer is dereferenced
+03_mistakes.c:140: error: 'a[i]' leaks: it may still own memory at return
+03_mistakes.c:152: error: 'a[i]' is freed twice
+03_mistakes.c:160: error: 'h' leaks: it still owns a handle at return
+03_mistakes.c:166: error: a handle that may be invalid is passed as argument 1 of 'slot_read', which is not maybe

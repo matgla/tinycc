@@ -26,6 +26,7 @@ IR_SRC = \
 	source/ir/lifetime.c \
 	source/ir/bounds.c \
 	source/ir/taint.c \
+	source/ir/regaccess.c \
 	source/ir/regalloc.c \
 	source/ir/regalloc_scan.c \
 	source/ir/regalloc_phi.c \

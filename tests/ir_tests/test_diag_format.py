@@ -59,7 +59,7 @@ def _write(tmp_path, name, src):
 
 
 def _tcc(tmp_path, *args, cwd=None):
-    return subprocess.run([str(TCC), *INCLUDE_FLAGS, *map(str, args)], capture_output=True, text=True, cwd=cwd or tmp_path)
+    return subprocess.run([str(TCC), "-Wno-missing-prototypes", *INCLUDE_FLAGS, *map(str, args)], capture_output=True, text=True, cwd=cwd or tmp_path)
 
 
 def _json(tmp_path, src, *flags, name="t.c"):
@@ -182,19 +182,22 @@ def test_objects_unchanged(tmp_path):
         assert (tmp_path / "a.o").read_bytes() == (tmp_path / "b.o").read_bytes()
 
 
-def test_max_errors(tmp_path):
-    src = "#include <stdlib.h>\nvoid g(void)\n{\n  char * owned p = malloc(3);\n  char * owned q = malloc(3);\n}\n"
+@pytest.mark.parametrize("opt", ["-O0", "-O2", "-fsyntax-only"])
+def test_max_errors(tmp_path, opt):
+    src = "#include <stdlib.h>\nvoid g(void)\n{\n  char * owned p = unsafe(malloc(3));\n  char * owned q = unsafe(malloc(3));\n}\n"
     _write(tmp_path, "t.c", src)
-    proc = _tcc(tmp_path, "-Werror=lifetime", "-Wno-unused", "-c", "t.c", "-o", "t.o")
+    proc = _tcc(tmp_path, opt, "-Werror=lifetime", "-Wno-unused", "-c", "t.c", "-o", "t.o")
     assert proc.stderr.count("error:") == 2
-    proc = _tcc(tmp_path, "-Werror=lifetime", "-Wno-unused", "-fmax-errors=1", "-c", "t.c", "-o", "t.o")
+    # -O1+: the diagnostics are held (driver/diag_out.c), counted in -O0's
+    # order when written
+    proc = _tcc(tmp_path, opt, "-Werror=lifetime", "-Wno-unused", "-fmax-errors=1", "-c", "t.c", "-o", "t.o")
     assert proc.returncode == 1
     assert proc.stderr.count("error:") == 1
     assert "compilation terminated due to -fmax-errors=1." in proc.stderr
     # the stop comes from inside the lifetime check: an ASan build reports what
     # the check had allocated if the compile ends there (tcc_ir_flow_checks)
     assert "Sanitizer" not in proc.stderr, proc.stderr
-    proc, diags = _json(tmp_path, src, "-Werror=lifetime", "-Wno-unused", "-fmax-errors=1")
+    proc, diags = _json(tmp_path, src, opt, "-Werror=lifetime", "-Wno-unused", "-fmax-errors=1")
     assert len(diags) == 1 and diags[0]["kind"] == "error"
 
 

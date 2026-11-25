@@ -1,0 +1,4 @@
+02_stack_budget.c:30: warning: the frame size of 'checksum_big' is 2064 bytes, larger than 1024 bytes
+02_stack_budget.c:30: warning: stack usage of 'checksum_big' is 2064 bytes, larger than 1024 bytes
+02_stack_budget.c:35: warning: variable length array 'squares' is used
+02_stack_budget.c:42: warning: stack usage of 'sum_squares' might be unbounded

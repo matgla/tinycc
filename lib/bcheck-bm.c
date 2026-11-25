@@ -18,9 +18,17 @@
  *
  * Regions: every global (the .bounds table the linker ends and names
  * __bound_globals), every local array or struct (registered where it is
- * declared, dropped at its function's exits) and every malloc'd block (one
- * byte more is allocated, so a one-past-the-end pointer never starts the next
- * block).  A pointer outside every region is not checked.
+ * declared, dropped where its scope ends), VLA and alloca block, local
+ * scalar whose address is taken, and every malloc'd block (one byte more is
+ * allocated, so a one-past-the-end pointer never starts the next block),
+ * and main's argv: each string and the array (__bound_main_arg).  A pointer
+ * outside every region is not checked.
+ *
+ * The C library's memcpy, memmove, memset, memcmp, strlen, strcpy, strncpy,
+ * strcmp, strncmp, strcat, strncat, strchr, strrchr and strdup are reached
+ * through the __bound_ wrappers below (the compiler redirects the calls under
+ * -b), which check what each reads and writes; __bound_longjmp drops the
+ * regions of the frames it leaves (newlib's ARM jmp_buf: sp is word 8).
  *
  * Errors print one line in old bcheck's words on stderr, then exit(255):
  *   BCHECK: 0x... is outside of the region (0x...0x...)
@@ -40,6 +48,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <setjmp.h>
 #include <reent.h>
 
 #define BC_INVALID_POINTER ((uintptr_t)-2)
@@ -58,6 +67,7 @@ typedef struct
   size_t size;
   unsigned char kind;
   unsigned char freed;
+  unsigned char exact; /* a scalar's: its one-past-end address is not its own */
 } Region;
 
 static Region *regions;
@@ -87,6 +97,9 @@ static void bc_outside(uintptr_t p, const Region *r, const char *tail, void *pc)
   bc_error("0x%08lx is outside of the region (0x%08lx..0x%08lx)", p, r->start, r->start + r->size - 1, tail, pc);
 }
 
+/* the arithmetic that made an invalid pointer */
+static void bc_invalid(const char *tail, void *pc);
+
 /* the index of the last region starting at or below addr, or -1 */
 static int bc_floor(uintptr_t addr)
 {
@@ -102,11 +115,16 @@ static int bc_floor(uintptr_t addr)
   return found;
 }
 
-/* the region holding addr, its one-past-the-end address included, or NULL */
+/* the region holding addr, its one-past-the-end address included, or NULL.
+   A scalar's region (`&x`) leaves its one-past-the-end address out: the
+   allocator packs scalars' homes, so that address is most often the next
+   object's, which -b does not know (a parameter's home, a temporary). */
 static Region *bc_find(uintptr_t addr)
 {
   int i = bc_floor(addr);
   if (i < 0 || addr - regions[i].start > regions[i].size)
+    return NULL;
+  if (regions[i].exact && addr - regions[i].start == regions[i].size)
     return NULL;
   return &regions[i];
 }
@@ -119,7 +137,7 @@ static void bc_remove(int i)
 
 static void bc_init(void);
 
-static void bc_insert(uintptr_t start, size_t size, int kind)
+static void bc_insert(uintptr_t start, size_t size, int kind, int exact)
 {
   int i;
   if (!inited)
@@ -149,6 +167,7 @@ static void bc_insert(uintptr_t start, size_t size, int kind)
   regions[i].size = size;
   regions[i].kind = kind;
   regions[i].freed = 0;
+  regions[i].exact = exact;
   nregions++;
 }
 
@@ -159,7 +178,7 @@ static void bc_init(void)
   inited = 1;
   if (__bound_globals)
     for (size_t *p = __bound_globals; p[0]; p += 2)
-      bc_insert(p[0], p[1], BC_GLOBAL);
+      bc_insert(p[0], p[1], BC_GLOBAL, 0);
 }
 
 __attribute__((constructor)) static void bc_constructor(void)
@@ -181,12 +200,17 @@ void *__bound_ptr_add(void *p, size_t offset)
   return (void *)res;
 }
 
+static void bc_invalid(const char *tail, void *pc)
+{
+  bc_error("0x%08lx is outside of the region (0x%08lx..0x%08lx)", bad_ptr, bad_start, bad_end, tail, pc);
+}
+
 static void *bc_indir(void *p, size_t offset, size_t size, void *pc)
 {
   uintptr_t addr = (uintptr_t)p, res = addr + offset;
   Region *r;
   if (addr >= BC_INVALID_POINTER - 0x10000)
-    bc_error("0x%08lx is outside of the region (0x%08lx..0x%08lx)", bad_ptr, bad_start, bad_end, "", pc);
+    bc_invalid("", pc);
   r = bc_find(addr);
   if (r)
   {
@@ -210,13 +234,26 @@ BOUND_PTR_INDIR(8)
 BOUND_PTR_INDIR(12)
 BOUND_PTR_INDIR(16)
 
-/* a local array or struct, where it is declared */
-void __bound_new_region(void *p, size_t size)
+/* SIZE bytes at P: an access of a size no __bound_ptr_indirN has (a struct
+   copied whole), P already checked as pointer arithmetic */
+void *__bound_check(void *p, size_t size)
 {
-  bc_insert((uintptr_t)p, size, BC_LOCAL);
+  return bc_indir(p, 0, size, __builtin_return_address(0));
 }
 
-/* ... and at its function's exits */
+/* a local array, struct, VLA or alloca block */
+void __bound_new_region(void *p, size_t size)
+{
+  bc_insert((uintptr_t)p, size, BC_LOCAL, 0);
+}
+
+/* a local scalar (or parameter) whose address is taken */
+void __bound_new_scalar(void *p, size_t size)
+{
+  bc_insert((uintptr_t)p, size, BC_LOCAL, 1);
+}
+
+/* ... and where its scope ends (or its function's exits) */
 void __bound_delete_region(void *p)
 {
   int i = bc_floor((uintptr_t)p);
@@ -224,12 +261,24 @@ void __bound_delete_region(void *p)
     bc_remove(i);
 }
 
+/* main's entry (frontend/gen/op/bcheck.c bcheck_main_entry): each string of
+   argv, and the array with its NULL, for the whole run */
+void __bound_main_arg(int argc, char **argv)
+{
+  if (!argv || argc < 0)
+    return;
+  for (int i = 0; i < argc; i++)
+    if (argv[i])
+      bc_insert((uintptr_t)argv[i], strlen(argv[i]) + 1, BC_GLOBAL, 0);
+  bc_insert((uintptr_t)argv, (argc + 1) * sizeof(char *), BC_GLOBAL, 0);
+}
+
 /* the malloc family, over newlib's reentrant allocator */
 void *malloc(size_t size)
 {
   void *p = _malloc_r(_REENT, size + 1);
   if (p)
-    bc_insert((uintptr_t)p, size, BC_HEAP);
+    bc_insert((uintptr_t)p, size, BC_HEAP, 0);
   return p;
 }
 
@@ -292,4 +341,157 @@ void *realloc(void *ptr, size_t size)
     free(ptr);
   }
   return p;
+}
+
+/* The C library's reads and writes.  TAIL names the function in the error. */
+
+/* N bytes at P */
+static void bc_range(const void *p, size_t n, const char *tail, void *pc)
+{
+  uintptr_t addr = (uintptr_t)p;
+  Region *r;
+  if (!n)
+    return;
+  if (addr >= BC_INVALID_POINTER - 0x10000)
+    bc_invalid(tail, pc);
+  r = bc_find(addr);
+  if (!r)
+    return;
+  if (r->freed)
+    bc_outside(addr, r, ": use after free", pc);
+  if (addr - r->start + n > r->size)
+    bc_outside(r->start + r->size, r, tail, pc);
+}
+
+/* the string at S, at most MAX bytes of it: its length, its terminator (if
+   MAX lets it be read) inside S's region */
+static size_t bc_strnlen(const char *s, size_t max, const char *tail, void *pc)
+{
+  uintptr_t addr = (uintptr_t)s;
+  Region *r;
+  size_t avail;
+  const char *z;
+  if (addr >= BC_INVALID_POINTER - 0x10000)
+    bc_invalid(tail, pc);
+  r = bc_find(addr);
+  if (!r)
+    return strnlen(s, max);
+  if (r->freed)
+    bc_outside(addr, r, ": use after free", pc);
+  avail = r->size - (addr - r->start);
+  z = memchr(s, 0, avail < max ? avail : max);
+  if (z)
+    return (size_t)(z - s);
+  if (max > avail)
+    bc_outside(r->start + r->size, r, tail, pc);
+  return max;
+}
+
+#define BC_PC __builtin_return_address(0)
+#define BC_STRLEN(s, tail) bc_strnlen((s), (size_t)-1, (tail), BC_PC)
+
+void *__bound_memcpy(void *d, const void *s, size_t n)
+{
+  bc_range(d, n, " in memcpy", BC_PC);
+  bc_range(s, n, " in memcpy", BC_PC);
+  return memcpy(d, s, n);
+}
+
+void *__bound_memmove(void *d, const void *s, size_t n)
+{
+  bc_range(d, n, " in memmove", BC_PC);
+  bc_range(s, n, " in memmove", BC_PC);
+  return memmove(d, s, n);
+}
+
+void *__bound_memset(void *d, int c, size_t n)
+{
+  bc_range(d, n, " in memset", BC_PC);
+  return memset(d, c, n);
+}
+
+int __bound_memcmp(const void *a, const void *b, size_t n)
+{
+  bc_range(a, n, " in memcmp", BC_PC);
+  bc_range(b, n, " in memcmp", BC_PC);
+  return memcmp(a, b, n);
+}
+
+size_t __bound_strlen(const char *s)
+{
+  return BC_STRLEN(s, " in strlen");
+}
+
+char *__bound_strcpy(char *d, const char *s)
+{
+  size_t n = BC_STRLEN(s, " in strcpy") + 1;
+  bc_range(d, n, " in strcpy", BC_PC);
+  return memcpy(d, s, n);
+}
+
+char *__bound_strncpy(char *d, const char *s, size_t n)
+{
+  bc_strnlen(s, n, " in strncpy", BC_PC);
+  bc_range(d, n, " in strncpy", BC_PC);
+  return strncpy(d, s, n);
+}
+
+int __bound_strcmp(const char *a, const char *b)
+{
+  BC_STRLEN(a, " in strcmp");
+  BC_STRLEN(b, " in strcmp");
+  return strcmp(a, b);
+}
+
+int __bound_strncmp(const char *a, const char *b, size_t n)
+{
+  bc_strnlen(a, n, " in strncmp", BC_PC);
+  bc_strnlen(b, n, " in strncmp", BC_PC);
+  return strncmp(a, b, n);
+}
+
+char *__bound_strcat(char *d, const char *s)
+{
+  size_t dl = BC_STRLEN(d, " in strcat"), sl = BC_STRLEN(s, " in strcat");
+  bc_range(d, dl + sl + 1, " in strcat", BC_PC);
+  return strcat(d, s);
+}
+
+char *__bound_strncat(char *d, const char *s, size_t n)
+{
+  size_t dl = BC_STRLEN(d, " in strncat"), sl = bc_strnlen(s, n, " in strncat", BC_PC);
+  bc_range(d, dl + sl + 1, " in strncat", BC_PC);
+  return strncat(d, s, n);
+}
+
+char *__bound_strchr(const char *s, int c)
+{
+  BC_STRLEN(s, " in strchr");
+  return strchr(s, c);
+}
+
+char *__bound_strrchr(const char *s, int c)
+{
+  BC_STRLEN(s, " in strrchr");
+  return strrchr(s, c);
+}
+
+char *__bound_strdup(const char *s)
+{
+  size_t n = BC_STRLEN(s, " in strdup") + 1;
+  char *p = malloc(n); /* registered, unlike newlib's own */
+  if (p)
+    memcpy(p, s, n);
+  return p;
+}
+
+/* the frames below the one setjmp saved are gone: their locals' regions too
+   (the stack grows down; newlib's ARM jmp_buf keeps sp in word 8) */
+void __bound_longjmp(jmp_buf env, int val)
+{
+  uintptr_t sp = ((uintptr_t *)env)[8];
+  for (int i = bc_floor(sp - 1); i >= 0; i--)
+    if (regions[i].kind == BC_LOCAL)
+      bc_remove(i);
+  longjmp(env, val);
 }

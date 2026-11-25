@@ -31,7 +31,7 @@ ASMS = dcp_aeabi.S
 
 # Borrowed verbatim from the soft-float runtime; see above.
 SOFT_DIR   = ../../soft
-SOFT_SRCS  = ddiv.c fcmp.c conv64.c
+SOFT_SRCS  = ddiv.c fcmp.c conv64.c divc3.c
 SOFT_ASMS  = fcmp_asm.S
 
 BUILD_DIR ?= build

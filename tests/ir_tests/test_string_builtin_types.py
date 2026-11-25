@@ -9,6 +9,7 @@ for null as with -fno-builtin.  The -Wlifetime record of the call (what may
 be null, which arguments may not) goes to the helper call too.
 """
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -52,7 +53,7 @@ def _compile(tmp_path, body, *flags):
     src = tmp_path / "t.c"
     src.write_text(body)
     return subprocess.run(
-        [str(TCC), "-c", *flags, str(src), "-o", str(tmp_path / "t.o")],
+        [str(TCC), "-Wno-missing-prototypes", "-c", *flags, str(src), "-o", str(tmp_path / "t.o")],
         capture_output=True, text=True,
     )
 
@@ -72,7 +73,8 @@ def _hit_lines(body):
 @pytest.mark.parametrize("level", LEVELS)
 @pytest.mark.parametrize("builtins", [(), ("-fno-builtin",)], ids=["builtin", "no-builtin"])
 def test_yasc_qualifiers_survive_the_redirect(tmp_path, level, builtins):
-    proc = _compile(tmp_path, YASC_DECLS + YASC_USES, "-std=yasc", "-Wall", level, *builtins)
+    # -ccompat: the flow checks' reports stay warnings (errors in safe mode)
+    proc = _compile(tmp_path, YASC_DECLS + YASC_USES, "-ccompat", "-std=yasc", "-Wlifetime", "-Wall", level, *builtins)
     assert proc.returncode == 0, proc.stderr
     assert _warned_lines(proc, YASC_LINES) == _hit_lines(YASC_USES), proc.stderr
 
@@ -110,12 +112,17 @@ def test_c_result_is_the_declared_type(tmp_path, level, builtins):
 
 def test_c_result_in_the_safe_default(tmp_path):
     # discarded-qualifiers is an error there; a regular C header's pointers
-    # are unchecked, so the plain `char *` of the uses is fine
+    # are unchecked: the uses take them as views with unsafe(...) (S2)
     (tmp_path / "decls.h").write_text(C_DECLS)
     body = '#include "decls.h"\n'
     # (not f8: its memchr folds to a null constant, which -Wlifetime reports
     # stored in a pointer that is not maybe)
-    uses = "".join(line.replace("char *", "char * view ").replace("void *", "void * view ") + "\n"
+    # unsafe(...) takes its whole line: one statement per line; a parameter
+    # written through or handed back as `char * view` says inout
+    uses = "".join(re.sub(r"char \*p = (.*?); return", r"char *p = unsafe(\1); return", line)
+                   .replace("(char *", "(inout char *")
+                   .replace("char *", "char * view ").replace("void *", "void * view ")
+                   .replace("{ ", "{\n  ").replace("; ", ";\n  ").replace(" }", "\n}") + "\n"
                    for line in C_USES.splitlines() if not line.startswith("char *f8"))
     proc = _compile(tmp_path, body + uses)
     assert proc.returncode == 0 and not proc.stderr, proc.stderr

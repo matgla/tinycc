@@ -3358,6 +3358,7 @@ const FloatingPointConfig *arm_determine_fpu_config(struct TCCState *s)
   switch (s->fpu_type)
   {
   case ARM_FPU_FPV4_SP_D16:
+    return &arm_fpv4_sp_d16_fpu_config; /* no vminnm/vmaxnm */
   case ARM_FPU_FPV5_SP_D16:
     return &arm_fpv5_sp_d16_fpu_config;
   case ARM_FPU_FPV5_D16:

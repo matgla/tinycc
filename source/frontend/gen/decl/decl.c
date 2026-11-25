@@ -27,7 +27,7 @@
  * is an ordinary identifier (<assert.h> defines it as a macro). */
 int tok_is_static_assert(void)
 {
-  return tok == TOK_STATIC_ASSERT || (tok == TOK_static_assert && tcc_state->cversion >= 202311);
+  return tok == TOK_STATIC_ASSERT || (tok == TOK_static_assert && TCC_C23(tcc_state));
 }
 
 void do_Static_assert(void)
@@ -124,6 +124,7 @@ static void save_function_body(TokenString **str, int **pack, int compiled_now, 
   const int *const saved_macro_ptr = macro_ptr;
   TokenString *const saved_macro_stack = tok_macro_stack();
   int stop;
+  tcc_diag_queue_begin(s1); /* the body may speak away from its place */
   *pack = pp_pack_snapshot(tcc_state);
   if ((stop = setjmp(jb)) != 0)
   {
@@ -134,11 +135,24 @@ static void save_function_body(TokenString **str, int **pack, int compiled_now, 
     pp_subst_depth = saved_subst;
     pp_expr = saved_pp_expr;
     tok_macro_restore(saved_macro_stack, saved_macro_ptr);
-    save_body_cut(*str, stop, sym);
+    /* the replay owns the tokens now: the function's record lets them go
+       (the compile ends, its records are freed after the macro stack) */
+    TokenString *cut = *str;
+    *str = NULL;
+    save_body_cut(cut, stop, sym);
   }
   s1->save_body_jmp = &jb;
+  /* a body a regular-C macro defines in yasc code: its expansion's "yasc off"
+     came before the '{', and a replay starts in the file's dialect */
+  const int dialect = s1->yasc;
   skip_or_save_block(str);
   s1->save_body_jmp = saved_jmp;
+  if (file && dialect != file->yasc)
+    tok_str_lead_yasc(*str, dialect);
+  /* what the parse says after the body comes after what the body says,
+     wherever it is parsed (driver/diag_out.c) */
+  if (s1->diag_in_parse && !s1->in_inline_expansion)
+    s1->diag_anchor = ++s1->diag_decl_seq;
   /* Replayed after the TU is parsed, its asm must not name an r0/r1 function. */
   gfunc_regpair_note_asm_names(*str);
   if (!compiled_now && pp_pack_captures != captures)
@@ -179,6 +193,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
     struct InlineFunc *fn;
     fn = tcc_mallocz(sizeof *fn);
     fn->filename = tcc_filename_intern(file->filename);
+    fn->anchor = tcc_state->diag_anchor;
     fn->sym = sym;
     dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
     save_function_body(&fn->func_str, &fn->pack, 0, sym);
@@ -343,6 +358,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
     struct InlineFunc *fn;
     fn = tcc_mallocz(sizeof *fn);
     fn->filename = tcc_filename_intern(file->filename);
+    fn->anchor = tcc_state->diag_anchor;
     fn->sym = sym;
     fn->func_str = NULL;
     save_function_body(&fn->func_str, &fn->pack, 1, sym);
@@ -655,6 +671,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
     {
       struct InlineFunc *fn = tcc_mallocz(sizeof *fn);
       fn->filename = tcc_filename_intern(file->filename);
+    fn->anchor = tcc_state->diag_anchor;
       fn->sym = sym;
       fn->func_str = NULL;
       save_function_body(&fn->func_str, &fn->pack, 1, sym);
@@ -836,6 +853,7 @@ static int defer_function_body(Sym *sym, Section *section)
     return 0;
   DeferredFunc *d = tcc_mallocz(sizeof *d);
   d->filename = tcc_filename_intern(file->filename);
+  d->anchor = tcc_state->diag_anchor;
   d->sym = sym;
   d->section = section;
   tcc_state->save_body_deferred = d;
@@ -869,6 +887,7 @@ void define_deferred_function(DeferredFunc *d)
   int saved_budget = called_once_budget_begin(body->len);
   Sym *saved_sym = tcc_state->deferred_sym;
   int saved_sites = tcc_state->deferred_call_sites;
+  const int saved_anchor = tcc_diag_anchor_enter(tcc_state, d->anchor);
   tcc_state->deferred_sym = d->sym;
   tcc_state->deferred_call_sites = d->call_sites;
   d->body = NULL;
@@ -891,6 +910,7 @@ void define_deferred_function(DeferredFunc *d)
   pp_pack_leave(tcc_state, saved_pack);
   tcc_state->deferred_sym = saved_sym;
   tcc_state->deferred_call_sites = saved_sites;
+  tcc_state->diag_anchor = saved_anchor;
   called_once_budget_end(saved_budget);
 }
 
@@ -963,8 +983,16 @@ static int defer_static_data(CType *type, AttributeDef *ad, int r, int v)
     if (!(sym->type.t & VT_EXTERN) || (esym && esym->st_shndx != SHN_UNDEF && esym->st_shndx != SHN_COMMON))
       return 0; /* already defined: let the definition path report it */
   }
+  /* an aggregate's initializer not in braces (nor a string, nor a compound
+     literal) is an error: said now, as the definition path says it (saved,
+     the ',' after its first element would end it) */
+  if ((type->t & VT_ARRAY || (type->t & VT_BTYPE) == VT_STRUCT) && !(type->t & VT_VECTOR) && tok != '{' &&
+      tok != TOK_STR && tok != TOK_LSTR && tok != '(')
+    return 0;
   TokenString *init;
+  skip_save_stop_semicolon = 1; /* a ';' right in its braces ends it: no initializer holds one */
   skip_or_save_block(&init);
+  skip_save_stop_semicolon = 0;
   if (unsized)
   {
     size_array_from_saved_init(type, init);
@@ -984,6 +1012,7 @@ static int defer_static_data(CType *type, AttributeDef *ad, int r, int v)
   }
   DeferredData *d = tcc_mallocz(sizeof *d);
   d->filename = tcc_filename_intern(file->filename);
+  d->anchor = tcc_state->diag_anchor;
   d->sym = sym;
   d->type = *type;
   d->ad = *ad;
@@ -993,6 +1022,9 @@ static int defer_static_data(CType *type, AttributeDef *ad, int r, int v)
   tok_str_spill(init);
   d->init = init;
   dynarray_add(&tcc_state->deferred_data, &tcc_state->nb_deferred_data, d);
+  tcc_diag_queue_begin(tcc_state); /* its initializer speaks at the end of the unit */
+  if (tcc_state->diag_in_parse) /* before what the parse says after it (driver/diag_out.c) */
+    tcc_state->diag_anchor = ++tcc_state->diag_decl_seq;
   return 1;
 }
 
@@ -1015,8 +1047,10 @@ static void define_deferred_data_replay(void *arg)
    (core/recover.c). */
 void define_deferred_data(DeferredData *d)
 {
+  const int anchor = tcc_diag_anchor_enter(tcc_state, d->anchor);
   tccpp_setfile_replay(d->filename);
   replay_recovering(define_deferred_data_replay, d);
+  tcc_state->diag_anchor = anchor;
 }
 
 /* Parse the initializer of an object prune_unused_statics dropped, for its
@@ -1049,10 +1083,12 @@ void check_dropped_deferred_data(DeferredData *d, TokenString *init)
   DroppedDataReplay a = {d, init};
   const int saved_nocode_wanted = nocode_wanted;
   nocode_wanted = DATA_ONLY_WANTED;
+  const int anchor = tcc_diag_anchor_enter(tcc_state, d->anchor);
   tcc_state->check_only++;
   tccpp_setfile_replay(d->filename);
   replay_recovering(check_dropped_deferred_data_replay, &a); /* goes on after an error */
   tcc_state->check_only--;
+  tcc_state->diag_anchor = anchor;
   nocode_wanted = saved_nocode_wanted;
 }
 
@@ -1060,6 +1096,7 @@ void check_dropped_deferred_data(DeferredData *d, TokenString *init)
 void check_dropped_function(DeferredFunc *d, TokenString *body)
 {
   int saved_pack[PACK_STACK_SIZE + 1];
+  const int anchor = tcc_diag_anchor_enter(tcc_state, d->anchor);
   tccpp_setfile_replay(d->filename);
   pp_pack_enter(tcc_state, d->pack, saved_pack);
   begin_macro_kept(body);
@@ -1067,6 +1104,7 @@ void check_dropped_function(DeferredFunc *d, TokenString *body)
   gen_function_check_only(d->sym);
   end_macro();
   pp_pack_leave(tcc_state, saved_pack);
+  tcc_state->diag_anchor = anchor;
 }
 
 /* -Wunused-*: the variable V just declared, at LINE: a local (or static
@@ -1185,15 +1223,100 @@ static __attribute__((noinline)) int nested_func_label(int v)
   return tok_alloc(mangled, strlen(mangled))->tok;
 }
 
+RecoverDeclList *recover_decl_list;
+RecoverDeclResume recover_decl_resume;
+
+/* The declaration lists being parsed (an error in one may go on with its
+   next declarator: core/recover.c), innermost first.  Their records are
+   kept off decl()'s frame, which an initializer's calls and inline
+   expansions put on the parser's recursive path: taken from a free list,
+   given back when decl() returns (DECL_RETURN) or an error's recovery
+   unwinds past them (decl_list_unwind). */
+static RecoverDeclList *decl_list_free;
+
+static __attribute__((noinline)) RecoverDeclList *decl_list_push(CType *btype, AttributeDef *adbase, int l)
+{
+  RecoverDeclList *dl = decl_list_free;
+  if (dl)
+    decl_list_free = dl->outer;
+  else
+    dl = tcc_malloc(sizeof *dl);
+  memset(dl, 0, sizeof *dl);
+  dl->outer = recover_decl_list;
+  dl->btype = btype;
+  dl->adbase = adbase;
+  dl->l = l;
+  recover_decl_list = dl;
+  return dl;
+}
+
+/* back to MARK (a recovery point's), NULL: all of them */
+void decl_list_unwind(RecoverDeclList *mark)
+{
+  while (recover_decl_list && recover_decl_list != mark)
+  {
+    RecoverDeclList *dl = recover_decl_list;
+    recover_decl_list = dl->outer;
+    dl->outer = decl_list_free;
+    decl_list_free = dl;
+  }
+}
+
+/* the end of the unit */
+void decl_list_reset(void)
+{
+  decl_list_unwind(NULL);
+  while (decl_list_free)
+  {
+    RecoverDeclList *dl = decl_list_free;
+    decl_list_free = dl->outer;
+    tcc_free(dl);
+  }
+}
+
+/* decl()'s way out: a file-scope or block-scope list's record goes */
+#define DECL_RETURN(x)                                                                                                 \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    if (dl)                                                                                                            \
+      decl_list_unwind(dl->outer);                                                                                     \
+    return (x);                                                                                                        \
+  } while (0)
+
 int decl(int l)
 {
-  int v, has_init, r, oldint, align, exported, this_exported, in_module;
+  int v, has_init, r, oldint, align, exported, this_exported, in_module, ndecl;
   CType type, btype;
   Sym *sym;
   AttributeDef ad, adbase;
-
+  /* the declaration list an error goes on in (core/recover.c) */
+  RecoverDeclList *dl = l == VT_CONST || l == VT_LOCAL ? decl_list_push(&btype, &adbase, l) : NULL;
   while (1)
   {
+    if (yasc_ntagged | yasc_nreg)
+      yasc_stmt_forget(); /* `int k = *p;` is no copy of a tag read before it */
+    if (l == VT_CONST && tcc_state->diag_in_parse)
+    {
+      /* a fatal error or the -fmax-errors cap stopped the parse: the bodies
+         saved before it are still parsed (core/recover.c tcc_recover_stop) */
+      if (tcc_state->diag_stop)
+        DECL_RETURN(0);
+      /* the next file-scope declaration: its diagnostics' anchor */
+      if (!recover_decl_resume.on)
+        tcc_state->diag_anchor = ++tcc_state->diag_decl_seq;
+    }
+    /* an error in the list's last declarator: it goes on with the next one
+       (core/recover.c) */
+    if (recover_decl_resume.on && recover_decl_resume.l == l && dl)
+    {
+      recover_decl_resume.on = 0;
+      btype = recover_decl_resume.btype;
+      adbase = recover_decl_resume.adbase;
+      oldint = recover_decl_resume.oldint;
+      exported = recover_decl_resume.exported;
+      ndecl = 1;
+      goto resume_list;
+    }
     /* Between file-scope declarations no saved body is being replayed. */
     if (l == VT_CONST)
       {
@@ -1212,7 +1335,7 @@ int decl(int l)
       {
         exported = yasc_file_scope_decl();
         if (exported == -2)
-          return 0; /* the end of an imported interface's headers */
+          DECL_RETURN(0); /* the end of an imported interface's headers */
         if (exported < 0)
           continue;
       }
@@ -1222,7 +1345,7 @@ int decl(int l)
     if (!parse_btype(&btype, &adbase, l == VT_LOCAL))
     {
       if (l == VT_JMP)
-        return 0;
+        DECL_RETURN(0);
       /* skip redundant ';' if not in old parameter decl scope */
       if (tok == ';' && l != VT_CMP)
       {
@@ -1276,7 +1399,17 @@ int decl(int l)
       }
     }
 
-    for (int ndecl = 0;; ndecl++)
+    ndecl = 0;
+  resume_list:
+    if (dl)
+    {
+      dl->oldint = oldint;
+      dl->exported = exported;
+      dl->scope = cur_scope;
+      dl->struct_depth = struct_body_depth;
+      dl->active = 1;
+    }
+    for (;; ndecl++)
     { /* iterate thru each declaration */
       Sym *stack_before = global_stack;
       type = btype;
@@ -1290,6 +1423,8 @@ int decl(int l)
         attr_deprecated_suppress++;
       /* yasc: a local's plain pointer waits for its body (plain_param.c) */
       const int pp_local = l == VT_LOCAL && tcc_state->yasc ? yasc_pp_local_begin() : -1;
+      if (dl)
+        dl->init_base = init_brace_depth;
       /* an error in the declarator still declares its name (core/recover.c) */
       recover_decl.l = l == VT_CONST || l == VT_LOCAL ? l : 0;
       recover_decl.v = 0;
@@ -1420,6 +1555,8 @@ int decl(int l)
 #endif
       if (tok == '{')
       {
+        if (dl)
+          dl->active = 0; /* a definition, no list */
         if ((type.t & VT_BTYPE) != VT_FUNC)
           expect("function definition");
 
@@ -1529,6 +1666,7 @@ int decl(int l)
               nf->sym->type.ref->f.func_auto_inline = 1;
               struct InlineFunc *fn = tcc_mallocz(sizeof *fn);
               fn->filename = tcc_filename_intern(file->filename);
+    fn->anchor = tcc_state->diag_anchor;
               fn->sym = nf->sym;
               /* Copy the token stream — nf->func_str is freed by end_macro()
                * during compile_nested_functions, so InlineFunc needs its own. */
@@ -1847,6 +1985,25 @@ int decl(int l)
             r |= VT_LVAL;
           }
           has_init = (tok == '=');
+          /* yasc `T x = undefined;`: an automatic local with no value on
+             purpose (decl_initializer_alloc: one the flow check cannot
+             follow needs it, as it needs an initializer) */
+          yasc_decl_undefined = 0;
+          if (has_init && tcc_state->yasc && l != VT_CONST && !(type.t & (VT_STATIC | VT_EXTERN)) &&
+              (type.t & VT_BTYPE) != VT_FUNC && !sym_find(TOK_undefined))
+          {
+            next();
+            if (tok == TOK_undefined)
+            {
+              next();
+              if (tok != ',' && tok != ';')
+                expect("',' or ';' after 'undefined'");
+              has_init = 0;
+              yasc_decl_undefined = 1;
+            }
+            else
+              unget_tok('=');
+          }
           if (has_init && (type.t & VT_VLA))
             tcc_error("variable length array cannot be initialized");
 
@@ -1901,6 +2058,7 @@ int decl(int l)
               tcc_typesig_note(v, decl_line, 1);
             if (!(has_init && l == VT_CONST && defer_static_data(&type, &ad, r, v)))
               decl_initializer_alloc(&type, &ad, r, has_init, v, l == VT_CONST);
+            yasc_decl_undefined = 0;
             if (ad.attr_deprecated | ad.attr_unused_result | ad.attr_fmt_kind | ad.attr_fmt_arg)
               attr_apply_decl_facts(sym_find(v), &ad);
             if (tcc_state->unused_on)
@@ -1915,16 +2073,20 @@ int decl(int l)
         if (tok != ',')
         {
           if (l == VT_JMP)
-            return 1;
+            DECL_RETURN(1);
           skip(';');
           break;
         }
         next();
       }
     }
+    if (dl)
+      dl->active = 0;
   }
-  return 0;
+  DECL_RETURN(0);
 }
+
+#undef DECL_RETURN
 
 /* ------------------------------------------------------------------------- */
 #undef gjmp_addr

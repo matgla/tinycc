@@ -1690,6 +1690,40 @@ def test_section_with_separate_run_and_load_address(script):
 
 
 @pytest.mark.linker
+@pytest.mark.linker_section
+def test_segment_sizes_stop_at_file_contents():
+    """Each PT_LOAD's p_filesz ends at its last section with file contents and
+    its p_memsz at its last section, as GNU ld writes them.  The padding before
+    a page-aligned .bss was counted as file data (p_filesz 0x1000 for 8 bytes
+    of .data: QEMU then loaded the image over its own code), and the first
+    segment's p_memsz carried the ELF header size although the headers are not
+    in it (zero fill over the .text after the vector table)."""
+    obj = _compile_to_object("15_segment_sizes", "sections")
+    elf = BUILD_DIR / "sections" / "15_segment_sizes.elf"
+    # linked as tests/ir_tests/qemu/mps2-an505 links (no -static: with it the
+    # orphan .got lands after .bss in .data's segment, docs/bugs/
+    # linker_static_got_after_bss.md)
+    extra = ["-Wl,-oformat=elf32-littlearm", "-T", str(LINKER_DIR / "sections" / "15_segment_sizes.ld")]
+    result = _link(ROOT, [obj], elf, extra)
+    assert result.returncode == 0, f"link failed: {result.cmd}\n{result.stdout}\n{result.stderr}"
+    loads = _readelf_loads(elf)
+    sections = [s for s in _readelf_sections(elf) if "A" in s["flags"]]
+    for vaddr, paddr, filesz, memsz in loads:
+        inside = [s for s in sections if vaddr <= int(s["addr"], 16) < vaddr + max(memsz, 1)]
+        assert inside, f"PT_LOAD at {vaddr:#x} holds no section: {loads}"
+        end = max(int(s["addr"], 16) + int(s["size"], 16) for s in inside)
+        file_end = max(
+            (int(s["addr"], 16) + int(s["size"], 16) for s in inside if s["type"] != "NOBITS"), default=vaddr
+        )
+        assert filesz == file_end - vaddr, f"PT_LOAD at {vaddr:#x}: p_filesz {filesz:#x}, file contents end {file_end:#x}"
+        assert memsz == end - vaddr, f"PT_LOAD at {vaddr:#x}: p_memsz {memsz:#x}, sections end {end:#x}"
+    # what a loader writes at the load addresses must not overlap
+    images = sorted((paddr, paddr + memsz) for _, paddr, _, memsz in loads if memsz)
+    for (a0, a1), (b0, b1) in zip(images, images[1:]):
+        assert a1 <= b0, f"load images overlap: [{a0:#x}, {a1:#x}) and [{b0:#x}, {b1:#x})"
+
+
+@pytest.mark.linker
 @pytest.mark.linker_symbol
 def test_loadaddr_inside_arithmetic():
     """LOADADDR() is evaluated after layout; the arithmetic around it must

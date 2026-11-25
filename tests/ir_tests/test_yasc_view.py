@@ -76,29 +76,29 @@ def _escape(name, how):
 RETURNED = "it is returned, and the result does not borrow from it"
 
 ESCAPES = {
-    "returned_other_parameter": ("char * borrows(a) f(char * view a, char * view b)\n{\n  return b;\n}\n", 3, "b", RETURNED),
+    "returned_other_parameter": ("char * borrows(a) f(char * view a, inout char * view b)\n{\n  return b;\n}\n", 3, "b", RETURNED),
     "returned_as_static": ("const char * borrows(static) f(char * view s)\n{\n  return s + 1;\n}\n", 3, "s", RETURNED),
-    "stored_in_global": ("void f(char * view s)\n{\n  g = s;\n}\n", 3, "s", "it is stored in global 'g'"),
+    "stored_in_global": ("void f(inout char * view s)\n{\n  g = s;\n}\n", 3, "s", "it is stored in global 'g'"),
     "stored_through_parameter": (
-        "void f(struct S * view o, char * view s)\n{\n  o->f = s;\n}\n",
+        "void f(inout struct S * view o, inout char * view s)\n{\n  o->f = s;\n}\n",
         3,
         "s",
         "it is stored through 'o'",
     ),
     "stored_through_out": (
-        "void f(char * view * view o, char * view s)\n{\n  *o = s;\n}\n",
+        "void f(inout char * view * view o, inout char * view s)\n{\n  *o = s;\n}\n",
         3,
         "s",
         "it is stored through 'o'",
     ),
     "through_a_local": (
-        "void f(char * view s)\n{\n  char * view q = s + 2;\n  char * view r = q;\n  g = r;\n}\n",
+        "void f(inout char * view s)\n{\n  char * view q = s + 2;\n  char * view r = q;\n  g = r;\n}\n",
         5,
         "s",
         "it is stored in global 'g'",
     ),
     "through_a_loop": (
-        "char * borrows(a) f(char * view a, char * view b, int n)\n{\n  char * view p = a;\n  while (n--)\n"
+        "char * borrows(a) f(inout char * view a, inout char * view b, int n)\n{\n  char * view p = a;\n  while (n--)\n"
         "    p = b;\n  return p;\n}\n",
         6,
         "b",
@@ -113,7 +113,7 @@ ESCAPES = {
         RETURNED,
     ),
     "through_an_owned_parameter": (
-        "struct T { char * view f; };\nvoid f(struct T * owned o, char * view s)\n{\n  o->f = s;\n  (void)o;\n}\n",
+        "struct T { char * view f; };\nvoid f(struct T * owned o, inout char * view s)\n{\n  o->f = s;\n  (void)o;\n}\n",
         4,
         "s",
         "it is stored through a parameter",
@@ -125,7 +125,7 @@ ESCAPES = {
         RETURNED,
     ),
     "conditional": (
-        "char * borrows(a) f(char * view a, char * view b)\n{\n  char * view maybe p = find(b, 3);\n"
+        "char * borrows(a) f(inout char * view a, char * view b)\n{\n  char * view maybe p = find(b, 3);\n"
         "  return p ? p : a;\n}\n",
         4,
         "b",
@@ -142,18 +142,18 @@ def test_escapes(tmp_path, name, opt):
 
 
 CLEAN = {
-    "elided_one": "char * view f(char * view s)\n{\n  return s + 1;\n}\n",
-    "elided_several": "char * view f(char * view a, char * view b, int c)\n{\n  return c ? a : b;\n}\n",
-    "named_source": "char * borrows(b) f(char * view a, char * view b)\n{\n  (void)a;\n  return b;\n}\n",
+    "elided_one": "char * view f(inout char * view s)\n{\n  return s + 1;\n}\n",
+    "elided_several": "char * view f(inout char * view a, inout char * view b, int c)\n{\n  return c ? a : b;\n}\n",
+    "named_source": "char * borrows(b) f(char * view a, inout char * view b)\n{\n  (void)a;\n  return b;\n}\n",
     "static_literal": "const char * borrows(static) f(int e)\n{\n  return e ? \"a\" : \"b\";\n}\n",
-    "static_and_parameter": "char * borrows(static, s) maybe f(char * view s, int e)\n{\n  return e ? s : 0;\n}\n",
+    "static_and_parameter": "char * borrows(static, s) maybe f(inout char * view s, int e)\n{\n  return e ? s : 0;\n}\n",
     "static_call": "void f(int e)\n{\n  gc = name(e);\n}\n",
     "call_result_returned": "char * view maybe f(char * view s)\n{\n  return find(s, 'x');\n}\n",
-    "local_struct": "void f(char * view s)\n{\n  struct S t;\n  t.f = s;\n  (void)t;\n}\n",
+    "local_struct": "void f(inout char * view s)\n{\n  struct S t = undefined;\n  t.f = s;\n  (void)t;\n}\n",
     "passed_down": "int use(char * view p);\nint f(char * view s)\n{\n  return use(s + 1);\n}\n",
-    "local_copy": "int f(char * view s)\n{\n  char * view q = s;\n  return q[0];\n}\n",
+    "local_copy": "int f(inout char * view s)\n{\n  char * view q = s;\n  return q[0];\n}\n",
     "read_through": "char f(char * view s)\n{\n  g = 0;\n  return *s;\n}\n",
-    "within_the_same_object": "void f(struct node * view n)\n{\n  n->next = n->next->next;\n}\n",
+    "within_the_same_object": "void f(inout struct node * view n)\n{\n  n->next = n->next->next;\n}\n",
     "loaded_int": "void f(struct node * view n)\n{\n  gi = n->len;\n}\n",
     "loaded_pointer_returned": "struct node * view f(struct node * view n)\n{\n  return n->next->next;\n}\n",
     "loaded_pointer_local": "void f(struct node * view n)\n{\n  struct node * view m = n->next;\n  if (m)\n"
@@ -212,7 +212,7 @@ def test_regular_c_is_untouched(tmp_path):
 @pytest.mark.parametrize("opt", LEVELS)
 def test_code_unchanged(tmp_path, opt):
     """borrows(...) never changes the generated code."""
-    body = "char * borrows(s) f(char * view s, int k)\n{\n  return s + k;\n}\n"
+    body = "char * borrows(s) f(inout char * view s, int k)\n{\n  return s + k;\n}\n"
     a = _compile(tmp_path, body, opt)
     assert a.returncode == 0, a.stderr
     first = (tmp_path / "t.o").read_bytes()
@@ -245,7 +245,7 @@ OWNED_BAD = {
         "a view of 'p' is stored in global 'g', which outlives it",
     ),
     "through_a_parameter": (
-        "void f(struct box * view b)\n{\n  char * owned p = malloc(4);\n  b->key = p;\n  free(p);\n}\n",
+        "void f(inout struct box * view b)\n{\n  char * owned p = malloc(4);\n  b->key = p;\n  free(p);\n}\n",
         4,
         "a view of 'p' is stored through 'b', which outlives it",
     ),
@@ -253,7 +253,7 @@ OWNED_BAD = {
 
 OWNED_CLEAN = {
     "moved_to_a_global": "void f(void)\n{\n  char * owned p = malloc(4);\n  g = p;\n  go = move(p);\n}\n",
-    "moved_to_a_member": "void f(struct box * view b)\n{\n  char * owned p = malloc(4);\n  b->key = p;\n"
+    "moved_to_a_member": "void f(inout struct box * view b)\n{\n  char * owned p = malloc(4);\n  b->key = p;\n"
     "  free(b->buf);\n  b->buf = move(p);\n}\n",
     "returned": "char * owned f(void)\n{\n  char * owned p = malloc(4);\n  g = p;\n  return p;\n}\n",
     "handed_on": "void f(void)\n{\n  char * owned p = malloc(4);\n  g = p;\n  keep(move(p));\n}\n",
@@ -290,34 +290,34 @@ KEY = "'key' borrows from 'buf': it can hold only a pointer into the same object
 LABEL = "'label' borrows from 'name': it can hold only a pointer into the same object's 'name'"
 
 FIELD_BAD = {
-    "other_object": ("void f(struct cache * view c, struct cache * view d)\n{\n  c->key = d->buf;\n}\n", 3, KEY),
-    "a_parameter": ("void f(struct cache * view c, char * view s)\n{\n  c->key = s;\n}\n", 3, KEY),
-    "other_member": ("void f(struct cache * view c)\n{\n  c->label = c->buf;\n}\n", 3, LABEL),
+    "other_object": ("void f(inout struct cache * view c, struct cache * view d)\n{\n  c->key = d->buf;\n}\n", 3, KEY),
+    "a_parameter": ("void f(inout struct cache * view c, inout char * view s)\n{\n  c->key = s;\n}\n", 3, KEY),
+    "other_member": ("void f(inout struct cache * view c)\n{\n  c->label = c->buf;\n}\n", 3, LABEL),
     "through_a_local": (
-        "void f(struct cache * view c, struct cache * view d)\n{\n  char * view k = d->buf;\n  c->key = k;\n}\n",
+        "void f(inout struct cache * view c, struct cache * view d)\n{\n  char * view k = d->buf;\n  c->key = k;\n}\n",
         4,
         KEY,
     ),
     "local_from_other_member": (
-        "void f(struct cache * view c)\n{\n  const char * view k = c->buf;\n  c->label = k;\n}\n",
+        "void f(inout struct cache * view c)\n{\n  const char * view k = c->buf;\n  c->label = k;\n}\n",
         4,
         LABEL,
     ),
 }
 
 FIELD_CLEAN = {
-    "pointer_member": "void f(struct cache * view c)\n{\n  c->key = c->buf + 2;\n}\n",
-    "borrow": "void f(struct cache * view c)\n{\n  c->key = borrow(c->buf);\n}\n",
-    "indexed": "void f(struct cache * view c, int i)\n{\n  c->key = c->buf + i;\n  c->label = c->name + i;\n}\n",
-    "array_member": "void f(struct cache * view c)\n{\n  c->label = c->name + 1;\n}\n",
-    "null_and_static": "void f(struct cache * view c)\n{\n  c->key = 0;\n  c->label = \"x\";\n}\n",
+    "pointer_member": "void f(inout struct cache * view c)\n{\n  c->key = c->buf + 2;\n}\n",
+    "borrow": "void f(inout struct cache * view c)\n{\n  c->key = borrow(c->buf);\n}\n",
+    "indexed": "void f(inout struct cache * view c, int i)\n{\n  c->key = c->buf + i;\n  c->label = c->name + i;\n}\n",
+    "array_member": "void f(inout struct cache * view c)\n{\n  c->label = c->name + 1;\n}\n",
+    "null_and_static": "void f(inout struct cache * view c)\n{\n  c->key = 0;\n  c->label = \"x\";\n}\n",
     "local_object": "void f(struct cache c)\n{\n  c.key = c.buf;\n  (void)c;\n}\n",
-    "through_a_local": "void f(struct cache * view c)\n{\n  char * view k = c->buf + 2;\n  c->key = k;\n}\n",
-    "through_a_local_on_two_paths": "void f(struct cache * view c, int x)\n{\n  char * view k = c->buf;\n"
+    "through_a_local": "void f(inout struct cache * view c)\n{\n  char * view k = c->buf + 2;\n  c->key = k;\n}\n",
+    "through_a_local_on_two_paths": "void f(inout struct cache * view c, int x)\n{\n  char * view k = c->buf;\n"
     "  if (x)\n    k = k + 1;\n  c->key = k;\n}\n",
-    "local_into_array": "void f(struct cache * view c)\n{\n  const char * view k = c->name + 3;\n  c->label = k;\n}\n",
+    "local_into_array": "void f(inout struct cache * view c)\n{\n  const char * view k = c->name + 3;\n  c->label = k;\n}\n",
     # paths that disagree: not known, not reported
-    "local_from_either": "void f(struct cache * view c, struct cache * view d, int x)\n{\n  char * view k = c->buf;\n"
+    "local_from_either": "void f(inout struct cache * view c, struct cache * view d, int x)\n{\n  char * view k = c->buf;\n"
     "  if (x)\n    k = d->buf;\n  c->key = k;\n}\n",
 }
 
@@ -351,7 +351,7 @@ def test_field_borrows_declaration_errors(tmp_path, name):
 
 
 def test_a_method_named_borrows(tmp_path):
-    body = "struct m { int v;\n  int * view borrows(struct m * view self) { return &self->v; } };\n"
+    body = "struct m { int v;\n  int * view borrows(inout struct m * view self) { return &self->v; } };\n"
     assert _diags(tmp_path, body) == []
 
 
@@ -365,15 +365,15 @@ struct kc { char * owned maybe buf; char * borrows(buf) maybe key; };
 DEAD = "'key' may be used after 'buf', which it borrows from, was freed or changed"
 
 KILL_BAD = {
-    "freed": ("void f(struct kc * view c)\n{\n  free(c->buf);\n  use(c->key);\n}\n", 4),
-    "freed_on_one_path": ("void f(struct kc * view c, int x)\n{\n  if (x)\n    free(c->buf);\n  use(c->key);\n}\n", 5),
-    "replaced": ("void f(struct kc * view c)\n{\n  free(c->buf);\n  c->buf = dup(\"x\");\n  use(c->key);\n}\n", 5),
+    "freed": ("void f(inout struct kc * view c)\n{\n  free(c->buf);\n  use(c->key);\n}\n", 4),
+    "freed_on_one_path": ("void f(inout struct kc * view c, int x)\n{\n  if (x)\n    free(c->buf);\n  use(c->key);\n}\n", 5),
+    "replaced": ("void f(inout struct kc * view c)\n{\n  free(c->buf);\n  c->buf = dup(\"x\");\n  use(c->key);\n}\n", 5),
 }
 KILL_CLEAN = {
-    "key_set_again": "void f(struct kc * view c)\n{\n  free(c->buf);\n  c->key = 0;\n  use(c->key);\n}\n",
-    "read_before": "void f(struct kc * view c)\n{\n  use(c->key);\n  free(c->buf);\n}\n",
-    "other_object": "void f(struct kc * view c, struct kc * view d)\n{\n  free(d->buf);\n  d->buf = 0;\n  use(c->key);\n}\n",
-    "pointed_again": "void f(struct kc * view c)\n{\n  free(c->buf);\n  c->buf = dup(\"x\");\n  c->key = c->buf;\n"
+    "key_set_again": "void f(inout struct kc * view c)\n{\n  free(c->buf);\n  c->key = 0;\n  use(c->key);\n}\n",
+    "read_before": "void f(inout struct kc * view c)\n{\n  use(c->key);\n  free(c->buf);\n}\n",
+    "other_object": "void f(struct kc * view c, inout struct kc * view d)\n{\n  free(d->buf);\n  d->buf = 0;\n  use(c->key);\n}\n",
+    "pointed_again": "void f(inout struct kc * view c)\n{\n  free(c->buf);\n  c->buf = dup(\"x\");\n  c->key = c->buf;\n"
     "  use(c->key + 1);\n}\n",
 }
 

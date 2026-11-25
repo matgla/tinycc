@@ -1632,18 +1632,29 @@ ST_FUNC int tcc_assemble(TCCState *s1, int do_preprocess)
 
 /* assemble the string 'str' in the current C compilation unit without
    C preprocessing. */
+/* what tcc_assemble_inline changed, for an error in the text
+   (asm_inline_recover) */
+static const int *asm_inline_macro_ptr;
+static int asm_inline_dotid, asm_inline_dolid, asm_inline_parse_flags;
+
 static void tcc_assemble_inline(TCCState *s1, const char *str, int len, int global)
 {
   const int *saved_macro_ptr = macro_ptr;
   int dotid = set_idnum('.', IS_ID);
 #ifndef TCC_TARGET_RISCV64
   int dolid = set_idnum('$', 0);
+  asm_inline_dolid = dolid;
 #endif
 
+  asm_inline_macro_ptr = saved_macro_ptr;
+  asm_inline_dotid = dotid;
+  asm_inline_parse_flags = parse_flags;
   tcc_open_bf(s1, ":asm:", len);
   memcpy(file->buffer, str, len);
   macro_ptr = NULL;
+  s1->asm_inline = 1; /* an error in the text: recover.c may go on */
   tcc_assemble_internal(s1, 0, global);
+  s1->asm_inline = 0;
   tcc_close();
 
 #ifndef TCC_TARGET_RISCV64
@@ -1651,6 +1662,26 @@ static void tcc_assemble_inline(TCCState *s1, const char *str, int len, int glob
 #endif
   set_idnum('.', dotid);
   macro_ptr = saved_macro_ptr;
+}
+
+/* An error in an asm statement's text: the C parse is put back as
+   tcc_assemble_inline would have (the error is said and the statement's
+   function, compiled, has an error: recover.c) */
+ST_FUNC void asm_inline_recover(void)
+{
+  TCCState *s1 = tcc_state;
+  if (!s1->asm_inline)
+    return;
+  s1->asm_inline = 0;
+  while (file && !strcmp(file->filename, ":asm:"))
+    tcc_close();
+#ifndef TCC_TARGET_RISCV64
+  set_idnum('$', asm_inline_dolid);
+#endif
+  set_idnum('.', asm_inline_dotid);
+  macro_ptr = asm_inline_macro_ptr;
+  parse_flags = asm_inline_parse_flags;
+  tok = ';'; /* where the asm statement was read up to */
 }
 
 /* find a constraint by its number or id (gcc 3 extended
@@ -1756,6 +1787,35 @@ static void subst_asm_operands(ASMOperand *operands, int nb_operands, CString *o
       if (c == '\0')
         break;
     }
+  }
+}
+
+/* The errors of an asm statement's operands that need no code: the
+   constraints (asm_check_constraints) and the operand references in its
+   text (subst_asm_operands') */
+static void asm_check_operands(ASMOperand *operands, int nb_operands, int nb_outputs, int nb_labels, const char *str)
+{
+  asm_check_constraints(operands, nb_operands, nb_outputs);
+  for (; *str; str++)
+  {
+    if (*str != '%')
+      continue;
+    if (str[1] == '%')
+    {
+      str++;
+      continue;
+    }
+    str++;
+    if (*str == 'c' || *str == 'n' || *str == 'b' || *str == 'w' || *str == 'h' || *str == 'k' || *str == 'q' ||
+        *str == 'l' ||
+#ifdef TCC_TARGET_RISCV64
+        *str == 'z' ||
+#endif
+        *str == 'P')
+      str++;
+    if (find_constraint(operands, nb_operands + nb_labels, str, NULL) < 0)
+      tcc_error("invalid operand reference after %%");
+    str--;
   }
 }
 
@@ -2041,6 +2101,10 @@ ST_FUNC void asm_instr(void)
      token after the assembler parsing */
   if (tok != ';')
     expect("';'");
+  /* the operands' errors, said here (the statement is dropped, the parse
+     goes on), not when the function is generated */
+  if (must_subst && !nocode_wanted) /* dead code was never checked: nothing generates it */
+    asm_check_operands(operands, nb_operands, nb_outputs, nb_labels, astr.data);
 
   /* IR-only mode: inline asm still relies on legacy backend load/store
      operand materialization and physical register state. */
@@ -2254,6 +2318,10 @@ ST_FUNC void asm_global_instr(void)
 ST_FUNC int tcc_assemble(TCCState *s1, int do_preprocess)
 {
   tcc_error("asm not supported");
+}
+
+ST_FUNC void asm_inline_recover(void)
+{
 }
 
 ST_FUNC void asm_instr(void)

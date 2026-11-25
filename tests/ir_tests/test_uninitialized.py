@@ -1,11 +1,12 @@
-"""-Wuninitialized / -Wmaybe-uninitialized (lifetime.c, tcc_ir_uninit_check).
+"""-Wuninitialized / -Wmaybe-uninitialized (lifetime.c, un_check).
 
 A scalar local declared without a value and read where no path stored one
 is "used uninitialized"; read where only some paths did, "may be used
 uninitialized".  A declaration inside a loop makes the variable uninitialised
 again on every iteration.  A local whose address is taken, or that a nested
-function captures, is not followed.  Plain C as well as yasc; off under
--ccompat unless asked for, on in the safe default.  Checked on the IR before
+function captures, is not followed.  Off under -ccompat unless asked for;
+the safe default is yasc, which enforces initialization (errors, and an
+address-taken local followed: test_yasc_init.py).  Checked on the IR before
 any pass: the same at every -O level, and the code does not change.
 """
 
@@ -32,7 +33,7 @@ def _run(tmp_path, body, *flags, obj="t.o"):
     src = tmp_path / "t.c"
     src.write_text(PRELUDE + body)
     return subprocess.run(
-        [str(TCC), "-c", *flags, str(src), "-o", str(tmp_path / obj)], capture_output=True, text=True
+        [str(TCC), "-Wno-missing-prototypes", "-c", *flags, str(src), "-o", str(tmp_path / obj)], capture_output=True, text=True
     )
 
 
@@ -127,14 +128,22 @@ def test_off_under_ccompat(tmp_path):
 
 
 def test_safe_default(tmp_path):
+    """The safe default is yasc, which enforces initialization: errors, the
+    "may" case too (test_yasc_init.py)"""
     proc = _run(tmp_path, BOTH)
-    assert proc.returncode == 0, proc.stderr
-    assert sorted(d[2] for d in _diags(proc)) == ["'x' is used uninitialized", "'y' may be used uninitialized"]
+    assert proc.returncode != 0, proc.stderr
+    assert sorted((d[1], d[2]) for d in _diags(proc)) == [
+        ("error", "'x' is used uninitialized"),
+        ("error", "'y' may be used uninitialized: yasc wants a value on every path"),
+    ]
 
 
 def test_wno(tmp_path):
-    proc = _run(tmp_path, BOTH, "-Wno-uninitialized", "-Wno-maybe-uninitialized")
+    """-Wno-uninitialized turns regular C's warnings off, not yasc's errors"""
+    proc = _run(tmp_path, BOTH, "-ccompat", "-Wall", "-Wno-uninitialized", "-Wno-maybe-uninitialized")
     assert proc.returncode == 0 and not proc.stderr, proc.stderr
+    proc = _run(tmp_path, BOTH, "-Wno-uninitialized", "-Wno-maybe-uninitialized")
+    assert proc.returncode != 0 and len(_diags(proc)) == 2, proc.stderr
 
 
 def test_werror_reports_all(tmp_path):

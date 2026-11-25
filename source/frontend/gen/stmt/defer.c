@@ -228,25 +228,33 @@ void defer_free_entries(Sym *from, Sym *to)
 
 /* `return EXPR;` with defers to run: EXPR is the value before they run, as
  * in Zig.  Load an lvalue and settle compare flags into a temporary first;
- * a struct is copied to one. */
+ * a struct or a _Complex lvalue is copied to a temp local (a temp holds a
+ * scalar: 8 bytes of a _Complex double). */
 void defer_settle_return_value(void)
 {
   Sym *cls;
   int pending = 0;
 
+  /* (-b's entries only drop regions: a value read after them is still
+     there, merely no longer checked) */
   for (cls = cur_scope->cl.s; cls && cls != root_scope->cl.s; cls = cls->next)
-    if (cls->type.t)
+    if (cls->type.t && cls->type.t != CLEANUP_BCHECK)
       pending = 1;
   if (!pending || !tcc_state->ir)
     return;
-  if ((vtop->type.t & VT_BTYPE) == VT_STRUCT)
+  if ((vtop->type.t & VT_BTYPE) == VT_STRUCT || (vtop->type.t & VT_COMPLEX))
   {
     if (vtop->r & VT_LVAL)
     {
       int align, vr = -1;
       const int size = type_size(&vtop->type, &align);
       CValue cv;
-      cv.i = get_temp_local_var(size, align, &vr);
+      /* a _Complex result sits in a temp local not marked as one (vr -1,
+         op/complex.c): get_temp_local_var could hand out that very slot */
+      if (vtop->type.t & VT_COMPLEX)
+        cv.i = loc = tcc_ir_frame_alloc(loc, size, -align);
+      else
+        cv.i = get_temp_local_var(size, align, &vr);
       vsetc(&vtop->type, VT_LOCAL | VT_LVAL, &cv);
       vtop->vr = vr;
       vswap();

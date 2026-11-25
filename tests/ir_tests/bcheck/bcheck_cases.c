@@ -1,5 +1,6 @@
 /* -b cases (test_bcheck.py): argv[1] picks one; each prints "go <case>"
    first and "ok <case> <value>" if nothing stopped it. */
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -203,6 +204,200 @@ static int global_read(int i)
   return garr[i];
 }
 
+/* a pointer into a block that is gone, read far past its end: checked (and
+   reported) only while the block's region is still registered */
+static char *leak;
+static int probe(void)
+{
+  volatile char *p = (volatile char *)leak;
+  return p[40] * 0;
+}
+
+/* `big` is declared after the return; the pass of the loop before registered
+   it, and its scope dropped it */
+static int after_return(int n)
+{
+  int r = 0;
+  for (int i = 0; i < 3; i++)
+  {
+    if (i == n)
+      return r;
+    char big[16];
+    memset(big, i, sizeof big);
+    leak = big;
+    r += big[15];
+  }
+  return r;
+}
+
+static int scalar_after_return(int n)
+{
+  int r = 0;
+  for (int i = 0; i < 3; i++)
+  {
+    if (i == n)
+      return r;
+    int x = i;
+    int *p = &x;
+    leak = (char *)p;
+    r += *p;
+  }
+  return r;
+}
+
+/* VLAs and alloca */
+static int vla_write(int n)
+{
+  int v[n];
+  for (int i = 0; i <= n; i++)
+    v[i] = i; /* v[n]: one past the end, written */
+  return v[0];
+}
+
+static int vla_scope(int n)
+{
+  int s = 0;
+  for (int k = 0; k < 2; k++)
+  {
+    int v[n];
+    v[n - 1] = k + 1;
+    s += v[n - 1];
+    leak = (char *)v;
+  }
+  return s + probe();
+}
+
+static __attribute__((noinline)) int alloca_use(int n, int over)
+{
+  char *p = __builtin_alloca(n);
+  memset(p, 1, n);
+  leak = p;
+  return p[n - 1 + over];
+}
+
+static int alloca_ok(int n)
+{
+  int r = alloca_use(n, 0);
+  return r + probe(); /* the block died with alloca_use's frame */
+}
+
+/* a scalar whose address is taken */
+static int scalar_addr(int i)
+{
+  int x = 3, y = 5;
+  int *p = &x;
+  p[i] += 1;
+  return x + y;
+}
+
+static __attribute__((noinline)) int param_addr(int a, int i)
+{
+  int *p = &a;
+  p[i] += 2;
+  return a;
+}
+
+/* the C library's reads and writes */
+static char src20[20] = "0123456789abcdefghi";
+static int lib_calls(int which)
+{
+  int a[4];
+  char d[6], s[4] = {'a', 'b', 'c', 'd'};
+  int r = 0;
+  switch (which)
+  {
+  case 0: /* all in bounds */
+  {
+    char *dup;
+    memcpy(a, src20, sizeof a);
+    memmove(a, (char *)a + 1, sizeof a - 1);
+    memset(d, 0, sizeof d);
+    strcpy(d, "abc");
+    strcat(d, "de");
+    strncpy(d, "xy", sizeof d);
+    strncat(d, "zzzz", 3);
+    dup = strdup(d);
+    r = (int)strlen(d) + (strchr(d, 'z') - d) + !memcmp(dup, d, 6) + !strcmp(dup, "xyzzz") +
+        !strncmp(dup, "xyzq", 3) + (strrchr(dup, 'z') - dup);
+    free(dup);
+    return r; /* 5 + 2 + 1 + 1 + 1 + 4 */
+  }
+  case 1:
+    memcpy(a, src20, sizeof a + 4);
+    break;
+  case 2:
+    memcpy(src20, a, sizeof a + 4); /* src20 is fine, a too short */
+    break;
+  case 3:
+    memset(d, 0, sizeof d + 1);
+    break;
+  case 4:
+    strcpy(d, "toolong");
+    break;
+  case 5:
+    r = (int)strlen(s); /* no terminator in s */
+    break;
+  case 6:
+    strcpy(d, "abc");
+    strcat(d, "def");
+    break;
+  }
+  return r + a[0] + d[0];
+}
+
+/* a struct copied whole: both regions */
+static int struct_copy_over(int which)
+{
+  struct S t;
+  struct S *p = malloc(sizeof(struct S) - sizeof(int));
+  memset(&t, 0, sizeof t);
+  if (which)
+    t = *p; /* the source is short */
+  else
+    *p = t; /* the destination is short */
+  free(p);
+  return t.tail;
+}
+
+/* longjmp leaves deep()'s frame: its buffer's region goes with it */
+static jmp_buf jb;
+static __attribute__((noinline)) void deep(int k)
+{
+  char buf[16];
+  memset(buf, 0, sizeof buf);
+  leak = buf;
+  if (k)
+    longjmp(jb, 5);
+}
+
+static int jump(void)
+{
+  volatile int v = setjmp(jb);
+  if (v == 0)
+  {
+    deep(1);
+    return -1;
+  }
+  return v + probe();
+}
+
+/* main's argv: the array, its NULL included, and each string are regions
+   (__bound_main_arg at main's entry) */
+static int argv_use(int argc, char **argv, int which)
+{
+  switch (which)
+  {
+  case 1:
+    return argv[argc + 1 + idx] != 0; /* past the NULL */
+  case 2:
+    return argv[1][strlen(argv[1]) + 1 + idx]; /* past the string's terminator */
+  case 3:
+    strcpy(argv[1], "longer than any case's name");
+    return 0;
+  }
+  return (argv[argc] == 0) + (int)strlen(argv[1]) + argv[1][strlen(argv[1])];
+}
+
 int main(int argc, char **argv)
 {
   const char *c = argc > 1 ? argv[1] : "local_ok";
@@ -261,6 +456,52 @@ int main(int argc, char **argv)
     set_st(9), r = get_st();
   else if (!strcmp(c, "global_read"))
     r = global_read(8);
+  else if (!strcmp(c, "after_return_ok"))
+    r = after_return(2), r += probe();
+  else if (!strcmp(c, "scalar_return_ok"))
+    r = scalar_after_return(2), r += probe();
+  else if (!strcmp(c, "vla_write"))
+    r = vla_write(idx + 5);
+  else if (!strcmp(c, "vla_scope_ok"))
+    r = vla_scope(idx + 3);
+  else if (!strcmp(c, "alloca_ok"))
+    r = alloca_ok(idx + 9);
+  else if (!strcmp(c, "alloca_write"))
+    r = alloca_use(idx + 9, 1);
+  else if (!strcmp(c, "scalar_ok"))
+    r = scalar_addr(idx) + param_addr(4, idx);
+  else if (!strcmp(c, "scalar_write"))
+    r = scalar_addr(idx + 1);
+  else if (!strcmp(c, "param_write"))
+    r = param_addr(4, idx + 1);
+  else if (!strcmp(c, "lib_ok"))
+    r = lib_calls(0);
+  else if (!strcmp(c, "memcpy_dst"))
+    r = lib_calls(1);
+  else if (!strcmp(c, "memcpy_src"))
+    r = lib_calls(2);
+  else if (!strcmp(c, "memset_over"))
+    r = lib_calls(3);
+  else if (!strcmp(c, "strcpy_over"))
+    r = lib_calls(4);
+  else if (!strcmp(c, "strlen_unterm"))
+    r = lib_calls(5);
+  else if (!strcmp(c, "strcat_over"))
+    r = lib_calls(6);
+  else if (!strcmp(c, "copy_dst"))
+    r = struct_copy_over(0);
+  else if (!strcmp(c, "copy_src"))
+    r = struct_copy_over(1);
+  else if (!strcmp(c, "longjmp_ok"))
+    r = jump();
+  else if (!strcmp(c, "argv_ok"))
+    r = argv_use(argc, argv, 0);
+  else if (!strcmp(c, "argv_past"))
+    r = argv_use(argc, argv, 1);
+  else if (!strcmp(c, "argv_str_past"))
+    r = argv_use(argc, argv, 2);
+  else if (!strcmp(c, "argv_strcpy"))
+    r = argv_use(argc, argv, 3);
   printf("ok %s %d\n", c, r);
   return 0;
 }

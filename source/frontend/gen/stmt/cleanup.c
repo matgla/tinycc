@@ -275,6 +275,13 @@ void try_call_scope_cleanup(Sym *stop)
   {
     Sym *fs, *vs;
 
+#ifdef CONFIG_TCC_BCHECK
+    if (cls->type.t == CLEANUP_BCHECK)
+    {
+      bcheck_cleanup(cls);
+      continue;
+    }
+#endif
     if (cls->type.t)
     {
       if (cls->type.t == CLEANUP_DEFER || cleanup_error_exit)

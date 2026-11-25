@@ -706,6 +706,39 @@ def test_header_leaves_out_qualifier_arguments(tmp_path):
     assert "borrows" not in text and "(close)" not in text and "(p)" not in text, text
 
 
+IN_MODULE = """\
+module ro;
+export int first(int n, const char * view * view argv);
+export int count(const char * view a[], char * view b[], int c[4], inout char * view e[], int g[owned]);
+export int bytes(const int * view maybe p, const char * view s, char * view const * view v);
+export int rows(const char (* view m)[4], const char (* view c)[4]);
+"""
+
+IN_TEXT = """\
+int first(int n, const char * const * argv);
+int count(const char * const a[], char * const b[], int const c[4], char * e[], int g[]);
+int bytes(const int * p, const char * s, char * const * v);
+int rows(const char(* m) [4], const char(* c) [4]);
+"""
+
+
+def test_header_spells_in_as_const(tmp_path):
+    """an `in` parameter's target is const in the C header: before the '*'
+    of its outermost pointer, and for an array parameter before its name --
+    the elements (`char * view b[]` is `char * const b[]`, not `char const *
+    b[]`); inout and an owned array say nothing"""
+    proc = _module(tmp_path, IN_MODULE, f"-fmodule-header={tmp_path / 'inc'}")
+    assert proc.returncode == 0 and not proc.stderr, proc.stderr
+    text = (tmp_path / "inc" / "ro.h").read_text()
+    assert IN_TEXT in text, text
+    if shutil.which("arm-none-eabi-gcc"):
+        (tmp_path / "user.c").write_text("#include <ro.h>\n")
+        r = subprocess.run(["arm-none-eabi-gcc", "-std=c99", "-Wall", "-Wextra", "-pedantic", "-Werror",
+                            f"-I{tmp_path / 'inc'}", "-fsyntax-only", str(tmp_path / "user.c")],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+
+
 def test_header_unchanged_keeps_its_time(tmp_path):
     import os
 

@@ -80,6 +80,29 @@ static int dls_call_result_used(TCCIRState *ir, int n, int ci)
   return 0;
 }
 
+/* -fyasc-facts (O1): the FUNCPARAMVAL at p hands its argument to a parameter
+ * that does not escape it (a checked `view`): the callee reads (and may
+ * write) the object while it runs, nothing after it does.  The call's
+ * instruction, -1 when it is no such argument. */
+static int dls_yf_noescape_call(TCCIRState *ir, int n, int p)
+{
+  IRQuadCompact *q = &ir->compact_instructions[p];
+  if (!ir->yf_calls || (q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCPARAMVOID))
+    return -1;
+  uint32_t enc = (uint32_t)tcc_ir_op_src2_imm(ir, q);
+  int cid = TCCIR_DECODE_CALL_ID(enc), ro;
+  if (!tcc_ir_yf_param(ir, cid, TCCIR_DECODE_PARAM_IDX(enc), &ro))
+    return -1;
+  for (int j = p + 1; j < n; j++)
+  {
+    IRQuadCompact *c = &ir->compact_instructions[j];
+    if ((c->op == TCCIR_OP_FUNCCALLVOID || c->op == TCCIR_OP_FUNCCALLVAL) &&
+        TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, c)) == cid)
+      return j;
+  }
+  return -1;
+}
+
 /* Value defs of each TEMP (saturating at 2); a STORE through one is no def. */
 static uint8_t *dls_temp_defs(TCCIRState *ir, int n)
 {
@@ -650,6 +673,9 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
         case TCCIR_OP_FUNCPARAMVOID:
           if ((is_write_p0 || is_memcpy_src_bounded) && k == 1)
             tame_here = 1;
+          /* a no-escape parameter: its read is recorded at the call below */
+          else if (k == 1 && dls_yf_noescape_call(ir, n, i) >= 0)
+            tame_here = 1;
           break;
         default:
           break;
@@ -729,6 +755,9 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
         case TCCIR_OP_FUNCPARAMVAL:
         case TCCIR_OP_FUNCPARAMVOID:
           if ((is_write_p0 || is_memcpy_src_bounded) && k == 1)
+            tame_here = 1;
+          /* a no-escape parameter: its read is recorded at the call below */
+          else if (k == 1 && v_slot != VR_SLOT_AMBIG && dls_yf_noescape_call(ir, n, i) >= 0)
             tame_here = 1;
           /* Any other PARAM — callee may dereference, non-tame. */
           break;
@@ -904,6 +933,39 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       }
     }
   }
+
+  /* -fyasc-facts (O1): an object handed to a no-escape parameter is read
+     -- all of it -- at the call, and by nothing after it */
+  if (ir->yf_calls)
+    for (int i = 0; i < n; i++)
+    {
+      int call = dls_yf_noescape_call(ir, n, i), lo, hi, foff, vr;
+      if (call < 0)
+        continue;
+      IROperand a = tcc_ir_op_get_src1(ir, &ir->compact_instructions[i]);
+      if (a.is_lval)
+        continue;
+      if (irop_get_tag(a) == IROP_TAG_STACKOFF && irop_is_local(a) && irop_get_vreg(a) == -1)
+        foff = irop_get_stack_offset(a);
+      else if ((vr = irop_get_vreg(a)) != -1 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP &&
+               dls_vreg_frame_off(ir, dls_tdefs, vr, i, &foff))
+        ;
+      else
+      {
+        int vf = vr != -1 ? dls_vr_flat(ir, max_vreg, vr) : -1, slot = vf >= 0 ? vreg_slot[vf] : -1;
+        if (slot == -1)
+          continue; /* not a frame address */
+        if (slot == VR_SLOT_AMBIG)
+          dls_live_add(&lv, -(1 << 28), 1 << 29, call);
+        else
+          dls_live_add(&lv, slot, 1 << 28, call);
+        continue;
+      }
+      if (tcc_ir_frame_object_at(ir, foff, &lo, &hi))
+        dls_live_add(&lv, lo, hi - lo, call);
+      else
+        dls_live_add(&lv, foff, 1 << 28, call);
+    }
 
   int changes = 0;
 

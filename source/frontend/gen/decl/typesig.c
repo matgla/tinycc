@@ -15,7 +15,8 @@
  * A record is four NUL-terminated strings: the ELF name, the type as C
  * ("int (int, char *)"), 'D' (defined here, a tentative definition too) or
  * 'U' (only used) followed by where ("a.h:3": the first declaration of a 'U',
- * the definition of a 'D'; empty when not known), and the unit's file name.
+ * the definition of a 'D'; empty when not known), and the unit (ts_unit_id:
+ * its file name, absolute path and an id).
  * With -c they go in the object's non-allocated section ".tcc.typesig" (only
  * with -Wcross-tu, so objects without it stay byte-identical; `tcc -ar` keeps
  * the section, `-r` merges it); a unit compiled straight into a link hands
@@ -336,7 +337,23 @@ static void ts_kind(char *buf, int size, int kind, int v)
     snprintf(buf, size, "%c", kind);
 }
 
+/* TYPE as the records write it: also -Wtainted-format's key for the
+   functions a call through a pointer may reach (ir/taint.c) */
+ST_FUNC void tcc_typesig_type(char *buf, int size, CType *type)
+{
+  ts_type(buf, size, type, NULL, 0);
+}
+
 static Section *ts_sec;
+
+/* NAME as an absolute path (the working directory in front of a relative one) */
+static void ts_abs_path(char *buf, int size, const char *name)
+{
+  buf[0] = 0;
+  if (!IS_ABSPATH(name) && getcwd(buf, size - 2))
+    pstrcat(buf, size, "/");
+  pstrcat(buf, size, name);
+}
 
 static void ts_record(TCCState *s1, const char *name, const char *sig, const char *kind, const char *unit)
 {
@@ -418,16 +435,40 @@ static void ts_structs(TCCState *s1, CType *type, const char *unit, int depth)
   }
 }
 
-/* the end of a unit: its global symbols' records */
-void tcc_typesig_unit(TCCState *s1, const char *unit)
+/* A unit's identity in its records: "NAME\x1dPATH\x1dID" -- the file name as
+   given (what the reports say), its absolute path, and an id: a hash of that
+   path with -c, the unit's number in the link otherwise.  Not the output
+   path: an object is the same whatever it is called (one compile to a.o and
+   to b.o, -O2 -finline-limit vs -finline-limit -O2).  The link adds the
+   object's path (tcc_typesig_section), so units of one name in different
+   directories, or one source compiled twice, are not mixed up. */
+static void ts_unit_id(TCCState *s1, char *buf, int size, const char *name)
 {
-  char sig[512], kind[300];
+  char src[1024];
+  unsigned h = 2166136261u;
+  static int unit_no;
+  ts_abs_path(src, sizeof src, name);
+  if (s1->output_type == TCC_OUTPUT_OBJ)
+  {
+    for (const char *p = src; *p; p++)
+      h = (h ^ (unsigned char)*p) * 16777619u;
+  }
+  else
+    h = ++unit_no;
+  snprintf(buf, size, "%s\x1d%s\x1d%08x", name, src, h);
+}
+
+/* the end of a unit: its global symbols' records */
+void tcc_typesig_unit(TCCState *s1, const char *name)
+{
+  char sig[512], kind[300], unit[2200];
   ts_sec = NULL;
   if (s1->output_type == TCC_OUTPUT_PREPROCESS || s1->syntax_only)
   {
     tcc_typesig_reset();
     return;
   }
+  ts_unit_id(s1, unit, sizeof unit, name);
   for (Sym *s = global_stack; s; s = s->prev)
   {
     ElfSym *esym;

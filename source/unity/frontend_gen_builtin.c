@@ -5,6 +5,7 @@
 #undef INLINE_GIANT_CALLER_TOKENS
 #undef INLINE_WRAPPER_PER_CALLER
 #include "../frontend/gen/builtin/chk.c"
+#include "../frontend/gen/builtin/fortify.c"
 #include "../frontend/gen/builtin/fp.c"
 #include "../frontend/gen/builtin/fp2.c"
 #include "../frontend/gen/builtin/misc.c"

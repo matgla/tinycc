@@ -85,3 +85,27 @@ def test_spill_file_gets_no_uninitialised_bytes(tmp_path, opt):
          "-o", str(tmp_path / "p.o")],
         capture_output=True, text=True, timeout=300)
     assert proc.returncode == 0 and "uninitialised" not in proc.stderr, proc.stderr
+
+
+# An error in the middle of a call: the -Wformat records of the call (its
+# format, the arguments kept for `%N$`) are freed by the error recovery.
+FMT_ERR = """int printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void f(int i)
+{
+  printf("%d %s %d\\n", i, "x", nope);
+  printf(i ? "%d" : "%u %d", i, missing(i, ;
+  printf("%2$s %1$d\\n", i, "y", printf("%d", undeclared));
+  printf("%d\\n", i);
+}
+"""
+
+
+def test_format_records_freed_after_an_error(tmp_path):
+    src = tmp_path / "e.c"
+    src.write_text(FMT_ERR)
+    proc = subprocess.run(
+        ["valgrind", "-q", "--leak-check=full", "--show-leak-kinds=definite,indirect", str(TCC), "-ccompat", "-Wall",
+         "-c", str(src), "-o", str(tmp_path / "e.o")],
+        capture_output=True, text=True, timeout=300)
+    assert proc.returncode != 0 and "error:" in proc.stderr, proc.stderr
+    assert "attr_format" not in proc.stderr, proc.stderr

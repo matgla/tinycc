@@ -4716,6 +4716,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   TCCPassTimer cg_pt = {0};
   int temp_uses_n = 0;
   int *temp_uses = TCC_OPT(tcc_state, optimize) > 0 ? ir_codegen_temp_uses(ir, &temp_uses_n) : NULL;
+  ir->codegen_temp_uses = temp_uses; /* an error in the passes below: tcc_ir_free's */
   int *used_elsewhere_refs = NULL; /* see ir_codegen_vreg_used_elsewhere */
   int p0_pool_entries = 0; /* literal-pool entries the discovery pass allocated */
   int outline_capturing = 0;
@@ -4734,7 +4735,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         cbz_dry_mapping = NULL;
       }
       ir->codegen_cbz_dry_mapping = NULL;
-      ir->codegen_dry_pool_entries = NULL; /* buffer itself freed at exit */
+      /* codegen_dry_pool_entries stays: the CBZ checks give up without the
+         mapping, and the buffer must stay where tcc_ir_free finds it -- an
+         error in this pass (an asm statement's text) is recovered from
+         (core/recover.c), and the function's end below is never reached */
     }
     /* PASS_TIME split of the codegen passes; begin closes the previous
        iteration's frame, the loop exit below closes the last one */
@@ -5608,6 +5612,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       case TCCIR_OP_FSUB:
       case TCCIR_OP_FMUL:
       case TCCIR_OP_FDIV:
+      case TCCIR_OP_FMIN:
+      case TCCIR_OP_FMAX:
       case TCCIR_OP_FNEG:
       case TCCIR_OP_FCMP:
       case TCCIR_OP_CVT_FTOF:
@@ -7546,6 +7552,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   tcc_free(dry_insn_scratch);
   ir->codegen_dry_insn_scratch = NULL;
   tcc_free(temp_uses);
+  ir->codegen_temp_uses = NULL;
   tcc_free(used_elsewhere_refs);
 }
 

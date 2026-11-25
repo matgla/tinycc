@@ -800,6 +800,8 @@ static __attribute__((noinline)) void gen_op_checked_narrow(int op)
 
 ST_FUNC void gen_op_checked(int op)
 {
+  if (TOK_ISCOND(op) && tcc_state->yasc)
+    yasc_null_pair(vtop - 1, vtop); /* `p == 0`: nullptr */
   if ((tcc_state->warn_conversion || tcc_state->warn_sign_conversion) && fe_eval_checks_wanted())
     gen_op_checked_narrow(op);
   else
@@ -894,6 +896,9 @@ ST_FUNC HOT void gen_op(int op)
   if ((MAYBE_ERRUNION(&vtop->type) && type_is_errunion(&vtop->type)) ||
       (MAYBE_ERRUNION(&vtop[-1].type) && type_is_errunion(&vtop[-1].type)))
     yasc_errunion_misuse();
+  if ((MAYBE_ERRUNION(&vtop->type) && type_is_slice(&vtop->type)) ||
+      (MAYBE_ERRUNION(&vtop[-1].type) && type_is_slice(&vtop[-1].type)))
+    yasc_slice_misuse();
   /* A byte-reversed member operand (big-endian scalar_storage_order) is
    * loaded and swapped first, never handed to the IR as a memory operand.
    * What still carries the mark afterwards is an array member's address:
@@ -1215,8 +1220,8 @@ redo:
         gen_opic(op);
       }
       type1.t &= ~(VT_ARRAY | VT_VLA);
-      /* yasc: p + n points into what p owns but owns nothing itself */
-      type_yasc_strip(&type1);
+      /* yasc: p + n points into what p points to but owns nothing itself */
+      type_yasc_derive(&type1);
       /* put again type if gen_opic() swaped operands */
       vtop->type = type1;
     }

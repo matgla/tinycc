@@ -439,3 +439,25 @@ void __ubsan_handle_out_of_bounds_abort(struct ubsan_oob *d, uintptr_t i)
 {
   ub_oob(d, i, 1);
 }
+
+struct ubsan_unreachable
+{
+  struct ubsan_loc loc;
+};
+
+/* __builtin_unreachable() under -fsanitize=unreachable, and yasc's
+   `unreachable` with it in handler mode: always fatal -- clang has no _abort
+   variant, and the code after the call is the compiler's trap */
+#ifdef __YASC__
+#define UB_VIEW view
+#else
+#define UB_VIEW
+#endif
+void __ubsan_handle_builtin_unreachable(struct ubsan_unreachable *UB_VIEW d);
+void __ubsan_handle_builtin_unreachable(struct ubsan_unreachable *UB_VIEW d)
+{
+  struct ubsan_out o;
+  ub_begin(&o, &d->loc, 1);
+  ub_str(&o, "execution reached an unreachable program point");
+  ub_end(&o, 1);
+}

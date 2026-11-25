@@ -16,16 +16,17 @@ from fe_check_cases import ALL_CHECKS, TCC, Case
 
 pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 
-# no plain pointers in yasc (the safe default): V is `view` there
-PRE = "#ifdef __YASC__\n#define V view\n#else\n#define V\n#endif\n"  # 5 lines
+# no plain pointers in yasc (the safe default): V is `view` there, and IO
+# `inout` (a view parameter's target is read-only without it)
+PRE = "#ifdef __YASC__\n#define V view\n#define IO inout\n#else\n#define V\n#define IO\n#endif\n"  # 7 lines
 
 HIT = PRE + (
     "int a[4];\nint m[3][5];\nint * V gp;\n"
     "struct T { int n; int d[4]; } gt;\n"
     "struct N { int d[2]; int n; };\n"
-    "int f1(struct N * V pn)\n{\n"
+    "int f1(IO struct N * V pn)\n{\n"
     "  int r = 0;\n"
-    "  int la[3];\n"
+    "  int la[3] = {};\n"
     "  la[0] = 1;\n"
     "  r += a[4]; /* W: array subscript 4 is above array bounds of 'int[4]' */\n"
     "  a[5] = 1; /* W: array subscript 5 is above array bounds of 'int[4]' */\n"
@@ -37,7 +38,7 @@ HIT = PRE + (
     "  r += 4[a]; /* W: array subscript 4 is above */\n"
     "  r += gt.d[4]; /* W: array subscript 4 is above */\n"
     "  r += pn->d[2]; /* W: array subscript 2 is above array bounds of 'int[2]' */\n"
-    '  r += "abc"[5]; /* W: array subscript 5 is above array bounds of \'char[4]\' */\n'
+    '  r += "abc"[5]; /* W: array subscript 5 is above array bounds of */\n'  # 'const char[4]' in the safe default (-Wwrite-strings)
     "  r += *(a + 4); /* W: array subscript 4 is above array bounds of 'int[4]' */\n"
     "  r += *(4 + a); /* W: array subscript 4 is above */\n"
     "  r += *(a - 1); /* W: array subscript -1 is below */\n"

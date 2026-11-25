@@ -42,6 +42,10 @@ void indir(void)
       return;
     expect("pointer");
   }
+  /* yasc: memory through a regular-C pointer only in unsafe (S2) */
+  if (tcc_state->yasc && !(vtop->type.t & VT_ARRAY) && (type_yasc(&vtop->type) & YASC_UNCHECKED) &&
+      tcc_warn_wanted(warn_unchecked))
+    yasc_unchecked_deref();
   const int os_rec = objsize_ctx && objsize_rec_is(vtop);
   /* A byte-reversed pointer member (big-endian scalar_storage_order) is
    * loaded and swapped; what it points to is in native order.  (A pointer

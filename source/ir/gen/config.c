@@ -62,6 +62,7 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_BFI] = {1, 1, 1},   /* dest = src1 w/ field[lsb,width] := src2; lsb/width in bfi_params[] */
     /* Floating point operations */
     [TCCIR_OP_FADD] = {1, 1, 1}, [TCCIR_OP_FSUB] = {1, 1, 1}, [TCCIR_OP_FMUL] = {1, 1, 1}, [TCCIR_OP_FDIV] = {1, 1, 1},
+    [TCCIR_OP_FMIN] = {1, 1, 1}, [TCCIR_OP_FMAX] = {1, 1, 1},
     [TCCIR_OP_FNEG] = {1, 1, 0}, /* unary: src1=input, dest */
     [TCCIR_OP_FCMP] = {0, 1, 1},
     /* Floating point conversion operations */

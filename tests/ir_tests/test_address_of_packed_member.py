@@ -29,7 +29,7 @@ LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 def _run(tmp_path, body, *flags, compat=True, out="t.o"):
     src = tmp_path / "t.c"
     src.write_text(body)
-    cmd = [str(TCC)] + (["-ccompat"] if compat else []) + ["-c", *flags, str(src), "-o", str(tmp_path / out)]
+    cmd = [str(TCC), "-Wno-missing-prototypes"] + (["-ccompat"] if compat else []) + ["-c", *flags, str(src), "-o", str(tmp_path / out)]
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
@@ -139,9 +139,9 @@ def test_pragma(tmp_path):
 def test_safe_default(tmp_path):
     body = (
         "struct __attribute__((packed)) P { char c; int u; };\n"
-        "int * view f(struct P * view p) { return &p->u; }\n"
-        "int * view g(struct P * view p) { int * view q = (int * view)&p->u; return q; }\n"
-        "void * view h(struct P * view p) { return &p->u; }\n"
+        "int * view f(inout struct P * view p) { return &p->u; }\n"
+        "int * view g(inout struct P * view p) { int * view q = (int * view)&p->u; return q; }\n"
+        "void * view h(inout struct P * view p) { return &p->u; }\n"
     )
     proc = _run(tmp_path, body, compat=False)
     assert proc.returncode == 0, proc.stderr

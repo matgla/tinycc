@@ -64,6 +64,7 @@ SELFHOST_COMPILE_SOURCES = [
     "source/ir/lifetime.c",
     "source/ir/bounds.c",
     "source/ir/taint.c",
+    "source/ir/regaccess.c",
     "source/ir/stack.c",
     "source/ir/type.c",
     "source/ir/vreg.c",
@@ -140,6 +141,7 @@ SELFHOST_COMPILE_SOURCES = [
     # source/frontend/gen/builtin/
     "source/frontend/gen/builtin/call.c",
     "source/frontend/gen/builtin/chk.c",
+    "source/frontend/gen/builtin/fortify.c",
     "source/frontend/gen/builtin/fp.c",
     "source/frontend/gen/builtin/fp2.c",
     "source/frontend/gen/builtin/misc.c",
@@ -173,6 +175,7 @@ SELFHOST_COMPILE_SOURCES = [
     "source/frontend/gen/expr/primary.c",
     "source/frontend/gen/expr/unary.c",
     "source/frontend/gen/expr/yasc_errors.c",
+    "source/frontend/gen/expr/yasc_slices.c",
     # source/frontend/gen/init/
     "source/frontend/gen/init/alloc.c",
     "source/frontend/gen/init/initializer.c",
@@ -294,6 +297,7 @@ SELFHOST_COMPILE_SOURCES = [
     "source/opt/flat/ipa/tu_noreturn.c",
     # source/opt/flat/loop/
     "source/opt/flat/loop/backedge_phi_hoist.c",
+    "source/opt/flat/loop/bounds_iv.c",
     "source/opt/flat/loop/const_sim.c",
     "source/opt/flat/loop/decrement_to_zero.c",
     "source/opt/flat/loop/decrement_carry.c",
@@ -447,6 +451,7 @@ SELFHOST_COMPILE_SOURCES = [
     "source/opt/ssa/scalar/tmp_block_const.c",
     # source/opt/ssa/string/
     "source/opt/ssa/string/const_string_fold.c",
+    "source/opt/ssa/string/str_fortify.c",
     "source/opt/ssa/string/str_memchr.c",
     "source/opt/ssa/string/str_strchr.c",
     "source/opt/ssa/string/str_strcmp.c",

@@ -25,7 +25,7 @@ struct stack
     if (!items)
     {
       mem_free(s);
-      return NULL;
+      return nullptr;
     }
     s->items = move(items);
     s->len = 0;
@@ -34,7 +34,7 @@ struct stack
   }
 
   /* a view self: it looks, or changes the fields, and never frees */
-  int push(struct stack * view self, int v)
+  int push(inout struct stack * view self, int v)
   {
     if (self->full())   /* a body may call any method of the struct */
       return -1;
@@ -42,7 +42,7 @@ struct stack
     return 0;
   }
 
-  int pop(struct stack * view self) { return self->items[--self->len]; }
+  int pop(inout struct stack * view self) { return self->items[--self->len]; }
 
   int full(const struct stack * view self) { return self->len == self->cap; }
 

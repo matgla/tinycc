@@ -120,6 +120,10 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "FMUL";
   case TCCIR_OP_FDIV:
     return "FDIV";
+  case TCCIR_OP_FMIN:
+    return "FMIN";
+  case TCCIR_OP_FMAX:
+    return "FMAX";
   case TCCIR_OP_FNEG:
     return "FNEG";
   case TCCIR_OP_FCMP:

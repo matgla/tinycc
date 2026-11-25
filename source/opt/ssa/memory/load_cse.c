@@ -10,6 +10,7 @@
 
 #define USING_GLOBALS
 #include "ir.h"
+#include "opt.h"
 #include "ssa_opt.h"
 #include "load_cse.h"
 #include "opt_du.h"
@@ -40,12 +41,42 @@ static int lcse_cmp_read_root(TCCIRState *ir, const IROptDU *du, IROperand op, i
   return ir_opt_du_idx(du, vr);
 }
 
+/* the instructions whose memory operands are exposed as LOADs: compares and
+   two-operand arithmetic (ARM reads memory into a register for them anyway;
+   as a LOAD, load_cse can reuse it -- and, with -fyasc-facts, keep it over
+   stores an exclusive parameter keeps apart) */
+static int lcse_exposable_op(int op)
+{
+  return op == TCCIR_OP_CMP || op == TCCIR_OP_ADD || op == TCCIR_OP_SUB || op == TCCIR_OP_MUL || op == TCCIR_OP_AND ||
+         op == TCCIR_OP_OR || op == TCCIR_OP_XOR;
+}
+
+/* instruction I's result goes back to where operand SRC reads (a
+   read-modify-write `*p = *p & m`): left folded for the RMW passes */
+static int lcse_rmw(TCCIRState *ir, int i, IROperand src)
+{
+  IRQuadCompact *q = &ir->compact_instructions[i];
+  if (q->op == TCCIR_OP_CMP || !irop_config[q->op].has_dest)
+    return 0;
+  int32_t res = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+  for (int j = i + 1; j < ir->next_instruction_index && j <= i + 4; j++)
+  {
+    IRQuadCompact *w = &ir->compact_instructions[j];
+    if (w->op != TCCIR_OP_STORE)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, w), v = tcc_ir_op_get_src1(ir, w);
+    if (irop_get_vreg(v) == res && d.is_lval && irop_get_vreg(d) == irop_get_vreg(src) && d.tag == src.tag)
+      return 1;
+  }
+  return 0;
+}
+
 int ssa_opt_expose_cmp_loads(TCCIRState *ir)
 {
   int n = ir->next_instruction_index, candidate = 0;
   for (int i = 0; i < n && !candidate; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_CMP)
+    if (lcse_exposable_op(q->op))
       for (int side = 0; side < 2; side++) {
         IROperand op = tcc_ir_op_get_src1_or_2(ir, q, side != 0);
         if (op.tag == IROP_TAG_VREG && op.is_lval && !irop_is_local(op) && !irop_is_llocal(op))
@@ -74,14 +105,14 @@ int ssa_opt_expose_cmp_loads(TCCIRState *ir)
   int changes = 0;
   /* Reverse insertion preserves the DU definition indices used by the profitability scan. */
   for (int i = n - 1; i >= 0; i--) {
-    if (ir->compact_instructions[i].op != TCCIR_OP_CMP)
+    if (!lcse_exposable_op(ir->compact_instructions[i].op))
       continue;
     int inserted = 0;
     for (int side = 1; side >= 0; side--) {
       IRQuadCompact *q = &ir->compact_instructions[i + inserted];
       IROperand src = tcc_ir_op_get_src1_or_2(ir, q, side != 0);
       int key = lcse_cmp_read_root(ir, &du, src, i);
-      if (key < 0 || reads[key] < 2)
+      if (key < 0 || reads[key] < 2 || lcse_rmw(ir, i + inserted, src))
         continue;
       int line = q->line_num;
       IROperand value = irop_make_vreg(tcc_ir_vreg_alloc_temp(ir), IROP_BTYPE_INT32);
@@ -637,12 +668,15 @@ static void iload_remove_vr(GLoadState *st, int32_t vr)
   }
 }
 
+
 /* a base with <=1 def is version-stable across copy chains; multi-def only safe in zero-hop `*V` form */
 typedef struct {
   uint8_t *var_defs;
   uint8_t *param_defs;
   int nvar;
   int nparam;
+  struct YfAlias *yf; /* -fyasc-facts: exclusive parameters, NULL none (tcc_ir_yf_alias_new) */
+  int yf_hits;
 } LcseDefCounts;
 
 static void lcse_count_def(const LcseDefCounts *dc, int32_t vr)
@@ -706,12 +740,34 @@ static void ptr_state_kill_for_addrtaken_def(TCCIRState *ir, GLoadState *st, int
   st->tvcount = 0;
 }
 
-/* different base_vr killed conservatively: distinct TEMPs may alias the same memory */
-static void iload_kill_for_store(GLoadState *st, int32_t store_base_vr, int store_lo, int store_hi)
+/* -fyasc-facts: a store through STORE_BASE (a parameter, a variable): the
+   tracked loads an exclusive parameter keeps apart from it stay, the rest go */
+static void iload_keep_apart(GLoadState *st, int32_t store_base, LcseDefCounts *dc)
+{
+  for (int k = 0; k < st->ilcount; k++)
+  {
+    if (store_base >= 0 && st->iloads[k].base_vr != store_base && tcc_ir_yf_alias_apart(dc->yf, st->iloads[k].base_vr, store_base))
+    {
+      dc->yf_hits++;
+      continue;
+    }
+    st->iloads[k] = st->iloads[--st->ilcount];
+    k--;
+  }
+}
+
+/* different base_vr killed conservatively: distinct TEMPs may alias the same memory
+   (unless -fyasc-facts says one is an exclusive parameter's and the other not) */
+static void iload_kill_for_store(GLoadState *st, int32_t store_base_vr, int store_lo, int store_hi,
+                                 LcseDefCounts *dc)
 {
   for (int k = 0; k < st->ilcount; k++) {
     const ILoadEntry *e = &st->iloads[k];
     int kill = 0;
+    if (e->base_vr != store_base_vr && dc && dc->yf && tcc_ir_yf_alias_apart(dc->yf, e->base_vr, store_base_vr)) {
+      dc->yf_hits++;
+      continue;
+    }
     if (e->base_vr != store_base_vr || iload_idx_is_reg(e)) {
       kill = 1;
     } else {
@@ -1297,7 +1353,10 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
           if (store_to_stack)
             iload_kill_for_stack_store(ctx, st, store_base_vr, store_lo, store_hi);
           else if (can_check)
-            iload_kill_for_store(st, store_base_vr, store_lo, store_hi);
+            iload_kill_for_store(st, store_base_vr, store_lo, store_hi, (LcseDefCounts *)dc);
+          else if (dc->yf && dest.tag == IROP_TAG_VREG && store_base_vr >= 0 &&
+                   (dest.is_lval || q->op == TCCIR_OP_STORE_INDEXED))
+            iload_keep_apart(st, store_base_vr, (LcseDefCounts *)dc); /* -fyasc-facts */
           else
             st->ilcount = 0;
         }
@@ -1546,7 +1605,12 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
         st->scount = 0;
         st->gscount = 0;
         st->tvcount = 0;
-        st->ilcount = 0;
+        /* -fyasc-facts: a store through a parameter or variable keeps the
+           loads an exclusive parameter keeps apart from it */
+        if (dc->yf && dest.tag == IROP_TAG_VREG && (dest.is_lval || q->op == TCCIR_OP_STORE_INDEXED))
+          iload_keep_apart(st, irop_get_vreg(dest), (LcseDefCounts *)dc);
+        else
+          st->ilcount = 0;
       }
       continue;
     }
@@ -1984,6 +2048,8 @@ int ssa_opt_load_cse(IRSSAOptCtx *ctx)
   dc.var_defs = tcc_mallocz(dc.nvar > 0 ? dc.nvar : 1);
   dc.param_defs = tcc_mallocz(dc.nparam > 0 ? dc.nparam : 1);
   lcse_count_defs(ctx->ir, &dc);
+  dc.yf = tcc_ir_yf_alias_new(ctx->ir, ctx->ssa);
+  dc.yf_hits = 0;
 
   GLoadState initial;
   initial.count = 0;
@@ -1996,6 +2062,13 @@ int ssa_opt_load_cse(IRSSAOptCtx *ctx)
   int changes = gload_process_block(ctx, &dc, reachable, &initial, 0);
   changes += lcse_linear_narrow_reloads(ctx);
   tcc_free(reachable);
+  if (dc.yf)
+  {
+    if (dc.yf_hits && getenv("TCC_YF_STATS"))
+      fprintf(stderr, "yasc-facts: load_cse: %d load%s kept over a store through another pointer in '%s'\n",
+              dc.yf_hits, dc.yf_hits == 1 ? "" : "s", funcname ? funcname : "?");
+    tcc_ir_yf_alias_delete(dc.yf);
+  }
   tcc_free(dc.var_defs);
   tcc_free(dc.param_defs);
   return changes;

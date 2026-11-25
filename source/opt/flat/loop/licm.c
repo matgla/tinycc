@@ -1307,7 +1307,69 @@ static void fph_kill_all(FPHLoc *locs, int nlocs, const char *why, int qidx)
 }
 
 /* Apply one loop instruction's memory write to the candidate set. */
-static void fph_note_write(TCCIRState *ir, IRLoop *loop, int qidx, FPHLoc *locs, int nlocs)
+static void fph_note_write_placed(TCCIRState *ir, IRLoop *loop, int qidx, FPHLoc *locs, int nlocs, IROperand w,
+                                  int variable_off);
+
+/* -fyasc-facts (O4): a candidate read through an exclusive parameter
+ * (`T * restrict view`, `T * owned`): nothing the loop reaches by another
+ * pointer is that memory.  A call writes it only when handed a pointer that
+ * may derive from the parameter, through a parameter that may write. */
+static int fph_yf_excl(const struct YfAlias *ya, const FPHLoc *l)
+{
+  return ya ? tcc_ir_yf_alias_excl(ya, l->root) : 0;
+}
+
+/* The pointer arguments call CALL_IDX may write through, into W[] (at most
+   FPH_YF_ARGS; -1 more than that).  Arguments are interleaved with nested
+   calls (`f(b, k())`: PARAM b; CALL k; PARAM t; CALL f), so they are matched
+   by call id back to the function start, or to an earlier call with the
+   same (wrapped) id. */
+#define FPH_YF_ARGS 16
+static int fph_yf_call_args(TCCIRState *ir, int call_idx, int32_t *w)
+{
+  IRQuadCompact *cq = &ir->compact_instructions[call_idx];
+  int cid = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, cq)), nw = 0;
+  for (int j = call_idx - 1; j >= 0; j--)
+  {
+    IRQuadCompact *p = &ir->compact_instructions[j];
+    if (p->op != TCCIR_OP_FUNCPARAMVAL)
+    {
+      if ((p->op == TCCIR_OP_FUNCCALLVAL || p->op == TCCIR_OP_FUNCCALLVOID) &&
+          TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, p)) == cid)
+        break;
+      continue;
+    }
+    uint32_t enc = (uint32_t)tcc_ir_op_src2_imm(ir, p);
+    if (TCCIR_DECODE_CALL_ID(enc) != cid)
+      continue;
+    IROperand a = tcc_ir_op_get_src1(ir, p);
+    int32_t vr = irop_is_none(a) ? -1 : irop_get_vreg(a);
+    int ro = 0;
+    if (vr < 0 || a.is_lval || irop_is_immediate(a))
+      continue;
+    if (tcc_ir_yf_param(ir, cid, TCCIR_DECODE_PARAM_IDX(enc), &ro) && ro)
+      continue;
+    if (nw == FPH_YF_ARGS)
+      return -1;
+    w[nw++] = vr;
+  }
+  return nw;
+}
+
+/* may a call with writing arguments W[NW] (fph_yf_call_args) write what
+   exclusive parameter EXCL reaches? */
+static int fph_yf_call_writes(const struct YfAlias *ya, int excl, const int32_t *w, int nw)
+{
+  if (nw < 0)
+    return 1;
+  for (int k = 0; k < nw; k++)
+    if (tcc_ir_yf_alias_may(ya, excl, w[k]))
+      return 1;
+  return 0;
+}
+
+static void fph_note_write(TCCIRState *ir, IRLoop *loop, int qidx, FPHLoc *locs, int nlocs,
+                           const struct YfAlias *ya)
 {
   IRQuadCompact *q = &ir->compact_instructions[qidx];
   int kill_all = 0;
@@ -1320,6 +1382,21 @@ static void fph_note_write(TCCIRState *ir, IRLoop *loop, int qidx, FPHLoc *locs,
     Sym *callee = tcc_ir_op_src1_sym(ir, q);
     if (callee && tcc_ir_get_func_purity(ir, callee) >= TCC_FUNC_PURITY_CONST)
       return; /* CONST: writes nothing */
+    if (ya)
+    {
+      /* exclusive candidates survive a call that is not handed them */
+      int32_t w[FPH_YF_ARGS];
+      int nw = -2;
+      for (int c = 0; c < nlocs; c++)
+      {
+        int ex = locs[c].alive ? fph_yf_excl(ya, &locs[c]) : 0;
+        if (ex && nw == -2)
+          nw = fph_yf_call_args(ir, qidx, w);
+        if (locs[c].alive && (!ex || fph_yf_call_writes(ya, ex, w, nw)))
+          locs[c].alive = 0;
+      }
+      return;
+    }
     kill_all = 1;
     why = "call";
   }
@@ -1358,6 +1435,28 @@ static void fph_note_write(TCCIRState *ir, IRLoop *loop, int qidx, FPHLoc *locs,
   if (!have_w)
     return;
 
+  /* exclusive candidates survive a store through a base that cannot derive
+     from their parameter; the rest go on below */
+  int32_t wbase = irop_get_tag(w) == IROP_TAG_VREG ? irop_get_vreg(w) : -1;
+  int saved_alive[FPH_MAX_PER_LOOP];
+  for (int c = 0; c < nlocs; c++)
+  {
+    int ex = locs[c].alive ? fph_yf_excl(ya, &locs[c]) : 0;
+    saved_alive[c] = ex && wbase >= 0 && !tcc_ir_yf_alias_may(ya, ex, wbase);
+    if (saved_alive[c])
+      locs[c].alive = 0; /* out of the way of the checks below */
+  }
+  fph_note_write_placed(ir, loop, qidx, locs, nlocs, w, variable_off);
+  for (int c = 0; c < nlocs; c++)
+    if (saved_alive[c])
+      locs[c].alive = 1;
+}
+
+/* fph_note_write for a write W the pass can place */
+static void fph_note_write_placed(TCCIRState *ir, IRLoop *loop, int qidx, FPHLoc *locs, int nlocs, IROperand w,
+                                  int variable_off)
+{
+  IRQuadCompact *q = &ir->compact_instructions[qidx];
   /* A read without an alias class may alias any write. */
   for (int c = 0; c < nlocs; c++)
     if (locs[c].alive && !locs[c].marked)
@@ -1667,6 +1766,7 @@ static int fph_emit_guard(TCCIRState *ir, int at, const FPHGuard *g)
 static int tcc_ir_hoist_invariant_field_ptr_loads(TCCIRState *ir, IRLoops *loops)
 {
   int total = 0;
+  struct YfAlias *ya = ir->yf_nb_excl ? tcc_ir_yf_alias_new(ir, NULL) : NULL;
   for (int li = 0; li < loops->num_loops; li++)
   {
     IRLoop *loop = &loops->loops[li];
@@ -1827,7 +1927,7 @@ static int tcc_ir_hoist_invariant_field_ptr_loads(TCCIRState *ir, IRLoops *loops
       int idx = loop->body_instrs[bi];
       if (idx < loop->start_idx || idx > loop->end_idx)
         continue;
-      fph_note_write(ir, loop, idx, locs, nlocs);
+      fph_note_write(ir, loop, idx, locs, nlocs, ya);
     }
     alive = 0;
     for (int c = 0; c < nlocs; c++)
@@ -1947,6 +2047,9 @@ static int tcc_ir_hoist_invariant_field_ptr_loads(TCCIRState *ir, IRLoops *loops
 
     glh_shift_after(loops, li, guard_at, ng + k);
   }
+  tcc_ir_yf_alias_delete(ya);
+  if (ya && total && getenv("TCC_YF_STATS"))
+    fprintf(stderr, "yasc-facts: licm_field_ptr: %d loads hoisted in '%s'\n", total, funcname ? funcname : "?");
   return total;
 }
 

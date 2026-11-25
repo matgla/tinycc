@@ -8,6 +8,7 @@ thumb_opcode th_vadd_f(uint32_t vd, uint32_t vn, uint32_t vm, uint32_t sz);
 thumb_opcode th_vsub_f(uint32_t vd, uint32_t vn, uint32_t vm, uint32_t sz);
 thumb_opcode th_vmul_f(uint32_t vd, uint32_t vn, uint32_t vm, uint32_t sz);
 thumb_opcode th_vdiv_f(uint32_t vd, uint32_t vn, uint32_t vm, uint32_t sz);
+thumb_opcode th_vminmaxnm_f32(uint32_t vd, uint32_t vn, uint32_t vm, int is_max);
 thumb_opcode th_vneg_f(uint32_t vd, uint32_t vm, uint32_t sz);
 thumb_opcode th_vcmp_f(uint32_t vd, uint32_t vm, uint32_t sz);
 thumb_opcode th_vpush(uint32_t regs, uint32_t is_doubleword);

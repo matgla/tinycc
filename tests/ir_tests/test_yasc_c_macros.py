@@ -6,6 +6,10 @@ argument) is regular C.  The '*' is in the dialect it was written in:
 `p` is yasc again, and `PTR(char) view p` qualifies it.  tcc's va_arg is
 function-like, as gcc's, so its type is a regular-C argument:
 `va_arg(ap, char *)`.
+
+`tcc -E` writes such an expansion between `_Pragma("tcc c_begin")` and
+`_Pragma("tcc c_end")`, inline, which the compile of the output reads as the
+markers: the output compiles to the same object with the same diagnostics.
 """
 
 import subprocess
@@ -42,7 +46,7 @@ def _run(tmp_path, body, *flags):
     (tmp_path / "y.h").write_text(Y_H)
     (tmp_path / "m.c").write_text('#include "c.h"\n#include "y.h"\n' + body)
     return subprocess.run(
-        [str(TCC), f"-B{REPO}", "-std=yasc", "-Wno-lifetime", "-I.", *flags, "-c", "m.c", "-o", "m.o"],
+        [str(TCC), f"-B{REPO}", "-ccompat", "-std=yasc", "-Wno-lifetime", "-I.", *flags, "-c", "m.c", "-o", "m.o"],
         capture_output=True,
         text=True,
         cwd=tmp_path,
@@ -88,7 +92,7 @@ def test_yasc_macro_alone_is_yasc(tmp_path):
 def test_star_from_c_macro(tmp_path, opt):
     body = """\
 void use(char * view);
-void g(char * view s)
+void g(inout char * view s)
 {
   PTR(char) a = s;       /* the '*' is regular C */
   CHARP b = s;
@@ -138,7 +142,7 @@ def test_code_unchanged(tmp_path, opt):
     """The same text as plain C and as yasc compiles to the same object."""
     body = "int g(int a)\n{\n  PTR(char) p = CAST(char *, &a);\n  CHARP q = p;\n  return ID(q[0]) + a;\n}\n"
     out = []
-    for flags in (["-ccompat"], ["-std=yasc", "-Wno-lifetime"]):
+    for flags in (["-ccompat"], ["-ccompat", "-std=yasc", "-Wno-lifetime"]):
         (tmp_path / "c.h").write_text(C_H)
         (tmp_path / "t.c").write_text('#include "c.h"\n' + body)
         proc = subprocess.run(
@@ -147,3 +151,70 @@ def test_code_unchanged(tmp_path, opt):
         assert proc.returncode == 0, proc.stderr
         out.append((tmp_path / "t.o").read_bytes())
     assert out[0] == out[1]
+
+
+ROUND_TRIP = [
+    NESTED,
+    """\
+void use(char * view);
+void g(char * view s)
+{
+  PTR(char) a = s;
+  CHARP b = s;
+  PTR(char) view c = s;
+  CHARP * view d = &b;
+  use(a); use(b); use(c); (void)d;
+}
+""",
+    "void g(void) { CHARP * d = 0; (void)d; }\n",
+    """\
+#include <stdarg.h>
+int f(int n, ...)
+{
+  va_list ap;
+  va_start(ap, n);
+  char * view s = va_arg(ap, char *);
+  va_end(ap);
+  return s[0];
+}
+""",
+    "void g(void) { ALIAS(char * p = 0;) (void)p; }\n",
+    "void g(char * view s) { ID(YPTR(char) u = s;) }\n",
+    "int g(int a)\n{\n  PTR(char) p = CAST(char *, &a);\n  CHARP q = p;\n  return ID(q[0]) + a;\n}\n"
+    "#define N 3\nint h(int view) { return view + N\n#include \"y.h\"\n; }\n",
+    "static int w(int x) { return (int)(PTR(char))x + ID(1 << 40); }\nint u(void) { return w(1) + w(2); }\n",
+]
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2", "-Os"])
+@pytest.mark.parametrize("case", range(len(ROUND_TRIP)))
+def test_preprocessed_output_compiles_the_same(tmp_path, opt, case):
+    """tcc -E of a yasc unit marks each regular-C macro expansion: compiling
+    the output gives the source's diagnostics and object (compiled under the
+    same name, so the objects' file symbol agrees)"""
+    flags = [f"-B{REPO}", "-ccompat", "-std=yasc", "-Wno-lifetime", "-Wall", opt]
+    direct = _run(tmp_path, ROUND_TRIP[case], opt, "-Wall")
+    pre = subprocess.run(
+        [str(TCC), f"-B{REPO}", "-std=yasc", "-I.", "-E", "m.c", "-o", "m.i"],
+        capture_output=True, text=True, cwd=tmp_path,
+    )
+    assert pre.returncode == 0, pre.stderr
+    if "c_begin" not in ROUND_TRIP[case]:
+        assert '_Pragma("tcc c_begin")' in (tmp_path / "m.i").read_text()
+    (tmp_path / "pp").mkdir()
+    (tmp_path / "pp" / "m.c").write_text((tmp_path / "m.i").read_text())
+    again = subprocess.run(
+        [str(TCC), *flags, "-c", "m.c", "-o", "m.o"], capture_output=True, text=True, cwd=tmp_path / "pp"
+    )
+    assert again.returncode == direct.returncode, again.stderr + direct.stderr
+    assert again.stderr == direct.stderr
+    if direct.returncode == 0:
+        assert (tmp_path / "pp" / "m.o").read_bytes() == (tmp_path / "m.o").read_bytes()
+    # and tcc -E of that output keeps the markers where they are
+    pre2 = subprocess.run(
+        [str(TCC), f"-B{REPO}", "-std=yasc", "-E", "m.c", "-o", "m2.i"],
+        capture_output=True, text=True, cwd=tmp_path / "pp",
+    )
+    assert pre2.returncode == 0, pre2.stderr
+    marks = lambda t: ["".join(l.split()) for l in t.splitlines() if "_Pragma" in l]
+    assert marks((tmp_path / "pp" / "m2.i").read_text()) == marks((tmp_path / "m.i").read_text())

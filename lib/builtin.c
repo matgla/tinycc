@@ -30,7 +30,8 @@ char *__tcc_strcpy(char *d, const char *s);
  * __builtin_clrsb
  * __builtin_popcount
  * __builtin_parity
- * for int, long and long long
+ * for int, long and long long, and libgcc's __clz/__ctz/__popcount/__parity
+ * si2 and di2 helpers
  */
 
 static const unsigned char table_1_32[] = {0,  1,  28, 2,  29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4,  8,
@@ -115,15 +116,6 @@ int BUILTIN(ctz)(unsigned int x)
   CTZI(x)
 }
 
-/* weak: libgcc-style runtime fallback.  libc (bitops.c) provides strong
-   definitions of the __*si2/__*di2 bit helpers; a strong def overrides this
-   weak one with no "defined twice" clash, yet programs that don't link this
-   libc (e.g. newlib-based test binaries) still resolve it from libtcc1. */
-__attribute__((weak)) int __ctzsi2(unsigned int x)
-{
-  CTZI(x)
-}
-
 int BUILTIN(ctzll)(unsigned long long x)
 {
   CTZL(x)
@@ -163,11 +155,6 @@ int BUILTIN(popcount)(unsigned int x)
   POPCOUNTI(x, 0x3f)
 }
 
-__attribute__((weak)) int __popcountsi2(unsigned int x)
-{
-  POPCOUNTI(x, 0x3f)
-}
-
 int BUILTIN(popcountll)(unsigned long long x)
 {
   POPCOUNTL(x, 0x7f)
@@ -192,6 +179,68 @@ int BUILTIN(parityl)(unsigned long x) __attribute__((alias(BUILTINN(parity))));
 #else
 int BUILTIN(parityl)(unsigned long x) __attribute__((alias(BUILTINN(parityll))));
 #endif
+
+/* ---------------------------------------------- */
+/* libgcc's bit-counting entry points (si: unsigned int, di: unsigned long
+ * long), what gcc and clang call for __builtin_clz and friends on a target
+ * without the instruction -- in objects they build that tcc links, zig's C
+ * among them.  tcc itself lowers its builtins inline or to the functions
+ * above.  They are the compiler runtime's, so they live here and the libc
+ * defines none of them.
+ *
+ * clz and ctz of 0 are the width: libgcc leaves it undefined, so no caller
+ * may count on anything else, and the width is the answer the CLZ
+ * instruction gives.
+ *
+ * weak: a link that also has libgcc (the bare-metal tests) takes whichever
+ * comes first without a "defined twice" clash. */
+__attribute__((weak)) int __clzsi2(unsigned int x)
+{
+  if (x == 0)
+    return (int)(sizeof x * 8);
+  CLZI(x)
+}
+
+__attribute__((weak)) int __clzdi2(unsigned long long x)
+{
+  if (x == 0)
+    return (int)(sizeof x * 8);
+  CLZL(x)
+}
+
+__attribute__((weak)) int __ctzsi2(unsigned int x)
+{
+  if (x == 0)
+    return (int)(sizeof x * 8);
+  CTZI(x)
+}
+
+__attribute__((weak)) int __ctzdi2(unsigned long long x)
+{
+  if (x == 0)
+    return (int)(sizeof x * 8);
+  CTZL(x)
+}
+
+__attribute__((weak)) int __popcountsi2(unsigned int x)
+{
+  POPCOUNTI(x, 0x3f)
+}
+
+__attribute__((weak)) int __popcountdi2(unsigned long long x)
+{
+  POPCOUNTL(x, 0x7f)
+}
+
+__attribute__((weak)) int __paritysi2(unsigned int x)
+{
+  POPCOUNTI(x, 0x01)
+}
+
+__attribute__((weak)) int __paritydi2(unsigned long long x)
+{
+  POPCOUNTL(x, 0x01)
+}
 
 #ifndef __TINYC__
 #if defined(__GNUC__) && (__GNUC__ >= 6)
@@ -756,6 +805,15 @@ unsigned long __tcc_strnlen(const char *s, unsigned long n)
     len++;
 
   return len;
+}
+
+/* -ffortify (builtin/fortify.c): a C string argument's NUL is inside the N
+   bytes its object has left; a null pointer passes (the callee says what it
+   makes of one) */
+void __tcc_fortify_str(const char *s, unsigned long n)
+{
+  if (s && __tcc_strnlen(s, n) == n)
+    __tcc_chk_fail_or_abort();
 }
 
 char *__tcc_strpbrk(const char *s1, const char *s2)

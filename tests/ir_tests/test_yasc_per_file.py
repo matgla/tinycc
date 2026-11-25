@@ -40,6 +40,7 @@ int included_from_yasc(void);
 YASC_HEADER = """\
 #pragma yasc
 char * owned yalloc(void);
+void yfree(drop char * owned p);
 """
 
 MAIN = """\
@@ -48,10 +49,10 @@ MAIN = """\
 int f(void)
 {
   char * owned p = yalloc();
-  char * view q = MKPTR(0);
+  char * view maybe q = MKPTR(0);
   struct maybe m = {TAKE(1)};
   (void)q;
-  (void)p;
+  yfree(p);
   return view(helper(m.out)) + included_from_yasc();
 }
 """
@@ -63,7 +64,7 @@ def _run(tmp_path, main, *flags):
     src = tmp_path / "m.c"
     src.write_text(main)
     return subprocess.run(
-        [str(TCC), "-c", "-Wno-lifetime", f"-I{tmp_path}", *flags, str(src), "-o", str(tmp_path / "m.o")],
+        [str(TCC), "-c", f"-I{tmp_path}", *flags, str(src), "-o", str(tmp_path / "m.o")],
         capture_output=True,
         text=True,
     )
@@ -120,7 +121,7 @@ def test_regular_c_header_code_unchanged(tmp_path, opt):
     body = '#include "c.h"\n#ifdef __YASC__\n#define VIEW view\n#else\n#define VIEW\n#endif\nint g(int a)\n{\n  char * VIEW q = MKPTR(a);\n  return TAKE(helper(a)) + (q != 0);\n}\n'
     (tmp_path / "c.h").write_text(C_HEADER.replace("#ifdef __YASC__", "#if 0"))
     out = {}
-    for name, flags in (("plain", ["-ccompat"]), ("yasc", ["-std=yasc", "-Wno-lifetime"])):
+    for name, flags in (("plain", ["-ccompat"]), ("yasc", ["-ccompat", "-std=yasc", "-Wno-lifetime"])):
         d = tmp_path / name
         d.mkdir()
         (d / "t.c").write_text(body)

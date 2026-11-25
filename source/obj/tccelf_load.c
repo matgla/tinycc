@@ -1282,10 +1282,13 @@ ST_FUNC void tcc_typesig_add(TCCState *s1, const char *name, const char *sig, in
 }
 
 /* a ".tcc.typesig" section's records (name, type, kind + where, unit; each
-   NUL-ended) */
-static void tcc_typesig_load(TCCState *s1, const char *data, unsigned long size)
+   NUL-ended), from the object OBJ (its path as linked: a part of each unit's
+   identity) */
+static void tcc_typesig_load(TCCState *s1, const char *data, unsigned long size, const char *obj)
 {
   const char *p = data, *end = data + size, *f[4];
+  size_t olen = strlen(obj);
+  char *unit = NULL;
   while (p < end)
   {
     if (!*p)
@@ -1301,23 +1304,47 @@ static void tcc_typesig_load(TCCState *s1, const char *data, unsigned long size)
       f[i] = p;
       p = z + 1;
     }
-    if (f[2][0])
-      tcc_typesig_add(s1, f[0], f[1], f[2][0], f[2] + 1, f[3]);
+    if (!f[2][0])
+      continue;
+    size_t len = strlen(f[3]) + olen + 2;
+    unit = tcc_realloc(unit, len);
+    snprintf(unit, len, "%s\x1d%s", f[3], obj);
+    tcc_typesig_add(s1, f[0], f[1], f[2][0], f[2] + 1, unit);
   }
+  tcc_free(unit);
 }
 
 /* an object file's ".tcc.typesig" section: read (with -Wcross-tu) and left
-   out of a linked output; `-r` keeps it.  Returns 1 when it was consumed. */
+   out of a linked output; `-r` keeps it.  Returns 1 when it was consumed.
+   ".tcc.taint" (-Wtainted-format) goes the same way. */
 ST_FUNC int tcc_typesig_section(TCCState *s1, int fd, unsigned long file_offset, const char *sh_name,
                                 ElfW(Shdr) * sh)
 {
-  char *data;
+  char *data, obj[1100];
+  if (!strcmp(sh_name, ".tcc.taint"))
+  {
+    /* -Wtainted-format's records: the same rules */
+    if (s1->output_type == TCC_OUTPUT_OBJ)
+      return 0;
+    if ((s1->warn_tainted_format & WARN_ON) && !s1->warn_none && sh->sh_size)
+    {
+      data = load_data(fd, file_offset + sh->sh_offset, sh->sh_size);
+      tcc_taint_link_add(s1, data, sh->sh_size);
+      tcc_free(data);
+    }
+    return 1;
+  }
   if (strcmp(sh_name, ".tcc.typesig") || s1->output_type == TCC_OUTPUT_OBJ)
     return 0;
   if ((s1->warn_cross_tu & WARN_ON) && sh->sh_size)
   {
+    /* an archive's member: the archive and where the member is in it */
+    if (s1->current_archive_path)
+      snprintf(obj, sizeof obj, "%s@%lu", s1->current_archive_path, file_offset);
+    else
+      pstrcpy(obj, sizeof obj, s1->current_filename ? s1->current_filename : "");
     data = load_data(fd, file_offset + sh->sh_offset, sh->sh_size);
-    tcc_typesig_load(s1, data, sh->sh_size);
+    tcc_typesig_load(s1, data, sh->sh_size, obj);
     tcc_free(data);
   }
   return 1;
@@ -1352,16 +1379,70 @@ static int typesig_compatible(const char *a, const char *b)
   return !strcmp(a, b) || typesig_open_match(a, b) || typesig_open_match(b, a);
 }
 
-/* where a record is, for a report: "at a.h:3 in a.c", "at a.c:3", "in a.c" */
-static const char *typesig_where(char *buf, int size, const struct TypeSig *t)
+/* field K of a unit's identity (typesig.c ts_unit_id: file name as given,
+   absolute path, id; the link adds the object's path): its length */
+static int typesig_unit_field(const char *unit, int k, const char **p)
 {
-  const char *colon = strrchr(t->loc, ':');
+  const char *s = unit, *e;
+  for (; k > 0 && s; k--)
+    if ((s = strchr(s, '\x1d')))
+      s++;
+  if (!s)
+    s = "";
+  e = strchr(s, '\x1d');
+  *p = s;
+  return e ? (int)(e - s) : (int)strlen(s);
+}
+
+/* How a report names the units UA and UB: their file names -- and when two
+   units have the same one, the first part of their identity that tells them
+   apart (the absolute path, the object as linked, the id), in parentheses */
+static void typesig_unit_names(const char *ua, const char *ub, char *na, char *nb, int size)
+{
+  const char *pa, *pb;
+  int la = typesig_unit_field(ua, 0, &pa), lb = typesig_unit_field(ub, 0, &pb);
+  snprintf(na, size, "%.*s", la, pa);
+  snprintf(nb, size, "%.*s", lb, pb);
+  if (la != lb || memcmp(pa, pb, la) || !strcmp(ua, ub))
+    return;
+  for (int o = 0; o < 3; o++)
+  {
+    int k = "\1\3\2"[o]; /* the absolute path, the object, the id */
+    la = typesig_unit_field(ua, k, &pa), lb = typesig_unit_field(ub, k, &pb);
+    if (la == lb && !memcmp(pa, pb, la))
+      continue;
+    if (k == 1)
+    {
+      /* two paths: from the last directory they differ in ("x/u.c", "y/u.c") */
+      int same = 0, ea, eb;
+      while (same < la && same < lb && pa[la - 1 - same] == pb[lb - 1 - same])
+        same++;
+      for (ea = same; ea < la && pa[la - 1 - ea] != '/'; ea++)
+        ;
+      for (eb = same; eb < lb && pb[lb - 1 - eb] != '/'; eb++)
+        ;
+      pa += la - ea, la = ea;
+      pb += lb - eb, lb = eb;
+    }
+    snprintf(na + strlen(na), size - strlen(na), " (%.*s)", la, pa);
+    snprintf(nb + strlen(nb), size - strlen(nb), " (%.*s)", lb, pb);
+    return;
+  }
+}
+
+/* where a record is, for a report: "at a.h:3 in a.c", "at a.c:3", "in a.c";
+   NAME: its unit as the report names it (typesig_unit_names) */
+static const char *typesig_where(char *buf, int size, const struct TypeSig *t, const char *name)
+{
+  const char *colon = strrchr(t->loc, ':'), *file;
+  int len = typesig_unit_field(t->unit, 0, &file);
+  const char *extra = name + strlen(name) > name + len ? name + len : "";
   if (!t->loc[0] || !colon)
-    snprintf(buf, size, "in %s", t->unit);
-  else if ((size_t)(colon - t->loc) == strlen(t->unit) && !strncmp(t->loc, t->unit, colon - t->loc))
-    snprintf(buf, size, "at %s", t->loc);
+    snprintf(buf, size, "in %s", name);
+  else if (colon - t->loc == len && !strncmp(t->loc, file, len))
+    snprintf(buf, size, "at %s%s", t->loc, extra);
   else
-    snprintf(buf, size, "at %s in %s", t->loc, t->unit);
+    snprintf(buf, size, "at %s in %s", t->loc, name);
   return buf;
 }
 
@@ -1454,7 +1535,8 @@ static void typesig_member_text(char *buf, int size, const char *f[3], const int
 
 /* how layouts A and B differ (their first member that does); 2 when only
    an offset or the size does (a member's own struct may be the cause) */
-static int typesig_layout_diff(char *buf, int size, const struct TypeSig *a, const struct TypeSig *b)
+static int typesig_layout_diff(CString *buf, const struct TypeSig *a, const struct TypeSig *b, const char *na,
+                               const char *nb)
 {
   char ta[300], tb[300];
   for (int i = 0;; i++)
@@ -1464,14 +1546,14 @@ static int typesig_layout_diff(char *buf, int size, const struct TypeSig *a, con
     int ha = typesig_member(a->sig, i, fa, la), hb = typesig_member(b->sig, i, fb, lb);
     if (!ha && !hb)
     {
-      snprintf(buf, size, "size/alignment %.*s in %s, %.*s in %s", (int)strcspn(a->sig, "\x1f"), a->sig, a->unit,
-               (int)strcspn(b->sig, "\x1f"), b->sig, b->unit);
+      cstr_printf(buf, "size/alignment %.*s in %s, %.*s in %s", (int)strcspn(a->sig, "\x1f"), a->sig, na,
+                  (int)strcspn(b->sig, "\x1f"), b->sig, nb);
       return 2;
     }
     if (ha != hb)
     {
       typesig_member_text(ta, sizeof ta, ha ? fa : fb, ha ? la : lb, 0);
-      snprintf(buf, size, "member %s is only in %s", ta, ha ? a->unit : b->unit);
+      cstr_printf(buf, "member %s is only in %s", ta, ha ? na : nb);
       return 1;
     }
     if (la[0] == lb[0] && la[1] == lb[1] && la[2] == lb[2] && !memcmp(fa[0], fb[0], la[0]) &&
@@ -1481,13 +1563,13 @@ static int typesig_layout_diff(char *buf, int size, const struct TypeSig *a, con
     {
       typesig_member_text(ta, sizeof ta, fa, la, 1);
       typesig_member_text(tb, sizeof tb, fb, lb, 1);
-      snprintf(buf, size, "member '%.*s' is %s in %s, %s in %s", la[0], fa[0], ta, a->unit, tb, b->unit);
+      cstr_printf(buf, "member '%.*s' is %s in %s, %s in %s", la[0], fa[0], ta, na, tb, nb);
     }
     else
     {
       typesig_member_text(ta, sizeof ta, fa, la, 0);
       typesig_member_text(tb, sizeof tb, fb, lb, 0);
-      snprintf(buf, size, "member %d is %s in %s, %s in %s", i + 1, ta, a->unit, tb, b->unit);
+      cstr_printf(buf, "member %d is %s in %s, %s in %s", i + 1, ta, na, tb, nb);
     }
     return la[0] == lb[0] && la[1] == lb[1] && !memcmp(fa[0], fb[0], la[0]) && !memcmp(fa[1], fb[1], la[1]) ? 2 : 1;
   }
@@ -1502,8 +1584,14 @@ static int typesig_layout_check(TsCheck *c, const char *tag, const char *ua, con
   TCCState *s1 = c->s1;
   struct TypeSig *a, *b;
   const char *p;
-  char sub[128], wa[300], wb[300], diff[800];
+  char sub[128];
   int nested = 0, how;
+  /* the report's text, off the stack of this recursion */
+  struct
+  {
+    char wa[1500], wb[1500], na[1200], nb[1200];
+  } * r;
+  CString diff;
   for (int i = 0; i < nseen; i++)
     if (!strcmp(seen[i], tag))
       return 0;
@@ -1522,12 +1610,20 @@ static int typesig_layout_check(TsCheck *c, const char *tag, const char *ua, con
   }
   if (!strcmp(a->sig, b->sig))
     return nested;
-  how = typesig_layout_diff(diff, sizeof diff, a, b);
-  if (how == 2 && nested)
-    return 1; /* moved by a member's struct, which is reported */
-  tcc_warning_c(warn_cross_tu)("'%s' has different layouts %s and %s ('%s' uses it): %s", tag,
-                               typesig_where(wa, sizeof wa, a), typesig_where(wb, sizeof wb, b), user, diff);
-  dynarray_add(&c->reported, &c->nb_reported, tcc_strdup(tag));
+  r = tcc_malloc(sizeof *r);
+  typesig_unit_names(a->unit, b->unit, r->na, r->nb, sizeof r->na);
+  cstr_new(&diff);
+  how = typesig_layout_diff(&diff, a, b, r->na, r->nb);
+  cstr_ccat(&diff, 0);
+  if (!(how == 2 && nested)) /* else moved by a member's struct, which is reported */
+  {
+    tcc_warning_c(warn_cross_tu)("'%s' has different layouts %s and %s ('%s' uses it): %s", tag,
+                                 typesig_where(r->wa, sizeof r->wa, a, r->na),
+                                 typesig_where(r->wb, sizeof r->wb, b, r->nb), user, diff.data);
+    dynarray_add(&c->reported, &c->nb_reported, tcc_strdup(tag));
+  }
+  cstr_free(&diff);
+  tcc_free(r);
   return 1;
 }
 
@@ -1550,6 +1646,7 @@ ST_FUNC void tcc_typesig_check(TCCState *s1)
   int n = s1->nb_typesigs;
   struct TypeSig *t = s1->typesigs;
   TsCheck c = {s1, t, n, NULL, 0};
+  char *buf = tcc_malloc(5400); /* a report's text */
   if (n > 1)
     tcc_qsort(t, n, sizeof *t, typesig_cmp);
   for (int i = 0; i < n;)
@@ -1573,7 +1670,7 @@ ST_FUNC void tcc_typesig_check(TCCState *s1)
     for (int k = i; ref >= 0 && k < j; k++)
     {
       struct TypeSig *r = &t[ref], *o = &t[k];
-      char wr[300], wo[300];
+      char *wr = buf, *wo = buf + 1500, *nr = buf + 3000, *no = buf + 4200;
       if (k == ref || o->kind == 'S')
         continue;
       if (typesig_compatible(r->sig, o->sig))
@@ -1581,8 +1678,9 @@ ST_FUNC void tcc_typesig_check(TCCState *s1)
         typesig_layouts(&c, r, o);
         continue;
       }
-      typesig_where(wr, sizeof wr, r);
-      typesig_where(wo, sizeof wo, o);
+      typesig_unit_names(r->unit, o->unit, nr, no, 1200);
+      typesig_where(wr, 1500, r, nr);
+      typesig_where(wo, 1500, o, no);
       if (r->kind == 'D' && o->kind == 'D')
         tcc_warning_c(warn_cross_tu)("'%s' defined as '%s' %s and as '%s' %s", r->name, r->sig, wr, o->sig, wo);
       else if (r->kind == 'D')
@@ -1595,6 +1693,7 @@ ST_FUNC void tcc_typesig_check(TCCState *s1)
     i = j;
   }
   dynarray_reset(&c.reported, &c.nb_reported);
+  tcc_free(buf);
   tcc_typesig_free(s1);
 }
 

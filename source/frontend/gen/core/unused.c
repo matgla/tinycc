@@ -79,6 +79,7 @@ typedef struct UnusedParamLine
 {
   Sym *func;
   int v, line;
+  int sys; /* -Wshadow: its name a system header's macro spelled */
 } UnusedParamLine;
 static UnusedParamLine *uu_plist, *uu_plines;
 static int uu_nb_plist, uu_cap_plist, uu_nb_plines, uu_cap_plines;
@@ -474,7 +475,7 @@ ST_FUNC void unused_discard(int effects_before, int line, int comma_lhs)
                      (last == UV_COMMA && (uv_comma_rhs_last == UV_ASSIGN || uv_comma_rhs_last == UV_INCDEC))))
     uu_pending->ymod &= ~SYM_UNUSED_READ;
   uu_pending = NULL;
-  if (!(tcc_state->warn_unused_value & WARN_ON) && !tcc_state->nb_diag_snaps)
+  if (!(tcc_state->warn_unused_value & WARN_ON) && !tcc_diag_snaps_on(warn_unused_value))
     return;
   if ((vtop->type.t & VT_BTYPE) == VT_VOID)
     return;
@@ -560,7 +561,7 @@ ST_FUNC void unused_declare_local(Sym *s, int line, int attr_unused)
   uu_add(&uu_locals, s, uu_cur_file(), line, (s->r & VT_SYM) ? UK_STATIC_LOCAL : UK_LOCAL);
 }
 
-static void uu_pline_add(UnusedParamLine **v, int *nb, int *cap, Sym *func, int tokv, int line)
+static void uu_pline_add(UnusedParamLine **v, int *nb, int *cap, Sym *func, int tokv, int line, int sys)
 {
   if (*nb == *cap)
   {
@@ -570,16 +571,17 @@ static void uu_pline_add(UnusedParamLine **v, int *nb, int *cap, Sym *func, int 
   (*v)[*nb].func = func;
   (*v)[*nb].v = tokv;
   (*v)[*nb].line = line;
+  (*v)[*nb].sys = sys;
   (*nb)++;
 }
 
 /* post_type parsed parameter V of a file-scope declarator at LINE; FIRST:
    the list's first */
-ST_FUNC void unused_param_line(int v, int line, int first)
+ST_FUNC void unused_param_line(int v, int line, int first, int sys)
 {
   if (first)
     uu_nb_plist = 0;
-  uu_pline_add(&uu_plist, &uu_nb_plist, &uu_cap_plist, NULL, v & ~SYM_FIELD, line);
+  uu_pline_add(&uu_plist, &uu_nb_plist, &uu_cap_plist, NULL, v & ~SYM_FIELD, line, sys);
 }
 
 /* the body of FUNC follows its declarator: its parameters' lines are those
@@ -589,7 +591,8 @@ ST_FUNC void unused_params_bind(Sym *func)
   if (!tcc_state->unused_on && !tcc_warn_wanted(warn_shadow))
     return;
   for (int i = 0; i < uu_nb_plist; i++)
-    uu_pline_add(&uu_plines, &uu_nb_plines, &uu_cap_plines, func, uu_plist[i].v, uu_plist[i].line);
+    uu_pline_add(&uu_plines, &uu_nb_plines, &uu_cap_plines, func, uu_plist[i].v, uu_plist[i].line,
+                 uu_plist[i].sys);
   uu_nb_plist = 0;
 }
 
@@ -599,6 +602,15 @@ ST_FUNC int unused_param_decl_line(Sym *func, int v)
   for (int i = uu_nb_plines; i-- > 0;)
     if (uu_plines[i].func == func && uu_plines[i].v == v)
       return uu_plines[i].line;
+  return 0;
+}
+
+/* Parameter V of FUNC was named by a system header's macro (-Wshadow) */
+ST_FUNC int unused_param_decl_sys(Sym *func, int v)
+{
+  for (int i = uu_nb_plines; i-- > 0;)
+    if (uu_plines[i].func == func && uu_plines[i].v == v)
+      return uu_plines[i].sys;
   return 0;
 }
 

@@ -136,6 +136,8 @@ static int sc_plain_op(int op)
   case TCCIR_OP_FSUB:
   case TCCIR_OP_FMUL:
   case TCCIR_OP_FDIV:
+  case TCCIR_OP_FMIN:
+  case TCCIR_OP_FMAX:
   case TCCIR_OP_FNEG:
   case TCCIR_OP_FCMP:
   case TCCIR_OP_CVT_FTOF:

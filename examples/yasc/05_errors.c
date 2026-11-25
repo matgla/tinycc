@@ -45,7 +45,7 @@ static !char * owned make_label(const char * view num)
   errdefer mem_free(buf);
   if (v == 0)
     return error.Empty;
-  snprintf(buf, 32, "item-%d", v);
+  snprintf(borrow(buf), 32, "item-%d", v);
   return buf;
 }
 

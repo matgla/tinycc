@@ -111,7 +111,7 @@ def test_nested_expression_fits_stack_wall(tmp_path):
 # function's body at each call, replaying its tokens inside the caller's
 # parse, and an expansion's own calls expand in turn, up to INLINE_NEST_MAX
 # (32) deep -- Zig's C (called-once chains) gets there.  Each level is
-# unary_funcall_body() -> replay_body_recovering() -> replay_recovering() ->
+# unary_funcall_body() -> replay_body_recovering() -> recover_call() ->
 # replay_block() -> block() -> block() -> ... -> unary() -> unary_funcall(),
 # plus decl() and the initializer when the call initializes a local.  At
 # c35ae0af90 the error recovery's jmp_buf and saved state (replay_recovering),

@@ -46,6 +46,7 @@ const FloatingPointConfig arm_fpv5_sp_d16_fpu_config = {
     .has_fsub = 1,
     .has_fmul = 1,
     .has_fdiv = 1,
+    .has_fminmax = 1, /* FPv5: vminnm/vmaxnm.f32 */
     .has_fcmp = 0,
     .has_ftof = 0,
     .has_itof = 0,
@@ -65,4 +66,15 @@ const FloatingPointConfig arm_fpv5_sp_d16_fpu_config = {
     .has_ftol = 0,
     .has_fneg = 0,
     .has_dneg = 0,
+};
+/* FPv4-SP (Cortex-M4): the same single-precision arithmetic, but no
+ * vminnm/vmaxnm (FPv5 / ARMv8 FP added those), so fmin/fmax stay calls. */
+const FloatingPointConfig arm_fpv4_sp_d16_fpu_config = {
+    .reg_size = 8,
+    .reg_count = 16,
+    .stack_align = 8,
+    .has_fadd = 1,
+    .has_fsub = 1,
+    .has_fmul = 1,
+    .has_fdiv = 1,
 };

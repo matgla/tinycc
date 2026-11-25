@@ -2,10 +2,12 @@
 
 A call to a function declared `__attribute__((format(printf, n, m)))` (also
 `__format__`, `gnu_printf`, `[[gnu::format(...)]]`) with a literal format has
-its arguments checked against the conversions, as they are parsed: the type
+its arguments checked against the conversions: the type
 (after the default promotions for printf; signedness is not checked, as with
 gcc), too few and too many arguments, unknown conversions, `*` widths.  YasOS
-libc's length modifiers are known: hh, h, l, ll, q, L, j, z, t.  -Wformat is in
+libc's length modifiers are known: hh, h, l, ll, q, L, j, z, t.  Operands by
+number (`%2$d`, `*1$`) are checked against that argument with gcc's rules, and
+each arm of a conditional format (`c ? "%d" : _("%s")`).  -Wformat is in
 -Wall (gcc's).
 
 -Wformat-security (not in -Wall, as in gcc; the safe default): the format is
@@ -32,6 +34,7 @@ int pf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 int sf(const char *fmt, ...) __attribute__((__format__(__scanf__, 1, 2)));
 int vpf(const char *fmt, __builtin_va_list ap) __attribute__((format(printf, 1, 0)));
 [[gnu::format(gnu_printf, 2, 3)]] int fpf(void *f, const char *fmt, ...);
+char *_F(const char *) __attribute__((format_arg(1)));
 """
 PL = PRELUDE.count("\n")
 
@@ -71,7 +74,9 @@ void t(int i, unsigned u, long l, unsigned long ul, long long ll, size_t z, ptrd
   sf("%d %u %ld %hd %hhd %f %lf %s %c %[a-z] %[^]x] %*d %p %n %ms", ip, (unsigned *)ip, lp, sp, scp, fp, dp, s, s,
      s, s, (void **)spp, ip, spp);
   fpf(p, "%s %d", s, i);
-  pf("%1$d %2$s\\n", i, s); /* operands by number: not checked */
+  pf("%1$d %2$s %1$*3$d %2$.*3$s\\n", i, s, i); /* operands by number */
+  pf(i ? "%d" : "%u", i);
+  pf(i ? _F("%s") : i > 1 ? "%.*s" + 2 : "<%s>", s);
 }
 """
 
@@ -150,6 +155,33 @@ def test_safe_default(tmp_path):
     body = "void t(long l) { pf(\"%d\", l); }\n"
     proc = _run(tmp_path, body, prelude=PRELUDE_YASC, ccompat=False)
     assert proc.returncode == 0 and "warning: format '%d' expects argument" in proc.stderr, proc.stderr
+
+
+def test_yasc_pointer_types_spelled_as_written(tmp_path):
+    """A yasc pointer's qualifiers as the source spells them, no trailing space."""
+    body = (
+        "void free(drop void * owned maybe p);\n"
+        "void t(const char * view maybe s, char * owned p, const char * view q, inout int * view maybe * view pp,\n"
+        "       char * owned maybe m)\n"
+        "{\n  pf(\"%d\", s);\n  pf(\"%d\", p);\n  pf(\"%d\", q);\n  pf(\"%d\", pp);\n  pf(\"%d\", m);\n"
+        "  free(p);\n  free(m);\n}\n"
+    )
+    proc = _run(tmp_path, body, prelude=PRELUDE_YASC, ccompat=False)
+    got = [m.split("has type ", 1)[1] for _, k, m in _diags(proc, 1) if "has type" in m]
+    assert got == ["'const char * view maybe'", "'char * owned'", "'const char * view'", "'int * view maybe * view'",
+                   "'char * owned maybe'"], proc.stderr
+    body = (
+        "struct T { char buf[8]; char * borrows(buf) key; };\ntypedef struct FILE FILE;\n"
+        "int fclose(drop FILE * owned maybe f);\n"
+        "void t(inout struct T * view x, FILE * owned(fclose) fp, const char * borrows(static) s)\n"
+        "{\n  pf(\"%d\", x->key);\n  pf(\"%d\", fp);\n  pf(\"%d\", s);\n  fclose(fp);\n}\n"
+    )
+    proc = _run(tmp_path, body, prelude=PRELUDE_YASC, ccompat=False)
+    got = [m.split("has type ", 1)[1] for _, k, m in _diags(proc, 1) if "has type" in m]
+    assert got == ["'char * borrows(buf)'", "'struct FILE * owned(fclose)'", "'const char * borrows(static)'"], proc.stderr
+    # regular C keeps its spelling
+    proc = _run(tmp_path, "void t(char *p) { pf(\"%d\", p); }\n", "-Wall")
+    assert "has type 'char *'" in proc.stderr, proc.stderr
 
 
 def test_pragma(tmp_path):
@@ -358,3 +390,132 @@ def test_format_arg_and_format_security(tmp_path):
         (4, "format not a string literal and no format arguments"),
         (5, "format '%d' expects a matching 'int' argument"),
     ], proc.stderr
+
+
+POSITIONAL = """\
+void t(int x, char *s, long l, int *ip)
+{
+  pf("%2$s %1$d\\n", x, s);
+  pf("%2$d %1$d\\n", x, s);
+  pf("%2$d\\n", x, x);
+  pf("%1$d %d\\n", x, x);
+  pf("%d %1$d\\n", x, x);
+  pf("%1$*2$d\\n", x, s);
+  pf("%1$*d\\n", x, x);
+  pf("%3$d\\n", x, x);
+  pf("%1$d\\n", x, x);
+  pf("%0$d\\n", x);
+  pf("%1$d %1$s\\n", x);
+  pf("%1$d %3$d\\n", x, x, x, x);
+  pf("%1$m %2$d\\n", x, x);
+  sf("%2$d %1$d", ip, ip);
+  sf("%2$d", ip, ip);
+  sf("%1$*d", ip);
+  vpf("%2$d", 0);
+  pf("%2$*1$d %1$.*2$d\\n", x, x);
+}
+"""
+# gcc 16's, but for its "field width specifier '$'" wording
+POSITIONAL_HITS = [
+    (4, "format '%2$d' expects argument of type 'int', but argument 3 has type 'char *'"),
+    (5, "format argument 1 unused before used argument 2 in '$'-style format"),
+    (6, "missing $ operand number in format"),
+    (7, "'$' operand number used after format without operand number"),
+    (8, "field width or precision in '%1$*2$d' expects argument of type 'int', but argument 3 has type 'char *'"),
+    (9, "missing $ operand number in format"),
+    (10, "operand number out of range in format"),
+    (11, "unused arguments in '$'-style format"),
+    (12, "operand number out of range in format"),
+    (13, "format '%1$s' expects argument of type 'char *', but argument 2 has type 'int'"),
+    (14, "format argument 2 unused before used argument 3 in '$'-style format"),
+    (14, "unused arguments in '$'-style format"),
+    (15, "operand number specified for format taking no argument"),
+    (17, "unused arguments in '$'-style format"),
+    (18, "operand number specified with suppressed assignment"),
+    (19, "format argument 1 unused before used argument 2 in '$'-style format"),
+]
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+def test_positional_operands(tmp_path, opt):
+    """%N$ and *N$ operands checked against the N-th argument, gcc's rules:
+    all or none numbered, no gap before the last one used (scanf may skip a
+    pointer), none past the arguments, none left over"""
+    proc = _run(tmp_path, POSITIONAL, opt, "-Wall")
+    assert proc.returncode == 0, proc.stderr
+    assert [(l, m) for l, _, m in _diags(proc)] == POSITIONAL_HITS, proc.stderr
+    assert _run(tmp_path, POSITIONAL, opt, "-Wall", "-Wno-format").stderr == ""
+    proc = _run(tmp_path, POSITIONAL, opt, "-Wall", "-Werror=format")
+    assert proc.returncode != 0 and "error: missing $ operand" in proc.stderr, proc.stderr
+
+
+CONDITIONAL = """\
+void t(int c, int x, char *s)
+{
+  pf(c ? "%d" : "%s", x);
+  pf(c ? "%d" : "%d %d", x);
+  pf(c ? "%d" : s, x);
+  pf(c ? s : "x");
+  pf(c ? "%d %d" : "%d", x, x);
+  pf(1 ? "%d" : "%s", x);
+  pf(c ? (c > 1 ? "%d" : "%s") : "%ld", x);
+  pf(c ? "a" : "b");
+  pf(c ? _F("%d") : "%s", x);
+  pf(c ? _F(s) : "%s", x);
+  pf(c ? "%d %d" : "%d %d %d", x, x, x, x);
+  pf(c ? "%1$d %2$d" : "%2$d %1$d", x, s);
+  pf(0 ? "%d" : "%s", x);
+  pf(s ?: "%d", x);
+}
+"""
+CONDITIONAL_HITS = [
+    (3, "format '%s' expects argument of type 'char *', but argument 2 has type 'int'"),
+    (4, "format '%d' expects a matching 'int' argument"),
+    (6, "format not a string literal and no format arguments"),
+    (9, "format '%s' expects argument of type 'char *', but argument 2 has type 'int'"),
+    (9, "format '%ld' expects argument of type 'long int', but argument 2 has type 'int'"),
+    (11, "format '%s' expects argument of type 'char *', but argument 2 has type 'int'"),
+    (12, "format '%s' expects argument of type 'char *', but argument 2 has type 'int'"),
+    (13, "too many arguments for format"),
+    (14, "format '%2$d' expects argument of type 'int', but argument 3 has type 'char *'"),
+    (14, "format '%2$d' expects argument of type 'int', but argument 3 has type 'char *'"),
+    (15, "format '%s' expects argument of type 'char *', but argument 2 has type 'int'"),
+]
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+def test_conditional_format(tmp_path, opt):
+    """`c ? "%d" : "%s"`: each arm is checked (a literal, a format_arg call
+    or another conditional; the arm a constant condition drops is not); too
+    many arguments only when every arm has some over; an arm that is no
+    literal makes it a non-literal format for -Wformat-security (gcc)"""
+    proc = _run(tmp_path, CONDITIONAL, opt, "-Wall", "-Wformat-security")
+    assert proc.returncode == 0, proc.stderr
+    assert [(l, m) for l, _, m in _diags(proc)] == CONDITIONAL_HITS, proc.stderr
+    assert _run(tmp_path, CONDITIONAL, opt, "-Wall", "-Wno-format").stderr == ""
+
+
+INLINE_POS = """\
+static inline int f(long x, int c) { return pf("%1$d %2$d", x, c) + pf(c ? "%d" : "%s", c); }
+int a(int y) { return f(y, 1) + f(y + 1, 0); }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2", "-Os"])
+def test_positional_conditional_once(tmp_path, opt):
+    proc = _run(tmp_path, INLINE_POS, opt, "-Wall")
+    assert [(l, m) for l, _, m in _diags(proc)] == [
+        (1, "format '%1$d' expects argument of type 'int', but argument 2 has type 'long'"),
+        (1, "format '%s' expects argument of type 'char *', but argument 2 has type 'int'"),
+    ], proc.stderr
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2", "-Os"])
+def test_positional_conditional_objects_identical(tmp_path, opt):
+    body = POSITIONAL + CONDITIONAL.replace("void t(", "void t2(") + INLINE_POS
+    a = _run(tmp_path, body, opt, "-w", "-Wno-format", "-Wno-format-security")
+    assert a.returncode == 0, a.stderr
+    obj_a = (tmp_path / "t.o").read_bytes()
+    b = _run(tmp_path, body, opt, "-Wformat", "-Wformat-security")
+    assert b.returncode == 0, b.stderr
+    assert (tmp_path / "t.o").read_bytes() == obj_a

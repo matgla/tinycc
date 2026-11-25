@@ -604,6 +604,243 @@ ST_FUNC int yasc_borrowing_struct(CType *type)
   return (type->t & (VT_BTYPE | VT_ARRAY)) == VT_STRUCT && type->ref && yasc_struct_params(type->ref) > 0;
 }
 
+/* yasc tagged unions: `union(k) { long i when(V_INT); char * view s
+   when(V_STR); } u;`, a member of the struct whose member k (declared
+   before it) says which member of u is live.  Kept by the union's tag Sym,
+   which never moves (member Syms spill: they are named by token).  The
+   values the members' when(...) name are a table, a bit each in the masks
+   the flow check follows (YASC_TAG_OTHER: any other value). */
+YascTagged *yasc_tagged;
+int yasc_ntagged;
+/* the struct or union body being parsed at each struct_body_depth (which
+   error recovery puts back, so an entry above it is never read) */
+#define STRUCT_BODY_AT_MAX 32
+static struct StructBody *struct_body_at[STRUCT_BODY_AT_MAX];
+static struct StructBody *struct_body_now(void)
+{
+  return struct_body_depth > 0 && struct_body_depth < STRUCT_BODY_AT_MAX ? struct_body_at[struct_body_depth] : NULL;
+}
+
+ST_FUNC YascTagged *yasc_tagged_of(Sym *u)
+{
+  for (int i = 0; i < yasc_ntagged; i++)
+    if (yasc_tagged[i].u == u)
+      return &yasc_tagged[i];
+  return NULL;
+}
+
+/* the member TOK of tagged union U: its index, -1 none */
+ST_FUNC int yasc_tagged_member(const YascTagged *t, int tok)
+{
+  for (int i = 0; i < t->nmem; i++)
+    if (t->mtok[i] == tok)
+      return i;
+  return -1;
+}
+
+/* yasc register fields: `uint32_t irq:1 w1c;`, `volatile uint32_t status
+   ro;` -- by the struct's tag Sym (it never moves) and the member's name */
+static struct
+{
+  Sym *st;
+  int tok, access;
+} *yasc_regs;
+int yasc_nreg;
+
+ST_FUNC void yasc_tagged_free(void)
+{
+  tcc_free(yasc_regs);
+  yasc_regs = NULL;
+  yasc_nreg = 0;
+  for (int i = 0; i < yasc_ntagged; i++)
+  {
+    tcc_free(yasc_tagged[i].mtok);
+    tcc_free(yasc_tagged[i].mmask);
+    tcc_free(yasc_tagged[i].mname);
+  }
+  tcc_free(yasc_tagged);
+  yasc_tagged = NULL;
+  yasc_ntagged = 0;
+}
+
+/* yasc register fields: `uint32_t irq:1 w1c;`, `volatile uint32_t status
+   ro;` -- by the struct's tag Sym (it never moves) and the member's name */
+
+ST_FUNC int yasc_reg_access(Sym *st, int tok)
+{
+  for (int i = 0; i < yasc_nreg; i++)
+    if (yasc_regs[i].st == st && yasc_regs[i].tok == tok)
+      return yasc_regs[i].access;
+  return 0;
+}
+
+/* OFF: where T starts, from the window's start (may be < 0) */
+static void yasc_reg_mask_of(CType *t, int off, uint32_t *mask, uint32_t *fbits, int *ftok, int *nf, int depth)
+{
+  if (depth > 4 || (t->t & VT_BTYPE) != VT_STRUCT || !t->ref || (t->t & VT_ARRAY))
+    return;
+  for (Sym *f = sym_first(t->ref); f; f = f->next)
+  {
+    const int o = off + f->c, tok = f->v & ~SYM_FIELD;
+    int fa, fsz = type_size(&f->type, &fa);
+    if (o >= 4 || o + (fsz > 0 ? fsz : 0) <= 0)
+      continue;
+    if ((f->type.t & VT_BTYPE) == VT_STRUCT)
+    {
+      yasc_reg_mask_of(&f->type, o, mask, fbits, ftok, nf, depth + 1);
+      continue;
+    }
+    if (yasc_reg_access(t->ref, tok) != YASC_REG_W1C)
+      continue;
+    uint64_t wide;
+    if (f->type.t & VT_BITFIELD)
+      wide = ((1ull << BIT_SIZE(f->type.t)) - 1) << BIT_POS(f->type.t);
+    else
+      wide = fsz >= 8 ? ~0ull : (1ull << (8 * fsz)) - 1;
+    /* placed at byte o of the window (o may be < 0: a member starting before it) */
+    uint32_t bits = o >= 0 ? (uint32_t)(wide << (8 * o)) : (uint32_t)(wide >> (-8 * o));
+    if (!bits)
+      continue;
+    *mask |= bits;
+    if (*nf < 8)
+      fbits[*nf] = bits, ftok[*nf] = tok, (*nf)++;
+  }
+}
+
+ST_FUNC uint32_t yasc_reg_w1c_mask(CType *t, int base, uint32_t *fbits, int *ftok, int *nf)
+{
+  uint32_t mask = 0;
+  *nf = 0;
+  if (yasc_nreg)
+    yasc_reg_mask_of(t, -base, &mask, fbits, ftok, nf, 0);
+  return mask;
+}
+
+/* `ro`, `wo`, `w1c` after member V of struct ST */
+static void yasc_reg_qualifier(Sym *st, int v)
+{
+  int access = tok == TOK_ro ? YASC_REG_RO : tok == TOK_wo ? YASC_REG_WO : YASC_REG_W1C;
+  if (!v)
+    tcc_error("'%s' names a register field: give the member a name", get_tok_str(tok, NULL));
+  next();
+  yasc_regs = tcc_realloc(yasc_regs, (yasc_nreg + 1) * sizeof *yasc_regs);
+  yasc_regs[yasc_nreg].st = st, yasc_regs[yasc_nreg].tok = v, yasc_regs[yasc_nreg].access = access;
+  yasc_nreg++;
+  if (tok == TOK_ro || tok == TOK_wo || tok == TOK_w1c)
+    tcc_error("a register field is one of ro, wo or w1c");
+}
+
+/* `when(K, ...)` after a member of tagged union T: the mask of its values */
+static void yasc_tagged_when(YascTagged *t, int v)
+{
+  uint32_t mask = 0;
+  int first = 0;
+  if (tok != TOK_when)
+    tcc_error("a member of a tagged union says when its tag selects it: '%s' when(...)", get_tok_str(v, NULL));
+  next();
+  skip('(');
+  for (;;)
+  {
+    int name = tok >= TOK_UIDENT ? tok : 0, k;
+    int64_t val = expr_const64();
+    for (k = 0; k < t->nvals && t->vals[k] != val; k++)
+      ;
+    if (k == t->nvals)
+    {
+      if (k == YASC_TAG_MAXVALS)
+        tcc_error("a tagged union names at most %d tag values", YASC_TAG_MAXVALS);
+      t->vals[k] = val;
+      t->vnames[k] = name;
+      t->nvals++;
+    }
+    mask |= 1u << k;
+    if (!first)
+      first = k + 1;
+    if (tok != ',')
+      break;
+    next();
+  }
+  skip(')');
+  t->mtok = tcc_realloc(t->mtok, (t->nmem + 1) * sizeof *t->mtok);
+  t->mmask = tcc_realloc(t->mmask, (t->nmem + 1) * sizeof *t->mmask);
+  t->mname = tcc_realloc(t->mname, (t->nmem + 1) * sizeof *t->mname);
+  t->mtok[t->nmem] = v;
+  t->mmask[t->nmem] = mask;
+  t->mname[t->nmem] = first - 1;
+  t->nmem++;
+}
+
+/* the owned pointers (or handles) in member type T of tagged union Y, at
+   OFF from the union, live when the tag is in MASK */
+static void yasc_tagged_owned(YascTagged *y, CType *t, int off, uint32_t mask, const char *name, int depth)
+{
+  int q = type_yasc(t);
+  if (depth > 4 || (t->t & VT_ARRAY))
+    return;
+  if ((q & YASC_OWNED) && !(q & YASC_UNCHECKED))
+  {
+    if (y->nown == YASC_TAG_MAXOWN)
+      tcc_error("a tagged union holds at most %d owned pointers", YASC_TAG_MAXOWN);
+    y->own_off[y->nown] = off;
+    y->own_mask[y->nown] = mask;
+    pstrcpy(y->own_name[y->nown], sizeof y->own_name[0], name);
+    y->nown++;
+    return;
+  }
+  if ((t->t & VT_BTYPE) == VT_STRUCT && t->ref && !IS_UNION(t->t))
+    for (Sym *f = sym_first(t->ref); f; f = f->next)
+    {
+      char n[48];
+      snprintf(n, sizeof n, "%s.%s", name, get_tok_str(f->v & ~SYM_FIELD, NULL));
+      yasc_tagged_owned(y, &f->type, off + f->c, mask, n, depth + 1);
+    }
+}
+
+/* after the layout of struct S: each tagged union member's tag, found by
+   name, as an offset from the union */
+static void yasc_tagged_resolve(Sym *s)
+{
+  for (int i = 0; i < yasc_ntagged; i++)
+  {
+    YascTagged *t = &yasc_tagged[i];
+    Sym *um = NULL, *km = NULL;
+    if (t->outer != s || t->resolved)
+      continue;
+    for (Sym *f = sym_first(s); f; f = f->next)
+    {
+      if ((f->type.t & VT_BTYPE) == VT_STRUCT && f->type.ref == t->u)
+        um = f;
+      else if ((f->type.t & VT_ARRAY) && f->type.ref && (f->type.ref->type.t & VT_BTYPE) == VT_STRUCT &&
+               f->type.ref->type.ref == t->u)
+        tcc_error("a tagged union is not an array: its struct has one tag");
+      if ((f->v & ~SYM_FIELD) == t->tag_tok)
+        km = f;
+    }
+    /* `v.a` through an anonymous one would not pass the union: no check */
+    if (!um || (um->v & ~SYM_FIELD) >= SYM_FIRST_ANOM)
+      tcc_error("a tagged union is a named member of the struct that holds its tag: union(%s) { ... } name;",
+                get_tok_str(t->tag_tok, NULL));
+    if (!km)
+      tcc_error("the tag '%s' of a tagged union is not a member of its struct", get_tok_str(t->tag_tok, NULL));
+    if (!is_integer_btype(km->type.t & VT_BTYPE) || (km->type.t & (VT_BITFIELD | VT_ARRAY)))
+      tcc_error("the tag '%s' of a tagged union is an integer or enum member, not a bit-field", get_tok_str(t->tag_tok, NULL));
+    if (km->c > um->c)
+      tcc_error("the tag '%s' of a tagged union is declared before the union", get_tok_str(t->tag_tok, NULL));
+    t->tag_rel = km->c - um->c;
+    t->name_tok = um->v & ~SYM_FIELD;
+    t->resolved = 1;
+    for (Sym *f = sym_first(t->u); f; f = f->next)
+    {
+      int m = yasc_tagged_member(t, f->v & ~SYM_FIELD);
+      char n[48];
+      if (m < 0)
+        continue;
+      snprintf(n, sizeof n, "%s.%s", get_tok_str(t->name_tok, NULL), get_tok_str(f->v & ~SYM_FIELD, NULL));
+      yasc_tagged_owned(t, &f->type, f->c, t->mmask[m], n, 0);
+    }
+  }
+}
+
 /* functions (by name: a parked prototype's type Sym is made again when it
    is named) whose result is a borrowing struct: what it borrows */
 static struct
@@ -696,6 +933,8 @@ typedef struct StructBody
   PendingFieldBorrows *fb;
   int u, c, nfb, with_methods;
   int flexible; /* the flexible array member's name: no member after it */
+  int tagged; /* a tagged union's body, yasc_tagged[tagged - 1] (an index: a
+                 union in a member grows the table): each member says when(...) */
 } StructBody;
 
 /* One member declaration of a struct or union body (error recovery goes on
@@ -726,10 +965,12 @@ static void struct_member(void *arg)
      declarator only its own */
   const unsigned char dep_spec = ad1.attr_deprecated;
   const int dep_spec_msg = ad1.attr_deprecated_msg;
+  const unsigned char yptr_spec = ad1.attr_yasc_ptr; /* yasc_view: the same */
   while (1)
   {
     ad1.attr_deprecated = dep_spec;
     ad1.attr_deprecated_msg = dep_spec_msg;
+    ad1.attr_yasc_ptr = yptr_spec;
     if (sb->flexible)
       tcc_error("flexible array member '%s' not at the end of struct", get_tok_str(sb->flexible, NULL));
     bit_size = -1;
@@ -768,6 +1009,11 @@ static void struct_member(void *arg)
       }
       if ((type1.t & VT_BTYPE) == VT_FUNC || (type1.t & VT_BTYPE) == VT_VOID || (type1.t & VT_STORAGE))
         tcc_error("invalid type for '%s'", get_tok_str(v, NULL));
+      /* yasc (S2, U2): which member of a union is live is not known, so an
+         owned one in it could be neither followed nor freed */
+      if (sb->u == VT_UNION && !sb->tagged && tcc_state->yasc && yasc_type_holds_annotated(&type1, 1, 0))
+        tcc_yasc_rule("a union holds an owned member%s%s%s: which member is live is not known, so it is never freed",
+                      v ? " '" : "", v ? get_tok_str(v, NULL) : "", v ? "'" : "");
     }
     if (tok == ':')
     {
@@ -780,6 +1026,13 @@ static void struct_member(void *arg)
         tcc_error("zero width for bit-field '%s'", get_tok_str(v, NULL));
       parse_attribute(&ad1);
     }
+    /* a tagged union's member: when(K, ...) */
+    if (sb->tagged && v)
+      yasc_tagged_when(&yasc_tagged[sb->tagged - 1], v);
+    /* a register field: ro, wo, w1c */
+    if (tcc_state->yasc && (tok == TOK_ro || tok == TOK_wo || tok == TOK_w1c))
+      yasc_reg_qualifier(sb->s, v);
+    attr_apply_member_facts(&type1, &ad1, v); /* a C header's yasc_view */
     size = type_size(&type1, &align);
     if (bit_size >= 0)
     {
@@ -861,9 +1114,26 @@ void struct_decl(CType *type, int u)
   parse_decl_attributes(&ad);
   const int tag_line = file ? file->line_num : 0; /* "declared here" for a deprecated tag */
 
+  /* yasc `union(k) [name] { ... }`: a tagged union, k its struct's member */
+  int tag_tok = 0;
+  Sym *tag_outer = NULL; /* the struct whose body holds it */
+  if (tcc_state->yasc && u == VT_UNION && tok == '(')
+  {
+    next();
+    if (tok < TOK_UIDENT)
+      expect("the tag member's name");
+    tag_tok = tok;
+    next();
+    skip(')');
+    if (!struct_body_now() || struct_body_now()->u != VT_STRUCT)
+      tcc_error("a tagged union is a member of the struct that holds its tag '%s'", get_tok_str(tag_tok, NULL));
+    tag_outer = struct_body_now()->s;
+  }
   v = 0;
   if (tok >= TOK_IDENT) /* struct/enum tag */
     v = tok, next();
+  if (tag_tok && tok != '{')
+    tcc_error("a tagged union is defined where it is declared: union(%s) { ... }", get_tok_str(tag_tok, NULL));
   /* yasc `struct T borrows(text) { ... }` (the names it borrows from) or,
      where the type is used, `struct T borrows(src)` (what this one does) */
   int bnames[4], bnb = 0, bstatic = 0, bwritten = 0;
@@ -1059,7 +1329,18 @@ do_decl:
     }
     else
     {
-      const int with_methods = tcc_state->yasc;
+      int tagged = 0; /* yasc_tagged[tagged - 1] */
+      if (tag_tok)
+      {
+        yasc_tagged = tcc_realloc(yasc_tagged, (yasc_ntagged + 1) * sizeof *yasc_tagged);
+        YascTagged *t = &yasc_tagged[yasc_ntagged++];
+        memset(t, 0, sizeof *t);
+        t->u = s;
+        t->outer = tag_outer;
+        t->tag_tok = tag_tok;
+        tagged = yasc_ntagged;
+      }
+      const int with_methods = tcc_state->yasc && !tagged; /* no methods in a tagged union */
       if (with_methods)
         yasc_struct_body_begin();
       StructBody sb;
@@ -1072,6 +1353,9 @@ do_decl:
       sb.flexible = 0;
       sb.nfb = 0;
       sb.with_methods = with_methods;
+      sb.tagged = tagged;
+      if (struct_body_depth < STRUCT_BODY_AT_MAX)
+        struct_body_at[struct_body_depth] = &sb;
       struct_body_recovering(struct_member, &sb);
       fb = sb.fb;
       nfb = sb.nfb;
@@ -1088,6 +1372,8 @@ do_decl:
       check_fields(type, 0);
       merge_symattr(&type->ref->a, &ad.a);
       struct_layout(type, &ad);
+      if (yasc_ntagged && u == VT_STRUCT)
+        yasc_tagged_resolve(s);
       if (nfb)
         yasc_resolve_field_borrows(type->ref, fb, nfb);
       tcc_free(fb);

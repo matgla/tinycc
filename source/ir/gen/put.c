@@ -165,6 +165,13 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
     if (nocode_wanted & ~0x20000000)
       return -1;
   }
+  /* yasc register fields: a call handed a pointer to volatile memory may
+     read a register through it (ir/regaccess.c) -- only in a unit with
+     register types (not gated on the warning: unsafe turns it off for a
+     region, and what such a call reads may be stored past it) */
+  if (op == TCCIR_OP_FUNCPARAMVAL && tcc_state->yasc && yasc_nreg && src1 && src2 &&
+      (src1->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && src1->type.ref && (src1->type.ref->type.t & VT_VOLATILE))
+    tcc_ir_note_vcall(ir, TCCIR_DECODE_CALL_ID(src2->c.i));
 #ifdef CONFIG_TCC_BCHECK
   /* -b: an access the frontend marked is checked first (frontend/gen/op/bcheck.c) */
   if (tcc_state->do_bounds_check)

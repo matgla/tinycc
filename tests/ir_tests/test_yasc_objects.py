@@ -30,7 +30,7 @@ void regfree(drop regex_t owned(regfree) * view preg);
 void other_free(drop regex_t owned(other_free) * view p);
 """
 PRELUDE_LINES = PRELUDE.count("\n")
-START = "void f(void)\n{\n  regex_t owned(regfree) re;\n  if (regcomp(&re, \"a\", 0))\n    return;\n"
+START = "void f(void)\n{\n  regex_t owned(regfree) re = undefined;\n  if (regcomp(&re, \"a\", 0))\n    return;\n"
 
 
 def _diags(tmp_path, body, *flags):
@@ -61,7 +61,7 @@ BAD = {
     "released_twice": (START + "  regfree(&re);\n  regfree(&re);\n}\n", 7, "'re' is released twice"),
     "wrong_deallocator": (START + "  other_free(&re);\n}\n", 6, "'re' is released by regfree, not other_free"),
     "not_declared_owned": (
-        "void f(void)\n{\n  regex_t re;\n  regcomp(&re, \"a\", 0);\n}\n",
+        "void f(void)\n{\n  regex_t re = undefined;\n  regcomp(&re, \"a\", 0);\n}\n",
         4,
         "what 'regcomp' writes is owned, but the local it is written into is not declared owned(...): "
         "it is never released",
@@ -78,6 +78,6 @@ def test_reported(tmp_path, name, opt):
 
 def test_needs_a_deallocator(tmp_path):
     src = tmp_path / "t.c"
-    src.write_text(PRELUDE + "void f(void) { regex_t owned re; (void)re; }\n")
+    src.write_text(PRELUDE + "void f(void) { regex_t owned re = undefined; (void)re; }\n")
     proc = subprocess.run([str(TCC), "-ccompat", "-c", str(src), "-o", str(tmp_path / "t.o")], capture_output=True, text=True)
     assert proc.returncode != 0 and "an owned object names its deallocator: owned(release)" in proc.stderr

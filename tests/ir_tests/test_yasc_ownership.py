@@ -37,14 +37,14 @@ def _compile(tmp_path, body, *flags, name="t.c", obj="t.o"):
     src = tmp_path / name
     src.write_text(body)
     return subprocess.run(
-        [str(TCC), "-c", *flags, str(src), "-o", str(tmp_path / obj)],
+        [str(TCC), "-Wno-missing-prototypes", "-Wno-cross-tu", "-Wno-tainted-format", "-c", *flags, str(src), "-o", str(tmp_path / obj)],
         capture_output=True, text=True,
     )
 
 
 def _yasc(tmp_path, body, *flags):
     # the flow checks (-Wlifetime, on by default) are test_lifetime.py's
-    return _compile(tmp_path, PRELUDE + body, "-std=yasc", "-Wno-lifetime", *flags)
+    return _compile(tmp_path, PRELUDE + body, "-ccompat", "-std=yasc", "-Wno-lifetime", *flags)
 
 
 def _warnings(proc):
@@ -81,7 +81,7 @@ char * owned pass(char * owned p) { return p; }
 void take(drop struct S * view s);
 int fill(out struct S * view s);
 void f(struct S * view s);
-void ok(struct S * view s)
+void ok(inout struct S * view s)
 {
   char * owned p = alloc(4);
   char * owned q = 0;
@@ -104,13 +104,13 @@ void ok(struct S * view s)
 @pytest.mark.parametrize(
     "body, expected",
     [
-        ("void f(char * view q) { char * owned p = q; release(p); }", [NOT_OWNING]),
-        ("void f(char * view q) { release(q); }", [NOT_OWNING]),
-        ("char * owned f(char * view q) { return q; }", [NOT_OWNING]),
+        ("void f(inout char * view q) { char * owned p = q; release(p); }", [NOT_OWNING]),
+        ("void f(inout char * view q) { release(q); }", [NOT_OWNING]),
+        ("char * owned f(inout char * view q) { return q; }", [NOT_OWNING]),
         ("void f(void) { char * owned p = plain(); release(p); }", [NOT_OWNING]),
-        ("typedef char * owned ostr;\nvoid f(char * view q) { ostr s = q; release(s); }", [NOT_OWNING]),
-        ("struct S { char * owned t; };\nvoid f(struct S * view s, char * view q) { s->t = q; }", [NOT_OWNING]),
-        ("void f(char * owned * view pp, char * view q) { *pp = q; }", [NOT_OWNING]),
+        ("typedef char * owned ostr;\nvoid f(inout char * view q) { ostr s = q; release(s); }", [NOT_OWNING]),
+        ("struct S { char * owned t; };\nvoid f(inout struct S * view s, inout char * view q) { s->t = q; }", [NOT_OWNING]),
+        ("void f(inout char * owned * view pp, inout char * view q) { *pp = q; }", [NOT_OWNING]),
         ("void f(void) { char * view v = make(); (void)v; }", [LEAK]),
         ("void use(char * view s);\nvoid f(void) { use(make()); }", [LEAK]),
         ("char * borrows(static) f(void) { return make(); }", [LEAK]),
@@ -144,7 +144,7 @@ def test_misplaced_qualifiers(tmp_path, body, message):
 def test_type_names_show_pointer_qualifiers(tmp_path):
     proc = _yasc(tmp_path, "struct S { int a; };\nvoid f(void) { struct S s; s = make(); }\n")
     assert proc.returncode != 0
-    assert "'char *owned '" in proc.stderr, proc.stderr
+    assert "'char * owned'" in proc.stderr, proc.stderr
 
 
 YASC_FILE = PRELUDE + """\
@@ -153,10 +153,10 @@ int fill(out struct node * view n) { n->next = 0; n->name = make(); return 0; }
 void drain(drop struct node * view n)
 {
   while (n->next) {
-    struct node * owned maybe next = n->next->next;
+    struct node * owned maybe next = move(n->next->next);
     release(n->next->name);
     release(n->next);
-    n->next = next;
+    n->next = move(next);
   }
   release(n->name);
 }
@@ -165,7 +165,7 @@ void drain(drop struct node * view n)
 
 @pytest.mark.parametrize("level", ["-O0", "-O1", "-O2", "-Os"])
 def test_qualifiers_do_not_change_code(tmp_path, level):
-    gone = ["-Downed=", "-Dview=", "-Dmaybe=", "-Dout=", "-Ddrop=", "-Dborrows(...)="]
+    gone = ["-Downed=", "-Dview=", "-Dmaybe=", "-Dout=", "-Ddrop=", "-Dborrows(...)=", "-Dmove(x)=(x)"]
     yasc = _compile(tmp_path, YASC_FILE, "-std=yasc", level, name="y.c", obj="y.o")
     # -std=yasc is safe mode, so -Wlifetime (the SSA path at -O0) is on there
     plain = _compile(tmp_path, YASC_FILE, "-std=c23", "-Wlifetime", level, *gone, name="p.c", obj="p.o")
@@ -232,7 +232,8 @@ def _located(proc):
 def test_legacy_c_pointers_are_unchecked(tmp_path):
     (tmp_path / "legacy.h").write_text(LEGACY_H)
     (tmp_path / "yasc.h").write_text(YASC_H)
-    proc = _compile(tmp_path, LEGACY_USER, "-std=yasc")
+    # -ccompat: the type rules below stay warnings (errors in safe mode)
+    proc = _compile(tmp_path, LEGACY_USER, "-ccompat", "-std=yasc")
     assert proc.returncode == 0, proc.stderr
     # silent: C functions, a C typedef, a C macro's cast, pointers to pointers,
     # an owned result handed to C; checked: a yasc macro's cast, a yasc view,
@@ -244,7 +245,7 @@ def test_legacy_c_in_safe_mode(tmp_path):
     # safe by default (no -ccompat) is yasc too
     (tmp_path / "legacy.h").write_text(LEGACY_H)
     body = ('#include "legacy.h"\nvoid release(drop void * owned maybe p);\n'
-            "void f(void) { char * owned a = c_alloc(4); release(a); }\n")
+            "void f(void)\n{\n  char * owned a = unsafe(c_alloc(4));\n  release(a);\n}\n")
     proc = _compile(tmp_path, body)
     assert proc.returncode == 0 and not proc.stderr, proc.stderr
 
@@ -308,7 +309,9 @@ MAYBE_INTO_Z = "a pointer that may be null is stored in 'z', which is not maybe"
 
 def test_attributes_refine_regular_c(tmp_path):
     (tmp_path / "attr.h").write_text(ATTR_H)
-    proc = _compile(tmp_path, ATTR_USER, "-std=yasc", "-Wall")
+    # -ccompat: the flow check's report below is a warning there (an error
+    # in safe mode, strict lifetimes)
+    proc = _compile(tmp_path, ATTR_USER, "-ccompat", "-std=yasc", "-Wall", "-Wlifetime")
     assert proc.returncode == 0, proc.stderr
     warnings = _located(proc)
     # silent: owned results into owned maybe pointers, an unchecked one, a

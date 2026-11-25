@@ -357,10 +357,12 @@ void gen_late_reopt_functions(TCCState *s)
     int saved_budget = called_once_budget_begin(body_len);
     tccpp_setfile_replay(fn->filename);
     pp_pack_enter(s, fn->pack, saved_pack);
+    const int saved_anchor = tcc_diag_anchor_enter(s, fn->anchor);
     begin_macro_kept(compile_ts);
     next();
     gen_function(sym);
     end_macro();
+    s->diag_anchor = saved_anchor;
     pp_pack_leave(s, saved_pack);
     called_once_budget_end(saved_budget);
     tok_str_release_spilled();
@@ -497,11 +499,13 @@ static void emit_inline_functions(TCCState *s, int owed_only)
         int saved_budget = called_once_budget_begin(fn->func_str->len);
         tccpp_setfile_replay(fn->filename);
         pp_pack_enter(s, fn->pack, saved_pack);
+        const int saved_anchor = tcc_diag_anchor_enter(s, fn->anchor);
         begin_macro_kept(fn->func_str);
         next();
         cur_text_section = function_text_section(s, sym);
         gen_function(sym);
         end_macro(); /* frees the tokens: the next body's ICF scan must not read them */
+        s->diag_anchor = saved_anchor;
         tok_str_release_spilled();
         sym_params_release();
         fn->func_str = NULL;
@@ -541,7 +545,7 @@ void free_inline_functions(TCCState *s)
   for (i = 0; i < s->nb_inline_fns; ++i)
   {
     struct InlineFunc *fn = s->inline_fns[i];
-    if (fn->sym)
+    if (fn->sym && fn->func_str) /* a body cut at the end of the input lent its tokens (decl.c save_body_cut) */
       tok_str_free(fn->func_str);
     tcc_free(fn->pack);
     inline_func_free_rare(fn);
@@ -1444,9 +1448,14 @@ void check_uncompiled_inline_functions(TCCState *s)
   /* after an error (recover.c) the unit was only checked from there on: a
      body whose calls generated nothing was never parsed, and may hold an
      error too */
-  if (!tcc_ir_flow_checks_wanted() && !fe_checks_wanted() && !unused_locals_wanted() &&
-      (s->warn_none || !((s->warn_vla | s->warn_alloca) & WARN_ON)) && !s->diag_spec_recheck && !s->recover_flipped)
-    return;
+  /* Without them still, for the errors: a body of the main file nothing
+     generated (unused, every call inlined, or -fsyntax-only, which expands
+     nothing) and one only folded (the speculation says no error) are parsed
+     once with them on -- what -O0 says of a body it compiles, at every -O
+     (an expansion said a header's body's) */
+  const int all = tcc_ir_flow_checks_wanted() || fe_checks_wanted() || unused_locals_wanted() ||
+                  (!s->warn_none && ((s->warn_vla | s->warn_alloca) & WARN_ON)) || s->diag_spec_recheck ||
+                  s->recover_flipped;
   for (int i = 0; i < s->nb_inline_fns; i++)
   {
     InlineFunc *fn = s->inline_fns[i];
@@ -1459,6 +1468,8 @@ void check_uncompiled_inline_functions(TCCState *s)
     /* a body only folded at compile time was never parsed with its
        diagnostics on: it gets all of them here (a call nothing generated) */
     if (!fn->expanded && !fn->folded && (!fn->filename || fn->filename != s->main_file))
+      continue;
+    if (!all && !fn->folded && (!fn->filename || fn->filename != s->main_file))
       continue;
     if (!opened)
     {
@@ -1474,10 +1485,12 @@ void check_uncompiled_inline_functions(TCCState *s)
     fn->sym = NULL;
     tccpp_setfile_replay(fn->filename);
     pp_pack_enter(s, fn->pack, saved_pack);
+    const int saved_anchor = tcc_diag_anchor_enter(s, fn->anchor);
     begin_macro_kept(body);
     next();
     gen_function_check_only(sym);
     end_macro();
+    s->diag_anchor = saved_anchor;
     pp_pack_leave(s, saved_pack);
     s->diag_flow_only = 0;
     debug_modes = saved_debug_modes;
@@ -1697,6 +1710,7 @@ void gen_deferred_function_bodies(TCCState *s)
      * emits it only if a reference survives. */
     InlineFunc *fn = tcc_mallocz(sizeof *fn);
     fn->filename = d->filename;
+    fn->anchor = d->anchor;
     fn->sym = sym;
     fn->func_str = d->body;
     fn->pack = d->pack;

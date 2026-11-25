@@ -86,7 +86,9 @@ EXTRA_CFLAGS ?=
 # Prebuilt objects linked into the test (e.g. gcc-compiled, for ABI interop).
 EXTRA_OBJS ?=
 # Test programs are regular C: -ccompat, unless CC is gcc (comparison runs).
-CFLAGS += $(if $(findstring tcc,$(notdir $(CC))),-ccompat)
+# CCOMPAT= compiles them in tcc's safe default (yasc, strict lifetimes).
+CCOMPAT ?= -ccompat
+CFLAGS += $(if $(findstring tcc,$(notdir $(CC))),$(CCOMPAT))
 CFLAGS += -nostdlib -fvisibility=hidden $(GCC_ABI_FLAGS) -ffunction-sections $(EXTRA_CFLAGS)
 
 # Two-phase compilation support (reduces memory usage)
@@ -173,6 +175,22 @@ LDFLAGS_TAIL := -B$(LIBTCC1_BM_DIR)
 # Name the static archive explicitly.  Defined outside the USE_NEWLIB_BUILD
 # split below because both branches reference it.
 SOFTFP_A := $(TCC_PATH)/lib/fp/libsoftfp.a
+SOFTFP_DEP :=
+# libsoftfp carries complex division (__divsc3/__divdc3, lib/fp/soft/divc3.c)
+# in the base PCS, and it comes before libgcc in the groups below: a hard-float
+# image would take it and read its operands from r0-r3 while the caller put
+# them in s0-s3 / d0-d3.  tcc links no FP runtime at all under
+# -mfloat-abi=hard (tccelf_get_fp_lib_name), so hard-float programs take
+# libgcc's; these images get the same from a copy without divc3.o.  Every
+# xdist worker may build it: each writes its own temporary and renames it
+# into place, as the libtcc1-bm archive above.
+ifeq ($(FLOAT_ABI),hard)
+SOFTFP_DEP := $(LIBTCC1_BM_DIR)libsoftfp-hard.a
+$(SOFTFP_DEP): $(SOFTFP_A)
+	@mkdir -p $(LIBTCC1_BM_DIR)
+	@t=$@.$$$$.tmp; cp $< $$t && ar d $$t divc3.o && mv -f $$t $@ || { rm -f $$t; exit 1; }
+SOFTFP_A := $(SOFTFP_DEP)
+endif
 
 ifeq ($(USE_NEWLIB_BUILD),1)
 NEWLIB_LIBC_A := $(if $(and $(filter 1,$(DEBUG_LIBC)),$(wildcard $(NEWLIB_LIBC_G))),$(NEWLIB_LIBC_G),$(NEWLIB_DIR)/libc.a)
@@ -217,7 +235,7 @@ $(OUTPUT)/%.o: $(MAKEFILE_DIR)%.c | $(OUTPUT)
 $(OUTPUT)/%.o: $(MAKEFILE_DIR)%.S | $(OUTPUT)
 	$(CC_WRAPPER) $(CC) $(CFLAGS) -c $< -o $@
 
-$(TARGET): $(OBJS) $(LIBTCC1_BM_A) $(if $(filter 1,$(USE_NEWLIB_BUILD)),$(NEWLIB_DIR)/libc.a)
+$(TARGET): $(OBJS) $(LIBTCC1_BM_A) $(SOFTFP_DEP) $(if $(filter 1,$(USE_NEWLIB_BUILD)),$(NEWLIB_DIR)/libc.a)
 	$(CC_WRAPPER) $(CC) $(CFLAGS) $(TCC_FLAGS) $(OBJS) $(EXTRA_OBJS) $(CRT_LIBS) -o $@ $(LDFLAGS) $(LDFLAGS_TAIL)
 
 # Build newlib from source if not already built (soft ABI by default; other

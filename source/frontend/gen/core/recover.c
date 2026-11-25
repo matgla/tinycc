@@ -12,18 +12,24 @@
  * reports more than its first mistake (gcc's -fmax-errors=N, here 8 by
  * default).
  *
- * Two recovery points, each a setjmp: one around the file-scope declaration
+ * Recovery points, each a setjmp: one around the file-scope declaration
  * loop (tccgen_decls_recovering), one around the parse of each function body
- * (gen_body_recovering, from gen_function and gen_function_check_only).  A
+ * (gen_body_recovering, from gen_function and gen_function_check_only), one
+ * per struct body, per replay, and per function's compile (RECOVER_FUNC:
+ * its setup and code generation, backend/generators/function.c).  A
  * tcc_error longjmps to the innermost armed one (error1 -> tcc_recover_jump)
  * when the state allows; otherwise, as before, out of the compile:
  *
- *   - inside a preprocessor directive, a macro's substitution or inline asm,
- *     after an internal error, and in const_eval's speculative parse;
- *   - while a function's parameters are set up or its code generated (no
- *     point is armed there);
+ *   - inside a preprocessor directive or an assembler file, after an
+ *     internal error, and in const_eval's speculative parse;
  *   - when a recovery would not move (the same token twice), and at the end
  *     of the input inside a body.
+ *
+ * A macro used with the wrong number of arguments, and a lexer error in a
+ * body saved as tokens, are said later, where the parse reads the marker
+ * tcc_error_stash put in the token stream.  After an error in a declarator
+ * the declaration list goes on with its next declarator
+ * (recover_next_declarator).
  *
  * At file scope the declaration is skipped to its ';' (out of the struct
  * bodies it is in), or past the braces of a function body.  In a body the
@@ -52,7 +58,11 @@ enum
   RECOVER_STRUCT, /* a struct or union body: the next member */
   RECOVER_INLINE, /* a replay (an inline expansion, a defer body, a saved
                      initializer): after it */
+  RECOVER_FUNC,   /* a function's compile: its setup, its code generation
+                     (backend/generators/function.c) */
 };
+
+_Static_assert(RECOVER_FUNC == RECOVER_CALL_FUNC, "tcc.h names RECOVER_FUNC");
 
 typedef struct RecoverLevel
 {
@@ -65,18 +75,21 @@ struct TCCRecover
 {
   jmp_buf jb;
   struct TCCRecover *outer;
-  unsigned char body;    /* RECOVER_FILE, RECOVER_BODY, RECOVER_STRUCT or RECOVER_INLINE */
+  unsigned char body;    /* RECOVER_* */
   unsigned char errored; /* an error was recovered from here */
-  unsigned char heap;    /* tcc_malloc'ed (replay_recovering), not a frame's */
+  unsigned char heap;    /* tcc_malloc'ed (recover_call, gen_body_recovering), not a frame's */
   unsigned char in_loop, in_switch, can_break;
   int nb_errors;         /* when armed */
   /* the state when armed */
   TokenString *mstack;
   SValue *vtop;
   int nocode_wanted, local_scope, unevaluated_operand, global_expr, func_param_decl_depth;
+  int param_names_nb, param_names_base; /* decl_param_names */
   int compound_depth, struct_depth, ym_depth, defer_level, cleanup_error_exit, check_only, parse_flags;
   int nb_stk_data, hidden_labels, inline_return_loc, inline_return_vr, rsym, func_var, func_has_label_addr;
   unsigned pending_call_temp_slots, diag_parse;
+  void *call_checks, *obj_calls; /* builtin/call.c, builtin/objsize.c: the calls begun */
+  void *fort_calls;              /* builtin/fortify.c */
   Sym *all_cleanups, *lt_loop, *lt_switch;
   struct scope *cur_scope, *loop_scope, *root_scope;
   struct switch_t *cur_switch;
@@ -96,12 +109,20 @@ struct TCCRecover
   struct scope *scopes;
   int dummy_b, dummy_c;
   struct switch_t *dummy_sw;
+  /* the declaration list the error was in, which goes on after its ',' */
+  RecoverDeclList *decl_list;
+  TokenString *pp_capture;
+  int diag_anchor, init_depth;
+  int dr_braces; /* the initializer braces the error was in */
+  unsigned char decl_resume;
+  RecoverDeclResume dr;
 };
 
 /* ------------------------------------------------------------------------- */
 /* state */
 
 RecoverDecl recover_decl;
+int init_brace_depth;
 
 static void recover_body_errored(TCCRecover *r);
 static void recover_syntax_only(TCCState *s1);
@@ -119,6 +140,7 @@ static void recover_save(TCCRecover *r, int body)
   r->unevaluated_operand = unevaluated_operand;
   r->global_expr = global_expr;
   r->func_param_decl_depth = func_param_decl_depth;
+  decl_param_names(0, &r->param_names_nb, &r->param_names_base);
   r->struct_depth = struct_body_depth;
   r->ym_depth = yasc_methods_depth(-1);
   r->defer_level = defer_body_level;
@@ -126,6 +148,9 @@ static void recover_save(TCCRecover *r, int body)
   r->check_only = s1->check_only;
   r->parse_flags = parse_flags;
   r->nb_stk_data = nb_stk_data;
+  r->call_checks = call_arg_checks_mark();
+  r->obj_calls = objsize_calls_mark();
+  r->fort_calls = fortify_calls_mark();
   r->hidden_labels = inline_hidden_label_depth();
   r->pending_call_temp_slots = pending_call_temp_slots;
   r->diag_parse = s1->diag_parse;
@@ -153,19 +178,22 @@ static void recover_save(TCCRecover *r, int body)
   r->inline_return_copied = s1->inline_return_copied;
   r->pack_depth = s1->pack_stack_ptr - s1->pack_stack;
   memcpy(r->pack, s1->pack_stack, sizeof r->pack);
+  r->decl_list = recover_decl_list;
+  r->pp_capture = pp_pragma_capture;
+  r->diag_anchor = s1->diag_anchor;
+  r->init_depth = init_brace_depth;
 }
 
 /* What the frames the longjmp left would have put back on their way out. */
 static void recover_restore(TCCRecover *r)
 {
   TCCState *s1 = tcc_state;
-  while (nb_stk_data > r->nb_stk_data)
-    tcc_free(*(void **)stk_data[--nb_stk_data]);
   vtop = r->vtop;
   nocode_wanted = r->nocode_wanted;
   unevaluated_operand = r->unevaluated_operand;
   global_expr = r->global_expr;
   func_param_decl_depth = r->func_param_decl_depth;
+  decl_param_names(1, &r->param_names_nb, &r->param_names_base);
   struct_body_depth = r->struct_depth;
   yasc_methods_depth(r->ym_depth);
   if (defer_body_level != r->defer_level)
@@ -201,10 +229,24 @@ static void recover_restore(TCCRecover *r)
   s1->inline_return_copied = r->inline_return_copied;
   memcpy(s1->pack_stack, r->pack, sizeof r->pack);
   s1->pack_stack_ptr = s1->pack_stack + r->pack_depth;
+  decl_list_unwind(r->decl_list);
+  recover_decl_resume.on = 0;
+  pp_pragma_capture = r->pp_capture;
+  init_brace_depth = r->init_depth;
+  if (r->body != RECOVER_FILE)
+    s1->diag_anchor = r->diag_anchor; /* the file-scope loop's is the declaration's */
+  if (s1->asm_inline)
+    asm_inline_recover(); /* an inline asm statement's text, assembled */
   discarded_call_vtop = NULL;
   unary_addr_operand = 0;
   indir_keep_lvalue = 0;
   yasc_returning = yasc_argument = 0;
+  if (s1->unsafe_depth)
+  {
+    BufferedFile *uf;
+    const char *un = tcc_diag_file(&uf);
+    tcc_unsafe_reset(s1, un, uf ? uf->line_num : 0);
+  }
   fe_compound_pending = 0;
   funcall_self_pending = 0;
   expr_eq_assigned = 0;
@@ -212,6 +254,9 @@ static void recover_restore(TCCRecover *r)
   yasc_plain_reset();
   yasc_pp_recover(r->body);
   attr_checks_recover();
+  call_arg_checks_unwind(r->call_checks);
+  objsize_calls_unwind(r->obj_calls);
+  fortify_calls_unwind(r->fort_calls);
   tcc_free(r->scopes);
   r->scopes = NULL;
   /* the defer bodies of the scopes the error left: one never replayed (its
@@ -267,6 +312,14 @@ ST_FUNC void tcc_recover_release(TCCState *s1)
   s1->recover = NULL;
 }
 
+/* The stk_push'd buffers of the frames a longjmp to R leaves: freed while
+   those frames still live -- after it, their pointers are dead stack. */
+static void recover_free_stk(const TCCRecover *r)
+{
+  while (nb_stk_data > r->nb_stk_data)
+    tcc_free(*(void **)stk_data[--nb_stk_data]);
+}
+
 /* error1 is raising an error that may be recovered from: unwind what the
    frames above the recovery point started and go there.  Returns when this
    one cannot be recovered from. */
@@ -294,7 +347,7 @@ ST_FUNC void tcc_recover_jump(TCCState *s1)
     recover_decl.l = 0; /* a declarator of the replayed body */
   }
 
-  if (r->body == RECOVER_STRUCT || r->body == RECOVER_INLINE)
+  if (r->body >= RECOVER_STRUCT)
   {
     r->closes = 0;
     r->in_parens = 0;
@@ -345,6 +398,28 @@ ST_FUNC void tcc_recover_jump(TCCState *s1)
     r->in_parens = 0;
   }
 
+  /* an error in a declaration list's declarator: the list may go on with
+     the next one (recover_next_declarator) -- at the point's own level, no
+     scope or struct body opened since the declaration began */
+  r->decl_resume = 0;
+  {
+    RecoverDeclList *dl = recover_decl_list;
+    if (!inj && dl && dl != r->decl_list && dl->active && dl->struct_depth == struct_body_depth &&
+        ((r->body == RECOVER_FILE && dl->l == VT_CONST && dl->outer == r->decl_list) ||
+         (r->body == RECOVER_BODY && dl->l == VT_LOCAL && dl->scope == cur_scope && r->keep == r->nlev &&
+          r->closes == 0 && cur_scope && (cur_scope->kind & SCOPE_BRACE))))
+    {
+      r->decl_resume = 1;
+      r->dr_braces = init_brace_depth - dl->init_base;
+      r->dr.on = 1;
+      r->dr.l = dl->l;
+      r->dr.oldint = dl->oldint;
+      r->dr.exported = dl->exported;
+      r->dr.btype = *dl->btype;
+      r->dr.adbase = *dl->adbase;
+    }
+  }
+
   /* the expansions the error is in are not expanded again */
   for (int d = r->inline_expansion_depth; d < s1->inline_expansion_depth && d < INLINE_NEST_MAX; d++)
   {
@@ -393,6 +468,40 @@ ST_FUNC void tcc_recover_jump(TCCState *s1)
     r->recoveries++;
   }
   s1->recover = r;
+  recover_free_stk(r);
+  longjmp(r->jb, 1);
+}
+
+/* The parse stops (a fatal error, or the -fmax-errors cap, while the
+   diagnostics are held: driver/diag_out.c): out to the compile of the
+   function it is in (RECOVER_FUNC) or to the file-scope loop, which see
+   tcc_state->diag_stop and read nothing more; the end of the unit still
+   parses the bodies saved before it, whose diagnostics come first, as at
+   -O0.  Returns when there is no such point. */
+ST_FUNC void tcc_recover_stop(TCCState *s1)
+{
+  TCCRecover *r = s1->recover;
+  while (r && r->body != RECOVER_FILE && r->body != RECOVER_FUNC)
+    r = r->outer;
+  if (!r)
+    return;
+  for (TCCRecover *q = s1->recover, *outer; q != r; q = outer)
+  {
+    outer = q->outer;
+    tcc_free(q->lev);
+    tcc_free(q->scopes);
+    q->lev = NULL;
+    q->scopes = NULL;
+    if (q->heap)
+      tcc_free(q); /* an inline expansion's or a body's: its frame is gone */
+  }
+  while (tok_macro_stack() && tok_macro_stack() != r->mstack)
+    end_macro();
+  pp_expr = 0;
+  pp_subst_depth = 0;
+  s1->error_fatal = 0;
+  s1->recover = r;
+  recover_free_stk(r);
   longjmp(r->jb, 1);
 }
 
@@ -426,6 +535,139 @@ ST_FUNC void tcc_undeclared(int t, const char *name)
 }
 
 /* ------------------------------------------------------------------------- */
+/* errors said later (tcc_error_stash) */
+
+/* An error said later, where the parse reaches the marker the caller puts
+   in the token stream: a TOK_PACK_REPLAY of the value returned.  The line is
+   the one error1 would give now.  For a macro used with the wrong number of
+   arguments (its expansion is the marker: the parser's recovery goes on
+   from there, out of the macro's substitution) and for a number's error in
+   a body being saved as tokens (-O0 says it where the parse reads it). */
+static int diag_stash_add(int kind, const char *msg)
+{
+  TCCState *s1 = tcc_state;
+  BufferedFile *f;
+  DiagStash *e;
+  int line = 0;
+  for (f = file; f && f->filename[0] == ':'; f = f->prev)
+    ;
+  if (f)
+    line = f->line_num - ((tok_flags & TOK_FLAG_BOL) && !macro_ptr);
+  if (s1->nb_diag_stash >= 0xffff)
+    tcc_error("%i:%s", line, msg); /* MSG is in the caller's frame */
+  if (s1->nb_diag_stash == s1->diag_stash_cap)
+  {
+    s1->diag_stash_cap = s1->diag_stash_cap ? 2 * s1->diag_stash_cap : 8;
+    s1->diag_stash = tcc_realloc(s1->diag_stash, s1->diag_stash_cap * sizeof *s1->diag_stash);
+  }
+  e = &s1->diag_stash[s1->nb_diag_stash++];
+  e->msg = tcc_strdup(msg);
+  e->line = line;
+  e->kind = kind;
+  e->raised = 0;
+  return (TCC_PCH_REPLAY_ERROR << 16) | s1->nb_diag_stash;
+}
+
+ST_FUNC int tcc_error_stash(const char *fmt, ...)
+{
+  /* in this frame: diag_stash_add's error (too many) is recovered from */
+  char msg[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof msg, fmt, ap);
+  va_end(ap);
+  return diag_stash_add(DIAG_STASH_ERROR, msg);
+}
+
+/* #error or #warning in a body being saved as tokens: a marker in the saved
+   stream says it where the parse of the body reaches it, as at -O0.  1 when
+   it is deferred so. */
+ST_FUNC int tcc_pp_diag_deferred(int kind, const char *msg)
+{
+  TCCState *s1 = tcc_state;
+  CValue cv;
+  if (!s1->save_body_jmp || !pp_pragma_capture || s1->fe_speculative)
+    return 0;
+  cv.i = diag_stash_add(kind, msg);
+  tok_str_add2(pp_pragma_capture, TOK_PACK_REPLAY, &cv);
+  return 1;
+}
+
+static void diag_stash_say(TCCState *s1, DiagStash *e)
+{
+  if (e->kind == DIAG_STASH_WARNING)
+  {
+    s1->diag_any_header = 1; /* given in a system header too, as gcc */
+    tcc_warning("%i:%s", e->line, e->msg);
+  }
+  else
+    tcc_error_noabort("%i:%s", e->line, e->msg);
+}
+
+/* next() read a TCC_PCH_REPLAY_ERROR marker: say its error, here */
+ST_FUNC void tcc_error_stash_raise(TCCState *s1, int idx)
+{
+  DiagStash *e;
+  if (!idx)
+  {
+    save_body_raise(s1);
+    return;
+  }
+  if (idx > s1->nb_diag_stash)
+    return;
+  e = &s1->diag_stash[idx - 1];
+  if (e->kind == DIAG_STASH_ERROR)
+  {
+    if (!s1->fe_speculative)
+      e->raised = 1;
+    tcc_error("%i:%s", e->line, e->msg);
+  }
+  /* #error, #warning: once, not in a speculative parse nor in an inline
+     expansion (quiet: the body's own parse, or the end of the unit, says it) */
+  if (e->raised || s1->fe_speculative || s1->in_inline_expansion)
+    return;
+  e->raised = 1;
+  diag_stash_say(s1, e);
+}
+
+/* The end of the unit: an error whose marker the parse never reached (a
+   saved body nothing parsed) is said all the same. */
+ST_FUNC void tcc_error_stash_unraised(TCCState *s1)
+{
+  for (int i = 0; i < s1->nb_diag_stash; i++)
+    if (!s1->diag_stash[i].raised)
+    {
+      s1->diag_stash[i].raised = 1;
+      diag_stash_say(s1, &s1->diag_stash[i]);
+    }
+}
+
+/* A lexer error of a token that can be read past (a number's): in a body
+   being saved as tokens it goes in the saved stream as a marker, said where
+   the parse of the body reaches it, as at -O0 (1: the caller makes the token
+   a 0 and goes on); otherwise said now. */
+ST_FUNC int tcc_lex_error_deferred(const char *fmt, ...)
+{
+  TCCState *s1 = tcc_state;
+  /* in this frame, not on the heap: the error said now is recovered from,
+     and a heap copy would be lost with its longjmp */
+  char msg[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof msg, fmt, ap);
+  va_end(ap);
+  if (s1->save_body_jmp && pp_pragma_capture && !s1->fe_speculative)
+  {
+    CValue cv;
+    cv.i = diag_stash_add(DIAG_STASH_ERROR, msg);
+    tok_str_add2(pp_pragma_capture, TOK_PACK_REPLAY, &cv);
+    return 1;
+  }
+  tcc_error("%s", msg);
+  return 0;
+}
+
+/* ------------------------------------------------------------------------- */
 /* skipping */
 
 /* a name in skipped tokens: whatever it names counts as used */
@@ -452,6 +694,122 @@ static int recover_leave_replay(TCCRecover *r)
       return 0;
   end_macro();
   next();
+  return 1;
+}
+
+/* After an error in a declarator of a declaration list or in its
+   initializer: the ',' at the list's level, before the ';' that ends it.
+   The brackets open where the error is are not known, so the tokens are read
+   up to the first ';' at the lowest depth reached (never inside a statement
+   expression opened after the error), and a ',' at that depth after the
+   depth got there is the list's.  With one, the parse goes on after it with
+   the list's next declarator (decl() takes recover_decl_resume) and 1 is
+   returned; with none, 2: the declaration is skipped, its ';' too.  A '}'
+   to a new low followed by what no initializer's brace is (a block's end:
+   the ';' is missing), or the end of the input: 0, the tokens read are put
+   back for the plain skip. */
+static int recover_next_declarator(TCCRecover *r)
+{
+  TokenString *buf = tok_str_alloc(), *rest;
+  int depth = 0, min = 0, sep = -1, sep_line = 0, end = 0, prev = 0, brace_low = 0;
+  CValue cv;
+  while (tok != TOK_EOF)
+  {
+    const int t = tok;
+    if (brace_low && t != ',' && t != ';' && t != '}' && t != ')' && t != ']' && t != '.' && t != '[' &&
+        t != TOK_ARROW)
+    {
+      /* the initializer the error was in ends there, its ';' missing:
+         the declaration ends with it, the parse goes on at T */
+      if (depth >= -r->dr_braces)
+        end = 2, sep = -1;
+      break;
+    }
+    brace_low = 0;
+    /* a function body (the error was in its declarator): the plain skip's */
+    if (t == '{' && prev == ')' && depth == min)
+      break;
+    if (t == '(' || t == '[' || t == '{')
+      depth++;
+    else if (t == ')' || t == ']' || t == '}')
+    {
+      if (--depth < min)
+        min = depth, sep = -1, brace_low = t == '}';
+    }
+    else if (t == ';' && depth == min)
+    {
+      tok_str_add_tok(buf);
+      end = 1;
+      break;
+    }
+    tok_str_add_tok(buf);
+    prev = t;
+    /* out of the initializer braces the error was in, at least */
+    if (t == ',' && depth == min && depth <= -r->dr_braces && sep < 0)
+    {
+      sep = buf->len;
+      sep_line = file->line_num;
+    }
+    next();
+  }
+  if (end && sep < 0)
+  {
+    /* no other declarator: the declaration is skipped */
+    prev = 0;
+    for (const int *p = tok_str_buf(buf), *e = p + buf->len; p < e;)
+    {
+      int t;
+      tok_get(&t, &p, &cv);
+      if (t != TOK_LINENUM)
+        recover_mention(t, prev), prev = t;
+    }
+    tok_str_free(buf);
+    if (end == 1)
+      next(); /* past its ';' */
+    return 2;
+  }
+  if (!end)
+  {
+    /* no ',' of the list: back to the first token read (the one the scan
+       stopped at comes after them again) */
+    if (buf->len)
+    {
+      if (tok != TOK_EOF)
+        tok_str_add_tok(buf);
+      tok_str_add(buf, 0);
+      begin_macro(buf, 1);
+      next();
+    }
+    else
+      tok_str_free(buf);
+    return 0;
+  }
+  /* the skipped names count as used; the rest is read again */
+  prev = 0;
+  {
+    const int *p = tok_str_buf(buf), *e = p + sep;
+    while (p < e)
+    {
+      int t;
+      tok_get(&t, &p, &cv);
+      if (t != TOK_LINENUM)
+        recover_mention(t, prev), prev = t;
+    }
+  }
+  rest = tok_str_alloc();
+  cv.i = sep_line;
+  tok_str_add2(rest, TOK_LINENUM, &cv);
+  for (const int *p = tok_str_buf(buf) + sep, *e = tok_str_buf(buf) + buf->len; p < e;)
+  {
+    int t;
+    tok_get(&t, &p, &cv);
+    tok_str_add2(rest, t, &cv);
+  }
+  tok_str_add(rest, 0);
+  tok_str_free(buf);
+  begin_macro(rest, 1);
+  next();
+  recover_decl_resume = r->dr;
   return 1;
 }
 
@@ -687,8 +1045,14 @@ ST_FUNC void tccgen_decls_recovering(TCCState *s1)
     nocode_wanted = DATA_ONLY_WANTED;
     s1->cur_func_sym = NULL;
     recover_syntax_only(s1);
-    recover_declare_pending(VT_CONST);
-    recover_skip_decl(rp);
+    if (s1->diag_stop)
+      recover_decl.l = 0; /* the parse stops: decl() reads no more */
+    else
+    {
+      recover_declare_pending(VT_CONST);
+      if (!rp->decl_resume || !recover_next_declarator(rp))
+        recover_skip_decl(rp);
+    }
   }
   decl(VT_CONST);
   s1->recover = r.outer;
@@ -826,7 +1190,8 @@ ST_FUNC int gen_body_recovering(void)
     recover_restore(rp);
     rp->errored = 1;
     recover_syntax_only(s1);
-    recover_skip_stmt(rp);
+    if (!rp->decl_resume || !recover_next_declarator(rp))
+      recover_skip_stmt(rp);
     recover_resume(rp);
   }
   else
@@ -898,6 +1263,15 @@ static void replay_block(void *ts)
    code, and the unit goes on as -fsyntax-only.  1 when an error ended it. */
 ST_FUNC int replay_recovering(void (*fn)(void *), void *arg)
 {
+  return recover_call(fn, arg, RECOVER_INLINE);
+}
+
+/* FN(ARG) with a recovery point of kind KIND (RECOVER_INLINE: a replay,
+   RECOVER_FUNC: a function's compile, outside its body's parse): an error
+   in it ends it, the unit goes on as -fsyntax-only.  1 when an error ended
+   it -- what FN left half done is the caller's to put back. */
+ST_FUNC int recover_call(void (*fn)(void *), void *arg, int kind)
+{
   TCCState *s1 = tcc_state;
   /* On the heap, not in this frame: inline expansions nest (INLINE_NEST_MAX
      deep, called-once chains in Zig's C get there), each one a replay with
@@ -905,7 +1279,7 @@ ST_FUNC int replay_recovering(void (*fn)(void *), void *arg)
      (360 bytes on the device) were a sixth of the stack an expansion level
      takes -- the device tcc's 32 KiB ran out on the kernel's C. */
   TCCRecover *r = tcc_malloc(sizeof *r);
-  recover_save(r, RECOVER_INLINE);
+  recover_save(r, kind);
   r->heap = 1;
   r->outer = s1->recover;
   s1->recover = r;
@@ -934,7 +1308,9 @@ ST_FUNC int replay_recovering(void (*fn)(void *), void *arg)
    body it is in gets no code (its IR holds half a replay). */
 ST_FUNC void replay_body_recovering(TokenString *ts, Sym *callee)
 {
-  if (replay_recovering(replay_block, ts) && callee && callee->type.ref)
+  /* recover_call itself, not replay_recovering: one frame less a level of
+     nested inline expansions */
+  if (recover_call(replay_block, ts, RECOVER_INLINE) && callee && callee->type.ref)
   {
     callee->type.ref->f.func_noinline = 1;
     callee->type.ref->f.func_auto_inline = 0;

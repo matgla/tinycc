@@ -325,3 +325,30 @@ UT_TEST(test_tcc_set_options_unrecognized_w_subflag_is_not_an_error)
   tcc_delete(s);
   return 0;
 }
+
+/* yasc unsafe { }: the inliner parses a body again at every call site, so
+ * the same region's edges come again.  They keep one record each, and an
+ * unsafe region (which only turns the strict options off) does not make
+ * every -W option wanted for the rest of the unit. */
+UT_TEST(test_unsafe_region_parsed_again_keeps_one_record_per_edge)
+{
+  TCCState *s = tcc_new();
+  UT_ASSERT(s != NULL);
+  TCCState *saved = tcc_state;
+  tcc_state = s;
+  s->warn_shadow = 0;
+  for (int i = 0; i < 100; i++)
+  {
+    tcc_unsafe_begin(s, "t.c", 4);
+    tcc_unsafe_end(s, "t.c", 7);
+  }
+  UT_ASSERT_EQ(s->nb_diag_snaps, 3); /* the command line's and the two edges */
+  UT_ASSERT(!tcc_warn_wanted(warn_shadow));
+  tcc_pragma_diagnostic(s, DIAG_PRAGMA_WARNING, "-Wshadow", "t.c", 9);
+  UT_ASSERT(tcc_warn_wanted(warn_shadow));
+  tcc_pragma_diagnostic(s, DIAG_PRAGMA_IGNORED, "-Wshadow", "t.c", 10);
+  UT_ASSERT(tcc_warn_wanted(warn_shadow)); /* on at line 9 */
+  tcc_state = saved;
+  tcc_delete(s);
+  return 0;
+}

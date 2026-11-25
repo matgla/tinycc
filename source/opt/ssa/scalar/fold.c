@@ -223,19 +223,22 @@ static int fold_mask_is_copy(IRSSAOptCtx *ctx, IROperand dest, IROperand src, in
   return 1;
 }
 
-/* Barrel-shift-annotated op: fold only the all-constant case, peek-only —
- * materialising into an annotated src2 would drop the shift (the
- * var_to_param_forward LSL-drop bug class). */
+/* Barrel-shift-annotated op: peek-only -- materialising the constant into
+ * an annotated src2 as it is would drop the shift (the var_to_param_forward
+ * LSL-drop bug class).  All constant: the result.  Only the shifted src2
+ * constant: the shift applied to it, an immediate with no annotation left
+ * (`x + (0 >> 2)` -> `x + #0`), which the plain rules then fold on. */
 OPT_GEN_SSA(fold_barrel, -1) {
   int32_t v1 = 0, v2 = 0;
+  int c1;
   MATCH();
   BIND(dest);
   BIND(src1);
   BIND(src2);
   GUARD(
     when(!irop_is_64bit(dest) && !irop_is_64bit(src1) && !irop_is_64bit(src2));
-    and(fold_read_imm32(ir, src1, &v1) || try_resolve_const_vreg(ctx, src1, i, &v1));
     and(fold_read_imm32(ir, src2, &v2) || try_resolve_const_vreg(ctx, src2, i, &v2)));
+  c1 = fold_read_imm32(ir, src1, &v1) || try_resolve_const_vreg(ctx, src1, i, &v1);
   uint8_t bs = tcc_ir_barrel_shift_at(ir, q);
   uint32_t stype = (bs >> 5) & 7;
   uint32_t samt = bs & 31;
@@ -251,6 +254,19 @@ OPT_GEN_SSA(fold_barrel, -1) {
     break;
   default:
     return 0;
+  }
+  if (!c1)
+  {
+    switch (q->op) {
+    case TCCIR_OP_ADD: case TCCIR_OP_SUB: case TCCIR_OP_AND: case TCCIR_OP_OR: case TCCIR_OP_XOR:
+      break;
+    default:
+      return 0;
+    }
+    if (src2.tag == IROP_TAG_VREG)
+      opt_dsl_drop_use(ctx, &src2, i);
+    fold_clear_barrel(ir, q);
+    REWRITE(set_src2_imm((int32_t)u2, irop_get_btype(src2)));
   }
   uint32_t u1 = (uint32_t)v1;
   uint32_t bres;
@@ -1727,7 +1743,13 @@ static int fold_binary(IRSSAOptCtx *ctx, int i)
   if (!is_value_dest(tcc_ir_op_get_dest(ir, q)))
     return 0;
   if (tcc_ir_barrel_shift_at(ir, q))
-    return opt_dsl_dispatch_fold_barrel(ctx, i);
+  {
+    /* the shift gone (src2 was constant): on to the plain rules */
+    int c = opt_dsl_dispatch_fold_barrel(ctx, i);
+    if (!c || tcc_ir_barrel_shift_at(ir, q) || q->op == TCCIR_OP_ASSIGN)
+      return c;
+    return c + opt_dsl_chain(ctx, i, fold_binary_rules, OPT_DSL_TABLE_COUNT(fold_binary_rules));
+  }
   fold_materialize_consts(ctx, i);
   return opt_dsl_chain(ctx, i, fold_binary_rules,
                        OPT_DSL_TABLE_COUNT(fold_binary_rules));

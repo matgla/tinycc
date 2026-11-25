@@ -1968,6 +1968,14 @@ LIBTCCAPI int tcc_output_file(TCCState *s, const char *filename)
     if (s->nb_errors != errors)
       return -1;
   }
+  /* -Wtainted-format: the flows from one unit into another */
+  if (s->output_type != TCC_OUTPUT_OBJ && s->taint_link_size)
+  {
+    int errors = s->nb_errors;
+    tcc_taint_link_check(s);
+    if (s->nb_errors != errors)
+      return -1;
+  }
   if (s->output_type == TCC_OUTPUT_OBJ)
     ret = elf_output_obj(s, filename);
 #ifdef TCC_TARGET_PE

@@ -5,16 +5,19 @@
 #   make mistakes   compile chapter 3, which is meant to warn
 #
 # tcc compiles yasc by default (safe mode); the regular C halves (mem.c,
-# counter.c) say -ccompat.
+# counter.c, slots.c) say -ccompat.
 
 TCC ?= tcc
 CFLAGS ?= -O1
-PROGS = hello names defer errors counter methods config
+PROGS = hello names defer errors counter methods config arrays
 
 all: $(PROGS)
 
 mem.o: mem.c mem.h
 	$(TCC) $(CFLAGS) -ccompat -c mem.c -o $@
+
+slots.o: slots.c
+	$(TCC) $(CFLAGS) -ccompat -c slots.c -o $@
 
 counter.o: counter.c counter.h
 	$(TCC) $(CFLAGS) -ccompat -c counter.c -o $@
@@ -39,6 +42,9 @@ methods: 07_methods.c mem.o
 
 config: 09_config.c 09_settings.txt mem.o
 	$(TCC) $(CFLAGS) 09_config.c mem.o -o $@
+
+arrays: 10_arrays.c slots.h mem.o slots.o
+	$(TCC) $(CFLAGS) 10_arrays.c mem.o slots.o -o $@
 
 mistakes:
 	$(TCC) -O1 -c 03_mistakes.c -o 03_mistakes.o

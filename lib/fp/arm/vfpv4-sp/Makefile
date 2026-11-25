@@ -35,7 +35,7 @@ SRCS = fops.c conv.c
 
 # Borrowed verbatim from the soft-float runtime; see above.
 SOFT_DIR  = ../../soft
-SOFT_SRCS = dadd.c dmul.c ddiv.c dcmp.c dconv.c fcmp.c conv64.c
+SOFT_SRCS = dadd.c dmul.c ddiv.c dcmp.c dconv.c fcmp.c conv64.c divc3.c
 SOFT_ASMS = dcmp_asm.S fcmp_asm.S f2d_stub.S
 
 BUILD_DIR ?= build

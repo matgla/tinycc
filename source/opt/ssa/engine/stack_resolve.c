@@ -299,23 +299,46 @@ int ssa_opt_stack_deref_fold(IRSSAOptCtx *ctx)
     int is_store = op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED;
     int indexed = op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_LOAD_INDEXED;
     IROperand base = tcc_ir_op_get_dest_or_src1(ir, q, !is_store);
-    if (irop_get_tag(base) != IROP_TAG_VREG || irop_is_local(base) || irop_is_llocal(base) || base.is_lval == indexed)
-      continue;
-    int32_t bvr = irop_get_vreg(base), slot_vr;
+    /* an indexed access may name the frame address itself (`buf[k]` once
+       unrolling made k a constant) */
+    const int direct = indexed && irop_get_tag(base) == IROP_TAG_STACKOFF && irop_get_vreg(base) < 0 &&
+                       irop_is_local(base) && !base.is_lval && !irop_is_llocal(base) && !base.is_param;
+    int32_t bvr = -1, slot_vr;
     int off;
-    if (!sdf_resolve(ctx, bvr, &off, &slot_vr))
-      continue;
+    if (direct)
+    {
+      off = irop_get_stack_offset(base);
+      slot_vr = irop_get_vreg(base);
+    }
+    else
+    {
+      if (irop_get_tag(base) != IROP_TAG_VREG || irop_is_local(base) || irop_is_llocal(base) || base.is_lval == indexed)
+        continue;
+      bvr = irop_get_vreg(base);
+      if (!sdf_resolve(ctx, bvr, &off, &slot_vr))
+        continue;
+    }
 
     /* The access's width and sign: the deref operand for a plain access, the
      * value (store) or result (load) for an indexed one, whose marks were
      * moved onto the base when it was fused. */
     IROperand acc = base;
     if (indexed) {
+      /* base + (index << scale) */
       IROperand scale = tcc_ir_op_get_scale(ir, q);
-      if (tcc_ir_op_src2_tag(ir, q) != IROP_TAG_IMM32 || tcc_ir_op_src2_is_lval(ir, q) ||
-          (!irop_is_none(scale) && (irop_get_tag(scale) != IROP_TAG_IMM32 || irop_get_imm32(scale) != 0)))
+      int sh = 0;
+      if (!irop_is_none(scale))
+      {
+        if (irop_get_tag(scale) != IROP_TAG_IMM32 || irop_get_imm32(scale) < 0 || irop_get_imm32(scale) > 3)
+          continue;
+        sh = irop_get_imm32(scale);
+      }
+      if (tcc_ir_op_src2_tag(ir, q) != IROP_TAG_IMM32 || tcc_ir_op_src2_is_lval(ir, q))
         continue;
-      off += tcc_ir_op_src2_imm32(ir, q);
+      const int32_t ix = tcc_ir_op_src2_imm32(ir, q);
+      if (ix < -0x100000 || ix > 0x100000)
+        continue;
+      off += (int)((uint32_t)ix << sh);
       acc = tcc_ir_op_get_dest_or_src1(ir, q, is_store);
       acc.aux = base.aux;
       if (irop_is_64bit(acc))
@@ -337,6 +360,11 @@ int ssa_opt_stack_deref_fold(IRSSAOptCtx *ctx)
       tcc_ir_set_src1(ir, i, slot);
 
     /* The pointer is no longer used here unless another operand names it. */
+    if (bvr < 0)
+    {
+      changes++;
+      continue;
+    }
     int still = 0;
     if (irop_config[q->op].has_dest)
       still |= tcc_ir_op_dest_vreg(ir, q) == bvr;

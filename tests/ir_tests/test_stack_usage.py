@@ -76,7 +76,7 @@ def test_frame_larger_than_clean_and_off(tmp_path):
 
 
 def test_frame_larger_than_not_in_safe_default(tmp_path):
-    body = BIG.replace("char *p", "char * view p")
+    body = BIG.replace("char *p", "char * view p").replace("char buf[5000];", "char buf[5000] = undefined;")
     proc = _cc(tmp_path, body, ccompat=False)
     assert proc.returncode == 0 and _frame_warnings(proc) == [], proc.stderr
 

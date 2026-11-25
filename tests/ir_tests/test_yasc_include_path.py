@@ -51,7 +51,7 @@ def _setup(tmp_path):
 
 
 def _tcc(tmp_path, *args, env=None):
-    return subprocess.run([str(TCC), *args], capture_output=True, text=True, cwd=tmp_path, env=env)
+    return subprocess.run([str(TCC), "-Wno-missing-prototypes", *args], capture_output=True, text=True, cwd=tmp_path, env=env)
 
 
 @pytest.mark.parametrize("opt", LEVELS)

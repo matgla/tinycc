@@ -15,6 +15,11 @@
 #include "../opt/ssa/cfg/switch_fold.c"
 #undef USING_GLOBALS
 #include "../opt/ssa/cfg/vrp.c"
+#undef SV_CHAIN_DEPTH
+#undef SV_CHAIN_STEPS
+#undef SV_PROVE_DEPTH
+#undef SV_VAR_WRITES
+#undef SV_WRITES
 #undef USING_GLOBALS
 #undef VRP_TOK_EQ
 #undef VRP_TOK_GE

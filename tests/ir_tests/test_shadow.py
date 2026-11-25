@@ -47,7 +47,7 @@ int f(int x)
 
 
 def test_option(tmp_path):
-    check_option(tmp_path, "shadow", TEXT, HIT, CLEAN, [5], in_wall=False, in_safe=False)
+    check_option(tmp_path, "shadow", TEXT, HIT, CLEAN, [5], in_wall=False, in_safe=True)
 
 
 def test_kinds_and_notes(tmp_path):

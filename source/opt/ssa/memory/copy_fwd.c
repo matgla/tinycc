@@ -127,6 +127,7 @@ typedef struct
   CfwAcc *acc;
   int nacc, cap;
   int *param_call;   /* FUNCPARAM* -> its call instruction, else -1 */
+  int *yf_next;      /* -fyasc-facts: a CALL -> its first FUNCPARAMVAL, a FUNCPARAMVAL -> the next one; -1 */
   int *block_start;  /* 1 at the first instruction of a basic block */
   int *block_of;     /* the basic block of each instruction */
   int nb;            /* basic blocks */
@@ -147,6 +148,7 @@ typedef struct
   } esc_map[CFW_ESC_MAPS]; /* cfw_esc_map's answers: the copies of one object ask alike */
   int esc_map_next;
   int nparam;
+  int yf_hits; /* -fyasc-facts: frame addresses handed to a parameter that does not escape */
 } Cfw;
 
 static void cfw_add(Cfw *c, int lo, int hi, int at, int insn, int kind)
@@ -398,6 +400,25 @@ static void cfw_scan(Cfw *c, int i)
       cfw_add(c, off, off + w, call, i, CFA_BYVAL);
       return;
     }
+    /* -fyasc-facts: a parameter that does not escape (a checked `view`)
+     * reads the object at the call and, unless it points to const, may write
+     * any of it -- but keeps no copy of the address: no escape (S4, O1). */
+    int ro = 0, lo, hi;
+    if (ir->yf_calls && !a.is_lval &&
+        tcc_ir_yf_param(ir, TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q)), pidx, &ro) &&
+        cfw_frame_addr(c, a, &off))
+    {
+      if (!tcc_ir_frame_object_at(ir, off, &lo, &hi))
+        lo = off, hi = off + 1;
+      cfw_add(c, lo, hi, call, i, CFA_READ);
+      if (!ro)
+      {
+        cfw_add(c, lo, hi, call, i, CFA_WRITE);
+        c->acc[c->nacc - 1].inexact = 1;
+      }
+      c->yf_hits++;
+      return;
+    }
     /* The struct-return buffer: the callee writes the result there and, the
      * pointer being no C value, cannot keep it -- a write at the call. */
     if (pidx == 0 && c->sret_param[call] == i && cfw_frame_addr(c, a, &off))
@@ -512,6 +533,30 @@ static int cfw_escaped(Cfw *c, int lo, int hi)
 }
 
 /* Could instruction j write D [dlo, dhi) or what S names? */
+/* -fyasc-facts: does call J write D [dlo, dhi) or frame S through a frame
+   address handed to a parameter that does not escape (and may write)? */
+static int cfw_yf_writes(Cfw *c, int j, int dlo, int dhi, const CfwSrc *src, int slo, int shi)
+{
+  TCCIRState *ir = c->ir;
+  /* the call's arguments wherever they are: one with control flow
+     (`fill(&x, c ? a() : b())`) leaves the earlier ones in another block */
+  for (int k = c->yf_next ? c->yf_next[j] : -1; k >= 0; k = c->yf_next[k])
+  {
+    IRQuadCompact *p = &ir->compact_instructions[k];
+    int ro = 0, off, lo, hi;
+    IROperand a = tcc_ir_op_get_src1(ir, p);
+    uint32_t enc = (uint32_t)tcc_ir_op_src2_imm(ir, p);
+    if (a.is_lval || !tcc_ir_yf_param(ir, TCCIR_DECODE_CALL_ID(enc), TCCIR_DECODE_PARAM_IDX(enc), &ro) || ro ||
+        !cfw_frame_addr(c, a, &off))
+      continue;
+    if (!tcc_ir_frame_object_at(ir, off, &lo, &hi))
+      lo = off, hi = off + 1;
+    if ((lo < dhi && dlo < hi) || (src->is_frame && lo < shi && slo < hi))
+      return 1;
+  }
+  return 0;
+}
+
 static int cfw_clobbers(Cfw *c, int j, int dlo, int dhi, const CfwSrc *src, int slo, int shi)
 {
   TCCIRState *ir = c->ir;
@@ -572,6 +617,8 @@ static int cfw_clobbers(Cfw *c, int j, int dlo, int dhi, const CfwSrc *src, int 
   case TCCIR_OP_FSUB:
   case TCCIR_OP_FMUL:
   case TCCIR_OP_FDIV:
+  case TCCIR_OP_FMIN:
+  case TCCIR_OP_FMAX:
   case TCCIR_OP_FNEG:
   case TCCIR_OP_FCMP:
   case TCCIR_OP_CVT_FTOF:
@@ -630,7 +677,10 @@ static int cfw_clobbers(Cfw *c, int j, int dlo, int dhi, const CfwSrc *src, int 
       if (src->is_frame && off < shi && slo < end)
         return 1;
     }
-    /* A callee cannot reach a frame object whose address never escaped. */
+    /* A callee cannot reach a frame object whose address never escaped --
+       but one handed to a parameter that does not escape it may write. */
+    if (ir->yf_calls && cfw_yf_writes(c, j, dlo, dhi, src, slo, shi))
+      return 1;
     return ptr_like;
   case TCCIR_OP_BLOCK_COPY:
   {
@@ -1541,6 +1591,8 @@ static int cfw_touches_unknown(Cfw *c, int i)
   case TCCIR_OP_FSUB:
   case TCCIR_OP_FMUL:
   case TCCIR_OP_FDIV:
+  case TCCIR_OP_FMIN:
+  case TCCIR_OP_FMAX:
   case TCCIR_OP_FNEG:
   case TCCIR_OP_FCMP:
   case TCCIR_OP_CVT_FTOF:
@@ -1857,6 +1909,11 @@ int ssa_opt_copy_fwd(IRSSAOptCtx *ctx)
     if (q->op == TCCIR_OP_IJUMP)
       goto out;
   }
+  if (ir->yf_calls)
+  {
+    c.yf_next = tcc_malloc(sizeof(int) * n);
+    memset(c.yf_next, -1, sizeof(int) * n);
+  }
   int *call_at = tcc_malloc(sizeof(int) * (max_id + 1));
   for (int k = 0; k <= max_id; k++)
     call_at[k] = -1;
@@ -1877,6 +1934,8 @@ int ssa_opt_copy_fwd(IRSSAOptCtx *ctx)
     if (call < i)
       continue;
     c.param_call[i] = call;
+    if (c.yf_next && q->op == TCCIR_OP_FUNCPARAMVAL)
+      c.yf_next[i] = c.yf_next[call], c.yf_next[call] = i;
     if (q->op == TCCIR_OP_FUNCPARAMVAL && pidx < 3)
       c.copy_param[3 * call + pidx] = i;
     if (q->op == TCCIR_OP_FUNCPARAMVAL && pidx == 0 && id < ir->sret_calls_size && ir->sret_calls[id] > 0)
@@ -1968,6 +2027,10 @@ int ssa_opt_copy_fwd(IRSSAOptCtx *ctx)
     }
   if (changes)
     tcc_ir_ssa_opt_rebuild(ctx);
+  /* -fyasc-facts counters: TCC_YF_STATS=1 says how often a fact was used */
+  if (c.yf_hits && getenv("TCC_YF_STATS"))
+    fprintf(stderr, "yasc-facts: copy_fwd: %d no-escape argument%s, %d copies forwarded in '%s'\n", c.yf_hits,
+            c.yf_hits == 1 ? "" : "s", changes, funcname ? funcname : "?");
   for (int k = 0; k < CFW_ESC_MAPS; k++)
     tcc_free(c.esc_map[k].map);
   tcc_free(c.esc);
@@ -1979,6 +2042,7 @@ int ssa_opt_copy_fwd(IRSSAOptCtx *ctx)
   tcc_free(c.pred);
   tcc_free(c.reach);
   tcc_free(c.param_call);
+  tcc_free(c.yf_next);
   tcc_free(c.block_start);
   tcc_free(c.copy_len);
   tcc_free(c.copy_align);
@@ -1988,6 +2052,7 @@ int ssa_opt_copy_fwd(IRSSAOptCtx *ctx)
 
 out:
   tcc_free(c.param_call);
+  tcc_free(c.yf_next);
   tcc_free(c.block_start);
   tcc_free(c.copy_len);
   tcc_free(c.copy_align);

@@ -6,6 +6,7 @@
 #undef CSF_MAX_FIELDS
 #undef USING_GLOBALS
 #include "../opt/flat/memory/entry_store_prop.c"
+#undef ESP_MAX_RO
 #undef ESTORE_COMPACT
 #undef LEA_SET
 #undef MAX_ADDRTAKEN_BASES
@@ -29,3 +30,4 @@
 #undef SL_FWD_MAX_INSNS
 #undef SL_PRED_INC
 #undef USING_GLOBALS
+#undef YFP_MAX
