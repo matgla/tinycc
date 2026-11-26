@@ -4,8 +4,11 @@ Under -share-rodata the code reaches .rodata through [r9, #24], a GOT slot the
 loader fills from a local relocation.  The writer emitted that relocation after
 the loop over .rel.got and returned before it when the GOT had no relocations
 -- a module with .rodata but no imports, like libsoftfp.so once divc3.c gave
-it constants.  Its slot stayed 0: __divsc3 faulted on QEMU and __divdc3 read
-the board's ROM as its constants (912_complex_div_runtime on the device).
+it constants.  Its slot stayed 0 and __divsc3 faulted on QEMU
+(912_complex_div_runtime).
+
+Only a YasOS cross reserves the slot (build_got) and shares .rodata by default;
+another cross skips these.
 """
 
 import struct
@@ -18,7 +21,16 @@ CURRENT_DIR = Path(__file__).parent
 TCC_TOP = CURRENT_DIR.parent.parent
 TCC = TCC_TOP / "armv8m-tcc"
 
-pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
+
+
+def _yasos_cross():
+    if not TCC.exists():
+        return False
+    proc = subprocess.run([str(TCC), "-dM", "-E", "-"], input="", capture_output=True, text=True)
+    return "__YasOS__" in proc.stdout
+
+
+pytestmark = pytest.mark.skipif(not _yasos_cross(), reason="needs a YasOS armv8m-tcc (TARGETOS_YasOS)")
 
 # YaffHeader (source/obj/tccyaff.h), packed
 SYMBOL_TABLE_RELOCATIONS_AMOUNT = 36

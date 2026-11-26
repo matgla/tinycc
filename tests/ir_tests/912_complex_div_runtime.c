@@ -8,7 +8,11 @@
  * each.  A result passes within 32 units in the last place, about gcc's
  * ERRLIM; the distance is taken on the bit patterns, so no FP operation of
  * this file's own runs and none of libm is needed.  Then C11 Annex G's
- * recoveries: nonzero/zero, infinite/finite, finite/infinite. */
+ * recoveries: nonzero/zero, infinite/finite, finite/infinite.
+ *
+ * The RP2350's double coprocessor reads a subnormal operand as zero (see
+ * ieee/cdivchkd in yasos's tests/smoke/tcc_suite_test.py): where a subnormal
+ * double compares equal to zero, the double vectors holding one are skipped. */
 #include <stdio.h>
 
 float _Complex __divsc3(float a_real, float a_imag, float b_real, float b_imag);
@@ -50,6 +54,13 @@ static unsigned long long ulps_d(double got, double want)
   if ((g.u ^ w.u) & 0x8000000000000000ull)
     return ~0ull;
   return g.u > w.u ? g.u - w.u : w.u - g.u;
+}
+
+static int subnormal_d(double x)
+{
+  dbits b;
+  b.d = x;
+  return (b.u & 0x7ff0000000000000ull) == 0 && (b.u & 0x000fffffffffffffull) != 0;
 }
 
 /* +inf, -inf, or (sign 0) a zero of either sign */
@@ -109,6 +120,8 @@ int main(void)
 {
   volatile float finf = 1.0f / 0.0f;
   volatile double dinf = 1.0 / 0.0;
+  volatile double dtiny = 0x1p-1060;
+  int flushes_subnormals = dtiny == 0.0;
   float _Complex fz;
   double _Complex dz;
 
@@ -127,6 +140,9 @@ int main(void)
   for (unsigned i = 0; i < sizeof DC / sizeof DC[0]; i++)
   {
     const struct dcase *c = &DC[i];
+    if (flushes_subnormals && (subnormal_d(c->xr) || subnormal_d(c->xi) || subnormal_d(c->yr) ||
+                               subnormal_d(c->yi) || subnormal_d(c->zr) || subnormal_d(c->zi)))
+      continue;
     dz = __divdc3(c->xr, c->xi, c->yr, c->yi);
     unsigned long long er = ulps_d(__real__ dz, c->zr), ei = ulps_d(__imag__ dz, c->zi);
     if (er > ULP_LIMIT || ei > ULP_LIMIT)
