@@ -114,7 +114,7 @@ PLAIN_STILL = {
 @pytest.mark.parametrize("name", sorted(PLAIN_STILL))
 def test_other_pointers_still_say_it(tmp_path, name):
     proc = _run(tmp_path, PLAIN_STILL[name])
-    assert proc.returncode != 0 and (1, "error", PLAIN) in _diags(proc), proc.stderr
+    assert proc.returncode != 0 and (1, "error", PLAIN + " for 'char *'") in _diags(proc), proc.stderr
 
 
 def test_redundant_view_warns_with_a_fixit(tmp_path):

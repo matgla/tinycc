@@ -290,7 +290,7 @@ def test_plain_pointer_param_fixit(tmp_path):
     # its inner level: said at once, no guess
     _write(tmp_path, "i.c", "int f(char **s) { return s[0][0]; }\n")
     proc = _tcc(tmp_path, "-fdiagnostics-parseable-fixits", "-c", "i.c", "-o", "i.o")
-    assert proc.stderr.splitlines() == ["i.c:1: error: plain pointer in yasc: say owned or view"], proc.stderr
+    assert proc.stderr.splitlines() == ["i.c:1: error: plain pointer in yasc: say owned or view for 'char *'"], proc.stderr
     # a local: decided by the body too (test_fixits.py); a cast: no guess
     _write(tmp_path, "l.c", "void f(void) { char *s = 0; (void)s; }\n")
     proc = _tcc(tmp_path, "-fdiagnostics-parseable-fixits", "-c", "l.c", "-o", "l.o")

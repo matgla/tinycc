@@ -105,6 +105,7 @@ typedef struct PlainParam
   unsigned char own_why, maybe_why; /* the first PP_OWN / PP_MAYBE seen */
   int own_line, maybe_line;
   int own_via, maybe_via; /* through this alias (a token), 0: itself */
+  char spell[64];         /* "char *": the pointer, for an error with no name */
 } PlainParam;
 static PlainParam *pp;
 static int pp_nb, pp_cap, pp_ids;
@@ -134,6 +135,12 @@ static int pp_new(int line, int state)
   pp[pp_nb].idx = -1;
   pp[pp_nb].id = ++pp_ids;
   return pp_nb++;
+}
+
+/* the error of entry I, which names no variable: the pointer's type */
+static void pp_unnamed_error(int i)
+{
+  tcc_error_noabort("%i:plain pointer in yasc: say owned or view for '%s'", pp[i].line, pp[i].spell);
 }
 
 /* the note's text: literals for the immediate path, this for the decided */
@@ -224,7 +231,7 @@ static void pp_report(int i)
   if (name)
     tcc_error_noabort("%i:plain pointer in yasc: say owned or view for '%s'", pp[i].line, name);
   else
-    tcc_error_noabort("%i:plain pointer in yasc: say owned or view", pp[i].line);
+    pp_unnamed_error(i);
 }
 
 /* entries FROM.. in state STATE (-1: any) are reported and dropped */
@@ -251,27 +258,28 @@ static void pp_flush(int from, int state)
 
 /* A function's own parameter at LINE is a plain pointer: 1 when it waits
    here (its name follows: yasc_pp_name) */
-int yasc_pp_hold(int line)
+int yasc_pp_hold(int line, CType *target)
 {
-  pp_new(line, PPS_HELD);
+  const int i = pp_new(line, PPS_HELD);
+  yasc_plain_spell(pp[i].spell, sizeof pp[i].spell, target);
   return 1;
 }
 
 /* A local declarator's own pointer at LINE is a plain pointer: 1 when it
    waits here (its name follows: yasc_pp_local_end).  An inner level of the
    same declarator (`char **pp`) waited first: it is said now. */
-int yasc_pp_hold_local(int line)
+int yasc_pp_hold_local(int line, CType *target)
 {
   if (!pp_bodies || tcc_state->in_inline_expansion)
     return 0;
   if (pp_nb && pp[pp_nb - 1].state == PPS_LHELD && !pp[pp_nb - 1].tok)
   {
-    pp_nb--;
-    tcc_error_noabort("%i:plain pointer in yasc: say owned or view", pp[pp_nb].line);
+    pp_unnamed_error(--pp_nb);
   }
   {
     int i = pp_new(line, PPS_LHELD); /* (pp may move) */
     pp[i].is_local = 1;
+    yasc_plain_spell(pp[i].spell, sizeof pp[i].spell, target);
   }
   return 1;
 }
@@ -296,7 +304,7 @@ void yasc_pp_local_end(int mark, int tok, int keep)
     {
       if (!keep || tok < TOK_UIDENT || (tok & SYM_FIELD))
       {
-        tcc_error_noabort("%i:plain pointer in yasc: say owned or view", pp[i].line);
+        pp_unnamed_error(i);
         continue;
       }
       pp[i].tok = tok;
@@ -442,7 +450,7 @@ void yasc_pp_recover(int body)
     /* a local declarator the error left: said now */
     for (i = 0; i < pp_nb; i++)
       if (pp[i].state == PPS_LHELD && !pp[i].tok)
-        tcc_error_noabort("%i:plain pointer in yasc: say owned or view", pp[i].line);
+        pp_unnamed_error(i);
       else
         pp[j++] = pp[i];
     pp_nb = j;

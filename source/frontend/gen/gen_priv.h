@@ -728,9 +728,11 @@ void decl_param_names(int set, int *nb, int *base);
 void yasc_plain_reset(void);
 /* decl/plain_param.c */
 extern int yasc_pp_live;
-int yasc_pp_hold(int line);
+int yasc_pp_hold(int line, CType *target);
+/* "T *", the plain pointer to TARGET, as its error names it (decl/declarator.c) */
+void yasc_plain_spell(char *buf, int size, CType *target);
 extern int yasc_pp_local_decl, yasc_pp_binding;
-int yasc_pp_hold_local(int line);
+int yasc_pp_hold_local(int line, CType *target);
 int yasc_pp_local_begin(void);
 void yasc_pp_local_end(int mark, int tok, int keep);
 void yasc_pp_local_bind(Sym *sym);

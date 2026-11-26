@@ -653,20 +653,30 @@ static int yasc_plain_nb;
    owned or view (decl/plain_param.c); one of a nested declarator is said
    now, with the view fix-it.  PARAM 2: a pointer written in a declarator's
    own chain (not abstract, nested or a parameter's), which a local's waits
-   for its body as a parameter's does. */
-static void yasc_plain_error(int line, int param)
+   for its body as a parameter's does.  The error names the pointer by its
+   type (TARGET is what it points at), which puts the caret under it. */
+void yasc_plain_spell(char *buf, int size, CType *target)
 {
-  if (param == 1 && func_param_decl_depth == 1 && yasc_pp_hold(line))
+  CType pt = *target;
+  mk_pointer(&pt);
+  type_to_str(buf, size, &pt, NULL);
+}
+
+static __attribute__((noinline)) void yasc_plain_error(int line, int param, CType *target)
+{
+  char buf[256];
+  if (param == 1 && func_param_decl_depth == 1 && yasc_pp_hold(line, target))
     return;
   /* a local's own pointer waits for its body, which decides too (in an
      inline expansion: the function's own body says it) */
   if (param == 2 && yasc_pp_local_decl && !func_param_decl_depth &&
-      (tcc_state->in_inline_expansion || yasc_pp_hold_local(line)))
+      (tcc_state->in_inline_expansion || yasc_pp_hold_local(line, target)))
     return;
   if (param == 1)
     tcc_fixit_next(line, "*", FIXIT_AFTER, " view ",
                    "a parameter the function does not free only borrows: write '* view' ('* owned' when it frees it)");
-  tcc_error_noabort("%i:plain pointer in yasc: say owned or view", line);
+  yasc_plain_spell(buf, sizeof buf, target);
+  tcc_error_noabort("%i:plain pointer in yasc: say owned or view for '%s'", line, buf);
 }
 
 /* error recovery: no pointer waits for its target any more */
@@ -683,7 +693,7 @@ static void yasc_plain_check(int from)
   for (int i = from; i < nb; i++)
     if ((yasc_plain[i]->type.t & VT_BTYPE) != VT_FUNC)
     {
-      yasc_plain_error(yasc_plain_line[i], 0);
+      yasc_plain_error(yasc_plain_line[i], 0, &yasc_plain[i]->type);
     }
 }
 
@@ -1117,7 +1127,7 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
         yasc_cast_type_plain++; /* a cast<...>'s type: its outermost pointer takes the operand's (yasc_cast.c) */
       else if (plain && (type->t & VT_BTYPE) != VT_FUNC)
         yasc_plain_error(file ? file->line_num : 0,
-                         (td & TYPE_PARAM) ? 0 : !(td & (TYPE_ABSTRACT | TYPE_NESTDECL)) ? 2 : 0);
+                         (td & TYPE_PARAM) ? 0 : !(td & (TYPE_ABSTRACT | TYPE_NESTDECL)) ? 2 : 0, type);
       mk_pointer_yasc(type, yq);
       if (dealloc)
         type->ref = sym_pointer_node_b(&type->ref->type, yq, dealloc), dealloc = 0;

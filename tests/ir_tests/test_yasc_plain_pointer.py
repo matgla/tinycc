@@ -7,7 +7,8 @@ a pointer type is written -- parameters, returns, members, globals, locals,
 typedefs, casts, compound literals, sizeof -- in yasc code only: a regular-C
 header, the expansion of a macro defined in regular C (NULL), and the body of
 a function written in regular C are not yasc.  A pointer to a function is
-exempt: it can only borrow.  A typedef that already says it, or a pointer
+exempt: it can only borrow.  The error names the pointer's type, and the
+caret is under it when that spelling is on the line once.  A typedef that already says it, or a pointer
 declared in regular C, needs nothing more; the latter reads as `view maybe`
 from yasc code (-Wlifetime).
 """
@@ -224,3 +225,29 @@ int f(const char *s)
     assert proc.returncode == 0, proc.stderr
     warnings = [line.split("warning: ", 1)[1] for line in proc.stderr.splitlines() if "warning: " in line]
     assert warnings == []
+
+
+# the error says which pointer: its type, with the caret under it
+@pytest.mark.parametrize(
+    "body,ptr",
+    [
+        ("int *p;", "int *"),
+        ("char * view * argv;", "char * view *"),
+        ("int f(char **s);", "char *"),
+        ("int (*ap)[3];", "int (*)[3]"),
+        ("int f(void) { return sizeof(char *); }", "char *"),
+    ],
+)
+def test_error_names_the_pointer(tmp_path, body, ptr):
+    proc = _compile(tmp_path, body, "-fdiagnostics-show-caret")
+    assert proc.returncode != 0
+    assert f"t.c:1: error: {ERROR} for '{ptr}'" in proc.stderr, proc.stderr
+
+
+def test_caret_under_the_pointer(tmp_path):
+    proc = _compile(tmp_path, "int x; char **s;", "-fdiagnostics-show-caret")
+    lines = proc.stderr.splitlines()
+    i = next(k for k, l in enumerate(lines) if f"{ERROR} for 'char *'" in l)
+    src, caret = lines[i + 1], lines[i + 2]
+    col = src.index("char **s")
+    assert caret[col:col + 6] == "^~~~~~", proc.stderr

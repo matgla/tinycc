@@ -356,7 +356,7 @@ int f(char *s)
     # (s is a view: a parameter's own pointer says nothing; an `in` one, so
     # its target is const)
     assert proc.stderr.splitlines() == [
-        "t.c:3: error: plain pointer in yasc: say owned or view",
+        "t.c:3: error: plain pointer in yasc: say owned or view for 'char *'",
         "t.c:4: error: assignment to 'char *' from 'const char * view' discards 'const' qualifier from pointer target type",
         "t.c:4: error: plain pointer in yasc: say owned or view for 'loc'",
         "t.c:4: note: the function only borrows through 'loc': write 'const * view'",
@@ -558,9 +558,9 @@ void f(inout char * view *v)
     _write(tmp_path, "t.c", src)
     proc = _tcc(tmp_path, "-fdiagnostics-parseable-fixits", "-c", "t.c", "-o", "t.o")
     assert proc.stderr.splitlines() == [
-        "t.c:3: error: plain pointer in yasc: say owned or view",
-        "t.c:4: error: plain pointer in yasc: say owned or view",
-        "t.c:5: error: plain pointer in yasc: say owned or view",
+        "t.c:3: error: plain pointer in yasc: say owned or view for 'char *'",
+        "t.c:4: error: plain pointer in yasc: say owned or view for 'char *'",
+        "t.c:5: error: plain pointer in yasc: say owned or view for 'char *'",
         "t.c:3: error: plain pointer in yasc: say owned or view for 'pp'",
         "t.c:3: note: the function only borrows through 'pp': write '* view'",
         'fix-it:"t.c":{3:9-3:12}:"* view pp"',
