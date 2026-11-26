@@ -462,7 +462,7 @@ int proto(char *s);
 struct node { int *next; int v; };
 int use(int *p, int *q)
 {
-  char *loc = nullptr;
+  char *loc[1] = {nullptr};
   int x;
   (void)loc;
   (void)q;
@@ -477,9 +477,10 @@ def test_yasc_plain_pointer_goes_on(tmp_path):
     p = _run(tmp_path, YASC, ccompat=False)
     d = [(l, k, m) for l, k, m in _diags(p)]
     plain = [l for l, k, m in d if "plain pointer in yasc" in m]
-    # a parameter's own pointer is a view (lines 1, 3); a member (line 2)
-    # and a local's pointer (loc, line 5, said at the end of its body, whose
-    # uses decide owned or view: decl/plain_param.c) are plain
+    # a parameter's own pointer is a view (lines 1, 3), and so is a local
+    # pointer its function does not own; a member (line 2) and an array of
+    # pointers (loc, line 5, said at the end of its body: decl/plain_param.c)
+    # are plain
     assert plain == [2, 5], p.stderr
     assert (9, "error", "'x' is used uninitialized") in d
     assert (11, "warning", "'unused_fn' defined but not used") in d

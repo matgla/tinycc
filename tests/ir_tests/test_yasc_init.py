@@ -140,9 +140,9 @@ GOOD = {
     "out_call": "int f(void)\n{\n  int n;\n  fill(&n);\n  return n;\n}\n",
     "out_inlined": "int f(void)\n{\n  int n;\n  ifill(&n);\n  return n;\n}\n",
     # `out` on the pointer p points at (the level below the parameter's own)
-    "out_pointer_call": "int f(void)\n{\n  const char * view maybe q;\n  pfill(&q);\n  return q != nullptr;\n}\n",
+    "out_pointer_call": "int f(void)\n{\n  const char * maybe q;\n  pfill(&q);\n  return q != nullptr;\n}\n",
     "out_pointer_inlined": (
-        "int f(const char *s)\n{\n  const char * view maybe q;\n  int b = ipfill(s, &q);\n  return q ? b : 0;\n}\n"
+        "int f(const char *s)\n{\n  const char * maybe q;\n  int b = ipfill(s, &q);\n  return q ? b : 0;\n}\n"
     ),
     "overflow_result": (
         "int f(int a, int b)\n{\n  int r;\n  if (__builtin_add_overflow(a, b, &r) || __builtin_mul_overflow(r, 2, &r))\n"

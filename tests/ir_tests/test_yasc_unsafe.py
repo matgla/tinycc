@@ -277,7 +277,7 @@ def test_what_needs_no_unsafe(tmp_path):
     and an annotated pointer handed to C."""
     body = (
         "#pragma tcc c_begin\n#define C_NONE ((char *)0)\n#pragma tcc c_end\n"
-        "int f(inout char *v)\n{\n  char * view maybe a = nullptr;\n  char * view maybe b = C_NONE;\n"
+        "int f(inout char *v)\n{\n  char * maybe a = nullptr;\n  char * maybe b = C_NONE;\n"
         "  c_keep(v);\n  return a == b;\n}\n"
     )
     proc = _compile(tmp_path, C_DECLS + body)
@@ -339,8 +339,8 @@ def test_unsafe_cast_needs_its_keyword(tmp_path, name):
 
 def test_casts_that_need_nothing(tmp_path):
     body = (
-        "int f(char *v)\n{\n  char buf[4] = {0};\n  char * view maybe z = nullptr;\n"
-        "  const char * view c = cast<as(const char * view)>(v);\n  char * view b = cast<as(char * view)>(buf);\n"
+        "int f(char *v)\n{\n  char buf[4] = {0};\n  char * maybe z = nullptr;\n"
+        "  const char * c = cast<as(const char * view)>(v);\n  char * b = cast<as(char * view)>(buf);\n"
         "  return (z != nullptr) + *c + *b;\n}\n"
     )
     proc = _compile(tmp_path, body)

@@ -26,20 +26,26 @@ A parameter's own pointer (the last `*` before its name) is the exception: it
 is a `view` unless it says `owned` or `borrows(...)` -- the most a callee can
 do with it is look -- so a parameter writes only what changes hands (`owned`,
 `drop ... owned`), `maybe`, `inout` / `out`. Writing `view` there anyway is
-`-Wredundant-view`. Inner levels, results, members and locals still say it.
+`-Wredundant-view`. A local pointer variable likewise is a `view` (one that
+may hold null: what it holds is what flows into it) unless its function owns
+it -- gives it an owned result (`malloc(n)`), frees it, hands it to an
+`owned` / `drop` parameter, stores or returns it as owned -- and then it says
+`owned`. `T * view p` on a local says more (never null); `view maybe` there
+is `-Wredundant-view`. Inner levels, arrays of pointers, statics, results,
+members and globals still say it.
 
 | Question | Answer | Write |
 |---|---|---|
 | Who frees it? | this pointer, once | `T * owned p` |
-| | someone else; it does not leave the function | `T * view p` (a parameter: `T *p`) |
+| | someone else; it does not leave the function | `T * view p` (a parameter or local: `T *p`) |
 | | someone else; it lives as long as `x` | `T * borrows(x) p` (results, members) |
-| Can it be null? | no | (nothing) |
-| | yes: test it before use | `T * view maybe p` (a parameter: `T * maybe p`) |
+| Can it be null? | no | (nothing; a local: `T * view p`) |
+| | yes: test it before use | `T * view maybe p` (a parameter: `T * maybe p`; a local: `T *p`) |
 | Can others reach it meanwhile? | yes (shared) | `T * view p` |
-| | no: an exclusive borrow, until its last use | `T * restrict view p` |
+| | no: an exclusive borrow, until its last use | `T * restrict view p` (a local: `T * restrict p`) |
 | Can I write through it? | a parameter: no, unless it says so | `T *p` (in), `inout T *p`, `out T *p` |
-| | a local or member: yes | `T * view p` |
-| | a local or member: no | `const T * view p` |
+| | a local or member: yes | `T *p` (a member: `T * view p`) |
+| | a local or member: no | `const T *p` (a member: `const T * view p`) |
 
 `view` is about ownership only. A view *parameter's* target is read-only
 unless the parameter says `inout` (or `out`, written before it is read) --
@@ -281,8 +287,8 @@ enum op  o    = cast<enum(enum op)>(byte);             /* must be an enumerator 
 long long w   = cast<as(long long)>(x);                /* lossless only */
 auto de = cast<ptr(struct dirent *), align>(buf + pos); /* pointee changes, alignment checked */
 uintptr_t a   = cast<addr(uintptr_t)>(p);
-char * view hit = unsafe_cast<qual(char *)>(s);        /* drops const: strchr */
-volatile uint32_t * view reg = unsafe_cast<addr(volatile uint32_t *)>(0x40070000u);
+char *hit = unsafe_cast<qual(char *)>(s);               /* drops const: strchr */
+volatile uint32_t *reg = unsafe_cast<addr(volatile uint32_t *)>(0x40070000u);
 (void)unused;                                          /* stays */
 ```
 
@@ -367,6 +373,8 @@ import lib.vec;                                  /* instead of #include */
 | a view parameter freed or kept | `the parameter 'p' owns nothing (a view unless it says owned): write '* owned p' ...` |
 | a handle in a plain int | `a handle is stored in a plain int: where it goes says 'int view' or 'int owned', or cast<as(int)>(fd) takes its number` |
 | `view` on a parameter | `a parameter's pointer is a view unless it says owned: drop 'view'` (-Wredundant-view) |
+| `view maybe` on a local | `a local's pointer is a view that may be null unless the function owns it: drop 'view'` (-Wredundant-view) |
+| a plain local freed or given `malloc(n)` | `plain pointer in yasc: 'p' owns what it points at, say owned` (the note says why, fix-it `* owned`) |
 | a borrow outliving its owner | `'tail' is used after 's', which it borrows from, was freed` |
 | `out` read first | `'*n' is read before it is written` |
 | an `in` parameter written | `assignment of read-only location` / `discards 'const'` |

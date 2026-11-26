@@ -1436,8 +1436,11 @@ int decl(int l)
       type_decl(&type, &ad, &v, TYPE_DIRECT);
       recover_decl.l = 0;
       if (pp_local >= 0)
-        yasc_pp_local_end(pp_local, v,
-                          !(type.t & (VT_TYPEDEF | VT_EXTERN | VT_STATIC)) && (type.t & VT_BTYPE) != VT_FUNC);
+      {
+        const int keep = !(type.t & (VT_TYPEDEF | VT_EXTERN | VT_STATIC)) && (type.t & VT_BTYPE) != VT_FUNC;
+        yasc_pp_local_end(pp_local, v, keep);
+        yasc_pp_redundant_view(&type, keep);
+      }
       if (adbase.attr_deprecated)
         attr_deprecated_suppress--;
       /* yasc: a plain pointer parameter waits for its definition's body */

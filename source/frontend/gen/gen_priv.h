@@ -736,6 +736,8 @@ int yasc_pp_hold_local(int line, CType *target);
 int yasc_pp_local_begin(void);
 void yasc_pp_local_end(int mark, int tok, int keep);
 void yasc_pp_local_bind(Sym *sym);
+void yasc_pp_redundant_view(CType *type, int keep);
+extern int yasc_pp_view_line;
 void yasc_pp_name(int mark, int tok, int idx);
 int yasc_pp_mark(void);
 void yasc_pp_declarator(Sym *def);

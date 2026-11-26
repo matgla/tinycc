@@ -291,10 +291,15 @@ def test_plain_pointer_param_fixit(tmp_path):
     _write(tmp_path, "i.c", "int f(char **s) { return s[0][0]; }\n")
     proc = _tcc(tmp_path, "-fdiagnostics-parseable-fixits", "-c", "i.c", "-o", "i.o")
     assert proc.stderr.splitlines() == ["i.c:1: error: plain pointer in yasc: say owned or view for 'char *'"], proc.stderr
-    # a local: decided by the body too (test_fixits.py); a cast: no guess
-    _write(tmp_path, "l.c", "void f(void) { char *s = 0; (void)s; }\n")
+    # a local: a view unless the body owns it, then `* owned` (test_fixits.py);
+    # a cast: no guess
+    _write(tmp_path, "l.c", "void f(void) { char *s = nullptr; (void)s; }\n")
     proc = _tcc(tmp_path, "-fdiagnostics-parseable-fixits", "-c", "l.c", "-o", "l.o")
-    assert 'fix-it:"l.c":{1:22-1:22}:" view maybe "' in proc.stderr, proc.stderr
+    assert proc.returncode == 0 and proc.stderr == "", proc.stderr
+    _write(tmp_path, "o.c", "void * owned maybe malloc(unsigned long n);\nvoid free(drop void * owned maybe p);\n"
+           "void f(void) { char *s = malloc(1); free(s); }\n")
+    proc = _tcc(tmp_path, "-fdiagnostics-parseable-fixits", "-c", "o.c", "-o", "o.o")
+    assert 'fix-it:"o.c":{3:22-3:22}:" owned maybe "' in proc.stderr, proc.stderr
     _write(tmp_path, "c.c", "int f(void) { return (char *)0 == 0; }\n")
     proc = _tcc(tmp_path, "-fdiagnostics-parseable-fixits", "-c", "c.c", "-o", "c.o")
     assert "note:" not in proc.stderr and "fix-it:" not in proc.stderr

@@ -104,7 +104,7 @@ int borrow_outlives_owner(void)
   char * owned maybe s = mem_strdup("abc");
   if (!s)
     return 0;
-  char * view tail = s + 1; /* borrows from s */
+  char *tail = s + 1; /* borrows from s */
   mem_free(s);
   return tail[0]; /* s is gone, and tail with it */
 }

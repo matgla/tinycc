@@ -1,7 +1,11 @@
 """yasc forbids plain pointers: every '*' says owned or view.
 
 But a parameter's own pointer (the last '*' before its name) is a view unless
-it says owned or borrows(...); its inner levels still say it.  `maybe`, `out`
+it says owned or borrows(...); its inner levels still say it.  A local
+pointer variable likewise is a `view maybe` unless its function owns it
+(gives it an owned value, frees it, stores or returns it as owned): then the
+error says owned.  An array of pointers, a local's inner level and a static
+local still say it.  `maybe`, `out`
 and `drop` combine with either.  The rule covers every place
 a pointer type is written -- parameters, returns, members, globals, locals,
 typedefs, casts, compound literals, sizeof -- in yasc code only: a regular-C
@@ -35,7 +39,9 @@ PLAIN = {
     "parameter_function": "int f(char *g(int));",
     "parameter_function_result": "int f(char *(*cb)(int));",
     "return": "char *f(void);",
-    "local": "void f(void) { int *p = 0; (void)p; }",
+    "local_array": "void f(void) { int *a[1] = {0}; (void)a; }",
+    "local_inner_level": "void f(void) { int * view x = 0; int **pp = &x; (void)pp; }",
+    "local_static": "void f(void) { static int *p; (void)p; }",
     "cast": "void f(void) { void * view v = (void *)0; (void)v; }",
     "sizeof": "int f(void) { return sizeof(char *); }",
     "typedef": "typedef char *str;",
@@ -66,8 +72,10 @@ ANNOTATED = {
     "function_pointer": "void (*fp)(int);",
     "function_pointer_param": "void h(void (*cb)(char *));",
     "function_typedef": "typedef int fn(int);\nfn *f2;",
-    "array_decay_and_string": "int f(void) { char b[4] = undefined; char * view p = b; const char * view s = \"x\"; return p != s; }",
-    "address_of": "int f(void) { int x = 1; int * view p = &x; return *p; }",
+    "array_decay_and_string": "int f(void) { char b[4] = undefined; char * p = b; const char * s = \"x\"; return p != s; }",
+    "address_of": "int f(void) { int x = 1; int * p = &x; return *p; }",
+    "local": "int f(const char *s) { const char *p = s; char b[2] = undefined; char *q = b; q[0] = *p; return q[0]; }",
+    "local_maybe": "int f(void) { int *p = nullptr; return p != nullptr; }",
 }
 
 
@@ -101,6 +109,50 @@ def test_regular_c_keeps_plain_pointers(tmp_path, name):
     assert proc.returncode == 0, proc.stderr
 
 
+OWNED_LOCAL = """\
+void free(drop void * owned maybe p);
+void * owned(free) maybe malloc(unsigned long n);
+void f(void) { char *p = malloc(4); free(p); }"""
+
+
+def test_owned_local_says_owned(tmp_path):
+    """a local its function owns is never a view: the error says owned"""
+    proc = _compile(tmp_path, OWNED_LOCAL, "-std=yasc")
+    assert proc.returncode != 0, proc.stderr
+    assert "t.c:3: error: plain pointer in yasc: 'p' owns what it points at, say owned" in proc.stderr, proc.stderr
+    assert "t.c:3: note: the function gives 'p' an owned value that may be null (line 3): write '* owned maybe'" in proc.stderr, proc.stderr
+
+
+def test_local_view_is_redundant(tmp_path):
+    """`view maybe` on a local pointer's own '*' says what it is anyway
+    (-Wredundant-view, fix-it: `* maybe`); `view` alone says more (never
+    null), and an array of them, an inner level or a static say it"""
+    body = """\
+int f(const char *s) {
+  const char * view p = s;
+  const char * view maybe q = nullptr;
+  const char * view a[1] = {s};
+  const char * view * view pp = &p;
+  static const char * view st;
+  return *p + (q != nullptr) + (a[0] != nullptr) + (*pp != nullptr) + (st != nullptr);
+}"""
+    proc = _compile(tmp_path, body, "-std=yasc", "-fdiagnostics-parseable-fixits")
+    assert proc.returncode == 0, proc.stderr
+    msg = "warning: a local's pointer is a view that may be null unless the function owns it: drop 'view'"
+    lines = [l for l in proc.stderr.splitlines() if msg in l]
+    assert lines == [f"{tmp_path / 't.c'}:3: {msg}"], proc.stderr
+    assert 'fix-it:"' + str(tmp_path / "t.c") + '":{3:16-3:21}:""' in proc.stderr, proc.stderr
+    # never null: a maybe value stored there is an error
+    proc = _compile(tmp_path, "int f(const char * maybe s) { const char * view p = s; return *p; }", "-std=yasc",
+                    "-Wlifetime")
+    assert proc.returncode != 0 and "may be null" in proc.stderr, proc.stderr
+    proc = _compile(tmp_path, "int f(const char * maybe s) { const char *p = s; return p ? *p : 0; }", "-std=yasc",
+                    "-Wlifetime")
+    assert proc.returncode == 0 and proc.stderr == "", proc.stderr
+    proc = _compile(tmp_path, body, "-std=yasc", "-Wno-redundant-view")
+    assert proc.returncode == 0 and "drop 'view'" not in proc.stderr, proc.stderr
+
+
 def test_the_safe_default_is_yasc(tmp_path):
     proc = _compile(tmp_path, "int *p;")
     assert proc.returncode != 0 and ERROR in proc.stderr, proc.stderr
@@ -127,10 +179,10 @@ def test_regular_c_header_and_its_macros(tmp_path, opt):
 #include <stddef.h>
 int f(const char *s)
 {
-  void * view maybe p = NULL;
-  void * view maybe q = MY_NULL;
+  void * maybe p = NULL;
+  void * maybe q = MY_NULL;
   cstr c = find(s, 'x');
-  char * view maybe d = unsafe(first(c));
+  char * maybe d = unsafe(first(c));
   return p == q && d == c;
 }"""
     proc = _compile(tmp_path, body, "-std=yasc", opt, header=HEADER)
@@ -187,8 +239,8 @@ def test_yasc_after_a_function_macro_is_checked(tmp_path, opt):
     macro in a function, stay yasc."""
     body = """\
 #include "h.h"
-DEFINE(one) { int *p = result; (void)p; reg_one(); }
-int first(const char *s) { int *q = 0; (void)q; return FIRST(s); }"""
+DEFINE(one) { int *p[1] = {result}; (void)p; reg_one(); }
+int first(const char *s) { int *q[1] = {nullptr}; (void)q; return FIRST(s); }"""
     proc = _compile_strict(tmp_path, body, FN_MACRO_HEADER, opt)
     assert proc.returncode != 0
     assert f"t.c:2: error: {ERROR}" in proc.stderr and f"t.c:3: error: {ERROR}" in proc.stderr, proc.stderr
@@ -210,7 +262,7 @@ def test_regular_c_pointer_is_unchecked(tmp_path):
 int f(const char *s)
 {
   char * view a = unsafe(find(s, 'a'));
-  char * view maybe b = unsafe(find(s, 'b'));
+  char * maybe b = unsafe(find(s, 'b'));
   cstr c = find(s, 'c');
   return *a + (b != nullptr) + unsafe(*c);
 }"""

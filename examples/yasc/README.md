@@ -59,7 +59,7 @@ it says so itself, which is why `<stdio.h>` keeps working. In regular C,
 ## 1. Every pointer says what it is
 
 ```c
-const char * view greeting = "hello, yasc";
+const char *greeting = "hello, yasc";
 ```
 
 In yasc a pointer either **owns** its target (`owned`: it must be freed or
@@ -68,15 +68,21 @@ plain `char *` is an error, "plain pointer in yasc: say owned or view".
 The qualifier goes after the `*`, so each level of a pointer to a pointer
 says what it is: `char * owned * view argv`.
 
-One pointer needs no word: a parameter's own (the last `*` before its
+Two pointers need no word. A parameter's own (the last `*` before its
 name) is a view unless it says `owned`, since the least a function can do
-with it -- look -- is the default. `int len(const char *s)` borrows `s`;
-writing `view` there anyway draws a warning (-Wredundant-view). Its inner
-levels still say it: `main`'s `const char * view *argv`.
+with it -- look -- is the default. `int len(const char *s)` borrows `s`.
+A local pointer variable, like `greeting`, is a view too unless its
+function owns it (gives it a `malloc` result, frees it, hands it on as
+owned); then the compiler says "'p' owns what it points at, say owned". A
+local view may hold null: what it holds is what flows into it, and the
+checks follow that. `T * view p` on a local says more -- never null -- but
+`view` on a parameter, or `view maybe` on a local, says nothing new and
+draws a warning (-Wredundant-view). Inner levels still say it: `main`'s
+`const char * view *argv`.
 
 A view parameter is read-only unless it says `inout` or `out`: `main`'s
 `argv` cannot reassign `argv[i]`, and the `const` keeps the strings
-read-only too. A local you only read through is `const T * view p`.
+read-only too. A local you only read through is `const T *p`.
 
 A string literal, an array decaying to a pointer, and `&x` are views.
 

@@ -1310,6 +1310,7 @@ void tcc_ir_taint_inline_mark(TCCIRState *ir, int begin, struct Sym *callee, int
 void tcc_ir_taint_unit_end(void);
 void tcc_ir_taint_unit_free(void);
 void tcc_ir_lt_add_var(TCCIRState *ir, int32_t vreg, struct Sym *sym);
+void tcc_ir_lt_silence(TCCIRState *ir, int32_t vreg);
 void tcc_ir_lt_scope_end(TCCIRState *ir, struct Sym *top, struct Sym *bottom);
 void tcc_ir_lt_return(TCCIRState *ir, int line);
 void tcc_ir_lt_inline_param(TCCIRState *ir, int32_t vreg, struct Sym *callee, int index);

@@ -101,6 +101,7 @@ typedef struct PlainParam
   int local_vr, local_c; /* its vreg, else frame offset (a popped Sym may be reused) */
   int alias_of; /* the id of the entry it copies, 0: none */
   unsigned char state, is_local;
+  unsigned char ptr_local;   /* a local pointer (not an array of them) */
   unsigned short flags;
   unsigned char own_why, maybe_why; /* the first PP_OWN / PP_MAYBE seen */
   int own_line, maybe_line;
@@ -114,6 +115,7 @@ static int pp_bodies;    /* bodies being parsed */
 int yasc_pp_live;        /* PPS_BODY / PPS_ALIAS entries: the hooks look */
 int yasc_pp_local_decl;  /* a local declarator is being read (decl()) */
 int yasc_pp_binding;     /* PPS_LHELD entries named: yasc_pp_local_bind looks */
+int yasc_pp_view_line;   /* the local declarator's own pointer says view, at this line */
 
 static void pp_count(void)
 {
@@ -174,6 +176,14 @@ static void pp_report(int i)
   const char *kw;
   if (pp[i].state == PPS_ALIAS)
     return;
+  /* a local pointer the body does not own is the `view maybe` it was while
+     the body was parsed (declarator.c): no error.  What it holds is what
+     flows into it; the checks followed it as a written one. */
+  if (pp[i].state == PPS_BODY && pp[i].is_local && pp[i].ptr_local && name && !(f & PP_OWN))
+    return;
+  /* an error: the flow checks say nothing more of it */
+  if (pp[i].state == PPS_BODY && pp[i].is_local)
+    tcc_ir_lt_silence(tcc_state->ir, pp[i].local_vr);
   if (pp[i].state == PPS_LHELD)
     ; /* a local never made: no decision, no fix-it */
   else if (pp[i].state == PPS_HELD || !name)
@@ -228,7 +238,9 @@ static void pp_report(int i)
       snprintf(pp_note + n, sizeof pp_note - n, ": write '%s* %s%s'", cnst ? "const " : "", kw, k & 1 ? " maybe" : "");
     pp_fixits(i, name, kws[k], pp_note, cnst);
   }
-  if (name)
+  if (name && pp[i].state == PPS_BODY && pp[i].is_local && pp[i].ptr_local)
+    tcc_error_noabort("%i:plain pointer in yasc: '%s' owns what it points at, say owned", pp[i].line, name);
+  else if (name)
     tcc_error_noabort("%i:plain pointer in yasc: say owned or view for '%s'", pp[i].line, name);
   else
     pp_unnamed_error(i);
@@ -288,6 +300,7 @@ int yasc_pp_hold_local(int line, CType *target)
 int yasc_pp_local_begin(void)
 {
   yasc_pp_local_decl = 1;
+  yasc_pp_view_line = 0;
   return pp_nb;
 }
 
@@ -315,6 +328,22 @@ void yasc_pp_local_end(int mark, int tok, int keep)
   pp_count();
 }
 
+/* the local declarator just read declares TYPE, an automatic variable when
+   KEEP: `view maybe` on its own pointer says what a plain one is
+   (-Wredundant-view; `* maybe` stays).  A `view` without maybe says more:
+   never null. */
+void yasc_pp_redundant_view(CType *type, int keep)
+{
+  const int line = yasc_pp_view_line;
+  yasc_pp_view_line = 0;
+  if (!line || !keep || (type->t & (VT_BTYPE | VT_ARRAY)) != VT_PTR || !tcc_warn_wanted(warn_redundant_view) ||
+      (type_yasc(type) & (YASC_VIEW | YASC_OWNED | YASC_UNCHECKED | YASC_MAYBE)) != (YASC_VIEW | YASC_MAYBE))
+    return;
+  tcc_warning_once_at(warn_redundant_view, line,
+                      "a local's pointer is a view that may be null unless the function owns it: drop 'view'");
+  tcc_fixit(line, "view ", FIXIT_REPLACE, "");
+}
+
 /* the local SYM is made: the pointer that waits for it is followed */
 void yasc_pp_local_bind(Sym *sym)
 {
@@ -325,6 +354,7 @@ void yasc_pp_local_bind(Sym *sym)
       pp[i].local = sym;
       pp[i].local_vr = sym->vreg;
       pp[i].local_c = sym->c;
+      pp[i].ptr_local = (sym->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR;
       break;
     }
   pp_count();
@@ -588,7 +618,9 @@ void yasc_pp_store(const SValue *dst, const SValue *val)
     /* a copy of a parameter that becomes a view: an `in` one, a const target */
     if (i >= 0 && i != d && pp[d].is_local && !pp[i].is_local)
       pp[d].flags |= PP_CONSTSRC;
-    if (i < 0 && pp[d].is_local && (type_yasc(&val->type) & YASC_OWNED))
+    /* an owned result (`malloc(n)`), not an owned variable or member, which
+       a view borrows */
+    if (i < 0 && pp[d].is_local && (type_yasc(&val->type) & YASC_OWNED) && !(val->r & VT_LVAL))
       pp_set(d, PP_OWNSRC);
     if (i < 0 && pp[d].is_local && ((type_yasc(&val->type) & YASC_MAYBE) || pp_null(val)))
       pp_set(d, PP_MAYBESRC);

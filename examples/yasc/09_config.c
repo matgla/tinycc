@@ -124,7 +124,7 @@ struct config
 
   !int number(const struct config *self, const char *key)
   {
-    const char * view maybe s = self->text(key);
+    const char * maybe s = self->text(key);
     if (!s)
       return error.NotFound;
     int v = 0;
@@ -164,7 +164,7 @@ int main(void)
     defer cfg.clear(); /* the entries are freed when this block ends */
 
     say("%d settings\n", cfg.parse(settings));
-    const char * view maybe name = cfg.text("name");
+    const char * maybe name = cfg.text("name");
     say("name: %s\n", name ? name : "(none)");
     say("area: %d\n", area(&cfg) catch -1);
     const char * view keys[] = {"depth", "speed"};

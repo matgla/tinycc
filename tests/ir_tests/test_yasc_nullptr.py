@@ -47,10 +47,10 @@ NULL_MSG = "NULL is regular C: write nullptr"
 ZERO_MSG = "0 as a null pointer: write nullptr"
 
 WARNS = [
-    ("void f(void) { char * view maybe p = NULL; take(p); }", NULL_MSG),
+    ("void f(void) { char * maybe p = NULL; take(p); }", NULL_MSG),
     ("int f(char * maybe p) { return p == NULL; }", NULL_MSG),
     ("void f(void) { take(NULL); }", NULL_MSG),
-    ("void f(void) { char * view maybe p = 0; take(p); }", ZERO_MSG),
+    ("void f(void) { char * maybe p = 0; take(p); }", ZERO_MSG),
     ("void f(char * maybe p) { p = 0; take(p); }", ZERO_MSG),
     ("void f(void) { take(0); }", ZERO_MSG),
     ("char * view maybe f(char * maybe q) { take(q); return 0; }", ZERO_MSG),
@@ -58,7 +58,7 @@ WARNS = [
     ("int f(char * maybe p) { return 0 == p; }", ZERO_MSG),
     ("char * view maybe f(inout char * maybe p, int c) { return c ? p : 0; }", ZERO_MSG),
     ("char * view maybe f(inout char * maybe p, int c) { return c ? 0 : p; }", ZERO_MSG),
-    ("void f(void) { char * view maybe q = 0; take(q); }", ZERO_MSG),
+    ("void f(void) { char * maybe q = 0; take(q); }", ZERO_MSG),
     ("void f(char * maybe p) { p = '\\0'; take(p); }", ZERO_MSG),
     ("void f(char * maybe p) { p = 1 - 1; take(p); }", ZERO_MSG),
     ("int f(void) { struct S s = {0}; return s.n; }", ZERO_MSG),
@@ -74,7 +74,7 @@ WARNS = [
 ]
 
 QUIET = [
-    "void f(void) { char * view maybe p = nullptr; take(p); }",
+    "void f(void) { char * maybe p = nullptr; take(p); }",
     "int f(char * maybe p) { return p == nullptr || p != nullptr; }",
     "int f(char * maybe p) { return !p; }",
     "int f(char * maybe p) { if (p) return 1; return 0; }",

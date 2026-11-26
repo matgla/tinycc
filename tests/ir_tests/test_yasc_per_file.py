@@ -49,7 +49,7 @@ MAIN = """\
 int f(void)
 {
   char * owned p = yalloc();
-  char * view maybe q = MKPTR(0);
+  char * maybe q = MKPTR(0);
   struct maybe m = {TAKE(1)};
   (void)q;
   yfree(p);

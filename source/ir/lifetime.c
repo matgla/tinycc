@@ -243,6 +243,17 @@ static int lt_var_by_vreg(const TCCIRState *ir, int32_t vreg)
 
 static int lt_self_kind(Sym *pa);
 
+/* yasc: the local of VREG, a `view maybe` while its body was parsed, is a
+   plain pointer the body owns, an error already (plain_param.c): nothing
+   more is said of it */
+void tcc_ir_lt_silence(TCCIRState *ir, int32_t vreg)
+{
+  int v = ir && ir->lt_on && vreg >= 0 ? lt_var_by_vreg(ir, vreg) : -1;
+  if (v >= 0)
+    ir->lt_vars[v].silent = 1;
+}
+
+
 /* An inlined callee's parameter: what the body does with it is the callee's
    to report; the argument stored into it is the caller's, as for a call. */
 void tcc_ir_lt_inline_param(TCCIRState *ir, int32_t vreg, Sym *callee, int index)

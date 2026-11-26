@@ -654,7 +654,10 @@ static int yasc_plain_nb;
    now, with the view fix-it.  PARAM 2: a pointer written in a declarator's
    own chain (not abstract, nested or a parameter's), which a local's waits
    for its body as a parameter's does.  The error names the pointer by its
-   type (TARGET is what it points at), which puts the caret under it. */
+   type (TARGET is what it points at), which puts the caret under it.
+   Returns 1 for a local's own pointer: it is a `view maybe` while the body is
+   parsed (every check sees what a written one gets), and an error after it
+   only when the body owns it (plain_param.c). */
 void yasc_plain_spell(char *buf, int size, CType *target)
 {
   CType pt = *target;
@@ -662,21 +665,22 @@ void yasc_plain_spell(char *buf, int size, CType *target)
   type_to_str(buf, size, &pt, NULL);
 }
 
-static __attribute__((noinline)) void yasc_plain_error(int line, int param, CType *target)
+static __attribute__((noinline)) int yasc_plain_error(int line, int param, CType *target)
 {
   char buf[256];
   if (param == 1 && func_param_decl_depth == 1 && yasc_pp_hold(line, target))
-    return;
+    return 0;
   /* a local's own pointer waits for its body, which decides too (in an
      inline expansion: the function's own body says it) */
   if (param == 2 && yasc_pp_local_decl && !func_param_decl_depth &&
       (tcc_state->in_inline_expansion || yasc_pp_hold_local(line, target)))
-    return;
+    return 1;
   if (param == 1)
     tcc_fixit_next(line, "*", FIXIT_AFTER, " view ",
                    "a parameter the function does not free only borrows: write '* view' ('* owned' when it frees it)");
   yasc_plain_spell(buf, sizeof buf, target);
   tcc_error_noabort("%i:plain pointer in yasc: say owned or view for '%s'", line, buf);
+  return 0;
 }
 
 /* error recovery: no pointer waits for its target any more */
@@ -1097,6 +1101,14 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
         tcc_fixit(line, "view ", FIXIT_REPLACE, "");
       }
     }
+    /* yasc: `view` on a local's own pointer (the last '*' before its name),
+       which is a `view maybe` anyway unless the body owns it: decl() says it
+       once the declaration is known to be an automatic pointer that says
+       maybe too (yasc_pp_redundant_view) */
+    if (star_yasc && !star_c && view_written && bnb < 0 && !bstatic && tok >= TOK_UIDENT && yasc_pp_local_decl &&
+        !func_param_decl_depth && !(td & (TYPE_PARAM | TYPE_ABSTRACT | TYPE_NESTDECL)) &&
+        !tcc_state->in_inline_expansion)
+      yasc_pp_view_line = file ? file->line_num : 0;
     int plain = star_yasc && !(yq & (YASC_OWNED | YASC_VIEW));
     /* yasc: a pointer written in regular C says nothing about ownership
        (unless yasc code after it does: `PTR(char) owned p`) */
@@ -1125,9 +1137,10 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
          said at once, the body decides nothing about it */
       if (plain && (type->t & VT_BTYPE) != VT_FUNC && yasc_cast_type_plain >= 0)
         yasc_cast_type_plain++; /* a cast<...>'s type: its outermost pointer takes the operand's (yasc_cast.c) */
-      else if (plain && (type->t & VT_BTYPE) != VT_FUNC)
-        yasc_plain_error(file ? file->line_num : 0,
-                         (td & TYPE_PARAM) ? 0 : !(td & (TYPE_ABSTRACT | TYPE_NESTDECL)) ? 2 : 0, type);
+      else if (plain && (type->t & VT_BTYPE) != VT_FUNC &&
+               yasc_plain_error(file ? file->line_num : 0,
+                                (td & TYPE_PARAM) ? 0 : !(td & (TYPE_ABSTRACT | TYPE_NESTDECL)) ? 2 : 0, type))
+        yq |= YASC_VIEW | YASC_MAYBE;
       mk_pointer_yasc(type, yq);
       if (dealloc)
         type->ref = sym_pointer_node_b(&type->ref->type, yq, dealloc), dealloc = 0;

@@ -16,11 +16,11 @@ int main(void)
     return 1;
   counter_add(borrow(c), COUNTER_STEP); /* lent: c is still owned */
   counter_add(borrow(c), 2);
-  const char * view name = unsafe(counter_name(borrow(c))); /* unchecked: unsafe vouches for it */
+  const char *name = unsafe(counter_name(borrow(c))); /* unchecked: unsafe vouches for it */
   printf("%s = %d\n", name, counter_get(borrow(c)));
   counter_free(c); /* the deallocator counter_new named */
 
-  counter_t * view maybe none = COUNTER_NONE; /* a C macro's cast is C too */
+  counter_t * maybe none = COUNTER_NONE; /* a C macro's cast is C too */
   printf("none is %s\n", none ? "set" : "null");
   return 0;
 }

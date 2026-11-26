@@ -10,7 +10,7 @@
 
 int main(void)
 {
-  const char * view greeting = "hello, yasc";
+  const char *greeting = "hello, yasc";
   printf("%s\n", greeting);
   return 0;
 }
