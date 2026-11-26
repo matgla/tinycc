@@ -58,6 +58,20 @@ BAD = {
     "declared": ("void f(void)\n{\n  FILE * owned(fclose) maybe f = 0;\n  release(f);\n}\n", 4,
                  "'f' is released by fclose, not release"),
     "call_result": ("void f(void)\n{\n  free(fopen(\"x\", \"r\"));\n}\n", 3, "a pointer released by fclose is passed to free"),
+    # move(p) is a copy of p: the deallocator goes with it
+    "move": ("void f(void)\n{\n  FILE * owned maybe f = fopen(\"a\", \"r\");\n  if (f)\n    free(move(f));\n}\n", 5,
+             "'f' is released by fclose, not free"),
+    "move_attribute": ("void f(void)\n{\n  void * owned maybe p = mem_new(4);\n  free(move(p));\n}\n", 4,
+                       "'p' is released by mem_free, not free"),
+    "move_declared": ("void f(void)\n{\n  FILE * owned(fclose) maybe f = fopen(\"a\", \"r\");\n  release(move(f));\n}\n", 4,
+                      "'f' is released by fclose, not release"),
+    "move_to_attribute_dealloc": ("void f(void)\n{\n  FILE * owned maybe f = fopen(\"a\", \"r\");\n  mem_free(move(f));\n}\n", 4,
+                                  "'f' is released by fclose, not mem_free"),
+    "move_into_variable": ("void f(void)\n{\n  FILE * owned maybe f = fopen(\"a\", \"r\");\n"
+                           "  void * owned maybe q = move(f);\n  free(q);\n}\n", 5, "'q' is released by fclose, not free"),
+    "move_into_declared": ("void f(void)\n{\n  void * owned maybe p = mem_new(4);\n"
+                           "  FILE * owned(fclose) maybe g = move(p);\n  fclose(g);\n}\n", 4,
+                           "a pointer released by mem_free is stored in 'g', which is released by fclose"),
 }
 
 
@@ -73,6 +87,11 @@ CLEAN = {
     "auto": "void f(void)\n{\n  auto f = fopen(\"a\", \"r\");\n  if (f)\n    fclose(f);\n}\n",
     "plain_owned_anywhere": "void f(void)\n{\n  void * owned maybe p = malloc(4);\n  free(p);\n  release(malloc(2));\n}\n",
     "attribute_pair": "void f(void)\n{\n  void * owned maybe p = mem_new(4);\n  mem_free(p);\n}\n",
+    "move_fclose": "void f(void)\n{\n  FILE * owned maybe f = fopen(\"a\", \"r\");\n  if (f)\n    fclose(move(f));\n}\n",
+    "move_attribute_pair": "void f(void)\n{\n  void * owned maybe p = mem_new(4);\n  mem_free(move(p));\n}\n",
+    "move_plain_owned": "void f(void)\n{\n  void * owned maybe p = malloc(4);\n  release(move(p));\n}\n",
+    "move_through_variable": "void f(void)\n{\n  FILE * owned maybe f = fopen(\"a\", \"r\");\n"
+                             "  FILE * owned maybe g = move(f);\n  if (g)\n    fclose(move(g));\n}\n",
 }
 
 

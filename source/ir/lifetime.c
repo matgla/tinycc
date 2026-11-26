@@ -7298,7 +7298,8 @@ done:
  * allocator.  A plain `owned` variable takes on the deallocator of what it
  * holds (a call's result, another owned variable); handed to a `drop`
  * parameter -- the parameter's own owned(...), else the callee's name -- of
- * another deallocator, it is reported.  Plain `owned` says nothing and is
+ * another deallocator, it is reported.  A copy (`move(p)`: `T <-- V [LOAD]`)
+ * carries the deallocator and the variable it was made from.  Plain `owned` says nothing and is
  * never compared.  One linear walk: a variable holds one kind of pointer. */
 /* -Wlifetime: a `T * restrict view r` local (S3).  While r is still to be
  * used, what it borrows is reached through r only: a variable it was made
@@ -7513,10 +7514,13 @@ void tcc_ir_restrict_check(TCCIRState *ir)
 void tcc_ir_dealloc_check(TCCIRState *ir)
 {
   int n = ir->next_instruction_index, ntemps = ir->next_temporary_variable, nv = ir->lt_nb_vars;
-  int *tdeal, *vdeal;
+  int *tdeal, *tdvar, *vdeal;
   if (!n || !ir->lt_nb_calls)
     return;
-  tdeal = tcc_mallocz((ntemps + 1) * sizeof(int));
+  /* per temp: the deallocator of its value, and 1 + the owned variable it
+     is a copy of (0: none) */
+  tdeal = tcc_mallocz(2 * (ntemps + 1) * sizeof(int));
+  tdvar = tdeal + ntemps + 1;
   vdeal = tcc_mallocz((nv + 1) * sizeof(int));
   int32_t *tfa = tcc_malloc((ntemps + 1) * sizeof(int32_t));
   for (int t = 0; t <= ntemps; t++)
@@ -7537,7 +7541,10 @@ void tcc_ir_dealloc_check(TCCIRState *ir)
     if (sv >= 0 && irop_is_vreg_value(src1))
     {
       if (TCCIR_DECODE_VREG_TYPE(sv) == TCCIR_VREG_TYPE_TEMP)
-        d = TCCIR_DECODE_VREG_POSITION(sv) < ntemps ? tdeal[TCCIR_DECODE_VREG_POSITION(sv)] : 0;
+      {
+        if (TCCIR_DECODE_VREG_POSITION(sv) < ntemps)
+          d = tdeal[TCCIR_DECODE_VREG_POSITION(sv)], var = tdvar[TCCIR_DECODE_VREG_POSITION(sv)] - 1;
+      }
       else
         for (int k = 0; k < nv; k++)
           if (ir->lt_vars[k].vreg == sv && !ir->lt_vars[k].silent && vdeal[k] >= 0)
@@ -7607,14 +7614,16 @@ void tcc_ir_dealloc_check(TCCIRState *ir)
     {
       int call_id = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, src2));
       d = call_id >= 0 && call_id < ir->lt_nb_calls ? ir->lt_calls[call_id].ret_dealloc : 0;
+      var = -1;
     }
-    else if (q->op != TCCIR_OP_ASSIGN)
-      d = 0;
+    else if (q->op != TCCIR_OP_ASSIGN && (q->op != TCCIR_OP_LOAD || !irop_is_vreg_value(src1)))
+      d = 0, var = -1; /* not a copy of src1 */
     if (TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP)
     {
       if (TCCIR_DECODE_VREG_POSITION(dv) < ntemps)
       {
         tdeal[TCCIR_DECODE_VREG_POSITION(dv)] = d;
+        tdvar[TCCIR_DECODE_VREG_POSITION(dv)] = d ? var + 1 : 0;
         tfa[TCCIR_DECODE_VREG_POSITION(dv)] =
             (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LEA) && lt_is_addr(src1) && irop_get_vreg(src1) < 0
                 ? (int32_t)irop_get_imm64_ex(ir, src1)
