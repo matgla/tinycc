@@ -254,8 +254,9 @@ void gfunc_param_typed(Sym *func, Sym *arg)
      * temporary copy is made here.  (A pointer to a copy for composites over
      * 16 bytes is the AArch64 rule.) */
     yasc_argument = 1;
+    yasc_argument_c = arg->yasc & YASC_PARAM_C;
     gen_assign_cast(&type);
-    yasc_argument = 0;
+    yasc_argument = yasc_argument_c = 0;
   }
 }
 

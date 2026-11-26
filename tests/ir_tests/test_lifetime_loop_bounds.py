@@ -31,7 +31,7 @@ PRELUDE = """\
 void * owned maybe malloc(unsigned n);
 void free(drop void * owned maybe p);
 typedef struct FILE FILE;
-FILE * owned(fclose) maybe fopen(const char * view path, const char * view mode);
+FILE * owned(fclose) maybe fopen(const char *path, const char *mode);
 int fclose(drop FILE * owned maybe f);
 """
 PRELUDE_LINES = PRELUDE.count("\n")
@@ -48,7 +48,7 @@ CLEAN = {
     "deallocator_from_type": "void f(int n)\n{\n  FILE * owned(fclose) maybe a[8] = undefined;\n"
     "  for (int k = 0; k < n; k++)\n    a[k] = fopen(\"x\", \"r\");\n"
     "  for (int j = 0; j < n; j++)\n    fclose(a[j]);\n}\n",
-    "used_between": "int use(char * view maybe p);\nvoid f(int n)\n{\n  char * owned maybe a[8] = undefined;\n" + ALLOC
+    "used_between": "int use(char * maybe p);\nvoid f(int n)\n{\n  char * owned maybe a[8] = undefined;\n" + ALLOC
     + "  for (int k = 0; k < n; k++)\n    use(a[k]);\n  for (int k = 0; k < n; k++)\n    free(a[k]);\n}\n",
 }
 

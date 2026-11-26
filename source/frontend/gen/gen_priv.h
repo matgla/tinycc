@@ -1070,6 +1070,7 @@ int is_compatible_unqualified_types(CType *type1, CType *type2);
 int mark_value_bytes(CType *type, int base, unsigned char *map, int map_size);
 void verify_assign_cast(CType *dt);
 extern int yasc_returning, yasc_argument;
+extern int yasc_argument_c;
 extern int yasc_stmt_bol, yasc_unsafe_expr_line; /* the statement read now begins its line; unsafe(expr)'s line */
 extern int yasc_rbrace_line;                     /* the line of the last compound statement's '}' */
 void yasc_unsafe_line_check(int line);

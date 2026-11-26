@@ -11,11 +11,11 @@
 /* `reset(b, k(i))` emits `PARAM b (reset#0); CALL k; PARAM T (reset#1);
  * CALL reset`.  licm.c fph_yf_call_writes looked for reset's arguments only
  * back to the previous call, missed b, and hoisted `b->data` (b a restrict
- * view parameter) out of the loop although reset replaces it.  The
+ *parameter) out of the loop although reset replaces it.  The
  * arguments are now found by call id wherever they are. */
 #pragma yasc
 
-int printf(const char * view fmt, ...);
+int printf(const char *fmt, ...);
 
 struct B
 {
@@ -32,19 +32,19 @@ __attribute__((noinline)) static int k(int i)
   return (i + 1) & 3;
 }
 
-__attribute__((noinline)) static void reset(inout struct B * view b, int v)
+__attribute__((noinline)) static void reset(inout struct B *b, int v)
 {
   b->data = &pool[v];
   b->n++;
 }
 
-__attribute__((noinline)) static int peek(const struct B * view b, int v)
+__attribute__((noinline)) static int peek(const struct B *b, int v)
 {
   return b->n + v;
 }
 
 /* the argument before the nested call may be written */
-__attribute__((noinline)) static int sum(inout struct B * restrict view b, int n)
+__attribute__((noinline)) static int sum(inout struct B * restrict b, int n)
 {
   int s = 0;
   for (int i = 0; i < n; i++)
@@ -56,7 +56,7 @@ __attribute__((noinline)) static int sum(inout struct B * restrict view b, int n
 }
 
 /* a read-only parameter with a nested call: b->data still hoists, same result */
-__attribute__((noinline)) static int sum_ro(struct B * restrict view b, int n)
+__attribute__((noinline)) static int sum_ro(struct B * restrict b, int n)
 {
   int s = 0;
   for (int i = 0; i < n; i++)

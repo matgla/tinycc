@@ -94,7 +94,7 @@ def test_abstract_and_prototype(tmp_path):
     body = (
         "void p(char * view []);\n"
         "void f(char * view a[]);\n"
-        "void f(char * view * view a)\n{\n  p(a);\n}\n"
+        "void f(char * view *a)\n{\n  p(a);\n}\n"
     )
     assert _diags(tmp_path, body) == []
 
@@ -143,10 +143,10 @@ def test_regular_c_array_param_is_unchecked(tmp_path):
     # a maybe value into a parameter array declared in regular C: unchecked,
     # not a non-maybe view
     header = "void legacy(char *a[]);\n"
-    body = '#include "h.h"\nvoid f(inout char * view * view maybe m)\n{\n  legacy(m);\n}\n'
+    body = '#include "h.h"\nvoid f(inout char * view * maybe m)\n{\n  legacy(m);\n}\n'
     assert _diags(tmp_path, body, header=header) == []
     # and in yasc a non-maybe view parameter does not take one
-    body = "void yasc_fn(char * view a[]);\nvoid f(char * view * view maybe m)\n{\n  yasc_fn(m);\n}\n"
+    body = "void yasc_fn(char * view a[]);\nvoid f(char * view * maybe m)\n{\n  yasc_fn(m);\n}\n"
     assert _diags(tmp_path, body) == [
         (4, "warning", "a pointer that may be null is passed as argument 1 of 'yasc_fn', which is not maybe")
     ]

@@ -22,8 +22,8 @@ Implementation: `source/frontend/gen/decl/method.c`. Tutorial: chapter 7 of
 struct vec
 {
   int x, y;
-  int len2(const struct vec * view self) { return self->x * self->x + self->y * self->y; }
-  void scale(struct vec * view self, int k) { self->x *= k; self->y *= k; }
+  int len2(const struct vec *self) { return self->x * self->x + self->y * self->y; }
+  void scale(struct vec *self, int k) { self->x *= k; self->y *= k; }
   struct vec add(struct vec self, struct vec o) { ... }   /* by value */
   struct vec make(int x, int y) { return (struct vec){x, y}; }   /* no self */
 };

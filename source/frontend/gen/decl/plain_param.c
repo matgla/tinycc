@@ -392,6 +392,13 @@ int yasc_pp_body_begin(Sym *sym)
 {
   int i, j;
   pp_bodies++;
+  if (tcc_state->yasc)
+    for (Sym *p = sym->type.ref->next; p; p = p->next)
+    {
+      Sym *l = (p->v & ~SYM_FIELD) ? sym_find(p->v & ~SYM_FIELD) : NULL;
+      if (l)
+        l->yasc |= YASC_BODY_PARAM;
+    }
   if (!pp_nb)
     return 0;
   for (i = 0; i < pp_nb; i++)

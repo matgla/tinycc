@@ -14,7 +14,7 @@
  * a stale slot.  Past 0xFFFF calls a function takes no facts. */
 #pragma yasc
 
-int printf(const char * view fmt, ...);
+int printf(const char *fmt, ...);
 
 static int nops;
 
@@ -23,12 +23,12 @@ __attribute__((noinline)) static void nop(void)
   nops++;
 }
 
-__attribute__((noinline)) static void fill(inout int * view p)
+__attribute__((noinline)) static void fill(inout int *p)
 {
   *p = 7;
 }
 
-__attribute__((noinline)) static int * borrows(p) keep(inout int * view p)
+__attribute__((noinline)) static int * borrows(p) keep(inout int *p)
 {
   return p;
 }

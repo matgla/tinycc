@@ -57,7 +57,7 @@ VEC = """
 struct vec
 {
   int x, y;
-  int len2(const struct vec * view self) { return self->x * self->x + self->y * self->y; }
+  int len2(const struct vec *self) { return self->x * self->x + self->y * self->y; }
   struct vec make(int x, int y) { return (struct vec){x, y}; }
 };
 """
@@ -100,7 +100,7 @@ def test_method_not_called(tmp_path):
 
 
 def test_field_and_method_share_a_name(tmp_path):
-    proc = _yasc(tmp_path, "struct v { int x; int x(const struct v * view s) { return 0; } };\n")
+    proc = _yasc(tmp_path, "struct v { int x; int x(const struct v *s) { return 0; } };\n")
     assert _error(proc) == "struct v: 'x' is both a field and a method"
 
 
@@ -136,7 +136,7 @@ def test_fields_are_unchanged(tmp_path):
         tmp_path,
         "int g(int a) { return a; }\n"
         "struct v { int x; int (*cb)(int); int arr[2]; unsigned b : 3; struct { int in; } s;"
-        " _Static_assert(1, \"ok\"); int m(const struct v * view self) { return self->cb(self->x); } };\n"
+        " _Static_assert(1, \"ok\"); int m(const struct v *self) { return self->cb(self->x); } };\n"
         "int f(void) { struct v a = { 1, g }; return a.cb(2) + a.m() + (int)sizeof a; }\n",
     )
     assert proc.returncode == 0 and not proc.stderr, proc.stderr
@@ -176,7 +176,7 @@ struct buf
     b->len = n;
     return b;
   }
-  int size(const struct buf * view self) { return self->len; }
+  int size(const struct buf *self) { return self->len; }
   void destroy(drop struct buf * owned self)
   {
     mem_free(self->data);
@@ -236,14 +236,14 @@ export struct pt
 {
   int x, y;
   struct pt make(int x, int y) { return (struct pt){x, y}; }
-  int sum(const struct pt * view self) { return self->x + self->y; }
-  inline int neg(const struct pt * view self) { return -self->x; }
-  static inline int twice(const struct pt * view self) { return 2 * pt__sum(self); }
+  int sum(const struct pt *self) { return self->x + self->y; }
+  inline int neg(const struct pt *self) { return -self->x; }
+  static inline int twice(const struct pt *self) { return 2 * pt__sum(self); }
 };
 struct hidden
 {
   int v;
-  int get(const struct hidden * view self) { return self->v; }
+  int get(const struct hidden *self) { return self->v; }
 };
 export int pts_hidden(int v) { struct hidden h = {v}; return h.get(); }
 """

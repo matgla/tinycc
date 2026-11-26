@@ -1,6 +1,8 @@
 """yasc forbids plain pointers: every '*' says owned or view.
 
-`maybe`, `out` and `drop` combine with either.  The rule covers every place
+But a parameter's own pointer (the last '*' before its name) is a view unless
+it says owned or borrows(...); its inner levels still say it.  `maybe`, `out`
+and `drop` combine with either.  The rule covers every place
 a pointer type is written -- parameters, returns, members, globals, locals,
 typedefs, casts, compound literals, sizeof -- in yasc code only: a regular-C
 header, the expansion of a macro defined in regular C (NULL), and the body of
@@ -27,8 +29,10 @@ ERROR = "plain pointer in yasc: say owned or view"
 PLAIN = {
     "global": "int *p;",
     "member": "struct S { int *m; };",
-    "parameter": "int f(char *s);",
-    "unnamed_parameter": "int f(char *);",
+    "parameter_inner_level": "int f(char **s);",
+    "parameter_array_element": "int f(char *a[]);",
+    "parameter_function": "int f(char *g(int));",
+    "parameter_function_result": "int f(char *(*cb)(int));",
     "return": "char *f(void);",
     "local": "void f(void) { int *p = 0; (void)p; }",
     "cast": "void f(void) { void * view v = (void *)0; (void)v; }",
@@ -46,15 +50,20 @@ ANNOTATED = {
     "view": "int * view p;",
     "view_maybe": "int * view maybe p;",
     "owned_maybe_param": "void release(void * owned maybe p);",
-    "out": "int fill(out int * view n);",
+    "out": "int fill(out int *n);",
     "drop": "void take(drop char * owned p);",
     "levels": "char * view * owned argv_copy;",
-    "abstract": "int f(char * view, int);",
+    "abstract": "int f(char *, int);",
+    "parameter": "int f(char *s);",
+    "parameter_maybe": "int f(char * maybe s);",
+    "parameter_restrict": "int f(char * restrict s, const char * restrict t);",
+    "parameter_inner_said": "int f(char * view *s);",
+    "function_type_parameter": "typedef int cmp(const void *, const void *);",
     "cast": "int f(void) { return (char * view)0 == 0; }",
     "sizeof": "int f(void) { return sizeof(char * owned); }",
     "typedef_use": "typedef char * view str;\nstr s;",
     "function_pointer": "void (*fp)(int);",
-    "function_pointer_param": "void h(void (*cb)(char * view));",
+    "function_pointer_param": "void h(void (*cb)(char *));",
     "function_typedef": "typedef int fn(int);\nfn *f2;",
     "array_decay_and_string": "int f(void) { char b[4] = undefined; char * view p = b; const char * view s = \"x\"; return p != s; }",
     "address_of": "int f(void) { int x = 1; int * view p = &x; return *p; }",
@@ -115,7 +124,7 @@ def test_regular_c_header_and_its_macros(tmp_path, opt):
     body = """\
 #include "h.h"
 #include <stddef.h>
-int f(const char * view s)
+int f(const char *s)
 {
   void * view maybe p = NULL;
   void * view maybe q = MY_NULL;
@@ -165,7 +174,7 @@ def test_regular_c_macro_defines_functions(tmp_path, opt):
 #include "h.h"
 DEFINE(one) { (void)result; reg_one(); }
 DEFINE(two) { (void)result; reg_two(); }
-int first(const char * view s) { return FIRST(s); }"""
+int first(const char *s) { return FIRST(s); }"""
     proc = _compile_strict(tmp_path, body, FN_MACRO_HEADER, opt)
     assert proc.returncode == 0, proc.stderr
     assert [line for line in proc.stderr.splitlines() if "error" in line or "warning" in line] == []
@@ -178,7 +187,7 @@ def test_yasc_after_a_function_macro_is_checked(tmp_path, opt):
     body = """\
 #include "h.h"
 DEFINE(one) { int *p = result; (void)p; reg_one(); }
-int first(const char * view s) { int *q = 0; (void)q; return FIRST(s); }"""
+int first(const char *s) { int *q = 0; (void)q; return FIRST(s); }"""
     proc = _compile_strict(tmp_path, body, FN_MACRO_HEADER, opt)
     assert proc.returncode != 0
     assert f"t.c:2: error: {ERROR}" in proc.stderr and f"t.c:3: error: {ERROR}" in proc.stderr, proc.stderr
@@ -197,7 +206,7 @@ def test_regular_c_pointer_is_unchecked(tmp_path):
     __attribute__((malloc)) -- is believed (test_yasc_ownership.py)."""
     body = """\
 #include "h.h"
-int f(const char * view s)
+int f(const char *s)
 {
   char * view a = unsafe(find(s, 'a'));
   char * view maybe b = unsafe(find(s, 'b'));

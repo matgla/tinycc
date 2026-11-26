@@ -22,17 +22,22 @@ says `#pragma yasc` (or comes from `-iyasc`).
 
 Every `*` says `owned` or `view` (or `borrows(...)`); the word goes **after**
 the `*` it qualifies. `maybe`, `restrict` and `const` combine with either.
+A parameter's own pointer (the last `*` before its name) is the exception: it
+is a `view` unless it says `owned` or `borrows(...)` -- the most a callee can
+do with it is look -- so a parameter writes only what changes hands (`owned`,
+`drop ... owned`), `maybe`, `inout` / `out`. Writing `view` there anyway is
+`-Wredundant-view`. Inner levels, results, members and locals still say it.
 
 | Question | Answer | Write |
 |---|---|---|
 | Who frees it? | this pointer, once | `T * owned p` |
-| | someone else; it does not leave the function | `T * view p` |
+| | someone else; it does not leave the function | `T * view p` (a parameter: `T *p`) |
 | | someone else; it lives as long as `x` | `T * borrows(x) p` (results, members) |
 | Can it be null? | no | (nothing) |
-| | yes: test it before use | `T * view maybe p` |
+| | yes: test it before use | `T * view maybe p` (a parameter: `T * maybe p`) |
 | Can others reach it meanwhile? | yes (shared) | `T * view p` |
 | | no: an exclusive borrow, until its last use | `T * restrict view p` |
-| Can I write through it? | a parameter: no, unless it says so | `T * view p` (in), `inout T * view p`, `out T * view p` |
+| Can I write through it? | a parameter: no, unless it says so | `T *p` (in), `inout T *p`, `out T *p` |
 | | a local or member: yes | `T * view p` |
 | | a local or member: no | `const T * view p` |
 
@@ -49,14 +54,15 @@ Each level says what it is:
 
 ```c
 char * owned * view argv_copy;       /* a view of an array of owned strings */
-void f(char * view args[]);          /* same as char * view * view args */
+void f(char * view args[]);          /* same as char * view *args: the inner level says it */
 void g(char * view args[owned]);     /* C99-style: the brackets qualify that pointer */
 void h(int a[maybe 4]);              /* also [view], [restrict], [const static 2] */
-int main(int argc, const char * view * view argv);  /* in: argv[i] is not reassigned */
+int main(int argc, const char * view *argv);  /* in: argv[i] is not reassigned */
 ```
 
 A string literal, `&x` and an array decaying in an expression are views.
-Function pointers are exempt.
+Function pointers are exempt (they point at code): `int (* view cmp)(...)`
+still says that one is never null.
 
 The null pointer is `nullptr`, and only that: `NULL`, `0` and `(T *)0` used as
 a pointer (stored, passed, returned, compared, in `?:` or an initializer)
@@ -72,7 +78,7 @@ yasc enforces initialization (errors; `unsafe { }` lowers them):
 ```c
 int x;                     /* fine while every path sets it before a read */
 if (c) x = 1; else x = 2;
-int n;   fill(&n);         /* fill(out int * view p): an out parameter sets it */
+int n;   fill(&n);         /* fill(out int *p): an out parameter sets it */
 int m = 0; keep(&m);       /* any other address needs a value first */
 char buf[64] = {};         /* arrays, structs, unions: an initializer ... */
 struct stat st = undefined;  /* ... or `= undefined`: filled later, no code */
@@ -87,12 +93,13 @@ nothing special where a variable `undefined` is in scope.
 
 | Write | Meaning |
 |---|---|
-| `T * view p` / `in T * view p` | the callee only reads `*p` (its target is const: the default) |
-| `inout T * view p` | the callee reads and writes `*p` (a method that changes `self`, `FILE *`, a buffer it appends to) |
-| `out T * view p` | the callee writes `*p` before returning, never reads it first |
-| `out T * borrows(s) * view p` | ... and what it writes there points into `s` (strtol's end): the caller's variable borrows from what it passed for `s` |
+| `T *p` / `in T *p` | the callee only reads `*p` (a view, its target const: the default) |
+| `inout T *p` | the callee reads and writes `*p` (a method that changes `self`, `FILE *`, a buffer it appends to) |
+| `out T *p` | the callee writes `*p` before returning, never reads it first |
+| `out T * borrows(s) *p` | ... and what it writes there points into `s` (strtol's end): the caller's variable borrows from what it passed for `s` |
+| `T * owned p` | the callee takes `p` over and keeps or hands it on |
 | `drop T * owned p` | the callee consumes `p` (frees it or hands it on) |
-| `drop struct S * view self` | the callee frees `self`'s owned fields, not `self` |
+| `drop struct S *self` | the callee frees `self`'s owned fields, not `self` |
 
 ## Moving and borrowing
 
@@ -109,8 +116,8 @@ nothing special where a variable `undefined` is in scope.
 | Write | Meaning |
 |---|---|
 | `T * owned maybe f(...)` | the caller owns the result, null on failure |
-| `T * view f(T * view s)` | borrows from the view parameters (the elision) |
-| `T * borrows(a) f(T * view a, T * view b)` | borrows from `a` only |
+| `T * view f(T *s)` | borrows from the view parameters (the elision) |
+| `T * borrows(a) f(T *a, T *b)` | borrows from `a` only |
 | `const char * borrows(static) name(int e)` | points to static storage |
 | `void * owned maybe takes(p) grow(void * owned p, unsigned n)` | on success the result took over `p`; on null `p` is still yours |
 
@@ -122,11 +129,20 @@ A view result with no view parameter is an error: write `borrows(static)`.
 FILE * owned(fclose) maybe f = fopen(path, "r");    /* released by fclose, not free */
 int owned(close) maybe fd = open(path, O_RDONLY);    /* an int handle; invalid = < 0 */
 int slot_read(int view h);                           /* borrows a handle */
+int n = (int)fd;                                     /* its number: a copy that owns nothing */
 regex_t owned(regfree) re;                           /* an object owned as a whole */
 ```
 
 The wrong deallocator is an error. For a `maybe` handle the tests are `fd < 0`,
 `fd == -1` and `fd >= 0`, not `if (fd)`.
+
+An `int` is a number: it points at nothing, so it is never a view by default.
+A handle goes only where the type says it is one -- `int view fd` (borrowed),
+`int owned(close) fd` (taken), `int view maybe dirfd` (AT_FDCWD or -1 fine).
+Storing one in a plain `int` (a parameter, a local, a member, a global, a
+result) is an error; `(int)fd` takes its number on purpose. A regular-C
+parameter cannot say it: an owned handle goes there as `borrow(fd)` or
+`move(fd)`, a view as it is.
 
 ## Structs
 
@@ -149,7 +165,7 @@ struct stack
 {
   int * owned items;
   int len, cap;
-  int push(inout struct stack * view self, int v) { /* ... */ return 0; }
+  int push(inout struct stack *self, int v) { /* ... */ return 0; }
   void destroy(drop struct stack * owned self) { /* ... */ }
 };
 s->push(10);  st.push(1);  stack.push(&st, 2);   /* all call stack__push */
@@ -214,7 +230,7 @@ checks off.
 
 ```c
 error ParseError { Empty, BadDigit, TooBig };
-!int parse_int(const char * view s);         /* an int or an error */
+!int parse_int(const char *s);                /* an int or an error */
 
 int a = parse_int(s) catch -1;               /* a default */
 int b = parse_int(s) catch |e| { printf("%s\n", error_name(e)); return; };
@@ -289,7 +305,7 @@ import lib.vec;                                  /* instead of #include */
 |---|---|
 | a pointer declared in regular C | `unchecked`: copies, compares, goes back to C freely |
 | unchecked into `owned` / `view` | only with `unsafe(expr)` |
-| owned into a regular-C parameter | `borrow(c)` (lend) or `move(c)` (hand over) |
+| owned into a regular-C parameter | `borrow(c)` (lend) or `move(c)` (hand over); an int handle too |
 | `__attribute__((malloc))` | the result is `owned maybe` |
 | `malloc(dealloc, n)` | `dealloc`'s n-th argument is `owned maybe drop` |
 | `returns_nonnull` | with `malloc`: `owned`, not `maybe` |
@@ -308,6 +324,9 @@ import lib.vec;                                  /* instead of #include */
 | `maybe` into a non-`maybe` | `a pointer that may be null is passed as argument 1` |
 | owned result ignored | `an owned result is discarded` |
 | a view kept | `'s' is a view: it cannot leave the function` |
+| a view parameter freed or kept | `the parameter 'p' owns nothing (a view unless it says owned): write '* owned p' ...` |
+| a handle in a plain int | `a handle is stored in a plain int: where it goes says 'int view' or 'int owned', or (int)fd takes its number` |
+| `view` on a parameter | `a parameter's pointer is a view unless it says owned: drop 'view'` (-Wredundant-view) |
 | a borrow outliving its owner | `'tail' is used after 's', which it borrows from, was freed` |
 | `out` read first | `'*n' is read before it is written` |
 | an `in` parameter written | `assignment of read-only location` / `discards 'const'` |

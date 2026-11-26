@@ -23,9 +23,9 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 
 PRELUDE = """\
 #pragma yasc
-int owned(close) maybe open(const char * view p, int flags);
+int owned(close) maybe open(const char *p, int flags);
 int close(int drop owned(close) fd);
-int read(int view fd, char * view maybe buf, int n);
+int read(int view fd, char * maybe buf, int n);
 int keep_fd(int owned(close) fd);
 int g_fd;
 """

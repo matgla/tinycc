@@ -39,7 +39,7 @@ ERRORS = {
     "array_param": "int f(char * readonly a[4]);\n",
     "brackets": "int f(char * view a[readonly]);\n",
     "nested": "void f(char (* readonly m)[4]);\n",
-    "local": "int f(const char * view s) { char * readonly p = s; return *p; }\n",
+    "local": "int f(const char *s) { char * readonly p = s; return *p; }\n",
     "member": "struct s { char * readonly name; };\n",
     "typedef": "typedef char * readonly str;\n",
 }
@@ -54,7 +54,7 @@ def test_gone(tmp_path, name):
 
 NAMES = {
     "variable": "int readonly = 3;\nint f(void) { return readonly; }\n",
-    "pointer_named": "int g(const char * view s) { const char * view readonly = s; return *readonly; }\n",
+    "pointer_named": "int g(const char *s) { const char * view readonly = s; return *readonly; }\n",
     "plain_named": "char *readonly;\n",
     "array_named": "const char * view readonly[2];\n",
     "times": "int f(int x, int readonly) { return x * readonly; }\n",
@@ -77,7 +77,7 @@ def test_a_name_in_regular_c(tmp_path):
 def test_the_long_spelling(tmp_path):
     """what it said: `const T * view`, and `const` at each level that has it"""
     src = ("#pragma yasc\n"
-           "int main(int argc, const char * view const * view argv) { return argc > 1 && argv[1][0]; }\n"
-           "int n(const char * view s) { const char * view p = s; return *p; }\n")
+           "int main(int argc, const char * view const *argv) { return argc > 1 && argv[1][0]; }\n"
+           "int n(const char *s) { const char * view p = s; return *p; }\n")
     proc = _compile(tmp_path, src, "-Werror")
     assert proc.returncode == 0 and not proc.stderr, proc.stderr

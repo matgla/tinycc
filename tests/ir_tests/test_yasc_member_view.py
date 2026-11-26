@@ -58,7 +58,7 @@ def test_view_member_needs_no_unsafe(tmp_path, opt):
     """The consumer dereferences the view and the checked maybe; the producer
     hands it a local for the call."""
     body = """\
-void consume(const void * view args)
+void consume(const void *args)
 {
   const ctx * view c = (const ctx * view)args;
   *c->result = (long)c->fd;
@@ -66,7 +66,7 @@ void consume(const void * view args)
     *c->opt = 2;
   *c->a = 3;
 }
-int spec(struct spec * view s) { return *s->x + *s->y; }
+int spec(struct spec *s) { return *s->x + *s->y; }
 long produce(void)
 {
   long r = 0, o = 0, a = 0;
@@ -82,10 +82,10 @@ long produce(void)
 @pytest.mark.parametrize(
     "body, message",
     [
-        ("long f(const ctx * view c) { return *c->plain; }", UNCHECKED),
+        ("long f(const ctx *c) { return *c->plain; }", UNCHECKED),
         # the attribute is one declarator's: `*a V, *b` leaves b unchecked
-        ("long f(const ctx * view c) { return *c->b; }", UNCHECKED),
-        ("void f(const ctx * view c) { *c->opt = 1; }", "'c->opt' may be null where it is dereferenced"),
+        ("long f(const ctx *c) { return *c->b; }", UNCHECKED),
+        ("void f(const ctx *c) { *c->opt = 1; }", "'c->opt' may be null where it is dereferenced"),
         ("static ctx g;\nvoid f(void) { long r; g.result = &r; }", "the address of a local variable is stored in global 'g', which outlives 'f'"),
     ],
     ids=["unannotated", "next_declarator", "maybe_unchecked", "local_escapes"],
@@ -98,7 +98,7 @@ def test_view_member_is_checked(tmp_path, body, message, opt):
 
 def test_misplaced_attributes_warn(tmp_path):
     (tmp_path / "w.h").write_text("struct w { int n __attribute__((yasc_view)); long *m __attribute__((yasc_maybe)); };\n")
-    proc = _compile(tmp_path, '#include "w.h"\nint f(struct w * view s) { return s->n; }')
+    proc = _compile(tmp_path, '#include "w.h"\nint f(struct w *s) { return s->n; }')
     assert proc.returncode == 0, proc.stderr
     assert [d.split(": ", 2)[2] for d in _diagnostics(proc)] == [
         "yasc_view on 'n', which is not a pointer: ignored",

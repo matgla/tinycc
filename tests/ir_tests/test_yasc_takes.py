@@ -26,7 +26,7 @@ void free(drop void * owned maybe p);
 void * owned maybe malloc(unsigned n);
 void * owned maybe takes(p) grow(void * owned p, unsigned n);
 void * owned takes(p) wrap(void * owned p);
-int use(void * view p);
+int use(void *p);
 """
 PRELUDE_LINES = PRELUDE.count("\n")
 START = "void f(unsigned n)\n{\n  void * owned maybe p = malloc(4);\n  if (!p)\n    return;\n"
@@ -114,9 +114,9 @@ def test_callee_keeps_it_on_success(tmp_path):
 
 
 ERRORS = {
-    "not_owned_result": ("void * view maybe takes(p) f(void * owned p, char * view s);", "takes(p): the result must be owned"),
+    "not_owned_result": ("void * view maybe takes(p) f(void * owned p, char *s);", "takes(p): the result must be owned"),
     "unknown": ("void * owned takes(x) f(void * owned p);", "takes(x): no parameter is called 'x'"),
-    "view_parameter": ("void * owned takes(p) f(void * view p);", "takes(p): 'p' must be an owned parameter that is not drop"),
+    "view_parameter": ("void * owned takes(p) f(void *p);", "takes(p): 'p' must be an owned parameter that is not drop"),
     "drop_parameter": (
         "void * owned takes(p) f(drop void * owned p);",
         "takes(p): 'p' must be an owned parameter that is not drop",

@@ -12,7 +12,7 @@
 
 error ParseError { Empty, BadDigit, TooBig };
 
-static !int parse_int(const char * view s)
+static !int parse_int(const char *s)
 {
   int v = 0;
   if (!*s)
@@ -29,14 +29,14 @@ static !int parse_int(const char * view s)
 }
 
 /* try: a failure of either parse is this function's failure */
-static !int add(const char * view a, const char * view b)
+static !int add(const char *a, const char *b)
 {
   return try parse_int(a) + try parse_int(b);
 }
 
 /* errdefer runs only when the function fails: the buffer is freed on the
    error paths, and handed to the caller on success. */
-static !char * owned make_label(const char * view num)
+static !char * owned make_label(const char *num)
 {
   int v = try parse_int(num);
   char * owned maybe buf = mem_new(32);

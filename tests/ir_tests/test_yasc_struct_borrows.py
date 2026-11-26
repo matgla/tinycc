@@ -26,8 +26,8 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 PRELUDE = """\
 #pragma yasc
 struct tokenizer borrows(text) { const char * borrows(text) pos; int n; };
-struct tokenizer borrows(src) tok_init(const char * view src);
-struct tokenizer tok_from(const char * view src, int k);
+struct tokenizer borrows(src) tok_init(const char *src);
+struct tokenizer tok_from(const char *src, int k);
 struct tokenizer borrows(static) tok_static(void);
 struct tokenizer borrows(static) g_tok;
 """
@@ -58,7 +58,7 @@ def _diags(tmp_path, body, *flags):
 
 @pytest.mark.parametrize("opt", ["-O0", "-O2"])
 def test_local_value_is_fine(tmp_path, opt):
-    body = "void f(const char * view s)\n{\n  struct tokenizer t = tok_init(s);\n  t.pos = s + 1;\n  (void)t;\n}\n"
+    body = "void f(const char *s)\n{\n  struct tokenizer t = tok_init(s);\n  t.pos = s + 1;\n  (void)t;\n}\n"
     assert _diags(tmp_path, body, opt) == []
 
 
@@ -68,8 +68,8 @@ def test_static_value_into_a_global(tmp_path, opt):
 
 
 STORES = {
-    "global": "void f(const char * view s)\n{\n  g_tok = tok_init(s);\n}\n",
-    "through_a_pointer": "void f(inout struct tokenizer * view o, const char * view s)\n{\n  *o = tok_from(s, 1);\n}\n",
+    "global": "void f(const char *s)\n{\n  g_tok = tok_init(s);\n}\n",
+    "through_a_pointer": "void f(inout struct tokenizer *o, const char *s)\n{\n  *o = tok_from(s, 1);\n}\n",
 }
 
 
@@ -85,7 +85,7 @@ ERRORS = {
         "struct tokenizer h(void);",
         "a 'struct tokenizer' result borrows: write borrows(static), or take a view parameter",
     ),
-    "unknown_parameter": ("struct tokenizer borrows(x) h(const char * view s);", "borrows(x): no parameter is called 'x'"),
+    "unknown_parameter": ("struct tokenizer borrows(x) h(const char *s);", "borrows(x): no parameter is called 'x'"),
     "not_borrowing": ("struct other { int a; };\nstruct other borrows(static) z;", "borrows(...): 'struct other' does not borrow"),
     "definition_needs_names": ("struct bad borrows(static) { int a; };", "a struct borrows from names it is given: borrows(text)"),
 }
@@ -113,19 +113,19 @@ FLOW_PRELUDE = """\
 void free(drop void * owned maybe p);
 void take(char * owned p);
 char * owned make(void);
-struct tokenizer borrows(a, b) tok2(const char * view a, const char * view b);
-int tok_next(inout struct tokenizer * view t);
-int tok_peek(const struct tokenizer * view t);
+struct tokenizer borrows(a, b) tok2(const char *a, const char *b);
+int tok_next(inout struct tokenizer *t);
+int tok_peek(const struct tokenizer *t);
 struct span borrows(t) { const char * borrows(t) p; };
-struct span borrows(src) span_of(const char * view src);
-static inline struct tokenizer borrows(src) tok_lit(const char * view src)
+struct span borrows(src) span_of(const char *src);
+static inline struct tokenizer borrows(src) tok_lit(const char *src)
 {
   struct tokenizer t = undefined;
   t.pos = "x";
   t.n = *src;
   return t;
 }
-static inline struct tokenizer borrows(src) tok_wrap(const char * view src, int c)
+static inline struct tokenizer borrows(src) tok_wrap(const char *src, int c)
 {
   struct tokenizer t = tok_init(src);
   if (c)
@@ -218,7 +218,7 @@ FLOW_CLEAN = {
     "  free(b);\n  return r;\n}\n",
     "borrowed_again": "int f(void)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(b);\n  free(b);\n"
     "  b = make();\n  t = tok_init(b);\n  int r = *t.pos;\n  free(b);\n  return r;\n}\n",
-    "member_repointed": "int f(const char * view s)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(b);\n"
+    "member_repointed": "int f(const char *s)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(b);\n"
     "  free(b);\n  t.pos = s;\n  return *t.pos;\n}\n",
     "other_member_read": "int f(void)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(b);\n  free(b);\n"
     "  return t.n;\n}\n",
@@ -232,7 +232,7 @@ FLOW_CLEAN = {
     "  return *t.pos;\n}\n",
     "in_a_loop": "int f(int n)\n{\n  char * owned b = make();\n  int r = 0;\n  for (int i = 0; i < n; i++)\n  {\n"
     "    struct tokenizer t = tok_init(b);\n    r += *t.pos;\n  }\n  free(b);\n  return r;\n}\n",
-    "view_source": "int f(const char * view s)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(s);\n"
+    "view_source": "int f(const char *s)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(s);\n"
     "  free(b);\n  return *t.pos;\n}\n",
 }
 

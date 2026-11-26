@@ -14,15 +14,15 @@
  * itself is no candidate. */
 #pragma yasc
 
-int printf(const char * view fmt, ...);
+int printf(const char *fmt, ...);
 
-__attribute__((noinline)) static int f(inout int * view p)
+__attribute__((noinline)) static int f(inout int *p)
 {
   *p = 1;
   return 2;
 }
 
-__attribute__((noinline)) static int set(inout int * view p, int v)
+__attribute__((noinline)) static int set(inout int *p, int v)
 {
   *p = v;
   return v + 100;

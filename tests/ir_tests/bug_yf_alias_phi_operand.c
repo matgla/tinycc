@@ -15,7 +15,7 @@
  * derive from their operands. */
 #pragma yasc
 
-int printf(const char * view fmt, ...);
+int printf(const char *fmt, ...);
 void * owned maybe malloc(unsigned long n);
 void free(drop void * owned maybe p);
 
@@ -26,7 +26,7 @@ __attribute__((noinline)) static void note(int k)
 }
 
 /* q = c ? p : o, then a store through q between two reads of *p */
-__attribute__((noinline)) static int join(inout int * restrict view p, inout int * view o, int c)
+__attribute__((noinline)) static int join(inout int * restrict p, inout int *o, int c)
 {
   int * view q;
   if (c)
@@ -45,7 +45,7 @@ __attribute__((noinline)) static int join(inout int * restrict view p, inout int
 }
 
 /* the same with an owned call result as the root */
-__attribute__((noinline)) static int join_owned(inout int * view o, int c, int k)
+__attribute__((noinline)) static int join_owned(inout int *o, int c, int k)
 {
   int * owned maybe r = malloc(16);
   if (!r)
@@ -64,7 +64,7 @@ __attribute__((noinline)) static int join_owned(inout int * view o, int c, int k
 }
 
 /* a loop-carried copy: q = phi(p, q + 1) */
-__attribute__((noinline)) static int carried(inout int * restrict view p, int n)
+__attribute__((noinline)) static int carried(inout int * restrict p, int n)
 {
   int * view q = p;
   int s = 0;

@@ -28,7 +28,7 @@ PRELUDE = """\
 #pragma yasc
 void * owned malloc(unsigned n);
 void free(drop void * owned maybe p);
-int use(char * view p);
+int use(char *p);
 int sink(int x);
 void take(char * owned p);
 void (*take_fp)(char * owned p);
@@ -164,7 +164,7 @@ def test_break_and_continue_end_the_body_scope(tmp_path):
 
 
 def test_use_after_move_into_owned_member(tmp_path):
-    body = "struct box { char * owned p; };\nvoid f(inout struct box * view b, char * owned p)\n{\n  b->p = move(p);\n  free(p);\n}\n"
+    body = "struct box { char * owned p; };\nvoid f(inout struct box *b, char * owned p)\n{\n  b->p = move(p);\n  free(p);\n}\n"
     assert _check(tmp_path, body) == [
         (5, "warning", "'p' is used after it was moved"),
         (4, "note", "'p' was moved here"),
@@ -202,17 +202,17 @@ CLEAN = {
     "    break;\n  default:\n    use(p);\n  }\n  free(p);\n}\n",
     "borrowed_copy": "void f(char * owned p)\n{\n  char * view q = p;\n  use(q);\n  free(p);\n}\n",
     # an owned out-parameter: p owns what get left there (test_yasc_outparams.py)
-    "address_taken": "void get(char * owned * view pp);\nvoid f(void)\n{\n  char * owned p = undefined;\n  get(&p);\n"
+    "address_taken": "void get(char * owned *pp);\nvoid f(void)\n{\n  char * owned p = undefined;\n  get(&p);\n"
     "  use(p);\n  free(p);\n}\n",
     "noreturn": "_Noreturn void die(void);\nvoid f(char * owned p)\n{\n  if (!use(p))\n    die();\n"
     "  free(p);\n}\n",
     # a store into an owned member moves (vstore notes it: lifetime.c)
-    "into_owned_member": "struct box { char * owned p; };\nvoid f(inout struct box * view b, char * owned p)\n{\n"
+    "into_owned_member": "struct box { char * owned p; };\nvoid f(inout struct box *b, char * owned p)\n{\n"
     "  b->p = move(p);\n}\n",
     # a store into a view member only borrows
     # a view of p kept in *b while p moves on (freeing p there is
     # test_yasc_view.py's: the view outlives it)
-    "into_view_member": "struct pin { char * view p; };\nvoid f(inout struct pin * view b, char * owned p)\n{\n"
+    "into_view_member": "struct pin { char * view p; };\nvoid f(inout struct pin *b, char * owned p)\n{\n"
     "  b->p = p;\n  take(move(p));\n}\n",
     # returned through an error union: the payload is owned
     "returned_in_error_union": "!char * owned make_errunion(int x)\n{\n  char * owned p = malloc(1);\n"
@@ -241,7 +241,7 @@ static char * owned make(int n)
   return p;
 }
 
-static int borrow(char * view p)
+static int borrow(char *p)
 {
   return use(p) + 1;
 }
@@ -381,8 +381,8 @@ def _maybe(tmp_path, body, *flags):
 
 
 MAYBE_BAD = {
-    "member": ("int f(struct node * view maybe p)\n{\n  return p->v;\n}\n", 3, "'p' may be null where it is dereferenced"),
-    "index": ("int f(char * view maybe s, int i)\n{\n  return s[i];\n}\n", 3, "'s' may be null where it is dereferenced"),
+    "member": ("int f(struct node * maybe p)\n{\n  return p->v;\n}\n", 3, "'p' may be null where it is dereferenced"),
+    "index": ("int f(char * maybe s, int i)\n{\n  return s[i];\n}\n", 3, "'s' may be null where it is dereferenced"),
     "store": (
         "void f(int k)\n{\n  struct node * view maybe q = find(k);\n  q->v = 1;\n}\n",
         4,
@@ -390,7 +390,7 @@ MAYBE_BAD = {
     ),
     "null": ("int f(void)\n{\n  struct node * view maybe q = 0;\n  return q->v;\n}\n", 4, "'q' is null where it is dereferenced"),
     "tested_on_one_path": (
-        "int f(struct node * view maybe p, int x)\n{\n  if (x && p)\n    x = 1;\n  return p->v;\n}\n",
+        "int f(struct node * maybe p, int x)\n{\n  if (x && p)\n    x = 1;\n  return p->v;\n}\n",
         5,
         "'p' may be null where it is dereferenced",
     ),
@@ -416,14 +416,14 @@ MAYBE_BAD = {
     ),
     # values followed across blocks: the pointer is read before the branch
     # of `?:` and dereferenced after it, or the arms meet in a temp
-    "ternary_untested": ("int f(struct node * view maybe p, int c)\n{\n  return c ? p->v : 0;\n}\n", 3, "'p' may be null where it is dereferenced"),
+    "ternary_untested": ("int f(struct node * maybe p, int c)\n{\n  return c ? p->v : 0;\n}\n", 3, "'p' may be null where it is dereferenced"),
     "store_before_ternary": (
-        "void f(inout struct node * view maybe p, int c)\n{\n  p->v = c ? 1 : 2;\n}\n",
+        "void f(inout struct node * maybe p, int c)\n{\n  p->v = c ? 1 : 2;\n}\n",
         3,
         "'p' may be null where it is dereferenced",
     ),
     "ternary_join_stored": (
-        "int f(inout struct node * view maybe p, int c)\n{\n  struct node * view x = c ? p : must(1);\n  return x->v;\n}\n",
+        "int f(inout struct node * maybe p, int c)\n{\n  struct node * view x = c ? p : must(1);\n  return x->v;\n}\n",
         3,
         "a pointer that may be null is stored in 'x', which is not maybe",
     ),
@@ -433,7 +433,7 @@ MAYBE_BAD = {
         "a pointer that may be null is returned from 'f', whose result is not maybe",
     ),
     "switch_value": (
-        "int f(struct node * view maybe p)\n{\n  switch (p->v)\n  {\n  case 1:\n    return 2;\n  }\n  return 0;\n}\n",
+        "int f(struct node * maybe p)\n{\n  switch (p->v)\n  {\n  case 1:\n    return 2;\n  }\n  return 0;\n}\n",
         3,
         "'p' may be null where it is dereferenced",
     ),
@@ -447,24 +447,24 @@ def test_maybe_reported(tmp_path, name):
 
 
 MAYBE_CLEAN = {
-    "if_set": "int f(struct node * view maybe p)\n{\n  if (p)\n    return p->v;\n  return 0;\n}\n",
-    "early_return": "int f(struct node * view maybe p)\n{\n  if (!p)\n    return 0;\n  return p->v;\n}\n",
-    "and_chain": "int f(struct node * view maybe p)\n{\n  return p != 0 && p->v;\n}\n",
-    "noreturn": "int f(struct node * view maybe p)\n{\n  if (!p)\n    die();\n  return p->v;\n}\n",
+    "if_set": "int f(struct node * maybe p)\n{\n  if (p)\n    return p->v;\n  return 0;\n}\n",
+    "early_return": "int f(struct node * maybe p)\n{\n  if (!p)\n    return 0;\n  return p->v;\n}\n",
+    "and_chain": "int f(struct node * maybe p)\n{\n  return p != 0 && p->v;\n}\n",
+    "noreturn": "int f(struct node * maybe p)\n{\n  if (!p)\n    die();\n  return p->v;\n}\n",
     "refilled": "int f(int k)\n{\n  struct node * view maybe q = find(k);\n  if (!q)\n    q = must(k);\n"
     "  return q->v;\n}\n",
-    "plain_parameter": "int f(struct node * view p)\n{\n  return p->v;\n}\n",
+    "plain_parameter": "int f(struct node *p)\n{\n  return p->v;\n}\n",
     "maybe_result": "struct node * borrows(static) maybe f(int k)\n{\n  return find(k);\n}\n",
-    "list_walk": "int f(struct node * view maybe p)\n{\n  int n = 0;\n  while (p)\n  {\n    n += p->v;\n"
+    "list_walk": "int f(struct node * maybe p)\n{\n  int n = 0;\n  while (p)\n  {\n    n += p->v;\n"
     "    p = p->next;\n  }\n  return n;\n}\n",
     "tested_return": "struct node * borrows(static) f(int k)\n{\n  struct node * view maybe q = find(k);\n  if (q)\n    return q;\n"
     "  return must(k);\n}\n",
-    "ternary": "int f(struct node * view maybe p)\n{\n  return p ? p->v : 0;\n}\n",
-    "tested_before_ternary": "int f(struct node * view maybe p, int c)\n{\n  if (!p)\n    return 0;\n"
+    "ternary": "int f(struct node * maybe p)\n{\n  return p ? p->v : 0;\n}\n",
+    "tested_before_ternary": "int f(struct node * maybe p, int c)\n{\n  if (!p)\n    return 0;\n"
     "  return c ? p->v : 0;\n}\n",
-    "ternary_join_tested": "int f(inout struct node * view maybe p, int c)\n{\n  struct node * view maybe x = c ? p : 0;\n"
+    "ternary_join_tested": "int f(inout struct node * maybe p, int c)\n{\n  struct node * view maybe x = c ? p : 0;\n"
     "  return x ? x->v : 0;\n}\n",
-    "ternary_join_set": "int f(inout struct node * view maybe p, int c)\n{\n  if (!p)\n    return 0;\n"
+    "ternary_join_set": "int f(inout struct node * maybe p, int c)\n{\n  if (!p)\n    return 0;\n"
     "  struct node * view x = c ? p : must(1);\n  return x->v;\n}\n",
 }
 
@@ -492,8 +492,8 @@ def test_maybe_same_at_every_level(tmp_path, opt):
 
 OUT_PRELUDE = """\
 struct S { int a, b; };
-int fill(out struct S * view s);
-void zero(inout struct S * view s);
+int fill(out struct S *s);
+void zero(inout struct S *s);
 """
 
 
@@ -503,19 +503,19 @@ def _out(tmp_path, body, *flags):
 
 OUT_BAD = {
     "not_on_one_path": (
-        "int f(out struct S * view s, int x)\n{\n  if (x)\n    return -1;\n  s->a = 1;\n  return 0;\n}\n",
+        "int f(out struct S *s, int x)\n{\n  if (x)\n    return -1;\n  s->a = 1;\n  return 0;\n}\n",
         4,
         "'*s' is not written when 'f' returns",
     ),
-    "read_first": ("int f(out int * view n)\n{\n  return *n;\n}\n", 3, "'*n' is read before it is written"),
-    "never": ("void f(out int * view n)\n{\n}\n", 3, "'*n' is not written when 'f' returns"),
+    "read_first": ("int f(out int *n)\n{\n  return *n;\n}\n", 3, "'*n' is read before it is written"),
+    "never": ("void f(out int *n)\n{\n}\n", 3, "'*n' is not written when 'f' returns"),
     "maybe_read_first": (
-        "int f(out int * view n, int x)\n{\n  if (x)\n    *n = 1;\n  return *n;\n}\n",
+        "int f(out int *n, int x)\n{\n  if (x)\n    *n = 1;\n  return *n;\n}\n",
         5,
         "'*n' may be read before it is written",
     ),
     "falls_off_the_end": (
-        "void f(out int * view n, int x)\n{\n  if (x)\n    *n = 1;\n}\n",
+        "void f(out int *n, int x)\n{\n  if (x)\n    *n = 1;\n}\n",
         5,
         # the false edge leaves the function by itself: on that path it is not
         "'*n' is not written when 'f' returns",
@@ -530,12 +530,12 @@ def test_out_reported(tmp_path, name):
 
 
 OUT_CLEAN = {
-    "members": "int f(out struct S * view s)\n{\n  s->a = 1;\n  s->b = 2;\n  return s->a;\n}\n",
-    "whole": "int f(out struct S * view s)\n{\n  *s = (struct S){1, 2};\n  return 0;\n}\n",
-    "out_callee": "int f(out struct S * view s)\n{\n  return fill(s);\n}\n",
-    "handed_on": "void f(out struct S * view s)\n{\n  zero(s);\n}\n",
-    "maybe_null": "void f(out int * view maybe n)\n{\n  if (n)\n    *n = 0;\n}\n",
-    "every_path": "int f(out int * view n, int x)\n{\n  if (x)\n  {\n    *n = 1;\n    return 1;\n  }\n  *n = 0;\n"
+    "members": "int f(out struct S *s)\n{\n  s->a = 1;\n  s->b = 2;\n  return s->a;\n}\n",
+    "whole": "int f(out struct S *s)\n{\n  *s = (struct S){1, 2};\n  return 0;\n}\n",
+    "out_callee": "int f(out struct S *s)\n{\n  return fill(s);\n}\n",
+    "handed_on": "void f(out struct S *s)\n{\n  zero(s);\n}\n",
+    "maybe_null": "void f(out int * maybe n)\n{\n  if (n)\n    *n = 0;\n}\n",
+    "every_path": "int f(out int *n, int x)\n{\n  if (x)\n  {\n    *n = 1;\n    return 1;\n  }\n  *n = 0;\n"
     "  return 0;\n}\n",
 }
 
@@ -569,11 +569,11 @@ def test_empty_body_owned_parameter(tmp_path):
 ARG_PRELUDE = """\
 struct node { int v; };
 struct node * borrows(static) maybe find(int k);
-int takes(struct node * view n);
-int takes_maybe(struct node * view maybe n);
-static int peek(struct node * view n) { return n->v; }
-int (*takes_fp)(struct node * view n);
-static int wrap(struct node * view maybe q) { return takes(q); }
+int takes(struct node *n);
+int takes_maybe(struct node * maybe n);
+static int peek(struct node *n) { return n->v; }
+int (*takes_fp)(struct node *n);
+static int wrap(struct node * maybe q) { return takes(q); }
 """
 
 ARG_BAD = {
@@ -639,21 +639,21 @@ int some(struct node *a, struct node *b);
 
 NONNULL_BAD = {
     "call_result": (
-        "int f(inout struct node * view d, int k)\n{\n  return cpy(d, find(k));\n}\n",
+        "int f(inout struct node *d, int k)\n{\n  return cpy(d, find(k));\n}\n",
         [(3, "warning", "a pointer that may be null is passed as argument 2 of 'cpy', which is declared nonnull")],
     ),
     "all_parameters": (
-        "int f(inout struct node * view d, int k)\n{\n  struct node * view maybe q = find(k);\n  return all(d, q);\n}\n",
+        "int f(inout struct node *d, int k)\n{\n  struct node * view maybe q = find(k);\n  return all(d, q);\n}\n",
         [(4, "warning", "a pointer that may be null is passed as argument 2 of 'all', which is declared nonnull")],
     ),
     "null_constant_once": (
-        "int f(inout struct node * view d)\n{\n  return cpy(d, 0);\n}\n",
+        "int f(inout struct node *d)\n{\n  return cpy(d, 0);\n}\n",
         [(3, "warning", "null passed as argument 2, which is declared nonnull")],
     ),
 }
 
 NONNULL_CLEAN = {
-    "tested": "int f(inout struct node * view d, int k)\n{\n  struct node * view maybe q = find(k);\n  return q ? cpy(d, q) : 0;\n}\n",
+    "tested": "int f(inout struct node *d, int k)\n{\n  struct node * view maybe q = find(k);\n  return q ? cpy(d, q) : 0;\n}\n",
     "not_nonnull": "int f(int k)\n{\n  return some(find(k), 0);\n}\n",
 }
 
@@ -693,7 +693,7 @@ def test_wrap_reports_once(tmp_path):
 # followed per owner (test_lifetime_paths.py owners_*).
 
 BORROW_PRELUDE = (
-    "char * owned make(void);\nchar * borrows(s) maybe find(char * view s, int c);\nchar * borrows(s) first(char * view s);\n"
+    "char * owned make(void);\nchar * borrows(s) maybe find(char *s, int c);\nchar * borrows(s) first(char *s);\n"
 )
 
 BORROW_BAD = {
@@ -727,18 +727,18 @@ BORROW_BAD = {
     ),
     # an inlined call (-O1+) borrows what the callee's declared result says
     "through_inline": (
-        "static inline char * view next(inout char * view s)\n{\n  return s + 1;\n}\n"
+        "static inline char * view next(inout char *s)\n{\n  return s + 1;\n}\n"
         "int f(void)\n{\n  char * owned p = make();\n  char * view v = next(p);\n  free(p);\n  return use(v);\n}\n",
         [(10, "warning", "'v' is used after 'p', which it borrows from, was freed"), (9, "note", "'p' was freed here")],
     ),
     "through_inline_borrows": (
-        "static inline char * borrows(s) maybe at(inout char * view s, int k)\n{\n  return k ? s + k : 0;\n}\n"
+        "static inline char * borrows(s) maybe at(inout char *s, int k)\n{\n  return k ? s + k : 0;\n}\n"
         "int f(int k)\n{\n  char * owned p = make();\n  char * view maybe v = at(p, k);\n  take(move(p));\n"
         "  return v ? *v : 0;\n}\n",
         [(10, "warning", "'v' is used after 'p', which it borrows from, was moved"), (9, "note", "'p' was moved here")],
     ),
     "through_nested_inline": (
-        "static inline char * view next(inout char * view s)\n{\n  return s + 1;\n}\n"
+        "static inline char * view next(inout char *s)\n{\n  return s + 1;\n}\n"
         "int f(void)\n{\n  char * owned p = make();\n  char * view v = next(next(p));\n  free(p);\n  return *v;\n}\n",
         [(10, "warning", "'v' is used after 'p', which it borrows from, was freed"), (9, "note", "'p' was freed here")],
     ),
@@ -749,16 +749,16 @@ BORROW_CLEAN = {
     "  return r;\n}\n",
     "borrowed_again": "int f(void)\n{\n  char * owned p = make();\n  char * view v = p;\n  free(p);\n  p = make();\n"
     "  v = p;\n  int r = use(v);\n  free(p);\n  return r;\n}\n",
-    "assigned_elsewhere": "int f(inout char * view s)\n{\n  char * owned p = make();\n  char * view v = p;\n  free(p);\n"
+    "assigned_elsewhere": "int f(inout char *s)\n{\n  char * owned p = make();\n  char * view v = p;\n  free(p);\n"
     "  v = s;\n  return use(v);\n}\n",
     "through_call_used_before": "int f(void)\n{\n  char * owned p = make();\n  char * view v = first(p);\n"
     "  int r = *v;\n  free(p);\n  return r;\n}\n",
-    "through_inline_used_before": "static inline char * view next(inout char * view s)\n{\n  return s + 1;\n}\n"
+    "through_inline_used_before": "static inline char * view next(inout char *s)\n{\n  return s + 1;\n}\n"
     "int f(void)\n{\n  char * owned p = make();\n  char * view v = next(p);\n  int r = *v;\n  free(p);\n"
     "  return r;\n}\n",
-    "through_inline_of_a_view": "static inline char * view next(inout char * view s)\n{\n  return s + 1;\n}\n"
-    "int f(inout char * view s)\n{\n  char * owned p = make();\n  char * view v = next(s);\n  free(p);\n  return *v;\n}\n",
-    "through_call_of_a_view": "int f(char * view s)\n{\n  char * owned p = make();\n  char * view v = first(s);\n"
+    "through_inline_of_a_view": "static inline char * view next(inout char *s)\n{\n  return s + 1;\n}\n"
+    "int f(inout char *s)\n{\n  char * owned p = make();\n  char * view v = next(s);\n  free(p);\n  return *v;\n}\n",
+    "through_call_of_a_view": "int f(char *s)\n{\n  char * owned p = make();\n  char * view v = first(s);\n"
     "  free(p);\n  return *v;\n}\n",
 }
 
@@ -796,16 +796,16 @@ MEMBER_PRELUDE = """\
 struct node { int v; struct node * view maybe next; };
 struct list { struct list * view maybe next; int v; };
 struct node * borrows(static) must(int k);
-void update(inout struct node * view n);
-void show(const struct node * view n);
-int both(inout struct node * view n, int x);
-void set_next(inout struct node * view maybe * view pp);
+void update(inout struct node *n);
+void show(const struct node *n);
+int both(inout struct node *n, int x);
+void set_next(inout struct node * view maybe *pp);
 int vsum(int n, ...);
-static inline void clear_next(inout struct node * view n)
+static inline void clear_next(inout struct node *n)
 {
   n->next = 0;
 }
-static inline int peek(const struct node * view n)
+static inline int peek(const struct node *n)
 {
   return n->v;
 }
@@ -820,96 +820,96 @@ def _member(tmp_path, body, *flags):
 MEMBER_BAD = {
     # r may point to the same node: the store forgets q->next too (strict lifetimes)
     "store_elsewhere": (
-        "int f(struct node * view q, inout struct node * view r)\n{\n  if (!q->next)\n    return 0;\n"
+        "int f(struct node *q, inout struct node *r)\n{\n  if (!q->next)\n    return 0;\n"
         "  r->next = 0;\n  return q->next->v;\n}\n",
         6,
         "'q->next' may be null where it is dereferenced",
     ),
-    "untested": ("int f(struct node * view q)\n{\n  return q->next->v;\n}\n", 3, "'q->next' may be null where it is dereferenced"),
-    "ternary_untested": ("int f(struct node * view q, int c)\n{\n  return c ? q->next->v : 0;\n}\n", 3, "'q->next' may be null where it is dereferenced"),
+    "untested": ("int f(struct node *q)\n{\n  return q->next->v;\n}\n", 3, "'q->next' may be null where it is dereferenced"),
+    "ternary_untested": ("int f(struct node *q, int c)\n{\n  return c ? q->next->v : 0;\n}\n", 3, "'q->next' may be null where it is dereferenced"),
     "copy_then_member_changed": (
-        "int f(inout struct node * view q)\n{\n  struct node * view maybe n = q->next;\n  q->next = 0;\n  if (n)\n"
+        "int f(inout struct node *q)\n{\n  struct node * view maybe n = q->next;\n  q->next = 0;\n  if (n)\n"
         "    return q->next->v;\n  return 0;\n}\n",
         6,
         "'q->next' is null where it is dereferenced",
     ),
     "copy_reassigned": (
-        "int f(struct node * view q, int c)\n{\n  struct node * view maybe n = q->next;\n  if (c)\n    n = must(1);\n"
+        "int f(struct node *q, int c)\n{\n  struct node * view maybe n = q->next;\n  if (c)\n    n = must(1);\n"
         "  if (n)\n    return q->next->v;\n  return 0;\n}\n",
         7,
         "'q->next' may be null where it is dereferenced",
     ),
     "copy_then_call": (
-        "int f(inout struct node * view q)\n{\n  struct node * view maybe n = q->next;\n  update(q);\n  if (!n)\n"
+        "int f(inout struct node *q)\n{\n  struct node * view maybe n = q->next;\n  update(q);\n  if (!n)\n"
         "    return 0;\n  return q->next->v;\n}\n",
         7,
         "'q->next' may be null where it is dereferenced",
     ),
-    "first_member": ("int f(struct list * view q)\n{\n  return q->next->v;\n}\n", 3, "'q->next' may be null where it is dereferenced"),
-    "through_dot": ("int f(struct node * view q)\n{\n  return (*q).next->v;\n}\n", 3, "'q->next' may be null where it is dereferenced"),
+    "first_member": ("int f(struct list *q)\n{\n  return q->next->v;\n}\n", 3, "'q->next' may be null where it is dereferenced"),
+    "through_dot": ("int f(struct node *q)\n{\n  return (*q).next->v;\n}\n", 3, "'q->next' may be null where it is dereferenced"),
     "store_through": (
-        "void f(struct node * view q)\n{\n  q->next->v = 1;\n}\n",
+        "void f(struct node *q)\n{\n  q->next->v = 1;\n}\n",
         3,
         "'q->next' may be null where it is dereferenced",
     ),
     "stored_null": (
-        "int f(inout struct node * view q)\n{\n  if (!q->next)\n    return 0;\n  q->next = 0;\n  return q->next->v;\n}\n",
+        "int f(inout struct node *q)\n{\n  if (!q->next)\n    return 0;\n  q->next = 0;\n  return q->next->v;\n}\n",
         6,
         "'q->next' is null where it is dereferenced",
     ),
     "tested_on_one_path": (
-        "int f(struct node * view q, int x)\n{\n  if (x && q->next)\n    x = 1;\n  return q->next->v;\n}\n",
+        "int f(struct node *q, int x)\n{\n  if (x && q->next)\n    x = 1;\n  return q->next->v;\n}\n",
         5,
         "'q->next' may be null where it is dereferenced",
     ),
     "call_forgets": (
-        "int f(inout struct node * view q)\n{\n  if (!q->next)\n    return 0;\n  update(q);\n  return q->next->v;\n}\n",
+        "int f(inout struct node *q)\n{\n  if (!q->next)\n    return 0;\n  update(q);\n  return q->next->v;\n}\n",
         6,
         "'q->next' may be null where it is dereferenced",
     ),
     "varargs_call_forgets": (
-        "int f(inout struct node * view q)\n{\n  if (!q->next)\n    return 0;\n  vsum(1, q);\n  return q->next->v;\n}\n",
+        "int f(inout struct node *q)\n{\n  if (!q->next)\n    return 0;\n  vsum(1, q);\n  return q->next->v;\n}\n",
         6,
         "'q->next' may be null where it is dereferenced",
     ),
     "address_passed": (
-        "int f(inout struct node * view q)\n{\n  if (!q->next)\n    return 0;\n  set_next(&q->next);\n  return q->next->v;\n}\n",
+        "int f(inout struct node *q)\n{\n  if (!q->next)\n    return 0;\n  set_next(&q->next);\n  return q->next->v;\n}\n",
         6,
         "'q->next' may be null where it is dereferenced",
     ),
     "inlined_call_forgets": (
-        "int f(inout struct node * view q)\n{\n  if (!q->next)\n    return 0;\n  clear_next(q);\n  return q->next->v;\n}\n",
+        "int f(inout struct node *q)\n{\n  if (!q->next)\n    return 0;\n  clear_next(q);\n  return q->next->v;\n}\n",
         6,
         "'q->next' may be null where it is dereferenced",
     ),
     "base_assigned": (
-        "int f(struct node * view q, struct node * view r)\n{\n  if (!q->next)\n    return 0;\n  q = r;\n"
+        "int f(struct node *q, struct node *r)\n{\n  if (!q->next)\n    return 0;\n  q = r;\n"
         "  return q->next->v;\n}\n",
         6,
         "'q->next' may be null where it is dereferenced",
     ),
     "other_base": (
-        "int f(struct node * view q, struct node * view r)\n{\n  if (q->next)\n    return r->next->v;\n  return 0;\n}\n",
+        "int f(struct node *q, struct node *r)\n{\n  if (q->next)\n    return r->next->v;\n  return 0;\n}\n",
         4,
         "'r->next' may be null where it is dereferenced",
     ),
     "two_levels": (
-        "int f(struct node * view q)\n{\n  if (!q->next)\n    return 0;\n  return q->next->next->v;\n}\n",
+        "int f(struct node *q)\n{\n  if (!q->next)\n    return 0;\n  return q->next->next->v;\n}\n",
         5,
         "'q->next->next' may be null where it is dereferenced",
     ),
     "returned": (
-        "struct node * view f(struct node * view q)\n{\n  return q->next;\n}\n",
+        "struct node * view f(struct node *q)\n{\n  return q->next;\n}\n",
         3,
         "a pointer that may be null is returned from 'f', whose result is not maybe",
     ),
     "stored_in_plain": (
-        "int f(struct node * view q)\n{\n  struct node * view n = q->next;\n  return n->v;\n}\n",
+        "int f(struct node *q)\n{\n  struct node * view n = q->next;\n  return n->v;\n}\n",
         3,
         "a pointer that may be null is stored in 'n', which is not maybe",
     ),
     "reported_once": (
-        "int f(struct node * view q)\n{\n  return q->next->v + q->next->v;\n}\n",
+        "int f(struct node *q)\n{\n  return q->next->v + q->next->v;\n}\n",
         3,
         "'q->next' may be null where it is dereferenced",
     ),
@@ -924,35 +924,35 @@ def test_member_reported(tmp_path, name, opt):
 
 
 MEMBER_CLEAN = {
-    "if_set": "int f(struct node * view q)\n{\n  if (q->next)\n    return q->next->v;\n  return 0;\n}\n",
-    "first_member": "int f(struct list * view q)\n{\n  if (q->next)\n    return q->next->v;\n  return 0;\n}\n",
-    "early_return": "int f(struct node * view q)\n{\n  if (!q->next)\n    return 0;\n  return q->next->v;\n}\n",
-    "compare_null": "int f(struct node * view q)\n{\n  if (q->next != 0)\n    return q->next->v;\n  return 0;\n}\n",
-    "and_chain": "int f(struct node * view q)\n{\n  return q->next && q->next->v;\n}\n",
-    "ternary": "int f(struct node * view q)\n{\n  return q->next ? q->next->v : 0;\n}\n",
-    "walk_to_last": "int f(struct node * view n)\n{\n  while (n->next)\n    n = n->next;\n  return n->v;\n}\n",
-    "for_walk": "int f(inout struct node * view h)\n{\n  int s = 0;\n  for (struct node * view n = h; n->next; n = n->next)\n"
+    "if_set": "int f(struct node *q)\n{\n  if (q->next)\n    return q->next->v;\n  return 0;\n}\n",
+    "first_member": "int f(struct list *q)\n{\n  if (q->next)\n    return q->next->v;\n  return 0;\n}\n",
+    "early_return": "int f(struct node *q)\n{\n  if (!q->next)\n    return 0;\n  return q->next->v;\n}\n",
+    "compare_null": "int f(struct node *q)\n{\n  if (q->next != 0)\n    return q->next->v;\n  return 0;\n}\n",
+    "and_chain": "int f(struct node *q)\n{\n  return q->next && q->next->v;\n}\n",
+    "ternary": "int f(struct node *q)\n{\n  return q->next ? q->next->v : 0;\n}\n",
+    "walk_to_last": "int f(struct node *n)\n{\n  while (n->next)\n    n = n->next;\n  return n->v;\n}\n",
+    "for_walk": "int f(inout struct node *h)\n{\n  int s = 0;\n  for (struct node * view n = h; n->next; n = n->next)\n"
     "    s += n->next->v;\n  return s;\n}\n",
-    "const_view_call": "int f(struct node * view q)\n{\n  if (!q->next)\n    return 0;\n  show(q);\n  return q->next->v;\n}\n",
-    "inlined_const_view": "int f(struct node * view q)\n{\n  if (!q->next)\n    return 0;\n  peek(q);\n"
+    "const_view_call": "int f(struct node *q)\n{\n  if (!q->next)\n    return 0;\n  show(q);\n  return q->next->v;\n}\n",
+    "inlined_const_view": "int f(struct node *q)\n{\n  if (!q->next)\n    return 0;\n  peek(q);\n"
     "  return q->next->v;\n}\n",
-    "argument_read_before_call": "int f(inout struct node * view q)\n{\n  if (!q->next)\n    return 0;\n"
+    "argument_read_before_call": "int f(inout struct node *q)\n{\n  if (!q->next)\n    return 0;\n"
     "  return both(q, q->next->v);\n}\n",
     # a local holding a copy of the member: testing one tells about the other
-    "copy_tested": "int f(struct node * view q)\n{\n  struct node * view maybe n = q->next;\n  if (n)\n"
+    "copy_tested": "int f(struct node *q)\n{\n  struct node * view maybe n = q->next;\n  if (n)\n"
     "    return q->next->v;\n  return 0;\n}\n",
-    "member_tested_copy_used": "int f(struct node * view q)\n{\n  struct node * view maybe n = q->next;\n"
+    "member_tested_copy_used": "int f(struct node *q)\n{\n  struct node * view maybe n = q->next;\n"
     "  if (q->next)\n    return n->v;\n  return 0;\n}\n",
-    "copy_early_return": "int f(struct node * view q)\n{\n  struct node * view maybe n = q->next;\n  if (!n)\n"
+    "copy_early_return": "int f(struct node *q)\n{\n  struct node * view maybe n = q->next;\n  if (!n)\n"
     "    return 0;\n  return q->next->v + n->v;\n}\n",
-    "ternary_tested": "int f(struct node * view q, int c)\n{\n  if (!q->next)\n    return 0;\n  return c ? q->next->v : 0;\n}\n",
-    "stored_set": "int f(inout struct node * view q)\n{\n  q->next = must(1);\n  return q->next->v;\n}\n",
-    "refilled": "int f(inout struct node * view q, int k)\n{\n  if (!q->next)\n    q->next = must(k);\n  return q->next->v;\n}\n",
-    "two_levels_tested": "int f(struct node * view q)\n{\n  if (q->next && q->next->next)\n    return q->next->next->v;\n"
+    "ternary_tested": "int f(struct node *q, int c)\n{\n  if (!q->next)\n    return 0;\n  return c ? q->next->v : 0;\n}\n",
+    "stored_set": "int f(inout struct node *q)\n{\n  q->next = must(1);\n  return q->next->v;\n}\n",
+    "refilled": "int f(inout struct node *q, int k)\n{\n  if (!q->next)\n    q->next = must(k);\n  return q->next->v;\n}\n",
+    "two_levels_tested": "int f(struct node *q)\n{\n  if (q->next && q->next->next)\n    return q->next->next->v;\n"
     "  return 0;\n}\n",
-    "maybe_local": "int f(struct node * view q)\n{\n  struct node * view maybe n = q->next;\n  if (n)\n    return n->v;\n"
+    "maybe_local": "int f(struct node *q)\n{\n  struct node * view maybe n = q->next;\n  if (n)\n    return n->v;\n"
     "  return 0;\n}\n",
-    "unlink_next": "void f(inout struct node * view q)\n{\n  if (q->next)\n    q->next = q->next->next;\n}\n",
+    "unlink_next": "void f(inout struct node *q)\n{\n  if (q->next)\n    q->next = q->next->next;\n}\n",
 }
 
 
@@ -989,31 +989,31 @@ OWNED_MEMBER_PRELUDE = "struct onode { int v; struct onode * owned maybe next; }
 
 OWNED_MEMBER_BAD = {
     "used_after_free": (
-        "int f(inout struct onode * view q)\n{\n  if (!q->next)\n    return 0;\n  free(q->next);\n  return q->next->v;\n}\n",
+        "int f(inout struct onode *q)\n{\n  if (!q->next)\n    return 0;\n  free(q->next);\n  return q->next->v;\n}\n",
         [(6, "warning", "'q->next' is used after it was freed"), (5, "note", "'q->next' was freed here")],
     ),
     "freed_twice": (
-        "void f(inout struct onode * view q)\n{\n  free(q->next);\n  free(q->next);\n  q->next = 0;\n}\n",
+        "void f(inout struct onode *q)\n{\n  free(q->next);\n  free(q->next);\n  q->next = 0;\n}\n",
         [(4, "warning", "'q->next' is freed twice"), (3, "note", "'q->next' was freed here")],
     ),
     "freed_on_one_path": (
-        "void f(inout struct onode * view q, int c)\n{\n  if (c)\n    free(q->next);\n  free(q->next);\n  q->next = 0;\n}\n",
+        "void f(inout struct onode *q, int c)\n{\n  if (c)\n    free(q->next);\n  free(q->next);\n  q->next = 0;\n}\n",
         [(5, "warning", "'q->next' may be freed twice"), (4, "note", "'q->next' was freed here")],
     ),
     "moved_out": (
-        "int f(inout struct onode * view q)\n{\n  struct onode * owned maybe n = move(q->next);\n  free(n);\n"
+        "int f(inout struct onode *q)\n{\n  struct onode * owned maybe n = move(q->next);\n  free(n);\n"
         "  return q->next ? q->next->v : 0;\n}\n",
         [(5, "warning", "'q->next' is used after it was moved"), (3, "note", "'q->next' was moved here")],
     ),
 }
 
 OWNED_MEMBER_CLEAN = {
-    "freed_then_cleared": "void f(inout struct onode * view q)\n{\n  free(q->next);\n  q->next = 0;\n}\n",
-    "freed_then_refilled": "int f(inout struct onode * view q, struct onode * owned n)\n{\n  free(q->next);\n  q->next = move(n);\n"
+    "freed_then_cleared": "void f(inout struct onode *q)\n{\n  free(q->next);\n  q->next = 0;\n}\n",
+    "freed_then_refilled": "int f(inout struct onode *q, struct onode * owned n)\n{\n  free(q->next);\n  q->next = move(n);\n"
     "  return q->next->v;\n}\n",
-    "pop_front": "void f(inout struct onode * view q)\n{\n  struct onode * owned maybe n = move(q->next);\n  if (n)\n  {\n"
+    "pop_front": "void f(inout struct onode *q)\n{\n  struct onode * owned maybe n = move(q->next);\n  if (n)\n  {\n"
     "    q->next = move(n->next);\n    free(n);\n  }\n}\n",
-    "tested_free": "void f(inout struct onode * view q)\n{\n  if (q->next)\n    free(q->next);\n  q->next = 0;\n}\n",
+    "tested_free": "void f(inout struct onode *q)\n{\n  if (q->next)\n    free(q->next);\n  q->next = 0;\n}\n",
 }
 
 
@@ -1060,7 +1060,7 @@ static inline void drop_next(void)
 OBJ_BAD = {
     # a call may change a global's members, an inlined one too (the same at every -O)
     "global_after_call": (
-        "int f(inout struct node * view q)\n{\n  if (!g.next)\n    return 0;\n  update(q);\n  return g.next->v;\n}\n",
+        "int f(inout struct node *q)\n{\n  if (!g.next)\n    return 0;\n  update(q);\n  return g.next->v;\n}\n",
         6,
         "'g.next' may be null where it is dereferenced",
     ),

@@ -28,19 +28,19 @@ LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 PRELUDE = """\
 void * owned maybe malloc(unsigned n);
 void free(drop void * owned maybe p);
-int use(char * view p);
+int use(char *p);
 struct box { char * owned maybe buf; char * owned maybe aux; int n; };
 """
 DECLARED = """\
-void touch(inout struct box * view b);
-int peek(const struct box * view b);
-void clear(drop struct box * view b);
+void touch(inout struct box *b);
+int peek(const struct box *b);
+void clear(drop struct box *b);
 """
 # the same methods with bodies, inlined at -O1+
 DEFINED = """\
-static void touch(inout struct box * view b) { b->n++; }
-static int peek(const struct box * view b) { return b->n; }
-static void clear(drop struct box * view b) { free(b->buf); free(b->aux); }
+static void touch(inout struct box *b) { b->n++; }
+static int peek(const struct box *b) { return b->n; }
+static void clear(drop struct box *b) { free(b->buf); free(b->aux); }
 """
 PRELUDE_LINES = PRELUDE.count("\n") + 3
 
@@ -61,31 +61,31 @@ def _diags(tmp_path, body, opt, methods=DECLARED):
 
 # the callee's side: a view self with an owned member left freed
 CALLEE_BAD = {
-    "freed_not_replaced": ("void reset(inout struct box * view b)\n{\n  free(b->buf);\n}\n",
+    "freed_not_replaced": ("void reset(inout struct box *b)\n{\n  free(b->buf);\n}\n",
                            (4, "'b->buf' is freed when 'reset' returns: 'b' still owns it -- give it a new value or null")),
-    "freed_on_one_path": ("void reset(inout struct box * view b, int c)\n{\n  if (c)\n    free(b->buf);\n}\n",
+    "freed_on_one_path": ("void reset(inout struct box *b, int c)\n{\n  if (c)\n    free(b->buf);\n}\n",
                           (5, "'b->buf' is freed when 'reset' returns: 'b' still owns it -- give it a new value "
                               "or null")),  # said on the exit where it is
-    "moved_out": ("char * owned maybe take(inout struct box * view b)\n{\n  return move(b->buf);\n}\n",
+    "moved_out": ("char * owned maybe take(inout struct box *b)\n{\n  return move(b->buf);\n}\n",
                   (3, "'b->buf' is moved when 'take' returns: 'b' still owns it -- give it a new value or null")),
-    "drop_partial": ("void wipe(drop struct box * view b)\n{\n  free(b->buf);\n}\n",
+    "drop_partial": ("void wipe(drop struct box *b)\n{\n  free(b->buf);\n}\n",
                      (4, "'b->aux' is not freed when 'wipe' returns, which drops 'b'")),
-    "drop_untouched": ("void wipe(drop struct box * view b)\n{\n  b->n = 0;\n  free(b->aux);\n}\n",
+    "drop_untouched": ("void wipe(drop struct box *b)\n{\n  b->n = 0;\n  free(b->aux);\n}\n",
                        (5, "'b->buf' is not freed when 'wipe' returns, which drops 'b'")),
-    "handed_freed": ("void f(inout struct box * view b)\n{\n  free(b->buf);\n  touch(b);\n  b->buf = nullptr;\n}\n",
+    "handed_freed": ("void f(inout struct box *b)\n{\n  free(b->buf);\n  touch(b);\n  b->buf = nullptr;\n}\n",
                      (4, "'b->buf' is freed when 'b' is handed to 'touch': give it a new value first")),
 }
 
 CALLEE_CLEAN = {
-    "replaced": "void reset(inout struct box * view b)\n{\n  char * owned maybe n = malloc(8);\n  free(b->buf);\n"
+    "replaced": "void reset(inout struct box *b)\n{\n  char * owned maybe n = malloc(8);\n  free(b->buf);\n"
     "  b->buf = move(n);\n}\n",
-    "nulled": "void reset(inout struct box * view b)\n{\n  free(b->buf);\n  b->buf = nullptr;\n}\n",
-    "moved_out_null": "void pop(inout struct box * view b)\n{\n  char * owned maybe n = move(b->buf);\n  if (n)\n  {\n"
+    "nulled": "void reset(inout struct box *b)\n{\n  free(b->buf);\n  b->buf = nullptr;\n}\n",
+    "moved_out_null": "void pop(inout struct box *b)\n{\n  char * owned maybe n = move(b->buf);\n  if (n)\n  {\n"
     "    b->buf = malloc(4);\n    free(n);\n  }\n}\n",
-    "drop_all": "void wipe(drop struct box * view b)\n{\n  free(b->buf);\n  free(b->aux);\n}\n",
-    "drop_null_member": "void wipe(drop struct box * view b)\n{\n  free(b->buf);\n  b->buf = nullptr;\n  free(b->aux);\n}\n",
-    "drop_by_method": "void wipe(drop struct box * view b)\n{\n  clear(b);\n}\n",
-    "const_view": "int f(const struct box * view b)\n{\n  return peek(b) + b->n;\n}\n",
+    "drop_all": "void wipe(drop struct box *b)\n{\n  free(b->buf);\n  free(b->aux);\n}\n",
+    "drop_null_member": "void wipe(drop struct box *b)\n{\n  free(b->buf);\n  b->buf = nullptr;\n  free(b->aux);\n}\n",
+    "drop_by_method": "void wipe(drop struct box *b)\n{\n  clear(b);\n}\n",
+    "const_view": "int f(const struct box *b)\n{\n  return peek(b) + b->n;\n}\n",
 }
 
 # the caller's side: a local struct handed to the methods
@@ -151,7 +151,7 @@ def test_same_at_every_level(tmp_path, name):
 
 def test_tutorial_example_is_clean(tmp_path):
     body = ("struct buf { char * owned maybe data; int len; };\n"
-            "void buf_fill(inout struct buf * view b);\nvoid buf_clear(drop struct buf * view b);\n"
+            "void buf_fill(inout struct buf *b);\nvoid buf_clear(drop struct buf *b);\n"
             "void f(void)\n{\n  struct buf b = {};\n  defer buf_clear(&b);\n  buf_fill(&b);\n}\n")
     for opt in LEVELS:
         assert _diags(tmp_path, body, opt) == []

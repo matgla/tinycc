@@ -37,13 +37,13 @@ PRELUDE = """\
 #pragma yasc
 void * owned maybe malloc(unsigned n);
 void free(drop void * owned maybe p);
-int use(char * view p);
+int use(char *p);
 int close(int drop owned(close) maybe fd);
-int owned(close) maybe open(const char * view p, int f);
-int pipe(out int owned(close) maybe * view fds);
+int owned(close) maybe open(const char *p, int f);
+int pipe(out int owned(close) maybe *fds);
 struct box { char * owned maybe buf; int n; };
 struct node { int v; struct node * view maybe next; };
-void fill(inout struct node * view a, int n);
+void fill(inout struct node *a, int n);
 struct node g[4];
 """
 PRELUDE_LINES = PRELUDE.count("\n")
@@ -106,7 +106,7 @@ int f(void)
 }
 """,
     "pointer": """\
-int f(struct node * view p, int i)
+int f(struct node *p, int i)
 {
   if (p[i].next)
     return p[i].next->v;
@@ -220,7 +220,7 @@ int f(int i)
 }
 """, 6, "'a[i].next' is null where it is dereferenced"),
     "pointer_untested": ("""\
-int f(struct node * view p, int i)
+int f(struct node *p, int i)
 {
   if (p[i].next)
     return p[i].next->v;

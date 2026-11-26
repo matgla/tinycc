@@ -56,9 +56,9 @@ static __attribute__((noinline)) void put([:0]char s, int i, char c) { s[i] = c;
 static __attribute__((noinline)) void cut([:0]char s, int i) { s[i] = '\0'; }
 static __attribute__((noinline)) void bump([:0]char s, int i) { s[i]++; }
 static __attribute__((noinline)) void mark([:0]char s, int i) { s[i] = 'x'; }
-static __attribute__((noinline)) [:0]char terminated(inout char * view p, int n) { return p[0:n:0]; }
+static __attribute__((noinline)) [:0]char terminated(inout char *p, int n) { return p[0:n:0]; }
 
-int main(int argc, const char * view * view argv)
+int main(int argc, const char * view *argv)
 {
   if (argc < 2)
     return 1;

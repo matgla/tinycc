@@ -283,18 +283,14 @@ def test_move_fixit_needs_one_occurrence(tmp_path):
 
 
 def test_plain_pointer_param_fixit(tmp_path):
-    src = "int f(char *s) { return s[0]; }\n"
-    _write(tmp_path, "t.c", src)
+    # a parameter's own pointer is a view: nothing to say
+    _write(tmp_path, "t.c", "int f(char *s) { return s[0]; }\n")
     proc = _tcc(tmp_path, "-fdiagnostics-parseable-fixits", "-c", "t.c", "-o", "t.o")
-    lines = proc.stderr.splitlines()
-    assert lines[0] == "t.c:1: error: plain pointer in yasc: say owned or view for 's'"
-    assert lines[1] == "t.c:1: note: the function only borrows 's': write '* view'"
-    assert lines[2] == 'fix-it:"t.c":{1:13-1:13}:" view "'
-    _, diags = _json(tmp_path, src)
-    fixed = _apply(src, diags[0]["fixits"])
-    assert fixed == "int f(char * view s) { return s[0]; }\n"
-    _write(tmp_path, "fixed.c", fixed)
-    assert _tcc(tmp_path, "-c", "fixed.c", "-o", "f.o").returncode == 0
+    assert proc.returncode == 0 and proc.stderr == "", proc.stderr
+    # its inner level: said at once, no guess
+    _write(tmp_path, "i.c", "int f(char **s) { return s[0][0]; }\n")
+    proc = _tcc(tmp_path, "-fdiagnostics-parseable-fixits", "-c", "i.c", "-o", "i.o")
+    assert proc.stderr.splitlines() == ["i.c:1: error: plain pointer in yasc: say owned or view"], proc.stderr
     # a local: decided by the body too (test_fixits.py); a cast: no guess
     _write(tmp_path, "l.c", "void f(void) { char *s = 0; (void)s; }\n")
     proc = _tcc(tmp_path, "-fdiagnostics-parseable-fixits", "-c", "l.c", "-o", "l.o")

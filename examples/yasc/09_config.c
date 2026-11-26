@@ -23,9 +23,9 @@ error ConfigError { NoEquals, EmptyKey, BadNumber, NotFound };
    (-Wformat): a %d given a string is a warning.  From here on this file
    makes it an error instead, whatever the command line says. */
 #pragma tcc diagnostic error "-Wformat"
-static void say(const char * view fmt, ...) __attribute__((format(printf, 1, 2)));
+static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
-static void say(const char * view fmt, ...)
+static void say(const char *fmt, ...)
 {
   va_list ap;
   va_start(ap, fmt);
@@ -34,7 +34,7 @@ static void say(const char * view fmt, ...)
 }
 
 /* s[0..n) as a new string */
-static !char * owned copy(const char * view s, int n)
+static !char * owned copy(const char *s, int n)
 {
   char * owned maybe buf = mem_new((size_t)n + 1);
   if (!buf)
@@ -45,7 +45,7 @@ static !char * owned copy(const char * view s, int n)
   return buf;
 }
 
-static int same(const char * view a, const char * view b)
+static int same(const char *a, const char *b)
 {
   while (*a && *a == *b)
     a++, b++;
@@ -65,7 +65,7 @@ struct config
   int count;
 
   /* one "key = value" line, s[0..n) */
-  !int add(inout struct config * view self, const char * view s, int n)
+  !int add(inout struct config *self, const char *s, int n)
   {
     int eq = 0;
     while (eq < n && s[eq] != '=')
@@ -96,7 +96,7 @@ struct config
   }
 
   /* every line of text; a bad one is reported and skipped */
-  int parse(inout struct config * view self, const char * view text)
+  int parse(inout struct config *self, const char *text)
   {
     int line = 0;
     for (const char * view p = text; *p;)
@@ -114,7 +114,7 @@ struct config
     return self->count;
   }
 
-  const char * view maybe text(const struct config * view self, const char * view key)
+  const char * view maybe text(const struct config *self, const char *key)
   {
     for (const struct entry * view maybe e = self->first; e; e = e->next)
       if (same(e->key, key))
@@ -122,7 +122,7 @@ struct config
     return nullptr;
   }
 
-  !int number(const struct config * view self, const char * view key)
+  !int number(const struct config *self, const char *key)
   {
     const char * view maybe s = self->text(key);
     if (!s)
@@ -137,7 +137,7 @@ struct config
     return v;
   }
 
-  void clear(drop struct config * view self)
+  void clear(drop struct config *self)
   {
     while (self->first)
     {
@@ -152,7 +152,7 @@ struct config
 };
 
 /* try: a missing or bad number is area's failure */
-static !int area(const struct config * view cfg)
+static !int area(const struct config *cfg)
 {
   return try cfg->number("width") * try cfg->number("height");
 }

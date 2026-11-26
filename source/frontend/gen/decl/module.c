@@ -484,25 +484,23 @@ static int yasc_ptr_qual(int t)
 
 /* A yasc parameter's target is read-only unless it says inout / out / drop
    (`in`, the default): in the C header the `*` at P of a parameter's
-   outermost pointer is `const *` when its qualifiers say view (not
-   owned), and an array parameter's name at P is
+   outermost pointer is `const *` unless its qualifiers say owned (a view,
+   `view` written or not), and an array parameter's name at P is
    `T const a[]`. */
 static int yasc_c_in(int t, const int *p, const int *stop)
 {
-  int n, view = 0;
+  int n;
   if (t == '*')
   {
     while ((n = yasc_peek(p, stop, &p)) != TOK_EOF && yasc_ptr_qual(n))
-    {
       if (n == TOK_owned)
         return 0;
-      view |= n == TOK_view;
-    }
     /* another '*' after it: not the outermost; '(' : a function's; the
-       name and '[': the array is (`char * view a[]` is `char * const a[]`) */
+       name and '[': the array is (`char * view a[]` is `char * const a[]`).
+*/
     if (n >= TOK_UIDENT && yasc_peek(p, stop, NULL) == '[')
       return 0;
-    return view && n != '*' && n != '(';
+    return n != '*' && n != '(';
   }
   /* `a[owned]`: the array a parameter becomes is owned, its elements free */
   return t >= TOK_UIDENT && yasc_peek(p, stop, &p) == '[' && yasc_peek(p, stop, NULL) != TOK_owned;

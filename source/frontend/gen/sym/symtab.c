@@ -802,6 +802,7 @@ static int sym_is_pointer_node(Sym *s)
  * kept on global_stack to the end of the TU and pointer nodes live as long. */
 #define PARK_VOLATILE 0x80000000 /* in ParkedParam.v: a.param_volatile */
 #define PARK_SCOPED 0x40000000   /* in ParkedParam.v: sym_scope is 1 */
+#define PARK_C 0x20000000        /* in ParkedParam.v: yasc YASC_PARAM_C (SYM_FIELD's bit, never kept) */
 
 typedef struct ParkedParam
 {
@@ -954,7 +955,8 @@ ST_FUNC void sym_park_proto(Sym *s, Sym *stack_before)
   rec->nb_params = n;
   for (p = f->next, i = 0; p; p = p->next, i++)
   {
-    rec->params[i].v = (p->v & ~SYM_FIELD) | (p->a.param_volatile ? PARK_VOLATILE : 0) | (p->sym_scope ? PARK_SCOPED : 0);
+    rec->params[i].v = (p->v & ~SYM_FIELD) | (p->a.param_volatile ? PARK_VOLATILE : 0) | (p->sym_scope ? PARK_SCOPED : 0) |
+                       ((p->yasc & YASC_PARAM_C) ? PARK_C : 0);
     rec->params[i].type = p->type;
   }
 
@@ -1036,7 +1038,8 @@ ST_FUNC Sym *sym_unpark(TokenSym *ts)
     ParkedParam *pr = &rec->params[i];
     p = sym_malloc();
     memset(p, 0, sizeof *p);
-    p->v = (pr->v & ~(PARK_VOLATILE | PARK_SCOPED)) | SYM_FIELD;
+    p->v = (pr->v & ~(PARK_VOLATILE | PARK_SCOPED | PARK_C)) | SYM_FIELD;
+    p->yasc = (pr->v & PARK_C) ? YASC_PARAM_C : 0;
     p->type = pr->type;
     p->r = VT_LOCAL | VT_LVAL;
     p->vreg = -1;

@@ -42,7 +42,7 @@ export sock_t * owned maybe sock_open(addr_t addr);
 export void sock_close(sock_t * owned drop s);
 
 struct sock { int fd; };            /* private: importers never see the body */
-int parse_port(const char * view s) { ... }   /* private: internal linkage */
+int parse_port(const char *s) { ... }   /* private: internal linkage */
 ```
 
 ```c

@@ -22,11 +22,8 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 
 LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 FLAGS = ["-ccompat", "-Wuninitialized", "-Wmaybe-uninitialized"]
-# VIEW: `view` where the file is yasc (the safe default), nothing in plain C
-PRELUDE = (
-    "#ifdef __YASC__\n#define VIEW view\n#else\n#define VIEW\n#endif\n"
-    "int g(int);\nvoid set(int * VIEW p);\n"
-)
+# set's parameter is a view in yasc (the safe default) without saying it
+PRELUDE = "int g(int);\nvoid set(int *p);\n"
 
 
 def _run(tmp_path, body, *flags, obj="t.o"):

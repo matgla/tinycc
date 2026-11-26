@@ -1,7 +1,7 @@
 /* imports yasc_methods_mod.c (module shapes2): its struct's methods */
 #pragma yasc
 import shapes2;
-extern int printf(const char * view, ...);
+extern int printf(const char *, ...);
 
 int main(void)
 {

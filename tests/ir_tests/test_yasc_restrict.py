@@ -27,8 +27,8 @@ LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 PRELUDE = """\
 void * owned maybe malloc(unsigned n);
 void free(drop void * owned maybe p);
-void cpy(char * restrict view d, const char * view s, int n);
-void two(char * restrict view a, char * restrict view b);
+void cpy(char * restrict d, const char *s, int n);
+void two(char * restrict a, char * restrict b);
 char gbuf[8];
 """
 PRELUDE_LINES = PRELUDE.count("\n")
@@ -59,11 +59,11 @@ def _diags(proc):
 
 
 BAD = {
-    "view_to_restrict": ("void f(char * view v, const char * view s)\n{\n  cpy(v, s, 1);\n}\n", 3, SHARED),
+    "view_to_restrict": ("void f(char *v, const char *s)\n{\n  cpy(v, s, 1);\n}\n", 3, SHARED),
     # p + n keeps what p is: a view stays one
-    "derived_from_view": ("void f(char * view v, const char * view s)\n{\n  cpy(v + 1, s, 1);\n}\n", 3, SHARED),
-    "global": ("void f(const char * view s)\n{\n  cpy(gbuf, s, 4);\n}\n", 3, GLOBAL),
-    "static_local": ("void f(const char * view s)\n{\n  static char b[4];\n  cpy(b, s, 4);\n}\n", 4, GLOBAL),
+    "derived_from_view": ("void f(char *v, const char *s)\n{\n  cpy(v + 1, s, 1);\n}\n", 3, SHARED),
+    "global": ("void f(const char *s)\n{\n  cpy(gbuf, s, 4);\n}\n", 3, GLOBAL),
+    "static_local": ("void f(const char *s)\n{\n  static char b[4];\n  cpy(b, s, 4);\n}\n", 4, GLOBAL),
     "same_array": (
         "void f(void)\n{\n  char buf[8] = {0};\n  cpy(buf, buf, 4);\n}\n",
         4,
@@ -81,7 +81,7 @@ BAD = {
         "argument 1 of 'cpy' is restrict, but argument 2 points into 'p' too",
     ),
     "same_restrict_param": (
-        "void f(char * restrict view r)\n{\n  cpy(r, r, 1);\n}\n",
+        "void f(char * restrict r)\n{\n  cpy(r, r, 1);\n}\n",
         3,
         "argument 1 of 'cpy' is restrict, but argument 2 points into 'r' too",
     ),
@@ -94,14 +94,14 @@ BAD = {
 
 CLEAN = {
     "two_arrays": "void f(void)\n{\n  char x[8] = {0};\n  char y[8] = {0};\n  cpy(x, y, 8);\n}\n",
-    "local_scalar": "void f(const char * view s)\n{\n  char c = 0;\n  cpy(&c, s, 1);\n}\n",
-    "owned": "void f(const char * view s)\n{\n  char * owned maybe p = malloc(8);\n  if (!p)\n    return;\n"
+    "local_scalar": "void f(const char *s)\n{\n  char c = 0;\n  cpy(&c, s, 1);\n}\n",
+    "owned": "void f(const char *s)\n{\n  char * owned maybe p = malloc(8);\n  if (!p)\n    return;\n"
     "  cpy(p, s, 8);\n  free(p);\n}\n",
     "two_owned": "void f(void)\n{\n  char * owned maybe p = malloc(8);\n  char * owned maybe q = malloc(8);\n"
     "  if (p && q)\n    cpy(p, q, 8);\n  free(p);\n  free(q);\n}\n",
-    "restrict_param_on": "void f(char * restrict view r, const char * view s)\n{\n  cpy(r, s, 1);\n"
+    "restrict_param_on": "void f(char * restrict r, const char *s)\n{\n  cpy(r, s, 1);\n"
     "  cpy(r + 1, s, 1);\n}\n",
-    "global_in_unsafe": "void f(const char * view s)\n{\n  cpy(unsafe(gbuf), s, 4);\n}\n",
+    "global_in_unsafe": "void f(const char *s)\n{\n  cpy(unsafe(gbuf), s, 4);\n}\n",
 }
 
 
@@ -143,8 +143,8 @@ def test_restrict_is_part_of_the_type(tmp_path):
     """A restrict view and a plain view are different pointer types to the
     checks (a restrict view converts to a view freely)."""
     body = (
-        "char * restrict view pick(inout char * restrict view a)\n{\n  return a;\n}\n"
-        "int g(inout char * restrict view r)\n{\n  char * view v = r;\n  return *v + *pick(r);\n}\n"
+        "char * restrict view pick(inout char * restrict a)\n{\n  return a;\n}\n"
+        "int g(inout char * restrict r)\n{\n  char * view v = r;\n  return *v + *pick(r);\n}\n"
     )
     proc = _compile(tmp_path, body)
     assert proc.returncode == 0 and _diags(proc) == [], proc.stderr
@@ -153,7 +153,7 @@ def test_restrict_is_part_of_the_type(tmp_path):
 @pytest.mark.parametrize("opt", LEVELS[1:])
 def test_code_unchanged(tmp_path, opt):
     """restrict changes the checks, not the code (S4 is what uses it)."""
-    body = "void f(char * restrict view r, const char * view s)\n{\n  cpy(r, s, 1);\n}\n"
+    body = "void f(char * restrict r, const char *s)\n{\n  cpy(r, s, 1);\n}\n"
     a = _compile(tmp_path, body, opt)
     oa = (tmp_path / "t.o").read_bytes()
     b = _compile(tmp_path, body.replace("restrict ", ""), opt, "-ccompat", "-std=yasc")
@@ -192,7 +192,7 @@ LOCAL_CLEAN = {
     "other_object": "int f(void)\n{\n  int a[4] = {0};\n  int b[4] = {0};\n  int * restrict view r = a;\n"
     "  b[0] = 1;\n  return r[0] + b[0];\n}\n",
     # r borrows what s->buf points to, not s: s->len is another object
-    "loaded_member": "struct S { char * owned buf; int len; };\nint f(inout struct S * view s)\n{\n"
+    "loaded_member": "struct S { char * owned buf; int len; };\nint f(inout struct S *s)\n{\n"
     "  char * restrict view r = s->buf;\n  r[0] = 1;\n  s->len = 3;\n  return r[1];\n}\n",
 }
 

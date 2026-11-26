@@ -15,7 +15,7 @@
  * call's arguments are now found wherever they are. */
 #pragma yasc
 
-int printf(const char * view fmt, ...);
+int printf(const char *fmt, ...);
 
 struct S
 {
@@ -23,19 +23,19 @@ struct S
 };
 
 /* y is filled through a view parameter: its address does not escape */
-__attribute__((noinline)) static void init(inout struct S * view p, int k)
+__attribute__((noinline)) static void init(inout struct S *p, int k)
 {
   for (int i = 0; i < 32; i++)
     p->v[i] = k + i;
 }
 
-__attribute__((noinline)) static void fill(inout struct S * view p, int v)
+__attribute__((noinline)) static void fill(inout struct S *p, int v)
 {
   p->v[0] = v;
   p->v[3] = v + 1;
 }
 
-__attribute__((noinline)) static int use(const struct S * view p, int v)
+__attribute__((noinline)) static int use(const struct S *p, int v)
 {
   return p->v[0] + p->v[1] + p->v[3] + v;
 }

@@ -29,7 +29,7 @@ PRELUDE = """\
 void * owned malloc(unsigned n);
 void free(drop void * owned maybe p);
 void take(char * owned p);
-int use(char * view p);
+int use(char *p);
 struct box { char * owned buf; char * view peek; };
 char * owned g;
 #pragma tcc c_begin
@@ -81,16 +81,16 @@ NEEDS_MOVE = {
         _moves("p"),
     ),
     "owned_member": (
-        "void f(inout struct box * view s)\n{\n  char * owned p = malloc(1);\n  free(s->buf);\n  s->buf = p;\n}\n",
+        "void f(inout struct box *s)\n{\n  char * owned p = malloc(1);\n  free(s->buf);\n  s->buf = p;\n}\n",
         5,
         _moves("p"),
     ),
     "out_of_member": (
-        "void f(inout struct box * view s)\n{\n  char * owned p = s->buf;\n  s->buf = 0;\n  free(p);\n}\n",
+        "void f(inout struct box *s)\n{\n  char * owned p = s->buf;\n  s->buf = 0;\n  free(p);\n}\n",
         3,
         MEMBER,
     ),
-    "return_member": ("char * owned f(inout struct box * view s)\n{\n  return s->buf;\n}\n", 3, MEMBER),
+    "return_member": ("char * owned f(inout struct box *s)\n{\n  return s->buf;\n}\n", 3, MEMBER),
     "return_global": ("char * owned f(void)\n{\n  return g;\n}\n", 3, _moves("g")),
     "return_static_local": (
         "char * owned f(void)\n{\n  static char * owned keep;\n  return keep;\n}\n",
@@ -140,7 +140,7 @@ NO_MOVE_NEEDED = {
     "return_parameter": "char * owned f(char * owned p)\n{\n  return p;\n}\n",
     "view_argument": "void f(void)\n{\n  char * owned p = malloc(1);\n  use(p);\n  free(p);\n}\n",
     "view_variable": "void f(void)\n{\n  char * owned p = malloc(1);\n  char * view v = p;\n  use(v);\n  free(p);\n}\n",
-    "view_member": "void f(inout struct box * view s)\n{\n  s->peek = s->buf;\n}\n",
+    "view_member": "void f(inout struct box *s)\n{\n  s->peek = s->buf;\n}\n",
     "call_result": "void f(void)\n{\n  take(malloc(1));\n  char * owned q = malloc(2);\n  free(q);\n}\n",
     "move_on_drop": "void f(void)\n{\n  char * owned p = malloc(1);\n  free(move(p));\n}\n",
     "move_on_return": "char * owned f(char * owned p)\n{\n  return move(p);\n}\n",
@@ -199,7 +199,7 @@ def test_move_discarded(tmp_path):
 
 @pytest.mark.parametrize("kw", ["move", "borrow"])
 def test_of_a_pointer_that_owns_nothing(tmp_path, kw):
-    proc, out = _check(tmp_path, f"void f(char * view v)\n{{\n  use({kw}(v));\n}}\n")
+    proc, out = _check(tmp_path, f"void f(char *v)\n{{\n  use({kw}(v));\n}}\n")
     assert proc.returncode != 0
     assert out[0][1:] == ("error", f"{kw} of a pointer that owns nothing")
 

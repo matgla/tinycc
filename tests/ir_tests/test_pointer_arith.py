@@ -101,7 +101,7 @@ def test_pragma(tmp_path):
 
 
 def test_safe_default_is_on(tmp_path):
-    body = "void * view f(inout void * view p) { return p + 1; }\n"
+    body = "void * view f(inout void *p) { return p + 1; }\n"
     proc = _run(tmp_path, body, compat=False)
     assert proc.returncode == 0 and _diags(proc) == [(1, ARITH)], proc.stderr
     proc = _run(tmp_path, body, "-Wno-pointer-arith", compat=False)

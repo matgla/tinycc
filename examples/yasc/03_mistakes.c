@@ -42,12 +42,12 @@ void discarded(void)
   mem_strdup("x"); /* an owned result nobody frees */
 }
 
-void not_mine(inout char * view borrowed)
+void not_mine(inout char *borrowed)
 {
   mem_free(borrowed); /* a view owns nothing to free */
 }
 
-int read_out(out int * view n)
+int read_out(out int *n)
 {
   return *n; /* out: written by this function, not read */
 }
@@ -81,12 +81,12 @@ struct node
   int v;
 };
 
-int maybe_member(const struct node * view q)
+int maybe_member(const struct node *q)
 {
   return q->next->v; /* q->next may be null */
 }
 
-static int length(const char * view s) /* s may not be null */
+static int length(const char *s) /* s may not be null */
 {
   int n = 0;
   while (s[n])
@@ -94,7 +94,7 @@ static int length(const char * view s) /* s may not be null */
   return n;
 }
 
-int maybe_argument(const char * view maybe s)
+int maybe_argument(const char * maybe s)
 {
   return length(s); /* test s first */
 }
@@ -109,7 +109,7 @@ int borrow_outlives_owner(void)
   return tail[0]; /* s is gone, and tail with it */
 }
 
-void dangling(inout int * view * view slot)
+void dangling(inout int * view *slot)
 {
   int x = 1;
   *slot = &x; /* x dies when dangling returns; *slot lives on */

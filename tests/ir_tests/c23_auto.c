@@ -2,7 +2,7 @@
  * evaluated once.  The QEMU build is -ccompat (C11), where only a yasc file
  * gives `auto` its C23 meaning; __auto_type infers everywhere. */
 #pragma yasc
-extern int printf(const char * view, ...);
+extern int printf(const char *, ...);
 
 struct pt { int x, y; };
 

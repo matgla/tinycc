@@ -249,7 +249,7 @@ static void recover_restore(TCCRecover *r)
   discarded_call_vtop = NULL;
   unary_addr_operand = 0;
   indir_keep_lvalue = 0;
-  yasc_returning = yasc_argument = 0;
+  yasc_returning = yasc_argument = yasc_argument_c = 0;
   if (s1->unsafe_depth)
   {
     BufferedFile *uf;

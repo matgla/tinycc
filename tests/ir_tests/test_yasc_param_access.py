@@ -1,9 +1,9 @@
 """What a yasc parameter does with what it points to, said before its type:
 
-    void f(T * view p);         // in (the default): *p is read-only
-    void f(in T * view p);      // the same, said
-    void f(inout T * view p);   // *p is read and written
-    void f(out T * view p);     // *p is written before it is read
+    void f(T *p);         // in (the default): *p is read-only
+    void f(in T *p);      // the same, said
+    void f(inout T *p);   // *p is read and written
+    void f(out T *p);     // *p is written before it is read
 
 A view parameter's target is const unless the parameter says inout or out
 (drop consumes it); owned pointers, int handles and regular-C pointers are
@@ -37,19 +37,19 @@ def _run(tmp_path, src, *flags):
 
 
 CLEAN = {
-    "read_in": "int f(int * view p) { return *p; }\n",
-    "read_in_said": "int f(in int * view p) { return *p; }\n",
-    "write_inout": "void f(inout int * view p) { *p = *p + 1; }\n",
-    "write_out": "void f(out int * view p) { *p = 1; }\n",
-    "member_inout": "void f(inout struct box * view b) { b->n = 1; }\n",
+    "read_in": "int f(int *p) { return *p; }\n",
+    "read_in_said": "int f(in int *p) { return *p; }\n",
+    "write_inout": "void f(inout int *p) { *p = *p + 1; }\n",
+    "write_out": "void f(out int *p) { *p = 1; }\n",
+    "member_inout": "void f(inout struct box *b) { b->n = 1; }\n",
     "array_out": "void f(out char a[2]) { a[0] = 0; a[1] = 0; }\n",
-    "inout_to_inout": "void g(inout int * view p);\nvoid f(inout int * view p) { g(p); }\n",
-    "in_to_in": "int g(int * view p);\nint f(int * view p) { return g(p); }\n",
+    "inout_to_inout": "void g(inout int *p);\nvoid f(inout int *p) { g(p); }\n",
+    "in_to_in": "int g(int *p);\nint f(int *p) { return g(p); }\n",
     "owned_writable": "void f(char * owned p) { p[0] = 0; free(p); }\n",
-    "handle_untouched": "int f(int view fd) { return fd; }\n",
+    "handle_untouched": "int f(int view fd) { return (int)fd; }\n",
     # `in` is a name everywhere but where a parameter's declaration starts
     "in_as_name": "int f(int in) { int out_ = in; return out_; }\nint g(void) { int in = 2; return in; }\n",
-    "free_member_inout": "void f(inout struct box * view b) { free(b->s); b->s = nullptr; }\n",
+    "free_member_inout": "void f(inout struct box *b) { free(b->s); b->s = nullptr; }\n",
 }
 
 
@@ -61,18 +61,18 @@ def test_clean(tmp_path, name, opt):
 
 
 ERRORS = {
-    "write_in": ("void f(int * view p) { *p = 1; }\n", RO),
-    "write_member_in": ("void f(struct box * view b) { b->n = 1; }\n", RO),
+    "write_in": ("void f(int *p) { *p = 1; }\n", RO),
+    "write_member_in": ("void f(struct box *b) { b->n = 1; }\n", RO),
     "write_array_in": ("void f(char a[2]) { a[0] = 0; }\n", RO),
-    "in_to_inout": ("void g(inout int * view p);\nvoid f(int * view p) { g(p); }\n", "discards 'const'"),
-    "return_in_writable": ("int * view f(int * view p) { return p; }\n", "discards 'const'"),
-    "both_words": ("void f(in inout int * view p);\n", "a parameter is in, inout or out: one of them"),
+    "in_to_inout": ("void g(inout int *p);\nvoid f(int *p) { g(p); }\n", "discards 'const'"),
+    "return_in_writable": ("int * view f(int *p) { return p; }\n", "discards 'const'"),
+    "both_words": ("void f(in inout int *p);\n", "a parameter is in, inout or out: one of them"),
     "inout_owned": ("void f(inout char * owned p);\n", "inout: only a view parameter's target"),
     "inout_int": ("void f(inout int n);\n", "inout: only a view parameter's target"),
-    "redecl": ("void f(inout int * view p);\nvoid f(int * view p) { (void)p; }\n",
+    "redecl": ("void f(inout int *p);\nvoid f(int *p) { (void)p; }\n",
                "differs in in / inout (whether its target is written)"),
     # a read-only parameter cannot give the member a new value
-    "free_member_in": ("void f(struct box * view b) { free(b->s); }\n",
+    "free_member_in": ("void f(struct box *b) { free(b->s); }\n",
                        "'b->s' is freed when 'f' returns: 'b' still owns it, and its target is read-only -- say "
                        "inout to give it a new value or null"),
 }
@@ -97,7 +97,7 @@ def test_c_header_spells_in_as_const(tmp_path):
     inout / out one is not, and the yasc words are gone"""
     (tmp_path / "m.c").write_text(
         "#pragma yasc\nmodule io;\n"
-        "export int get(int * view p, inout int * view q, out int * view r, in const char * view s);\n"
+        "export int get(int *p, inout int *q, out int *r, in const char *s);\n"
         "export int arr(int a[4], inout char b[4]);\n"
     )
     proc = subprocess.run(

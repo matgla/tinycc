@@ -18,7 +18,7 @@ LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 PRELUDE = """\
 void * owned maybe malloc(unsigned n);
 void free(drop void * owned maybe p);
-int use(char * view p);
+int use(char *p);
 struct box { char * owned buf; int n; };
 struct box * borrows(static) holder(void);
 """
@@ -39,9 +39,9 @@ def _diags(tmp_path, body, opt):
 
 
 BAD = {
-    "used_after_free": ("int f(inout struct box * view b)\n{\n  free(b->buf);\n  return use(b->buf);\n}\n",
+    "used_after_free": ("int f(inout struct box *b)\n{\n  free(b->buf);\n  return use(b->buf);\n}\n",
                         (4, "'b->buf' is used after it was freed")),
-    "freed_twice": ("void f(inout struct box * view b)\n{\n  free(b->buf);\n  free(b->buf);\n}\n",
+    "freed_twice": ("void f(inout struct box *b)\n{\n  free(b->buf);\n  free(b->buf);\n}\n",
                     (4, "'b->buf' is freed twice")),
     "through_call_result": ("void f(void)\n{\n  free(holder()->buf);\n}\n",
                             (3, "'buf' of a call's result is owned and the lifetime check does not follow it: "
@@ -49,8 +49,8 @@ BAD = {
 }
 
 CLEAN = {
-    "read": "int f(struct box * view b)\n{\n  return use(b->buf) + b->buf[0];\n}\n",
-    "replaced": "void f(inout struct box * view b)\n{\n  char * owned maybe n = malloc(4);\n  if (!n)\n    return;\n"
+    "read": "int f(struct box *b)\n{\n  return use(b->buf) + b->buf[0];\n}\n",
+    "replaced": "void f(inout struct box *b)\n{\n  char * owned maybe n = malloc(4);\n  if (!n)\n    return;\n"
     "  free(b->buf);\n  b->buf = move(n);\n  use(b->buf);\n}\n",
 }
 

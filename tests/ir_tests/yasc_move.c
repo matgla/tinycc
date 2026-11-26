@@ -1,13 +1,13 @@
 /* yasc move(p) / borrow(p): the value is the pointer itself, at every -O. */
 #pragma yasc
-extern int printf(const char * view, ...);
+extern int printf(const char *, ...);
 void * owned maybe malloc(unsigned long n);
 void free(drop void * owned maybe p);
 
 struct box { char * owned maybe buf; };
 
 static char * owned keep(char * owned p) { p[0] = 'k'; return p; }
-static int peek(const char * view p) { return p[0]; }
+static int peek(const char *p) { return p[0]; }
 
 int main(void)
 {

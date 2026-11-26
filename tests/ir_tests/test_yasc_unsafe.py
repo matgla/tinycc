@@ -26,7 +26,7 @@ PRELUDE = """\
 void * owned maybe malloc(unsigned n);
 void free(drop void * owned maybe p);
 void take(char * owned p);
-int use(char * view p);
+int use(char *p);
 int * view g;
 """
 PRELUDE_LINES = PRELUDE.count("\n")
@@ -75,7 +75,7 @@ def test_command_line_cannot_lower(tmp_path, flag):
     assert any("cannot be lowered" in m for _, _, m in d), proc.stderr
 
 
-RETLOCAL = "int * view f(int * view p)\n{\n  int x = *p;\n  return &x;\n}\n"
+RETLOCAL = "int * view f(int *p)\n{\n  int x = *p;\n  return &x;\n}\n"
 RETLOCAL_MSG = "'f' returns the address of a local variable"
 
 
@@ -130,10 +130,11 @@ def test_ccompat_keeps_warnings(tmp_path):
 
 
 def test_type_rule_is_an_error(tmp_path):
-    body = "void f(inout char * view v)\n{\n  char * owned p = v;\n  take(p);\n}\n"
+    body = "void f(inout char *v)\n{\n  char * owned p = v;\n  take(p);\n}\n"
     proc = _compile(tmp_path, body)
     assert proc.returncode != 0
-    assert (3, "error", "a pointer that owns nothing is stored in an owned pointer") in _diags(proc), proc.stderr
+    assert (3, "error", "the parameter 'v' owns nothing (a view unless it says owned): write '* owned v' when the "
+            "function takes it over, 'drop' before the type too when it frees it") in _diags(proc), proc.stderr
 
 
 @pytest.mark.parametrize("opt", LEVELS)
@@ -188,7 +189,7 @@ def test_unsafe_covers_the_frontend_rules(tmp_path):
     """-Wimplicit-move and the ownership type rules, said while the body is
     parsed, are off in the region too."""
     body = (
-        "void f(inout char * view v)\n{\n  char * owned maybe p = malloc(1);\n  unsafe {\n    take(p);\n"
+        "void f(inout char *v)\n{\n  char * owned maybe p = malloc(1);\n  unsafe {\n    take(p);\n"
         "    char * owned q = v;\n    take(q);\n  }\n}\n"
     )
     proc = _compile(tmp_path, body)
@@ -253,9 +254,9 @@ FROM_C = "a pointer from regular C becomes %s here: write unsafe(...)"
 @pytest.mark.parametrize(
     "body,line,what",
     [
-        ("int f(const char * view s)\n{\n  char * view a = c_find(s);\n  return *a;\n}\n", 3, "a view"),
-        ("char * owned f(const char * view s)\n{\n  return c_find(s);\n}\n", 3, "owned"),
-        ("int f(const char * view s)\n{\n  return use(c_find(s));\n}\n", 3, "a view"),
+        ("int f(const char *s)\n{\n  char * view a = c_find(s);\n  return *a;\n}\n", 3, "a view"),
+        ("char * owned f(const char *s)\n{\n  return c_find(s);\n}\n", 3, "owned"),
+        ("int f(const char *s)\n{\n  return use(c_find(s));\n}\n", 3, "a view"),
     ],
     ids=["initializer", "return", "argument"],
 )
@@ -266,7 +267,7 @@ def test_regular_c_pointer_needs_unsafe(tmp_path, body, line, what):
 
 
 def test_unsafe_vouches_for_it(tmp_path):
-    body = "int f(const char * view s)\n{\n  char * view a = unsafe(c_find(s));\n  return *a;\n}\n"
+    body = "int f(const char *s)\n{\n  char * view a = unsafe(c_find(s));\n  return *a;\n}\n"
     proc = _compile(tmp_path, C_DECLS + body)
     assert proc.returncode == 0 and _diags(proc) == [], proc.stderr
 
@@ -276,7 +277,7 @@ def test_what_needs_no_unsafe(tmp_path):
     and an annotated pointer handed to C."""
     body = (
         "#pragma tcc c_begin\n#define C_NONE ((char *)0)\n#pragma tcc c_end\n"
-        "int f(inout char * view v)\n{\n  char * view maybe a = nullptr;\n  char * view maybe b = C_NONE;\n"
+        "int f(inout char *v)\n{\n  char * view maybe a = nullptr;\n  char * view maybe b = C_NONE;\n"
         "  c_keep(v);\n  return a == b;\n}\n"
     )
     proc = _compile(tmp_path, C_DECLS + body)
@@ -284,7 +285,7 @@ def test_what_needs_no_unsafe(tmp_path):
 
 
 def test_ccompat_converts_silently(tmp_path):
-    body = "int f(const char * view s)\n{\n  char * view a = c_find(s);\n  return *a;\n}\n"
+    body = "int f(const char *s)\n{\n  char * view a = c_find(s);\n  return *a;\n}\n"
     proc = _compile(tmp_path, C_DECLS + body, "-ccompat", "-std=yasc")
     assert proc.returncode == 0 and _diags(proc) == [], proc.stderr
 
@@ -299,7 +300,7 @@ CASTS = {
     "drops_const": ("char * view d = (char * view)s;", "a cast drops const: write unsafe(...)"),
     "owned_to_view": ("char * view e = (char * view)o;", "a cast makes an owned pointer a view: write borrow(...)"),
 }
-CAST_FN = "void f(const char * view s, inout char * view maybe m, inout char * view v, char * owned o)\n{\n  %s\n  free(o);\n}\n"
+CAST_FN = "void f(const char *s, inout char * maybe m, inout char *v, char * owned o)\n{\n  %s\n  free(o);\n}\n"
 
 
 @pytest.mark.parametrize("name", sorted(CASTS))
@@ -320,7 +321,7 @@ def test_cast_in_unsafe(tmp_path, name):
 
 def test_casts_that_need_nothing(tmp_path):
     body = (
-        "int f(char * view v)\n{\n  char buf[4] = {0};\n  char * view maybe z = (char * view maybe)nullptr;\n"
+        "int f(char *v)\n{\n  char buf[4] = {0};\n  char * view maybe z = (char * view maybe)nullptr;\n"
         "  const char * view c = (const char * view)v;\n  char * view b = (char * view)buf;\n"
         "  return (z != nullptr) + *c + *b;\n}\n"
     )
@@ -340,7 +341,7 @@ DEREF = "a pointer from regular C is dereferenced: write unsafe { } around it"
 )
 def test_deref_of_regular_c_pointer(tmp_path, expr):
     decls = C_DECLS.replace("#pragma tcc c_end", "struct cn { int v; };\nstruct cn *c_node(void);\n#pragma tcc c_end")
-    body = f"int f(const char * view s)\n{{\n  return {expr};\n}}\n"
+    body = f"int f(const char *s)\n{{\n  return {expr};\n}}\n"
     proc = _compile(tmp_path, decls + body)
     assert proc.returncode != 0
     assert (9, "error", DEREF) in _diags(proc), proc.stderr
@@ -376,7 +377,7 @@ def test_unsafe_report(tmp_path, opt):
 
 
 def test_offset_from_regular_c_stays_unchecked(tmp_path):
-    body = "int f(const char * view s)\n{\n  char * view a = c_find(s) + 1;\n  return *a;\n}\n"
+    body = "int f(const char *s)\n{\n  char * view a = c_find(s) + 1;\n  return *a;\n}\n"
     proc = _compile(tmp_path, C_DECLS + body)
     assert proc.returncode != 0
     assert (7, "error", FROM_C % "a view") in _diags(proc), proc.stderr
@@ -395,10 +396,10 @@ def test_w_does_not_hide_strict_errors(tmp_path):
     proc = _compile(tmp_path, TWICE, "-w")
     assert proc.returncode != 0
     assert (5, "error", TWICE_MSG) in _diags(proc), proc.stderr
-    plain = _compile(tmp_path, "int f(char * view p)\n{\n  int x = 0;\n  return p[0];\n}\n", "-w")
+    plain = _compile(tmp_path, "int f(char *p)\n{\n  int x = 0;\n  return p[0];\n}\n", "-w")
     assert plain.returncode == 0 and plain.stderr == "", plain.stderr
     # yasc enforces initialization (test_yasc_init.py): an error -w keeps
-    uninit = _compile(tmp_path, "int f(char * view p)\n{\n  int x;\n  return x + p[0];\n}\n", "-w")
+    uninit = _compile(tmp_path, "int f(char *p)\n{\n  int x;\n  return x + p[0];\n}\n", "-w")
     assert uninit.returncode != 0 and (4, "error", "'x' is used uninitialized") in _diags(uninit), uninit.stderr
 
 

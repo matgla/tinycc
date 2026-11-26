@@ -32,7 +32,7 @@ static struct name * owned maybe push(struct name * owned maybe head, char * own
 
 /* Only looks: the list is borrowed (view) and may be empty (maybe).  `out`
    says the function writes *chars before it returns. */
-static int count(const struct name * view maybe list, out int * view chars)
+static int count(const struct name * maybe list, out int *chars)
 {
   int n = 0;
   *chars = 0;

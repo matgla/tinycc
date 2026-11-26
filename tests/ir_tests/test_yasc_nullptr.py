@@ -40,7 +40,7 @@ PRE = """\
 #include "c.h"
 #include <s.h>
 struct S { char * view maybe p; int n; };
-void take(char * view maybe p);
+void take(char * maybe p);
 """
 
 NULL_MSG = "NULL is regular C: write nullptr"
@@ -48,44 +48,44 @@ ZERO_MSG = "0 as a null pointer: write nullptr"
 
 WARNS = [
     ("void f(void) { char * view maybe p = NULL; take(p); }", NULL_MSG),
-    ("int f(char * view maybe p) { return p == NULL; }", NULL_MSG),
+    ("int f(char * maybe p) { return p == NULL; }", NULL_MSG),
     ("void f(void) { take(NULL); }", NULL_MSG),
     ("void f(void) { char * view maybe p = 0; take(p); }", ZERO_MSG),
-    ("void f(char * view maybe p) { p = 0; take(p); }", ZERO_MSG),
+    ("void f(char * maybe p) { p = 0; take(p); }", ZERO_MSG),
     ("void f(void) { take(0); }", ZERO_MSG),
-    ("char * view maybe f(char * view maybe q) { take(q); return 0; }", ZERO_MSG),
-    ("int f(char * view maybe p) { return p != 0; }", ZERO_MSG),
-    ("int f(char * view maybe p) { return 0 == p; }", ZERO_MSG),
-    ("char * view maybe f(inout char * view maybe p, int c) { return c ? p : 0; }", ZERO_MSG),
-    ("char * view maybe f(inout char * view maybe p, int c) { return c ? 0 : p; }", ZERO_MSG),
+    ("char * view maybe f(char * maybe q) { take(q); return 0; }", ZERO_MSG),
+    ("int f(char * maybe p) { return p != 0; }", ZERO_MSG),
+    ("int f(char * maybe p) { return 0 == p; }", ZERO_MSG),
+    ("char * view maybe f(inout char * maybe p, int c) { return c ? p : 0; }", ZERO_MSG),
+    ("char * view maybe f(inout char * maybe p, int c) { return c ? 0 : p; }", ZERO_MSG),
     ("void f(void) { take((char * view maybe)0); }", ZERO_MSG),
-    ("void f(char * view maybe p) { p = '\\0'; take(p); }", ZERO_MSG),
-    ("void f(char * view maybe p) { p = 1 - 1; take(p); }", ZERO_MSG),
+    ("void f(char * maybe p) { p = '\\0'; take(p); }", ZERO_MSG),
+    ("void f(char * maybe p) { p = 1 - 1; take(p); }", ZERO_MSG),
     ("int f(void) { struct S s = {0}; return s.n; }", ZERO_MSG),
     ("int f(int k) { struct S s = { .p = 0, .n = k }; return s.n; }", ZERO_MSG),
     ("int f(void) { char * view maybe a[2] = {0}; return a[1] != nullptr; }", ZERO_MSG),
     ("static struct S g = {0};\nint f(void) { return g.n; }", ZERO_MSG),
     # spelled by this code: in a macro's argument, a header macro of its own
-    ("int f(char * view maybe p) { SYS_CHECK(p != NULL); return 0; }", NULL_MSG),
-    ("int f(char * view maybe p) { SYS_CHECK(p != 0); return 0; }", ZERO_MSG),
+    ("int f(char * maybe p) { SYS_CHECK(p != NULL); return 0; }", NULL_MSG),
+    ("int f(char * maybe p) { SYS_CHECK(p != 0); return 0; }", ZERO_MSG),
     ("void f(void) { CALL(take, NULL); }", NULL_MSG),
     ("void f(void) { CALL(take, 0); }", ZERO_MSG),
-    ("int f(char * view maybe p) { return ISNULL(p); }", NULL_MSG),
+    ("int f(char * maybe p) { return ISNULL(p); }", NULL_MSG),
 ]
 
 QUIET = [
     "void f(void) { char * view maybe p = nullptr; take(p); }",
-    "int f(char * view maybe p) { return p == nullptr || p != nullptr; }",
-    "int f(char * view maybe p) { return !p; }",
-    "int f(char * view maybe p) { if (p) return 1; return 0; }",
-    "int f(char * view maybe p) { return p && *p; }",
-    "char * view maybe f(inout char * view maybe p) { return p + 0; }",
-    "long f(char * view p, char * view q) { return p - q; }",
+    "int f(char * maybe p) { return p == nullptr || p != nullptr; }",
+    "int f(char * maybe p) { return !p; }",
+    "int f(char * maybe p) { if (p) return 1; return 0; }",
+    "int f(char * maybe p) { return p && *p; }",
+    "char * view maybe f(inout char * maybe p) { return p + 0; }",
+    "long f(char *p, char *q) { return p - q; }",
     "int f(void) { int x = 0; long y = 0; return x + (int)y; }",
     "int f(void) { struct S s = {}; return s.n; }",
     "struct T { int n; char * view maybe p; };\nint f(void) { struct T t = {0}; return t.n; }",
     # a system header's macros
-    "int f(char * view maybe p) { return SYS_ISNULL(p); }",
+    "int f(char * maybe p) { return SYS_ISNULL(p); }",
     "void f(void) { take(SYS_NONE); take(SYS_ZERO); }",
 ]
 
@@ -145,6 +145,6 @@ char *f(char *p, int c)
 
 
 def test_once_per_place(tmp_path):
-    proc = _compile(tmp_path, "int f(char * view maybe p)\n{\n  if (p == NULL)\n    return 1;\n  return p == 0;\n}")
+    proc = _compile(tmp_path, "int f(char * maybe p)\n{\n  if (p == NULL)\n    return 1;\n  return p == 0;\n}")
     lines = [l for l in proc.stderr.splitlines() if "write nullptr" in l]
     assert len(lines) == 2 and "t.c:8:" in lines[0] and "t.c:10:" in lines[1], proc.stderr

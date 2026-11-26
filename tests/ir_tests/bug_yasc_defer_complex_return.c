@@ -11,7 +11,7 @@
  * defer_settle_return_value loaded a _Complex lvalue into a scalar temp,
  * 8 bytes of a 16-byte value: it copies it to a temp local now, as a struct. */
 #pragma yasc
-extern int printf(const char * view, ...);
+extern int printf(const char *, ...);
 
 static volatile double vre = 1.5, vim = -2.25;
 static volatile float fre = 3.0f, fim = 4.5f;

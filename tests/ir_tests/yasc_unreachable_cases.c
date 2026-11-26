@@ -69,7 +69,7 @@ static int builtin(int x)
   __builtin_unreachable(); /* LINE builtin */
 }
 
-int main(int argc, char * view * view argv)
+int main(int argc, char * view *argv)
 {
   const char * view c = argc > 1 ? argv[1] : "none";
   int r = 0;

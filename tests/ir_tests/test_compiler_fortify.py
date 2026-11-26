@@ -148,7 +148,7 @@ def test_off_is_the_unchecked_code(tmp_path):
 
 def test_on_by_default_in_the_safe_mode(tmp_path):
     body = ("#include <stddef.h>\n"
-            "void fill(char * view d, size_t n) __attribute__((access(write_only, 1, 2)));\n"
+            "void fill(char *d, size_t n) __attribute__((access(write_only, 1, 2)));\n"
             "void chk_rt(size_t n) { char b[8] = undefined; fill(b, n); }\n")
     proc, obj = _compile(tmp_path, body, "-O1", ccompat=False)
     assert proc.returncode == 0, proc.stderr
@@ -218,7 +218,7 @@ void fill(char d[n], size_t n);
 void wr(const void buf[n], size_t n);
 void rd(out void buf[n], size_t n);
 void fill_first(size_t n, char d[n]);
-void use(char * view p);
+void use(char *p);
 char * borrows(static) chk_str(void) { static char g[16]; return pdir(g); }
 void chk_rt(size_t n) { char b[8] = undefined; fill(b, n); use(b); }
 void chk_wr(size_t n) { int b[4] = undefined; wr(b, n); }
@@ -231,13 +231,13 @@ void ok_first(void) { char b[8] = undefined; fill_first(8, b); use(b); }
 
 ATTRS = """\
 #include <stddef.h>
-char * borrows(path) pdir(char * view maybe path) __attribute__((null_terminated_string_arg(1)));
-void fill(char * view d, size_t n) __attribute__((access(read_write, 1, 2)));
-void wr(const void * view buf, size_t n) __attribute__((access(read_only, 1, 2)));
-void rd(out void * view buf, size_t n) __attribute__((access(write_only, 1, 2)));
-void fill_first(size_t n, char * view d) __attribute__((access(read_write, 2, 1)));
-void use(char * view p);
-""" + SYNTAX.split("void use(char * view p);\n", 1)[1]
+char * borrows(path) pdir(char * maybe path) __attribute__((null_terminated_string_arg(1)));
+void fill(char *d, size_t n) __attribute__((access(read_write, 1, 2)));
+void wr(const void *buf, size_t n) __attribute__((access(read_only, 1, 2)));
+void rd(out void *buf, size_t n) __attribute__((access(write_only, 1, 2)));
+void fill_first(size_t n, char *d) __attribute__((access(read_write, 2, 1)));
+void use(char *p);
+""" + SYNTAX.split("void use(char *p);\n", 1)[1]
 
 
 @pytest.mark.parametrize("opt", ["-O0", "-O2"])
@@ -266,7 +266,7 @@ def test_bound_after_the_array_checks_the_body(tmp_path):
 @pytest.mark.parametrize("decl,msg", [
     ("void f(char s[:1]);", "0: a parameter array's sentinel"),
     ("void f(char d[m], unsigned n);", "'m' undeclared"),
-    ("void f(char d[p], char * view p);", "a parameter's bound is an integer parameter"),
+    ("void f(char d[p], char *p);", "a parameter's bound is an integer parameter"),
     ("void f(char d[d]);", "a parameter's bound is an integer parameter"),
 ])
 def test_syntax_errors(tmp_path, decl, msg):

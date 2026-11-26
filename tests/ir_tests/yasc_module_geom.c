@@ -26,4 +26,4 @@ export int geom_calls(void) { return calls; }
 
 static grid_t the_grid = {8, 6};
 export grid_t * borrows(static) grid_get(void) { return &the_grid; }
-export int grid_cells(const grid_t * view g) { return g->w * g->h; }
+export int grid_cells(const grid_t *g) { return g->w * g->h; }

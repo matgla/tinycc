@@ -40,7 +40,7 @@ PL = PRELUDE.count("\n")
 
 # yasc spelling for the safe default
 PRELUDE_YASC = """\
-int pf(const char * view fmt, ...) __attribute__((format(printf, 1, 2)));
+int pf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 """
 
 
@@ -161,7 +161,7 @@ def test_yasc_pointer_types_spelled_as_written(tmp_path):
     """A yasc pointer's qualifiers as the source spells them, no trailing space."""
     body = (
         "void free(drop void * owned maybe p);\n"
-        "void t(const char * view maybe s, char * owned p, const char * view q, inout int * view maybe * view pp,\n"
+        "void t(const char * maybe s, char * owned p, const char *q, inout int * view maybe *pp,\n"
         "       char * owned maybe m)\n"
         "{\n  pf(\"%d\", s);\n  pf(\"%d\", p);\n  pf(\"%d\", q);\n  pf(\"%d\", pp);\n  pf(\"%d\", m);\n"
         "  free(p);\n  free(m);\n}\n"
@@ -173,7 +173,7 @@ def test_yasc_pointer_types_spelled_as_written(tmp_path):
     body = (
         "struct T { char buf[8]; char * borrows(buf) key; };\ntypedef struct FILE FILE;\n"
         "int fclose(drop FILE * owned maybe f);\n"
-        "void t(inout struct T * view x, FILE * owned(fclose) fp, const char * borrows(static) s)\n"
+        "void t(inout struct T *x, FILE * owned(fclose) fp, const char * borrows(static) s)\n"
         "{\n  pf(\"%d\", x->key);\n  pf(\"%d\", fp);\n  pf(\"%d\", s);\n  fclose(fp);\n}\n"
     )
     proc = _run(tmp_path, body, prelude=PRELUDE_YASC, ccompat=False)
@@ -258,11 +258,11 @@ def test_format_security(tmp_path):
     got = [line for line, _, m in _diags(_run(tmp_path, SECURITY, "-Wformat-security")) if m == msg]
     assert got == [3]
     assert msg not in _run(tmp_path, SECURITY, "-Wformat-security", "-Wno-format-security").stderr
-    proc = _run(tmp_path, "void t(const char * view nf) { pf(nf); }\n", prelude=PRELUDE_YASC, ccompat=False)
+    proc = _run(tmp_path, "void t(const char *nf) { pf(nf); }\n", prelude=PRELUDE_YASC, ccompat=False)
     assert proc.returncode == 0 and "warning: " + msg in proc.stderr, proc.stderr
 
 
-NBODY = "void t(int * view ip) { pf(\"%d%n\\n\", 1, ip); }\n"
+NBODY = "void t(int *ip) { pf(\"%d%n\\n\", 1, ip); }\n"
 NMSG = "'%n' in format writes through its argument"
 
 

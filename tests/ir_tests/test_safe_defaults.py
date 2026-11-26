@@ -112,7 +112,7 @@ def test_safe_code_compiles_cleanly(tmp_path):
 void * owned maybe alloc(unsigned n);
 void release(drop void * owned maybe p);
 int use(void);
-static int sum(const int * view v, int n)
+static int sum(const int *v, int n)
 {
   int s = 0;
   for (int i = 0; i < n; i++)
@@ -136,7 +136,7 @@ def test_pragma_yasc_is_c23_under_ccompat(tmp_path):
     """yasc is C23: a regular-C build (-ccompat, C11) of a file that says
     #pragma yasc has nullptr, true and false there (libc's libgen.c)"""
     src = tmp_path / "p.c"
-    src.write_text("#pragma yasc\nint t0(int * view maybe q)\n{\n  return q == nullptr;\n}\n"
+    src.write_text("#pragma yasc\nint t0(int * maybe q)\n{\n  return q == nullptr;\n}\n"
                    "bool t(void)\n{\n  return true && !false;\n}\n")
     proc = subprocess.run([str(TCC), "-ccompat", "-Wall", "-Werror", "-c", str(src), "-o", str(tmp_path / "p.o")],
                           capture_output=True, text=True)

@@ -3678,6 +3678,7 @@ static const FlagDef options_W[] = {
     /* On by default, yasc only: an owned variable handed on without move(p). */
     {offsetof(TCCState, warn_implicit_move), WD_STRICT, "implicit-move"},
     {offsetof(TCCState, warn_unchecked), WD_STRICT, "unchecked"},
+    {offsetof(TCCState, warn_redundant_view), WD_SAFE, "redundant-view"},
     /* yasc spells the null pointer one way: nullptr (NULL and 0 are
        regular C).  On in the safe default; -ccompat code says nothing. */
     {offsetof(TCCState, warn_zero_as_null_pointer_constant), WD_SAFE, "zero-as-null-pointer-constant"},

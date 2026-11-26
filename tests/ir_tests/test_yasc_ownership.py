@@ -22,6 +22,9 @@ TCC = CURRENT_DIR.parent.parent / "armv8m-tcc"
 pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 
 NOT_OWNING = "a pointer that owns nothing is stored in an owned pointer"
+# ... when it is a parameter (a view unless it says owned)
+NOT_OWNING_Q = ("the parameter 'q' owns nothing (a view unless it says owned): write '* owned q' when the function "
+                "takes it over, 'drop' before the type too when it frees it")
 LEAK = "an owned result is stored in a pointer that owns nothing: it is never freed"
 DISCARD = "an owned result is discarded: it is never freed"
 
@@ -78,10 +81,10 @@ def test_correct_ownership_is_silent(tmp_path):
 struct S { char * owned text; char * view peek; };
 typedef char * owned ostr;
 char * owned pass(char * owned p) { return p; }
-void take(drop struct S * view s);
-int fill(out struct S * view s);
-void f(struct S * view s);
-void ok(inout struct S * view s)
+void take(drop struct S *s);
+int fill(out struct S *s);
+void f(struct S *s);
+void ok(inout struct S *s)
 {
   char * owned p = alloc(4);
   char * owned q = 0;
@@ -104,15 +107,15 @@ void ok(inout struct S * view s)
 @pytest.mark.parametrize(
     "body, expected",
     [
-        ("void f(inout char * view q) { char * owned p = q; release(p); }", [NOT_OWNING]),
-        ("void f(inout char * view q) { release(q); }", [NOT_OWNING]),
-        ("char * owned f(inout char * view q) { return q; }", [NOT_OWNING]),
+        ("void f(inout char *q) { char * owned p = q; release(p); }", [NOT_OWNING_Q]),
+        ("void f(inout char *q) { release(q); }", [NOT_OWNING_Q]),
+        ("char * owned f(inout char *q) { return q; }", [NOT_OWNING_Q]),
         ("void f(void) { char * owned p = plain(); release(p); }", [NOT_OWNING]),
-        ("typedef char * owned ostr;\nvoid f(inout char * view q) { ostr s = q; release(s); }", [NOT_OWNING]),
-        ("struct S { char * owned t; };\nvoid f(inout struct S * view s, inout char * view q) { s->t = q; }", [NOT_OWNING]),
-        ("void f(inout char * owned * view pp, inout char * view q) { *pp = q; }", [NOT_OWNING]),
+        ("typedef char * owned ostr;\nvoid f(inout char *q) { ostr s = q; release(s); }", [NOT_OWNING_Q]),
+        ("struct S { char * owned t; };\nvoid f(inout struct S *s, inout char *q) { s->t = q; }", [NOT_OWNING_Q]),
+        ("void f(inout char * owned *pp, inout char *q) { *pp = q; }", [NOT_OWNING_Q]),
         ("void f(void) { char * view v = make(); (void)v; }", [LEAK]),
-        ("void use(char * view s);\nvoid f(void) { use(make()); }", [LEAK]),
+        ("void use(char *s);\nvoid f(void) { use(make()); }", [LEAK]),
         ("char * borrows(static) f(void) { return make(); }", [LEAK]),
         ("void f(void) { make(); }", [DISCARD]),
         ("void f(void) { alloc(8), make(); }", [DISCARD, DISCARD]),
@@ -149,8 +152,8 @@ def test_type_names_show_pointer_qualifiers(tmp_path):
 
 YASC_FILE = PRELUDE + """\
 struct node { struct node * owned maybe next; char * owned name; };
-int fill(out struct node * view n) { n->next = 0; n->name = make(); return 0; }
-void drain(drop struct node * view n)
+int fill(out struct node *n) { n->next = 0; n->name = make(); return 0; }
+void drain(drop struct node *n)
 {
   while (n->next) {
     struct node * owned maybe next = move(n->next->next);
@@ -204,7 +207,7 @@ LEGACY_USER = """\
 #include "yasc.h"
 char * owned make(void);
 char * borrows(static) y_view(void);
-void y_take(char * view p);
+void y_take(char *p);
 void release(drop void * owned maybe p);
 #define Y_MK(n) ((char * view)c_alloc(n))
 void f(void)

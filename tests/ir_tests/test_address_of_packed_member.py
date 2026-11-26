@@ -139,9 +139,9 @@ def test_pragma(tmp_path):
 def test_safe_default(tmp_path):
     body = (
         "struct __attribute__((packed)) P { char c; int u; };\n"
-        "int * view f(inout struct P * view p) { return &p->u; }\n"
-        "int * view g(inout struct P * view p) { int * view q = (int * view)&p->u; return q; }\n"
-        "void * view h(inout struct P * view p) { return &p->u; }\n"
+        "int * view f(inout struct P *p) { return &p->u; }\n"
+        "int * view g(inout struct P *p) { int * view q = (int * view)&p->u; return q; }\n"
+        "void * view h(inout struct P *p) { return &p->u; }\n"
     )
     proc = _run(tmp_path, body, compat=False)
     assert proc.returncode == 0, proc.stderr

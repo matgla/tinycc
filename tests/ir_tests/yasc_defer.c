@@ -3,10 +3,10 @@
  * Names in the body bind where the defer is written, a return value is
  * computed before the defers run, and a defer not reached yet does not run. */
 #pragma yasc
-extern int printf(const char * view, ...);
+extern int printf(const char *, ...);
 
-static void note(const char * view s) { printf("%s\n", s); }
-static void cl(int * view p) { printf("cleanup %d\n", *p); }
+static void note(const char *s) { printf("%s\n", s); }
+static void cl(int *p) { printf("cleanup %d\n", *p); }
 
 static void t_lifo(void)
 {

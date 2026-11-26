@@ -84,11 +84,11 @@ Rules for every item:
 
 ```c
 char * owned maybe p = malloc(n);                    /* owns; may be null */
-char * borrows(s) find(char * view s, int c);        /* result points into s */
+char * borrows(s) find(char *s, int c);        /* result points into s */
 const char * borrows(static) err_name(int e);
 struct cache { char * owned buf; char * borrows(buf) key; };
 struct tokenizer borrows(text) { const char * borrows(text) pos; };
-FILE * owned(fclose) maybe fopen(const char * view path, const char * view mode);
+FILE * owned(fclose) maybe fopen(const char *path, const char *mode);
 int owned(close) maybe fd = open(path, O_RDONLY);    /* int handle; invalid is < 0 */
 void * owned maybe takes(p) realloc(void * owned maybe p, size_t n);
 regex_t owned(regfree) re;                           /* an object owned as a whole */
@@ -149,7 +149,7 @@ bodies are silent; a static every call inlined gets a check-only parse.
   one is fine).  The caller hands the struct over with them set and not
   freed: a local struct passed by `&s` stays followed (it was "not
   followed" before), and its members still own memory after the call (maybe
-  ones may be null).  `drop struct T * view self` frees them: the callee
+  ones may be null).  `drop struct T *self` frees them: the callee
   must free every one (its struct's owned members are paths from the
   start), and the caller's count as freed (`defer s.clear()`).  An inlined
   method's self binding is the same handing over, so -O changes nothing.

@@ -184,6 +184,7 @@ void cast_error(CType *st, CType *dt)
 
 /* gen_assign_cast is converting a return statement's value, an argument */
 int yasc_returning, yasc_argument;
+int yasc_argument_c; /* yasc_argument: the parameter is regular C's (YASC_PARAM_C) */
 int yasc_stmt_bol, yasc_unsafe_expr_line, yasc_rbrace_line;
 
 static BufferedFile *yasc_unsafe_expr_file;
@@ -393,6 +394,28 @@ static void yasc_verify_assign(CType *dt)
     /* int handles: a constant (-1, ...) owns nothing and is fine anywhere */
     if ((dq | sq) & YASC_UNCHECKED)
       return;
+    /* A handle into a plain int: an int is a number, it points at nothing, so
+       where a handle goes says what it is -- `int view fd` borrows it, `int
+       owned(close) fd` takes it.  A regular-C parameter cannot say it: an
+       owned handle goes there as borrow(fd) or move(fd), a view as it is.
+       `(int)fd` is the number, on purpose: a copy that owns nothing. */
+    if (!type_is_handle(dt))
+    {
+      if (yasc_argument && yasc_argument_c)
+      {
+        if (sq & YASC_OWNED)
+          yasc_owned_to_unchecked(sq);
+        return;
+      }
+      if (!(sq & YASC_FRESH) || (vtop->r & VT_LVAL))
+      {
+        Sym *v = yasc_vtop_var();
+        const char *name = v ? get_tok_str(v->v, NULL) : "...";
+        tcc_yasc_rule("a handle is stored in a plain int: where it goes says 'int view' or 'int owned', or (int)%s "
+                      "takes its number", name);
+        return;
+      }
+    }
     if ((dq & YASC_OWNED) && !(sq & YASC_OWNED) && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) != VT_CONST)
       tcc_yasc_rule("an int that owns nothing is stored in an owned handle");
     else if (!(dq & YASC_OWNED) && (sq & YASC_FRESH) && !(vtop->r & VT_LVAL))
@@ -419,7 +442,19 @@ static void yasc_verify_assign(CType *dt)
   if (dq & YASC_RESTRICT)
     yasc_verify_restrict(sq);
   if ((dq & YASC_OWNED) && !(sq & YASC_OWNED) && !is_null_pointer(vtop))
-    tcc_yasc_rule("a pointer that owns nothing is stored in an owned pointer");
+  {
+    Sym *v = (vtop->r & VT_LVAL) ? yasc_vtop_var() : NULL;
+    /* a parameter is a view unless it says owned: free(p) of `char *p` (one
+       diagnostic: a note is not replayed with a body parsed again) */
+    if (v && (v->yasc & YASC_BODY_PARAM) && (sq & YASC_VIEW) && !type_borrows(&vtop->type))
+    {
+      const char *n = get_tok_str(v->v, NULL);
+      tcc_yasc_rule("the parameter '%s' owns nothing (a view unless it says owned): write '* owned %s' when the "
+                    "function takes it over, 'drop' before the type too when it frees it", n, n);
+    }
+    else
+      tcc_yasc_rule("a pointer that owns nothing is stored in an owned pointer");
+  }
   else if (!(dq & YASC_OWNED) && (sq & YASC_FRESH) && !(vtop->r & VT_LVAL))
     tcc_yasc_rule("an owned result is stored in a pointer that owns nothing: it is never freed");
   yasc_verify_move(dq, sq);

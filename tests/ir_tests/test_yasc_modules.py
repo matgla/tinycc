@@ -241,7 +241,7 @@ sock_t * owned maybe sock_open(int port) { (void)port; return 0; }
 export inline int twice(int v) { return v * 2 + RED; }
 export static inline int thrice(int v) { return v * 3; }
 export struct __attribute__((packed)) packed_s { char c; int i; };
-export size_t len_of(const char * view s);
+export size_t len_of(const char *s);
 """
 
 IFACE_TEXT = (
@@ -254,7 +254,7 @@ IFACE_TEXT = (
     "static inline int twice ( int v ) { return v * 2 + RED ; } "
     "static inline int thrice ( int v ) { return v * 3 ; } "
     "struct __attribute__ ( ( packed ) ) packed_s { char c ; int i ; } ; "
-    "size_t len_of ( const char * view s ) ;"
+    "size_t len_of ( const char * s ) ;"
 )
 
 
@@ -331,7 +331,7 @@ def test_no_interface_without_module_or_on_error(tmp_path):
             "an exported inline function uses the private 'h': export it",
         ),
         (
-            "module a;\nstruct s { int fd; };\nexport inline int fd_of(struct s * view p) { return p->fd; }\n",
+            "module a;\nstruct s { int fd; };\nexport inline int fd_of(struct s *p) { return p->fd; }\n",
             "an exported inline function uses struct s, whose body is private: export the definition",
         ),
         (
@@ -350,7 +350,7 @@ def test_interface_names_that_are_fine(tmp_path):
     body = (
         "module a;\nextern int outside(void);\nexport inline int h(void) { return outside(); }\n"
         "int fd;\nexport struct q { int fd; };\n"
-        "export inline int g(struct q * view p) { return p->fd; }\n"
+        "export inline int g(struct q *p) { return p->fd; }\n"
         "export enum { M = 2 };\nexport int tbl[M];\n"
         "export typedef int pub_t;\nexport pub_t get(void);\n"
     )
@@ -358,7 +358,7 @@ def test_interface_names_that_are_fine(tmp_path):
     assert proc.returncode == 0 and not proc.stderr, proc.stderr
     body = (
         "module a;\nint fd;\nexport struct q { int fd; };\n"
-        "export inline int g(struct q * view p) { return p->fd; }\n"
+        "export inline int g(struct q *p) { return p->fd; }\n"
         "export enum { M = 2 };\nexport int tbl[M];\n"
         "export typedef int pub_t;\nexport pub_t get(void);\n"
     )
@@ -396,9 +396,9 @@ def test_import_records_imports(tmp_path):
 
 
 def test_import_ignores_importer_macros(tmp_path):
-    _ok(_cc(tmp_path, "a", "module a;\nexport struct p { int x; };\nexport int get(struct p * view q);\n"))
+    _ok(_cc(tmp_path, "a", "module a;\nexport struct p { int x; };\nexport int get(struct p *q);\n"))
     _ok(_cc(tmp_path, "m", "#define x 999\n#define get broken(\nimport a;\n#undef x\n#undef get\n"
-            "int f(struct p * view q) { return q->x + get(q); }\n"))
+            "int f(struct p *q) { return q->x + get(q); }\n"))
 
 
 def test_import_includes_module_headers(tmp_path):
@@ -588,7 +588,7 @@ export enum color { RED, GREEN = 5 };
 struct sock { int fd; };
 export sock_t * owned maybe sock_open(int port);
 export void sock_close(drop sock_t * owned s);
-export size_t name_len(const char * view s);
+export size_t name_len(const char *s);
 export int counter = 3, arr[2] = {1, 2};
 export const double scale = 2.5;
 export float half(float f) { return f * 0.5f; }
@@ -678,10 +678,10 @@ struct grid { int n; };
 export struct tok borrows(text) { const char * borrows(text) pos; };
 static struct grid the_grid;
 export struct grid * borrows(static) grid_get(void) { return &the_grid; }
-export const char * borrows(s) skip(const char * view s) { return s + 1; }
+export const char * borrows(s) skip(const char *s) { return s + 1; }
 export char * owned takes(p) keep(char * owned p) { return p; }
 export int owned(close) maybe open_fd(int f);
-export struct tok borrows(src) tok_init(const char * view src);
+export struct tok borrows(src) tok_init(const char *src);
 export int takes(int v);
 """
 
@@ -708,9 +708,9 @@ def test_header_leaves_out_qualifier_arguments(tmp_path):
 
 IN_MODULE = """\
 module ro;
-export int first(int n, const char * view * view argv);
+export int first(int n, const char * view *argv);
 export int count(const char * view a[], char * view b[], int c[4], inout char * view e[], int g[owned]);
-export int bytes(const int * view maybe p, const char * view s, char * view const * view v);
+export int bytes(const int * maybe p, const char *s, char * view const *v);
 export int rows(const char (* view m)[4], const char (* view c)[4]);
 """
 

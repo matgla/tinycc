@@ -49,12 +49,12 @@ struct rec {
 };
 
 void rec_free(int flags, drop rec * owned maybe r);
-rec * owned(rec_free) maybe rec_new(const char * view name) __yl_nonnull(1);
-char * borrows(s) maybe rec_find(const char * view s, int c);
-long rec_read(inout rec * view r, out char * view maybe dst, in const char * view src);
-int rec_open(int owned(close) fd, char * owned(free) maybe * view out_name);
+rec * owned(rec_free) maybe rec_new(const char *name) __yl_nonnull(1);
+char * borrows(s) maybe rec_find(const char *s, int c);
+long rec_read(inout rec *r, out char * maybe dst, in const char *src);
+int rec_open(int owned(close) fd, char * owned(free) maybe *out_name);
 char * borrows(path) rec_base(inout char path[maybe :0]);
-int rec_sort(rec * view base, int (* view cmp)(const rec * view, const rec * view));
+int rec_sort(rec *base, int (* view cmp)(const rec *, const rec *));
 #ifdef __YASC__
 int rec_count([]const char names);
 #else
@@ -185,7 +185,7 @@ def test_c_section_survives_an_include(tmp_path, before):
     (tmp_path / "inline.h").write_text("static inline int up(int c) { return c + 1; }\n")
     (tmp_path / "h.h").write_text("#pragma yasc\n#pragma tcc c_begin\n#include \"other.h\"\n"
                                   "struct s { char *p; };\nint c_fn(char *p);\n#pragma tcc c_end\n"
-                                  "int y_fn(char *p);\n")
+                                  "char *y_p;\n")  # (a parameter's own pointer would be a view)
     (tmp_path / "u.c").write_text(before + "#include \"h.h\"\n")
     proc = subprocess.run([str(TCC), "-std=yasc", "-fsyntax-only", str(tmp_path / "u.c")], capture_output=True,
                           text=True)

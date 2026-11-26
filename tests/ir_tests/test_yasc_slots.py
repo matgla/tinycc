@@ -27,11 +27,11 @@ PRELUDE = """\
 void * owned maybe malloc(unsigned n);
 void free(drop void * owned maybe p);
 int close(int drop owned(close) maybe fd);
-int owned(close) maybe open(const char * view p, int f);
-int pipe(out int owned(close) maybe * view fds);
-int use(char * view p);
+int owned(close) maybe open(const char *p, int f);
+int pipe(out int owned(close) maybe *fds);
+int use(char *p);
 struct box { char * owned maybe buf; int n; };
-void touch(inout struct box * view b);
+void touch(inout struct box *b);
 """
 PRELUDE_LINES = PRELUDE.count("\n")
 LEVELS = ["-O0", "-O1", "-O2", "-Os"]

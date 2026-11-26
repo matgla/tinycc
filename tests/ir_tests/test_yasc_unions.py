@@ -26,7 +26,7 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 PRELUDE = """\
 typedef unsigned long uintptr_t;
 typedef unsigned uint32_t;
-int use(char * view p);
+int use(char *p);
 union val { char * view s; uintptr_t addr; int i; };
 struct holder { char * view p; int n; };
 union agg { struct holder h; int raw[2]; };
@@ -69,12 +69,12 @@ def _diags(proc):
 
 # one statement per line: an unsafe region owns its lines
 NEEDS_UNSAFE = {
-    "read": ("int f(union val * view v)\n{\n  return use(%s);\n}\n", "v->s", FROM_C),
-    "deref": ("int f(struct tagged * view t)\n{\n  return *%s;\n}\n", "t->u.s", DEREF),
-    "nested": ("int f(union agg * view a)\n{\n  return use(%s);\n}\n", "a->h.p", FROM_C),
-    "element": ("int f(union arr * view a)\n{\n  return use(%s);\n}\n", "a->a[1]", FROM_C),
-    "whole": ("struct holder f(union agg * view a)\n{\n  return %s;\n}\n", "a->h", WHOLE),
-    "address": ("char * view * view f(inout union val * view v)\n{\n  return %s;\n}\n", "&v->s", ADDR),
+    "read": ("int f(union val *v)\n{\n  return use(%s);\n}\n", "v->s", FROM_C),
+    "deref": ("int f(struct tagged *t)\n{\n  return *%s;\n}\n", "t->u.s", DEREF),
+    "nested": ("int f(union agg *a)\n{\n  return use(%s);\n}\n", "a->h.p", FROM_C),
+    "element": ("int f(union arr *a)\n{\n  return use(%s);\n}\n", "a->a[1]", FROM_C),
+    "whole": ("struct holder f(union agg *a)\n{\n  return %s;\n}\n", "a->h", WHOLE),
+    "address": ("char * view * view f(inout union val *v)\n{\n  return %s;\n}\n", "&v->s", ADDR),
 }
 
 
@@ -99,7 +99,7 @@ def test_what_needs_no_unsafe(tmp_path):
     pointers at all (U1)."""
     body = (
         "#pragma tcc c_begin\nvoid c_keep(char *p);\n#pragma tcc c_end\n"
-        "void f(inout union val * view v, inout union agg * view a, char * view maybe p)\n{\n"
+        "void f(inout union val *v, inout union agg *a, char * maybe p)\n{\n"
         "  v->addr = 0x20000000;\n"
         "  a->h.n = 3;\n"
         "  int n = v->i + a->h.n + a->raw[1] + (int)sizeof(v->s) + (int)sizeof(a->h);\n"
@@ -117,7 +117,7 @@ def test_what_needs_no_unsafe(tmp_path):
 def test_store_is_checked_as_its_type(tmp_path):
     """`v->s = p` stores a view: it is not regular C, so a view parameter
     stored there still cannot leave the function."""
-    proc = _compile(tmp_path, "void f(inout union val * view v, char * view p) { v->s = p; }\n")
+    proc = _compile(tmp_path, "void f(inout union val *v, char *p) { v->s = p; }\n")
     assert proc.returncode != 0
     assert any(m.startswith("'p' is a view: it cannot leave the function") for _, _, m in _diags(proc)), proc.stderr
 
@@ -151,7 +151,7 @@ BITFIELD_STORES = {
 def test_volatile_bitfield_store(tmp_path, name):
     body = (
         "struct regs { volatile uint32_t f:4; uint32_t g:4; };\n"
-        "void f(inout volatile ctrl_t * view r, inout struct regs * view s)\n{\n  %s\n}\n" % BITFIELD_STORES[name]
+        "void f(inout volatile ctrl_t *r, inout struct regs *s)\n{\n  %s\n}\n" % BITFIELD_STORES[name]
     )
     proc = _compile(tmp_path, body)
     assert proc.returncode != 0
@@ -168,7 +168,7 @@ def test_volatile_bitfield_what_is_fine(tmp_path):
     """Reads, the explicit copy-change-store, a volatile local's initializer,
     a non-volatile register image, and unsafe."""
     body = (
-        "uint32_t f(inout volatile ctrl_t * view r, inout ctrl_t * view img)\n{\n"
+        "uint32_t f(inout volatile ctrl_t *r, inout ctrl_t *img)\n{\n"
         "  ctrl_t v = *r;\n  v.b.en = 1;\n  *r = v;\n"
         "  volatile ctrl_t l = { .b = { .en = 1 } };\n  l.raw = 0;\n"
         "  img->b.div = 4;\n"

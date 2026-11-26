@@ -292,6 +292,7 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
            nocode_wanted) which is why we push them here as normal symbols
            temporarily.  Example: int func(int a, int b[++a]); */
         s = sym_push(n, &pt, VT_LOCAL | VT_LVAL, 0);
+        s->yasc = pp_in_c() ? YASC_PARAM_C : 0;
         s->a.param_volatile = param_volatile;
         s->a.param_array = param_array;
         if (tcc_state->unused_on)
@@ -909,6 +910,19 @@ static void yasc_result_takes(Sym *f, int name)
   yasc_requalify(&pa->type, pa->type.ref->yasc | YASC_TAKEN); /* a pointer or an int handle */
 }
 
+/* tok is a parameter's name: whether the declarator ends with it (',' or
+   ')' follows, or an attribute), so the '*' before it is the parameter's
+   own -- not an array's element (`char *a[]`) or a function's result
+   (`char *g(int)`) */
+static int yasc_param_name_ends(void)
+{
+  int name = tok, after;
+  next();
+  after = tok;
+  unget_tok(name);
+  return after == ',' || after == ')' || after == TOK_ATTRIBUTE1 || after == TOK_ATTRIBUTE2;
+}
+
 CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
 {
   CType *post, *ret;
@@ -944,6 +958,7 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
        regular-C PTR is a regular-C pointer, though the tokens after it are
        yasc again (the marker after the expansion applies with the next one) */
     const int star_yasc = tcc_state->yasc, star_c = pp_in_c();
+    int view_written = 0; /* `view` written on this '*' (not borrows(...)) */
     if ((bnb >= 0 || bstatic) && nstar == 1 && (td & TYPE_PARAM))
     {
       memcpy(tbnames, bnames, bnb * sizeof(int));
@@ -994,6 +1009,8 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
       int kw = tok;
       if (kw != TOK_owned && kw != TOK_maybe && kw != TOK_view)
         tcc_error("'%s' qualifies the object: write it before the type", get_tok_str(kw, NULL));
+      if (kw == TOK_view)
+        view_written = 1;
       yq |= kw == TOK_owned ? YASC_OWNED : kw == TOK_view ? YASC_VIEW : YASC_MAYBE;
       if (kw == TOK_owned)
       {
@@ -1050,6 +1067,24 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
       parse_attribute(ad);
       break;
     }
+    /* yasc: a parameter's own pointer -- the last '*' before its name, or
+       before the ',' / ')' of an abstract one -- is a view unless it says
+       owned or borrows(...): the most a callee can do with it is look.  Not
+       an inner level (`char **pp`'s first '*', `char *a[]`'s), not a nested
+       declarator's, not one before a parameter list (a function pointer's
+       result: `char *(*cb)(int)`), not a slice's element (`[]char * view a`). */
+    if (star_yasc && !star_c && (td & TYPE_PARAM) && !(td & TYPE_NESTDECL) && !ad->yslice && (type->t & VT_BTYPE) != VT_FUNC &&
+        (tok == ',' || tok == ')' || (tok >= TOK_UIDENT && yasc_param_name_ends())))
+    {
+      if (!(yq & (YASC_OWNED | YASC_VIEW)))
+        yq |= YASC_VIEW;
+      else if (view_written && bnb < 0 && !bstatic && tcc_warn_wanted(warn_redundant_view))
+      {
+        const int line = file ? file->line_num : 0;
+        tcc_warning_once(warn_redundant_view, "a parameter's pointer is a view unless it says owned: drop 'view'");
+        tcc_fixit(line, "view ", FIXIT_REPLACE, "");
+      }
+    }
     int plain = star_yasc && !(yq & (YASC_OWNED | YASC_VIEW));
     /* yasc: a pointer written in regular C says nothing about ownership
        (unless yasc code after it does: `PTR(char) owned p`) */
@@ -1074,9 +1109,11 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
     }
     else
     {
+      /* a parameter's '*' that is plain is an inner level (its own is a view):
+         said at once, the body decides nothing about it */
       if (plain && (type->t & VT_BTYPE) != VT_FUNC)
         yasc_plain_error(file ? file->line_num : 0,
-                         (td & TYPE_PARAM) ? 1 : !(td & (TYPE_ABSTRACT | TYPE_NESTDECL)) ? 2 : 0);
+                         (td & TYPE_PARAM) ? 0 : !(td & (TYPE_ABSTRACT | TYPE_NESTDECL)) ? 2 : 0);
       mk_pointer_yasc(type, yq);
       if (dealloc)
         type->ref = sym_pointer_node_b(&type->ref->type, yq, dealloc), dealloc = 0;

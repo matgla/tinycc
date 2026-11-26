@@ -119,7 +119,7 @@ def test_no_and_error_forms(tmp_path):
 def test_safe_default_error_once(tmp_path, level):
     # the safe default: int-conversion is an error -- reported at its line
     body = ("static inline int f(int a) { int * view p = a; return p != 0; }\n"
-            "int main(int argc, char * view * view argv) { (void)argv; return f(argc) + f(argc + 1); }\n")
+            "int main(int argc, char * view *argv) { (void)argv; return f(argc) + f(argc + 1); }\n")
     proc = _run(tmp_path, body, level, compat=False)
     assert proc.returncode != 0
     assert _diags(proc, "error") == [(1, INT_PTR)], proc.stderr

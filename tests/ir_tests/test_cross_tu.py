@@ -167,7 +167,7 @@ def test_yasc_and_c_agree(tmp_path):
     use = '#include "api.h"\nchar *first(void) { return dup_name("a"); }\n'
     defs = (
         "#include <stdlib.h>\n"
-        "char * owned dup_name(const char * view s)\n{\n  char * owned p = unsafe(malloc(2));\n  p[0] = s[0];\n"
+        "char * owned dup_name(const char *s)\n{\n  char * owned p = unsafe(malloc(2));\n  p[0] = s[0];\n"
         "  p[1] = 0;\n  return p;\n}\n"
     )
     _setup(tmp_path, defs, use=use, header=header)

@@ -97,10 +97,10 @@ def test_code_unchanged(tmp_path, opt):
 # yasc: a call's result that borrows from an argument (borrows(...), or the
 # elision) points into that argument, a frame address too
 YASC_PRELUDE = (
-    "char * borrows(p) f(char * view maybe p);\n"
-    "char * borrows(static, p) fs(char * view maybe p);\n"
-    "char * view v(char * view p);\n"
-    "char * borrows(a) two(char * view a, char * view b);\n"
+    "char * borrows(p) f(char * maybe p);\n"
+    "char * borrows(static, p) fs(char * maybe p);\n"
+    "char * view v(char *p);\n"
+    "char * borrows(a) two(char *a, char *b);\n"
 )
 
 YASC_BAD = {
@@ -111,7 +111,7 @@ YASC_BAD = {
     "offset": ("char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return f(buf) + 1;\n}\n", "f"),
     "element": ("char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return f(&buf[1]);\n}\n", "f"),
     "borrowed_one": (
-        "char * borrows(p) g(char * view p)\n{\n  char buf[4] = \"ab\";\n  return two(buf, p);\n}\n",
+        "char * borrows(p) g(char *p)\n{\n  char buf[4] = \"ab\";\n  return two(buf, p);\n}\n",
         "two",
     ),
 }
@@ -119,8 +119,8 @@ YASC_BAD = {
 YASC_CLEAN = {
     "static": "char * borrows(static) g(void)\n{\n  static char sb[4];\n  return f(sb);\n}\n",
     "literal": "char * borrows(static) g(void)\n{\n  return f(\"lit\");\n}\n",
-    "parameter": "char * borrows(p) g(char * view p)\n{\n  return f(p);\n}\n",
-    "not_borrowed": "char * borrows(p) g(char * view p)\n{\n  char buf[4] = \"ab\";\n  return two(p, buf);\n}\n",
+    "parameter": "char * borrows(p) g(char *p)\n{\n  return f(p);\n}\n",
+    "not_borrowed": "char * borrows(p) g(char *p)\n{\n  char buf[4] = \"ab\";\n  return two(p, buf);\n}\n",
     "used_inside": "int g(void)\n{\n  char buf[4] = \"ab\";\n  char * view r = f(buf);\n  return *r;\n}\n",
 }
 

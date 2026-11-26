@@ -29,12 +29,12 @@ PRELUDE = """\
 #pragma yasc
 void * owned malloc(unsigned n);
 void free(drop void * owned maybe p);
-int use(char * view p);
+int use(char *p);
 struct node { int v; struct node * view maybe next; };
 struct buf { char * owned maybe p; };
 struct node gn;
 void reset(void);
-void put(char * owned maybe * view pp);
+void put(char * owned maybe *pp);
 struct buf * borrows(static) holder(void);
 """
 PRELUDE_LINES = PRELUDE.count("\n")

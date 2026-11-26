@@ -8,9 +8,9 @@ struct P
   int a, b, c, d;
 };
 
-int use(const struct P * view p);   /* reads */
-void fill(inout struct P * view p, int v); /* writes every member */
-void bump(inout struct P * view p);       /* writes one member */
+int use(const struct P *p);   /* reads */
+void fill(inout struct P *p, int v); /* writes every member */
+void bump(inout struct P *p);       /* writes one member */
 int say(int x);                     /* touches no P */
 
 /* read-only parameter, then another call: t's stores survive */
@@ -81,7 +81,7 @@ struct B
 };
 
 /* a field reloaded after a store through another pointer */
-int case_restrict_reload(struct B * restrict view b, inout int * view other, int n)
+int case_restrict_reload(struct B * restrict b, inout int *other, int n)
 {
   int x = b->cap;
   other[2] = n;
@@ -90,7 +90,7 @@ int case_restrict_reload(struct B * restrict view b, inout int * view other, int
 }
 
 /* an element reloaded after a store through another pointer */
-int case_restrict_array(int * restrict view d, inout int * view s, int n)
+int case_restrict_array(int * restrict d, inout int *s, int n)
 {
   int x = d[3];
   s[1] = n;
@@ -98,7 +98,7 @@ int case_restrict_array(int * restrict view d, inout int * view s, int n)
 }
 
 /* a store through the restrict pointer itself is seen */
-int case_restrict_self(inout int * restrict view d, int n)
+int case_restrict_self(inout int * restrict d, int n)
 {
   int x = d[3];
   d[3] = n;
@@ -106,7 +106,7 @@ int case_restrict_self(inout int * restrict view d, int n)
 }
 
 /* through a pointer derived from it */
-int case_restrict_derived(inout int * restrict view d, inout int * view s, int n)
+int case_restrict_derived(inout int * restrict d, inout int *s, int n)
 {
   int x = d[3];
   int * view e = d + 2;
@@ -117,7 +117,7 @@ int case_restrict_derived(inout int * restrict view d, inout int * view s, int n
 
 /* through a pointer derived at a run-time offset: no common base, the
    derivation alone says it may be the same memory */
-int case_restrict_runtime_offset(inout int * restrict view d, int k, int n)
+int case_restrict_runtime_offset(inout int * restrict d, int k, int n)
 {
   int x = d[3];
   int * view e = d + k;
@@ -128,10 +128,10 @@ int case_restrict_runtime_offset(inout int * restrict view d, int k, int n)
 /* ---- O2: a fresh owned result is new memory ---- */
 void * owned maybe malloc(unsigned n);
 void free(drop void * owned maybe p);
-int peek(const int * view p);
+int peek(const int *p);
 
 /* reloaded after a store through another pointer, then freed */
-int case_fresh(inout int * view other, int n)
+int case_fresh(inout int *other, int n)
 {
   int * owned maybe p = malloc(32);
   if (!p)
@@ -145,7 +145,7 @@ int case_fresh(inout int * view other, int n)
 }
 
 /* an exclusive parameter handed to a parameter that does not escape it */
-int case_restrict_peeked(int * restrict view d, inout int * view s, int n)
+int case_restrict_peeked(int * restrict d, inout int *s, int n)
 {
   int x = d[4];
   int z = peek(d);
@@ -154,10 +154,10 @@ int case_restrict_peeked(int * restrict view d, inout int * view s, int n)
 }
 
 /* ---- O1 for scalars: `int x; f(&x);` with a no-escape parameter ---- */
-int peeki(const int * view p);  /* reads */
-void puti(inout int * view p, int v); /* writes */
-void bumpi(inout int * view p);       /* reads and writes */
-long long peekll(const long long * view p);
+int peeki(const int *p);  /* reads */
+void puti(inout int *p, int v); /* writes */
+void bumpi(inout int *p);       /* reads and writes */
+long long peekll(const long long *p);
 
 /* read by the call, kept across another one */
 int case_scalar_read(int n)
@@ -292,10 +292,10 @@ int case_named_write_in_loop(int n)
 }
 
 /* ---- O4 in LICM: an exclusive parameter's field read in a loop ---- */
-void bumpi(inout int * view p);
+void bumpi(inout int *p);
 
 /* hoisted: the loop stores through another pointer and calls say() */
-int case_licm_field(struct B * restrict view b, inout int * view dst, int n)
+int case_licm_field(struct B * restrict b, inout int *dst, int n)
 {
   int s = 0;
   for (int i = 0; i < n; i++)
@@ -307,7 +307,7 @@ int case_licm_field(struct B * restrict view b, inout int * view dst, int n)
 }
 
 /* kept: the loop writes the field through the parameter */
-int case_licm_self(inout struct B * restrict view b, inout int * view dst, int n)
+int case_licm_self(inout struct B * restrict b, inout int *dst, int n)
 {
   int s = 0;
   for (int i = 0; i < n; i++)
@@ -320,7 +320,7 @@ int case_licm_self(inout struct B * restrict view b, inout int * view dst, int n
 }
 
 /* kept: through a pointer derived from it */
-int case_licm_derived(inout int * restrict view d, inout int * view dst, int k, int n)
+int case_licm_derived(inout int * restrict d, inout int *dst, int k, int n)
 {
   int s = 0;
   int * view e = d + k;
@@ -334,7 +334,7 @@ int case_licm_derived(inout int * restrict view d, inout int * view dst, int k, 
 }
 
 /* kept: handed to a call that writes */
-int case_licm_handed(inout int * restrict view d, inout int * view dst, int n)
+int case_licm_handed(inout int * restrict d, inout int *dst, int n)
 {
   int s = 0;
   for (int i = 0; i < n; i++)

@@ -4,7 +4,7 @@
 The object (a struct, not a pointer) holds what a function gave it and a
 deallocator takes back: `int regcomp(out regex_t owned(regfree) * view
 preg, ...)` writes it (a status result's test deciding), `void
-regfree(drop regex_t owned(regfree) * view preg)` releases it, and a read
+regfree(drop regex_t owned(regfree) *preg)` releases it, and a read
 through a pointer that cannot write (`const regex_t * view`) uses it.  The
 slot check follows it like an owned item: leaks, use after release,
 release twice, the wrong deallocator.  Its address written into by such a
@@ -24,10 +24,10 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 PRELUDE = """\
 #pragma yasc
 typedef struct { int re_nsub; void * view maybe impl; } regex_t;
-int regcomp(out regex_t owned(regfree) * view preg, const char * view pat, int fl);
-int regexec(const regex_t * view preg, const char * view s);
-void regfree(drop regex_t owned(regfree) * view preg);
-void other_free(drop regex_t owned(other_free) * view p);
+int regcomp(out regex_t owned(regfree) *preg, const char *pat, int fl);
+int regexec(const regex_t *preg, const char *s);
+void regfree(drop regex_t owned(regfree) *preg);
+void other_free(drop regex_t owned(other_free) *p);
 """
 PRELUDE_LINES = PRELUDE.count("\n")
 START = "void f(void)\n{\n  regex_t owned(regfree) re = undefined;\n  if (regcomp(&re, \"a\", 0))\n    return;\n"

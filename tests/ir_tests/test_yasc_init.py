@@ -33,15 +33,15 @@ LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 PRELUDE = (
     "#pragma yasc\n"
     "int g(int);\n"
-    "void fill(out int * view p);\n"
-    "void plain(int * view p);\n"
-    "void see(const int * view p);\n"
-    "static inline void ifill(out int * view p) { *p = 7; }\n"
-    "void pfill(out const char * view maybe * view p);\n"
-    "static inline int ipfill(const char * view s, out const char * borrows(s) maybe * view p)\n"
+    "void fill(out int *p);\n"
+    "void plain(int *p);\n"
+    "void see(const int *p);\n"
+    "static inline void ifill(out int *p) { *p = 7; }\n"
+    "void pfill(out const char * view maybe *p);\n"
+    "static inline int ipfill(const char *s, out const char * borrows(s) maybe *p)\n"
     "{\n  *p = nullptr;\n  if (s[0] == '0')\n    *p = s;\n  return 8;\n}\n"
     "struct pt { int x, y; };\n"
-    "void sfill(out struct pt * view p);\n"
+    "void sfill(out struct pt *p);\n"
 )
 
 READ_MAY = "may be used uninitialized: yasc wants a value on every path"
@@ -142,7 +142,7 @@ GOOD = {
     # `out` on the pointer p points at (the level below the parameter's own)
     "out_pointer_call": "int f(void)\n{\n  const char * view maybe q;\n  pfill(&q);\n  return q != nullptr;\n}\n",
     "out_pointer_inlined": (
-        "int f(const char * view s)\n{\n  const char * view maybe q;\n  int b = ipfill(s, &q);\n  return q ? b : 0;\n}\n"
+        "int f(const char *s)\n{\n  const char * view maybe q;\n  int b = ipfill(s, &q);\n  return q ? b : 0;\n}\n"
     ),
     "overflow_result": (
         "int f(int a, int b)\n{\n  int r;\n  if (__builtin_add_overflow(a, b, &r) || __builtin_mul_overflow(r, 2, &r))\n"

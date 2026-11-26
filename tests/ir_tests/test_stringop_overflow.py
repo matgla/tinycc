@@ -49,8 +49,8 @@ PL = PRELUDE.count("\n")
 
 PRELUDE_YASC = """\
 typedef unsigned int size_t;
-void * view memcpy(void * view d, const void * view s, size_t n);
-int sprintf(char * view d, const char * view f, ...);
+void * view memcpy(void *d, const void *s, size_t n);
+int sprintf(char *d, const char *f, ...);
 """
 
 
@@ -231,7 +231,7 @@ def test_system_header_quiet(tmp_path):
 
 
 def test_safe_default(tmp_path):
-    body = "void f(const char * view s) { char b[4] = undefined; memcpy(b, s, 5); sprintf(b, \"%d\", 12345); }\n"
+    body = "void f(const char *s) { char b[4] = undefined; memcpy(b, s, 5); sprintf(b, \"%d\", 12345); }\n"
     proc = _run(tmp_path, body, prelude=PRELUDE_YASC, ccompat=False)
     assert proc.returncode == 0, proc.stderr
     assert "warning: 'memcpy' writing 5 bytes into a region of size 4" in proc.stderr, proc.stderr

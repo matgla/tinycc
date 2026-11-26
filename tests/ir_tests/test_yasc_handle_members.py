@@ -23,10 +23,10 @@ LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 
 PRELUDE = """\
 int close(drop int owned maybe fd);
-int owned(close) maybe open(const char * view p, int fl);
-long write(int view fd, const void * view b, unsigned n);
+int owned(close) maybe open(const char *p, int fl);
+long write(int view fd, const void *b, unsigned n);
 struct conn { int owned(close) maybe fd; int n; };
-struct m { int owned(close) maybe fd; int get(struct m * view self); };
+struct m { int owned(close) maybe fd; int get(struct m *self); };
 """
 PRELUDE_LINES = PRELUDE.count("\n")
 
@@ -56,11 +56,11 @@ MAYBE_ARG = "a handle that may be invalid is passed as argument 1 of 'write', wh
 
 BAD = {
     "leak": ("void f(void) { struct conn c = undefined; c.fd = open(\"x\", 0); }", "'c.fd' leaks: it still owns a handle at the end of its scope"),
-    "twice": ("void f(inout struct conn * view c) { close(c->fd); close(c->fd); }", "'c->fd' is released twice"),
-    "after": ("void f(inout struct conn * view c) { if (c->fd < 0) return; close(c->fd); write(c->fd, \"x\", 1); }",
+    "twice": ("void f(inout struct conn *c) { close(c->fd); close(c->fd); }", "'c->fd' is released twice"),
+    "after": ("void f(inout struct conn *c) { if (c->fd < 0) return; close(c->fd); write(c->fd, \"x\", 1); }",
               "'c->fd' is used after it was released"),
-    "untested": ("void f(struct conn * view c) { write(c->fd, \"x\", 1); }", MAYBE_ARG),
-    "plain_int": ("void f(inout struct conn * view c, int fd) { c->fd = fd; }", "an int that owns nothing is stored in an owned handle"),
+    "untested": ("void f(struct conn *c) { write(c->fd, \"x\", 1); }", MAYBE_ARG),
+    "plain_int": ("void f(inout struct conn *c, int fd) { c->fd = fd; }", "an int that owns nothing is stored in an owned handle"),
     "local_twice": ("void f(void) { struct conn c = undefined; c.fd = open(\"x\", 0); close(c.fd); close(c.fd); }", "'c.fd' is released twice"),
 }
 
@@ -77,13 +77,13 @@ def test_handle_member_errors(tmp_path, name, opt):
 
 
 GOOD = {
-    "tested": "void f(struct conn * view c) { if (c->fd >= 0) write(c->fd, \"x\", 1); }",
-    "early_return": "void f(struct conn * view c) { if (c->fd < 0) return; write(c->fd, \"x\", 1); }",
-    "minus_one": "void f(struct conn * view c) { if (c->fd == -1) return; write(c->fd, \"x\", 1); }",
-    "reopen": "void f(inout struct conn * view c) { close(c->fd); c->fd = open(\"y\", 0); close(c->fd); c->fd = -1; }",
-    "closed_and_cleared": "void f(inout struct conn * view c) { close(c->fd); c->fd = -1; }",
+    "tested": "void f(struct conn *c) { if (c->fd >= 0) write(c->fd, \"x\", 1); }",
+    "early_return": "void f(struct conn *c) { if (c->fd < 0) return; write(c->fd, \"x\", 1); }",
+    "minus_one": "void f(struct conn *c) { if (c->fd == -1) return; write(c->fd, \"x\", 1); }",
+    "reopen": "void f(inout struct conn *c) { close(c->fd); c->fd = open(\"y\", 0); close(c->fd); c->fd = -1; }",
+    "closed_and_cleared": "void f(inout struct conn *c) { close(c->fd); c->fd = -1; }",
     "local_closed": "void f(void) { struct conn c = undefined; c.fd = open(\"x\", 0); close(c.fd); }",
-    "method": "int m__get(struct m * view self) { return self->fd; }",
+    "method": "int m__get(struct m *self) { return (int)self->fd; }",  # its number
 }
 
 

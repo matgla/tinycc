@@ -852,6 +852,12 @@ struct Sym
 /* On a parameter's pointer node (ERRUNION's bit, which only goes on other
    Syms): the function's result takes it over -- `takes(p)` on the result */
 #define YASC_TAKEN 0x80
+/* on a function type's parameter Sym (never a node): declared in regular C,
+   which says nothing about an int handle (yasc_verify_assign) */
+#define YASC_PARAM_C 0x01
+/* on a parameter's variable in its function's body (or an inline expansion
+   of it): the messages name it a parameter */
+#define YASC_BODY_PARAM 0x02
 /* yasc modules (decl/module.c), in Sym.ymod of a file-scope identifier Sym or
    a struct/union/enum tag Sym: declared by the module itself, and exported */
 #define YASC_MODULE_OWN 0x01
@@ -2009,6 +2015,7 @@ struct TCCState
   unsigned char warn_null_dereference;          /* a dereference the optimizer proved null */
   unsigned char warn_implicit_move;             /* yasc: ownership leaves a variable without move() */
   unsigned char warn_unchecked;                 /* yasc: a regular-C pointer becomes owned / view outside unsafe */
+  unsigned char warn_redundant_view;            /* yasc: `view` on a parameter's own pointer, which is one anyway */
   unsigned char warn_zero_as_null_pointer_constant; /* yasc: a null pointer written NULL or 0, not nullptr */
   unsigned char warn_volatile_bitfield;         /* yasc: a bit-field store to volatile memory (hidden read-modify-write) */
   unsigned char warn_register_access;           /* yasc: a register field marked ro written, wo read, w1c written back */

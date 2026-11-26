@@ -29,10 +29,10 @@ LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 
 PRELUDE = """\
 enum vkind { V_INT, V_STR, V_ADDR, V_D, V_E };
-int use(char * view p);
+int use(char *p);
 struct value;
-int look(const struct value * view v);
-void poke(inout struct value * view v);
+int look(const struct value *v);
+void poke(inout struct value *v);
 struct value {
   enum vkind k;
   union(k) {
@@ -76,38 +76,38 @@ def _msg(member, values):
 
 GOOD = {
     "switch": (
-        "int f(struct value * view v)\n{\n  switch (v->k) {\n  case V_INT: return (int)v->u.i;\n"
+        "int f(struct value *v)\n{\n  switch (v->k) {\n  case V_INT: return (int)v->u.i;\n"
         "  case V_STR: return use(v->u.s);\n  case V_D: case V_E: return v->u.de;\n  default: return 0;\n  }\n}\n"
     ),
-    "early_return": "int f(struct value * view v)\n{\n  if (v->k != V_STR)\n    return 0;\n  return use(v->u.s);\n}\n",
-    "and": "int f(struct value * view v)\n{\n  return v->k == V_STR && use(v->u.s);\n}\n",
-    "ternary": "int f(struct value * view v)\n{\n  return v->k == V_STR ? use(v->u.s) : 0;\n}\n",
-    "store_tag_first": "void f(inout struct value * view v)\n{\n  v->k = V_INT;\n  v->u.i = 3;\n}\n",
+    "early_return": "int f(struct value *v)\n{\n  if (v->k != V_STR)\n    return 0;\n  return use(v->u.s);\n}\n",
+    "and": "int f(struct value *v)\n{\n  return v->k == V_STR && use(v->u.s);\n}\n",
+    "ternary": "int f(struct value *v)\n{\n  return v->k == V_STR ? use(v->u.s) : 0;\n}\n",
+    "store_tag_first": "void f(inout struct value *v)\n{\n  v->k = V_INT;\n  v->u.i = 3;\n}\n",
     "loop": (
-        "int f(inout struct value * view v)\n{\n  int n = 0;\n  while (v->k == V_STR) {\n    n += use(v->u.s);\n"
+        "int f(inout struct value *v)\n{\n  int n = 0;\n  while (v->k == V_STR) {\n    n += use(v->u.s);\n"
         "    v->k = V_INT;\n  }\n  return n;\n}\n"
     ),
     "const_call_keeps": (
-        "int f(struct value * view v)\n{\n  if (v->k != V_STR)\n    return 0;\n  look(v);\n  return use(v->u.s);\n}\n"
+        "int f(struct value *v)\n{\n  if (v->k != V_STR)\n    return 0;\n  look(v);\n  return use(v->u.s);\n}\n"
     ),
-    "nested_struct": "int f(struct value * view v)\n{\n  if (v->k == V_ADDR)\n    return use(v->u.st.path);\n  return 0;\n}\n",
-    "array": "int f(struct value * view v)\n{\n  if (v->k == V_E)\n    return use(v->u.arr[1]);\n  return 0;\n}\n",
-    "test_zero": "long f(struct value * view v)\n{\n  if (!v->k)\n    return v->u.i;\n  return 0;\n}\n",
+    "nested_struct": "int f(struct value *v)\n{\n  if (v->k == V_ADDR)\n    return use(v->u.st.path);\n  return 0;\n}\n",
+    "array": "int f(struct value *v)\n{\n  if (v->k == V_E)\n    return use(v->u.arr[1]);\n  return 0;\n}\n",
+    "test_zero": "long f(struct value *v)\n{\n  if (!v->k)\n    return v->u.i;\n  return 0;\n}\n",
     "local": "long f(void)\n{\n  struct value v = undefined;\n  v.k = V_INT;\n  v.u.i = 3;\n  return v.u.i;\n}\n",
     "global": "unsigned long f(void)\n{\n  if (g.k == V_ADDR)\n    return g.u.a;\n  return 0;\n}\n",
-    "unsafe": "int f(struct value * view v)\n{\n  return use(unsafe(v->u.s));\n}\n",
+    "unsafe": "int f(struct value *v)\n{\n  return use(unsafe(v->u.s));\n}\n",
     "tag_copied": (
-        "int f(struct value * view v)\n{\n  enum vkind k = v->k;\n  if (k != V_STR)\n    return 0;\n  return use(v->u.s);\n}\n"
+        "int f(struct value *v)\n{\n  enum vkind k = v->k;\n  if (k != V_STR)\n    return 0;\n  return use(v->u.s);\n}\n"
     ),
     "switch_on_copy": (
-        "int f(struct value * view v)\n{\n  enum vkind k = v->k;\n  switch (k) {\n  case V_INT: return (int)v->u.i;\n"
+        "int f(struct value *v)\n{\n  enum vkind k = v->k;\n  switch (k) {\n  case V_INT: return (int)v->u.i;\n"
         "  case V_STR: return use(v->u.s);\n  default: return 0;\n  }\n}\n"
     ),
     "global_pointer": "struct value * view gp;\nlong f(void)\n{\n  if (gp->k == V_INT)\n    return gp->u.i;\n  return 0;\n}\n",
-    "jump_to_the_end": "void f(struct value * view v)\n{\n  if (v->k == V_STR)\n    use(v->u.s);\n}\n",
+    "jump_to_the_end": "void f(struct value *v)\n{\n  if (v->k == V_STR)\n    use(v->u.s);\n}\n",
     "inline": (
-        "static inline long peek(struct value * view v)\n{\n  return v->k == V_INT ? v->u.i : -1;\n}\n"
-        "long f(struct value * view v)\n{\n  return peek(v) + peek(v);\n}\n"
+        "static inline long peek(struct value *v)\n{\n  return v->k == V_INT ? v->u.i : -1;\n}\n"
+        "long f(struct value *v)\n{\n  return peek(v) + peek(v);\n}\n"
     ),
 }
 
@@ -120,19 +120,19 @@ def test_tag_known(tmp_path, name, opt):
 
 
 BAD = {
-    "untested": ("int f(struct value * view v)\n{\n  return use(v->u.s);\n}\n", 3, _msg("s", "V_STR")),
+    "untested": ("int f(struct value *v)\n{\n  return use(v->u.s);\n}\n", 3, _msg("s", "V_STR")),
     "wrong_variant": (
-        "int f(struct value * view v)\n{\n  if (v->k == V_INT)\n    return use(v->u.s);\n  return 0;\n}\n",
+        "int f(struct value *v)\n{\n  if (v->k == V_INT)\n    return use(v->u.s);\n  return 0;\n}\n",
         4,
         _msg("s", "V_STR"),
     ),
     "member_before_tag": (
-        "void f(inout struct value * view v)\n{\n  v->u.i = 3;\n  v->k = V_INT;\n}\n",
+        "void f(inout struct value *v)\n{\n  v->u.i = 3;\n  v->k = V_INT;\n}\n",
         3,
         _msg("i", "V_INT"),
     ),
     "call_forgets": (
-        "int f(inout struct value * view v)\n{\n  if (v->k != V_STR)\n    return 0;\n  poke(v);\n  return use(v->u.s);\n}\n",
+        "int f(inout struct value *v)\n{\n  if (v->k != V_STR)\n    return 0;\n  poke(v);\n  return use(v->u.s);\n}\n",
         6,
         _msg("s", "V_STR"),
     ),
@@ -142,40 +142,40 @@ BAD = {
         _msg("a", "V_ADDR"),
     ),
     "two_values": (
-        "int f(struct value * view v)\n{\n  if (v->k == V_D)\n    return 0;\n  return v->u.de;\n}\n",
+        "int f(struct value *v)\n{\n  if (v->k == V_D)\n    return 0;\n  return v->u.de;\n}\n",
         5,
         _msg("de", "V_D or V_E"),
     ),
     "address": (
-        "char * view * view f(inout struct value * view v)\n{\n  return &v->u.arr[0];\n}\n",
+        "char * view * view f(inout struct value *v)\n{\n  return &v->u.arr[0];\n}\n",
         3,
         _msg("arr", "V_E"),
     ),
     "unknown_store": (
-        "int f(inout struct value * view v, int k)\n{\n  v->k = V_STR;\n  v->k = k;\n  return use(v->u.s);\n}\n",
+        "int f(inout struct value *v, int k)\n{\n  v->k = V_STR;\n  v->k = k;\n  return use(v->u.s);\n}\n",
         5,
         _msg("s", "V_STR"),
     ),
     "base_reassigned": (
-        "int f(struct value * view v, struct value * view w)\n{\n  if (v->k != V_STR)\n    return 0;\n"
+        "int f(struct value *v, struct value *w)\n{\n  if (v->k != V_STR)\n    return 0;\n"
         "  v = w;\n  return use(v->u.s);\n}\n",
         6,
         _msg("s", "V_STR"),
     ),
     "copy_stale_after_call": (
-        "int f(inout struct value * view v)\n{\n  enum vkind k = v->k;\n  poke(v);\n  if (k == V_STR)\n    return use(v->u.s);\n"
+        "int f(inout struct value *v)\n{\n  enum vkind k = v->k;\n  poke(v);\n  if (k == V_STR)\n    return use(v->u.s);\n"
         "  return 0;\n}\n",
         6,
         _msg("s", "V_STR"),
     ),
     "copy_stale_after_store": (
-        "int f(inout struct value * view v)\n{\n  enum vkind k = v->k;\n  v->k = V_INT;\n  if (k == V_STR)\n    return use(v->u.s);\n"
+        "int f(inout struct value *v)\n{\n  enum vkind k = v->k;\n  v->k = V_INT;\n  if (k == V_STR)\n    return use(v->u.s);\n"
         "  return 0;\n}\n",
         6,
         _msg("s", "V_STR"),
     ),
     "copy_changed_on_a_path": (
-        "int f(struct value * view v, int z)\n{\n  enum vkind k = v->k;\n  if (z)\n    k = V_STR;\n  if (k == V_STR)\n"
+        "int f(struct value *v, int z)\n{\n  enum vkind k = v->k;\n  if (z)\n    k = V_STR;\n  if (k == V_STR)\n"
         "    return use(v->u.s);\n  return 0;\n}\n",
         7,
         _msg("s", "V_STR"),
@@ -245,7 +245,7 @@ def test_regular_c_has_no_tagged_union(tmp_path):
 
 def test_switch_misses_a_variant(tmp_path):
     body = (
-        "int f(struct value * view v)\n{\n  switch (v->k) {\n  case V_INT: return (int)v->u.i;\n"
+        "int f(struct value *v)\n{\n  switch (v->k) {\n  case V_INT: return (int)v->u.i;\n"
         "  case V_STR: return use(v->u.s);\n  }\n  return 0;\n}\n"
     )
     proc = _compile(tmp_path, body, "-Wno-switch")
@@ -256,7 +256,7 @@ def test_switch_misses_a_variant(tmp_path):
 @pytest.mark.parametrize("copy", ["  enum vkind k = v->k;\n", "  enum vkind k;\n  k = v->k;\n"], ids=["init", "assign"])
 def test_switch_on_a_copy_misses_a_variant(tmp_path, copy):
     body = (
-        "int f(struct value * view v)\n{\n" + copy + "  switch (k) {\n  case V_INT: return (int)v->u.i;\n"
+        "int f(struct value *v)\n{\n" + copy + "  switch (k) {\n  case V_INT: return (int)v->u.i;\n"
         "  case V_STR: return use(v->u.s);\n  case V_ADDR: return (int)v->u.a;\n  }\n  return 0;\n}\n"
     )
     proc = _compile(tmp_path, body, "-Wno-switch")
@@ -268,10 +268,10 @@ def test_switch_on_a_copy_misses_a_variant(tmp_path, copy):
 def test_tag_read_in_another_function_is_no_switch_value(tmp_path):
     """vregs start again per function: `*p` in g is where `v->k` was in f."""
     body = (
-        "int fa(struct value * view v)\n{\n  return v->k;\n}\n"
-        "int ga(int * view p)\n{\n  switch (*p) {\n  case 1: return 1;\n  }\n  return 0;\n}\n"
-        "int ha(struct value * view v)\n{\n  int k = v->k;\n  return k;\n}\n"
-        "int ja(int * view p)\n{\n  int k = *p;\n  switch (k) {\n  case 1: return 1;\n  }\n  return 0;\n}\n"
+        "int fa(struct value *v)\n{\n  return v->k;\n}\n"
+        "int ga(int *p)\n{\n  switch (*p) {\n  case 1: return 1;\n  }\n  return 0;\n}\n"
+        "int ha(struct value *v)\n{\n  int k = v->k;\n  return k;\n}\n"
+        "int ja(int *p)\n{\n  int k = *p;\n  switch (k) {\n  case 1: return 1;\n  }\n  return 0;\n}\n"
     )
     proc = _compile(tmp_path, body, "-Wno-switch")
     assert proc.returncode == 0 and _diags(proc) == [], proc.stderr
@@ -282,7 +282,7 @@ def test_tag_read_in_another_function_is_no_switch_value(tmp_path):
 )
 def test_copy_of_the_tag_stored_again_is_not_checked(tmp_path, store):
     body = (
-        "int rd(void);\nint f(struct value * view v, int * view q)\n{\n  int k = v->k;\n" + store +
+        "int rd(void);\nint f(struct value *v, int *q)\n{\n  int k = v->k;\n" + store +
         "  switch (k) {\n  case 1: return 1;\n  }\n  return 0;\n}\n"
     )
     proc = _compile(tmp_path, body, "-Wno-switch")
@@ -291,7 +291,7 @@ def test_copy_of_the_tag_stored_again_is_not_checked(tmp_path, store):
 
 def test_copy_of_the_tag_stored_again_from_the_tag_is_checked(tmp_path):
     body = (
-        "int rd(void);\nint f(struct value * view v)\n{\n  int k = rd();\n  k = v->k;\n"
+        "int rd(void);\nint f(struct value *v)\n{\n  int k = rd();\n  k = v->k;\n"
         "  switch (k) {\n  case V_INT: return 1;\n  default: break;\n  }\n  k = rd();\n  k = v->k;\n"
         "  switch (k) {\n  case V_INT: return 1;\n  }\n  return 0;\n}\n"
     )
@@ -308,7 +308,7 @@ def test_switch_on_a_plain_int_is_not_checked(tmp_path):
 
 def test_switch_handles_every_variant(tmp_path):
     body = (
-        "int f(struct value * view v)\n{\n  switch (v->k) {\n  case V_INT: return (int)v->u.i;\n"
+        "int f(struct value *v)\n{\n  switch (v->k) {\n  case V_INT: return (int)v->u.i;\n"
         "  case V_STR: return use(v->u.s);\n  case V_ADDR: return (int)v->u.a;\n  case V_D: case V_E: return v->u.de;\n"
         "  }\n  return 0;\n}\n"
     )
@@ -327,20 +327,20 @@ struct box { enum vkind k; union(k) { long i when(V_INT); char * owned maybe s w
 
 OWNED_GOOD = {
     "free_then_switch": (
-        "void f(inout struct box * view b)\n{\n  if (b->k == V_STR)\n    free(b->u.s);\n  b->k = V_INT;\n  b->u.i = 3;\n}\n"
+        "void f(inout struct box *b)\n{\n  if (b->k == V_STR)\n    free(b->u.s);\n  b->k = V_INT;\n  b->u.i = 3;\n}\n"
     ),
     "move_then_switch": (
-        "void f(inout struct box * view b)\n{\n  if (b->k != V_STR)\n    return;\n  take(move(b->u.s));\n  b->k = V_INT;\n}\n"
+        "void f(inout struct box *b)\n{\n  if (b->k != V_STR)\n    return;\n  take(move(b->u.s));\n  b->k = V_INT;\n}\n"
     ),
     "set_after_free": (
-        "void f(inout struct box * view b)\n{\n  if (b->k == V_STR)\n    free(b->u.s);\n  b->k = V_STR;\n"
+        "void f(inout struct box *b)\n{\n  if (b->k == V_STR)\n    free(b->u.s);\n  b->k = V_STR;\n"
         "  b->u.s = malloc(4);\n}\n"
     ),
     "free_then_null": (
-        "void f(inout struct box * view b)\n{\n  if (b->k == V_STR) {\n    free(b->u.s);\n    b->u.s = nullptr;\n  }\n}\n"
+        "void f(inout struct box *b)\n{\n  if (b->k == V_STR) {\n    free(b->u.s);\n    b->u.s = nullptr;\n  }\n}\n"
     ),
     "free_then_new": (
-        "void f(inout struct box * view b)\n{\n  if (b->k != V_STR)\n    return;\n  free(b->u.s);\n  b->u.s = malloc(3);\n}\n"
+        "void f(inout struct box *b)\n{\n  if (b->k != V_STR)\n    return;\n  free(b->u.s);\n  b->u.s = malloc(3);\n}\n"
     ),
     "local_freed": (
         "void f(void)\n{\n  struct box b = undefined;\n  b.k = V_STR;\n  b.u.s = malloc(4);\n  free(b.u.s);\n  b.k = V_INT;\n"
@@ -358,34 +358,34 @@ def test_owned_member_released(tmp_path, name, opt):
 
 OWNED_BAD = {
     "variant_change": (
-        "void f(inout struct box * view b)\n{\n  b->k = V_INT;\n  b->u.i = 3;\n}\n",
+        "void f(inout struct box *b)\n{\n  b->k = V_INT;\n  b->u.i = 3;\n}\n",
         3,
         "'u.s' may still own memory when 'k' changes: free or move it first",
     ),
     "tag_only": (
-        "void f(inout struct box * view b)\n{\n  b->k = V_INT;\n}\n",
+        "void f(inout struct box *b)\n{\n  b->k = V_INT;\n}\n",
         3,
         "'u.s' may still own memory when 'k' changes: free or move it first",
     ),
     "tag_only_in_branch": (
-        "void f(inout struct box * view b)\n{\n  if (b->k == V_STR)\n    b->k = V_INT;\n}\n",
+        "void f(inout struct box *b)\n{\n  if (b->k == V_STR)\n    b->k = V_INT;\n}\n",
         4,
         "'u.s' may still own memory when 'k' changes: free or move it first",
     ),
     "freed_still_selected": (
-        "void f(inout struct box * view b)\n{\n  if (b->k == V_STR)\n    free(b->u.s);\n}\n",
+        "void f(inout struct box *b)\n{\n  if (b->k == V_STR)\n    free(b->u.s);\n}\n",
         4,
         "'u.s' is freed or moved out, and 'k' still selects it when the function returns: change the variant or give "
         "it a new value",
     ),
     "moved_still_selected": (
-        "void f(inout struct box * view b)\n{\n  if (b->k != V_STR)\n    return;\n  take(move(b->u.s));\n}\n",
+        "void f(inout struct box *b)\n{\n  if (b->k != V_STR)\n    return;\n  take(move(b->u.s));\n}\n",
         5,
         "'u.s' is freed or moved out, and 'k' still selects it when the function returns: change the variant or give "
         "it a new value",
     ),
     "written_over": (
-        "void f(inout struct box * view b)\n{\n  if (b->k != V_STR)\n    return;\n  b->u.s = malloc(4);\n}\n",
+        "void f(inout struct box *b)\n{\n  if (b->k != V_STR)\n    return;\n  b->u.s = malloc(4);\n}\n",
         5,
         "'u.s' may still own memory: free or move it before it is written over",
     ),
@@ -395,7 +395,7 @@ OWNED_BAD = {
         "'b.u.s' leaks: it still owns memory at the end of its scope",
     ),
     "freed_twice": (
-        "void f(inout struct box * view b)\n{\n  if (b->k != V_STR)\n    return;\n  free(b->u.s);\n  free(b->u.s);\n}\n",
+        "void f(inout struct box *b)\n{\n  if (b->k != V_STR)\n    return;\n  free(b->u.s);\n  free(b->u.s);\n}\n",
         6,
         "'b->s' is freed twice",
     ),
@@ -422,7 +422,7 @@ def test_nested_member_path_is_named_in_place(tmp_path):
     """`v->in.p` is the member in place, not element 1 of an array of `in`s."""
     body = (
         "void free(drop void * owned maybe p);\nstruct o { int a; struct { char * owned maybe p; } in; };\n"
-        "void f(inout struct o * view v)\n{\n  free(v->in.p);\n  free(v->in.p);\n}\n"
+        "void f(inout struct o *v)\n{\n  free(v->in.p);\n  free(v->in.p);\n}\n"
     )
     proc = _compile(tmp_path, body)
     assert (6, "error", "'v->p' is freed twice") in _diags(proc), proc.stderr
@@ -447,9 +447,9 @@ def test_tagged_union_inside_a_member_of_another(tmp_path, prelude):
     """The inner union's entry grows the table while the outer's body is
     parsed: the outer's later when(...)s still land in its own entry."""
     body = NESTED + (
-        "int f(struct N * view n)\n{\n  switch (n->k) {\n  case 1: return n->u.s.j;\n  case 2: return (int)n->u.i;\n"
+        "int f(struct N *n)\n{\n  switch (n->k) {\n  case 1: return n->u.s.j;\n  case 2: return (int)n->u.i;\n"
         "  case 3: return (int)n->u.q;\n  }\n  return 0;\n}\n"
-        "long h(struct P * view p)\n{\n  return p->w.b;\n}\n"
+        "long h(struct P *p)\n{\n  return p->w.b;\n}\n"
     )
     if prelude:
         proc = _compile(tmp_path, body, "-Wno-switch")

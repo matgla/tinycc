@@ -23,7 +23,7 @@ YASC_H = """\
 char * owned yalloc(void);
 void yfree(drop char * owned p);
 #include "ynext.h"
-static inline int ylen(char * view s) { return s[0]; }
+static inline int ylen(char *s) { return s[0]; }
 """
 YNEXT_H = "char * borrows(static) ynext(void);\n"
 C_H = "int view(int owned);\n"

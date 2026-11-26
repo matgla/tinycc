@@ -34,7 +34,7 @@ struct stack
   }
 
   /* a view self: it looks, or changes the fields, and never frees */
-  int push(inout struct stack * view self, int v)
+  int push(inout struct stack *self, int v)
   {
     if (self->full())   /* a body may call any method of the struct */
       return -1;
@@ -42,11 +42,11 @@ struct stack
     return 0;
   }
 
-  int pop(inout struct stack * view self) { return self->items[--self->len]; }
+  int pop(inout struct stack *self) { return self->items[--self->len]; }
 
-  int full(const struct stack * view self) { return self->len == self->cap; }
+  int full(const struct stack *self) { return self->len == self->cap; }
 
-  int empty(const struct stack * view self) { return self->len == 0; }
+  int empty(const struct stack *self) { return self->len == 0; }
 
   /* a drop self: the call consumes the object, as mem_free would */
   void destroy(drop struct stack * owned self)
@@ -61,7 +61,7 @@ struct range
 {
   int from, to;
   int length(struct range self) { return self.to - self.from; }
-  int contains(const struct range * view self, int v) { return v >= self->from && v < self->to; }
+  int contains(const struct range *self, int v) { return v >= self->from && v < self->to; }
 };
 
 int main(void)

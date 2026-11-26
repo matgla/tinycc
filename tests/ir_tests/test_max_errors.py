@@ -460,7 +460,7 @@ def test_static_inline_error_once(tmp_path):
 YASC = """\
 int proto(char *s);
 struct node { int *next; int v; };
-int use(int * view p, int *q)
+int use(int *p, int *q)
 {
   char *loc = nullptr;
   int x;
@@ -477,10 +477,10 @@ def test_yasc_plain_pointer_goes_on(tmp_path):
     p = _run(tmp_path, YASC, ccompat=False)
     d = [(l, k, m) for l, k, m in _diags(p)]
     plain = [l for l, k, m in d if "plain pointer in yasc" in m]
-    # a definition's parameter (q, line 3) and a local's pointer (loc, line
-    # 5) are said at the end of their body, in line order, whose uses decide
-    # owned or view (decl/plain_param.c)
-    assert plain == [1, 2, 3, 5], p.stderr
+    # a parameter's own pointer is a view (lines 1, 3); a member (line 2)
+    # and a local's pointer (loc, line 5, said at the end of its body, whose
+    # uses decide owned or view: decl/plain_param.c) are plain
+    assert plain == [2, 5], p.stderr
     assert (9, "error", "'x' is used uninitialized") in d
     assert (11, "warning", "'unused_fn' defined but not used") in d
     assert (12, "error", "'undecl' undeclared") in d

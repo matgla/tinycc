@@ -38,7 +38,7 @@ PRELUDE = """\
 #pragma yasc
 void * owned malloc(unsigned n);
 void free(drop void * owned maybe p);
-int use(char * view p);
+int use(char *p);
 struct node { int v; struct node * view maybe next; };
 struct node * borrows(static) maybe find(int k);
 struct node * borrows(static) must(int k);
@@ -49,16 +49,16 @@ static inline struct node * borrows(static) maybe ifind(int k)
     return nullptr;
   return &gn;
 }
-int peek(char * owned const * view pp);
-static inline int ipeek(char * owned const * view pp)
+int peek(char * owned const *pp);
+static inline int ipeek(char * owned const *pp)
 {
   return **pp;
 }
-int pma(out void * owned maybe * view memptr, unsigned long sz);
-void fill(inout struct node * view a);
+int pma(out void * owned maybe *memptr, unsigned long sz);
+void fill(inout struct node *a);
 struct node g[4];
 void take(char * owned p);
-char * borrows(s) bfirst(char * view s);
+char * borrows(s) bfirst(char *s);
 """
 PRELUDE_LINES = PRELUDE.count("\n")
 
@@ -104,12 +104,12 @@ CLEAN = {
     "bool_flag": "void f(int c)\n{\n  char * owned p = malloc(1);\n  _Bool kept = 1;\n  if (c)\n  {\n    free(p);\n"
     "    kept = 0;\n  }\n  if (kept)\n    free(p);\n}\n",
     # a local holding a null test
-    "ok_local": "int f(struct node * view maybe p)\n{\n  int ok = p != 0;\n  if (ok)\n    return p->v;\n  return 0;\n}\n",
-    "not_local": "int f(struct node * view maybe p)\n{\n  int z = !p;\n  if (z)\n    return 0;\n  return p->v;\n}\n",
+    "ok_local": "int f(struct node * maybe p)\n{\n  int ok = p != 0;\n  if (ok)\n    return p->v;\n  return 0;\n}\n",
+    "not_local": "int f(struct node * maybe p)\n{\n  int z = !p;\n  if (z)\n    return 0;\n  return p->v;\n}\n",
     "ok_owned": "void f(void)\n{\n  char * owned maybe p = malloc(1);\n  _Bool ok = p;\n  if (ok)\n    free(p);\n}\n",
     # values with no name
     "must_result": "int f(int k)\n{\n  return must(k)->v;\n}\n",
-    "tested_ternary": "int f(int c, struct node * view p, struct node * view maybe q)\n{\n  if (!q)\n    return 0;\n"
+    "tested_ternary": "int f(int c, struct node *p, struct node * maybe q)\n{\n  if (!q)\n    return 0;\n"
     "  return (c ? p : q)->v;\n}\n",
     "result_in_variable": "int f(int k)\n{\n  struct node * view maybe n = find(k);\n  if (!n)\n    return 0;\n"
     "  return n->v;\n}\n",
@@ -118,7 +118,7 @@ CLEAN = {
     "  return 0;\n}\n",
     "element_zero": "int f(void)\n{\n  struct node a[4] = undefined;\n  fill(a);\n  if (!a[0].next)\n    return 0;\n"
     "  return a[0].next->v;\n}\n",
-    "pointer_element": "int f(struct node * view p)\n{\n  if (p[1].next)\n    return p[1].next->v;\n  return 0;\n}\n",
+    "pointer_element": "int f(struct node *p)\n{\n  if (p[1].next)\n    return p[1].next->v;\n  return 0;\n}\n",
     "global_element": "int f(void)\n{\n  if (g[2].next)\n    return g[2].next->v;\n  return 0;\n}\n",
     "call_result_copied": "int f(int k)\n{\n  struct node * view n = must(k);\n  if (n->next)\n"
     "    return n->next->v;\n  return 0;\n}\n",
@@ -150,7 +150,7 @@ CLEAN = {
     "owners_in_loop": "int f(int n)\n{\n  char * owned p = malloc(1);\n  char * owned q = malloc(1);\n  int r = 0;\n"
     "  for (int i = 0; i < n; i++)\n  {\n    char * view v = i & 1 ? p : q;\n    r += use(v);\n  }\n  free(p);\n"
     "  free(q);\n  return r;\n}\n",
-    "owner_or_view_used_before": "int f(int c, inout char * view s)\n{\n  char * owned p = malloc(1);\n"
+    "owner_or_view_used_before": "int f(int c, inout char *s)\n{\n  char * owned p = malloc(1);\n"
     "  char * view v = c ? p : s;\n  int r = use(v);\n  free(p);\n  return r;\n}\n",
 }
 
@@ -196,12 +196,12 @@ BAD = {
         [(9, "warning", "'p' leaks: it may still own memory at the end of its scope")],
     ),
     "ok_reassigned": (
-        "int f(struct node * view maybe p)\n{\n  int ok = p != 0;\n  ok = 1;\n  if (ok)\n    return p->v;\n"
+        "int f(struct node * maybe p)\n{\n  int ok = p != 0;\n  ok = 1;\n  if (ok)\n    return p->v;\n"
         "  return 0;\n}\n",
         [(6, "warning", "'p' may be null where it is dereferenced")],
     ),
     "ok_pointer_reassigned": (
-        "int f(struct node * view maybe p, struct node * view maybe q)\n{\n  int ok = p != 0;\n  p = q;\n"
+        "int f(struct node * maybe p, struct node * maybe q)\n{\n  int ok = p != 0;\n  p = q;\n"
         "  if (ok)\n    return p->v;\n  return 0;\n}\n",
         [(6, "warning", "'p' may be null where it is dereferenced")],
     ),
@@ -222,7 +222,7 @@ BAD = {
         [(3, "warning", "a pointer that may be null is stored in 'q', which is not maybe")],
     ),
     "ternary": (
-        "int f(int c, struct node * view p, struct node * view maybe q)\n{\n  return (c ? p : q)->v;\n}\n",
+        "int f(int c, struct node *p, struct node * maybe q)\n{\n  return (c ? p : q)->v;\n}\n",
         [(3, "warning", "a pointer that may be null is dereferenced")],
     ),
     "two_calls_one_line": (
@@ -248,7 +248,7 @@ BAD = {
         [(6, "warning", "'a[1].next' is null where it is dereferenced")],
     ),
     "pointer_element": (
-        "int f(struct node * view p)\n{\n  if (p[1].next)\n    return p[1].next->v;\n  return p[2].next->v;\n}\n",
+        "int f(struct node *p)\n{\n  if (p[1].next)\n    return p[1].next->v;\n  return p[2].next->v;\n}\n",
         [(5, "warning", "'p[2].next' may be null where it is dereferenced")],
     ),
     "global_element": (
@@ -289,7 +289,7 @@ BAD = {
         [(7, "warning", "'v' may be used after 'q', which it may borrow from, was freed"), (6, "note", "'q' was freed here")],
     ),
     "owner_or_view": (
-        "int f(int c, inout char * view s)\n{\n  char * owned p = malloc(1);\n  char * view v = c ? p : s;\n  free(p);\n"
+        "int f(int c, inout char *s)\n{\n  char * owned p = malloc(1);\n  char * view v = c ? p : s;\n  free(p);\n"
         "  return use(v);\n}\n",
         [(6, "warning", "'v' may be used after 'p', which it may borrow from, was freed"), (5, "note", "'p' was freed here")],
     ),

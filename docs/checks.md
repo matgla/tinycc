@@ -746,7 +746,7 @@ With YasOS libc's headers, whose allocators carry the attributes:
 #include <stdlib.h>
 #include <string.h>
 
-char * owned maybe dup_upper(const char * view s)
+char * owned maybe dup_upper(const char *s)
 {
   char * owned maybe d = malloc(strlen(s) + 1);
   strcpy(d, s);
@@ -787,8 +787,8 @@ view / maybe / drop / borrows) are an error: `'f' is declared again with
 another yasc contract: parameter 1 ('p') differs in ...`.
 
 A pointer handed back through an out parameter says where it points the
-same way a result does: `long strtol(const char * view s, out char *
-borrows(s) * view maybe end, int base)`.  The callee may store a pointer
+same way a result does: `long strtol(const char *s, out char *
+borrows(s) * maybe end, int base)`.  The callee may store a pointer
 into `s` through `end` (any other view parameter stored there still
 escapes), and the caller's `char * view e` whose address it passed borrows,
 after the call, from the owned variable passed for `s` -- `free(buf)` then
@@ -814,8 +814,8 @@ In yasc (under `-Wlifetime`: the safe default, where only `unsafe { }`
 lowers it) every local has a value before anything can see it:
 
 ```c
-void fill(out int * view p);
-void keep(int * view p);
+void fill(out int *p);
+void keep(int *p);
 
 int f(int c)
 {
@@ -926,7 +926,7 @@ global (line 21, the safe default). A store through a parameter
 (`*slot = &local`) is reported too; a global cleared again before the
 function returns is not. In yasc the address is followed through a call
 whose result borrows from the argument it went to: `return f(buf);` with
-`char * borrows(p) f(char * view p)` (or the elision) is reported.
+`char * borrows(p) f(char *p)` (or the elision) is reported.
 
 **`-Wnull-dereference`:** `*p` with `p` null (line 27). This check runs after optimisation, so it
 finds more at `-O1` and up (a callee returning null, once inlined), and its

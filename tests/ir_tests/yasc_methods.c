@@ -3,15 +3,15 @@
  * passes p, a by-value self gets a copy, a method without self is called as
  * TAG.m().  Bodies see the whole struct and every method, whatever the order. */
 #pragma yasc
-extern int printf(const char * view, ...);
+extern int printf(const char *, ...);
 
 struct vec
 {
   int x, y;
 
-  int len2(const struct vec * view self) { return self->x * self->x + self->y * self->y; }
+  int len2(const struct vec *self) { return self->x * self->x + self->y * self->y; }
 
-  void scale(inout struct vec * view self, int k)
+  void scale(inout struct vec *self, int k)
   {
     self->x *= k;
     self->y *= k;
@@ -29,20 +29,20 @@ struct vec
   struct vec make(int x, int y) { return (struct vec){x, y}; }
 
   /* calls a method declared further down */
-  int dot(const struct vec * view self, const struct vec * view o)
+  int dot(const struct vec *self, const struct vec *o)
   {
     return self->x * o->x + self->y * o->y + self->zero();
   }
 
-  static int zero(const struct vec * view self) { return self->x - self->x; }
+  static int zero(const struct vec *self) { return self->x - self->x; }
 
-  static inline int sum(const struct vec * view self) { return self->x + self->y; }
+  static inline int sum(const struct vec *self) { return self->x + self->y; }
 
   /* declared here, defined below under its symbol name */
-  int area(const struct vec * view self);
+  int area(const struct vec *self);
 };
 
-int vec__area(const struct vec * view self) { return self->x * self->y; }
+int vec__area(const struct vec *self) { return self->x * self->y; }
 
 typedef struct vec vec_t;
 
@@ -50,13 +50,13 @@ union num
 {
   int i;
   unsigned u;
-  int is_negative(const union num * view self) { return self->i < 0; }
+  int is_negative(const union num *self) { return self->i < 0; }
 };
 
 struct counter
 {
   int n;
-  struct counter * view bump(inout struct counter * view self)
+  struct counter * view bump(inout struct counter *self)
   {
     self->n++;
     return self;
@@ -66,7 +66,7 @@ struct counter
 
 typedef struct counter counter_t;
 
-static int apply(int (*f)(const struct vec * view), const struct vec * view v) { return f(v); }
+static int apply(int (*f)(const struct vec *), const struct vec *v) { return f(v); }
 
 static struct vec make_global(void) { return vec.make(7, 1); }
 

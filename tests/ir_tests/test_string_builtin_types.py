@@ -24,28 +24,28 @@ LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 
 YASC_DECLS = """\
 typedef unsigned size_t;
-char * view maybe strchr(const char * view s, int c);
-char * view maybe strrchr(const char * view s, int c);
-char * view maybe strstr(const char * view s, const char * view n);
-char * view maybe strpbrk(const char * view s, const char * view a);
-char * view maybe index(const char * view s, int c);
-void * view maybe memchr(const void * view s, int c, size_t n);
-size_t strlen(const char * view s);
+char * view maybe strchr(const char *s, int c);
+char * view maybe strrchr(const char *s, int c);
+char * view maybe strstr(const char *s, const char *n);
+char * view maybe strpbrk(const char *s, const char *a);
+char * view maybe index(const char *s, int c);
+void * view maybe memchr(const void *s, int c, size_t n);
+size_t strlen(const char *s);
 """
 YASC_LINES = YASC_DECLS.count("\n")
 
 # each line marked HIT warns, no other line does
 YASC_USES = """\
-int a(const char * view s) { const char * view p = strchr(s, 'x'); return *p; } /* HIT store */
-int b(const char * view s) { char * view maybe p = strrchr(s, 'x'); return *p; } /* HIT deref */
-int c(const char * view s) { const char * view p = strstr(s, "ab"); return p != 0; } /* HIT store */
-int d(const char * view s) { char * view maybe p = strpbrk(s, "ab"); return *p; } /* HIT deref */
-int e(const char * view s) { char * view maybe p = index(s, 'x'); return *p; } /* HIT deref */
-int f(const char * view s) { const char * view maybe p = memchr(s, 'x', 4); return *p; } /* HIT deref */
-int g(const char * view s) { const char * view maybe p = strchr(s, 'x'); return p ? *p : 0; }
-int h(const char * view s) { char * view maybe p = strstr(s, "ab"); if (!p) return 0; return *p; }
-int i(char * view maybe s) { return strlen(s) != 0; } /* HIT maybe arg */
-int j(const char * view s) { return strlen(s) != 0; }
+int a(const char *s) { const char * view p = strchr(s, 'x'); return *p; } /* HIT store */
+int b(const char *s) { char * view maybe p = strrchr(s, 'x'); return *p; } /* HIT deref */
+int c(const char *s) { const char * view p = strstr(s, "ab"); return p != 0; } /* HIT store */
+int d(const char *s) { char * view maybe p = strpbrk(s, "ab"); return *p; } /* HIT deref */
+int e(const char *s) { char * view maybe p = index(s, 'x'); return *p; } /* HIT deref */
+int f(const char *s) { const char * view maybe p = memchr(s, 'x', 4); return *p; } /* HIT deref */
+int g(const char *s) { const char * view maybe p = strchr(s, 'x'); return p ? *p : 0; }
+int h(const char *s) { char * view maybe p = strstr(s, "ab"); if (!p) return 0; return *p; }
+int i(char * maybe s) { return strlen(s) != 0; } /* HIT maybe arg */
+int j(const char *s) { return strlen(s) != 0; }
 """
 
 
@@ -118,10 +118,12 @@ def test_c_result_in_the_safe_default(tmp_path):
     # (not f8: its memchr folds to a null constant, which -Wlifetime reports
     # stored in a pointer that is not maybe)
     # unsafe(...) takes its whole line: one statement per line; a parameter
-    # written through or handed back as `char * view` says inout
-    uses = "".join(re.sub(r"char \*p = (.*?); return", r"char *p = unsafe(\1); return", line)
-                   .replace("(char *", "(inout char *")
-                   .replace("char *", "char * view ").replace("void *", "void * view ")
+    # written through or handed back as `char * view` says inout; a parameter's
+    # own pointer is a view without saying it
+    uses = "".join(re.sub(r"(\(|, )((?:inout |const )*)(char|void) \* view ", r"\1\2\3 *",
+                          re.sub(r"char \*p = (.*?); return", r"char *p = unsafe(\1); return", line)
+                          .replace("(char *", "(inout char *")
+                          .replace("char *", "char * view ").replace("void *", "void * view "))
                    .replace("{ ", "{\n  ").replace("; ", ";\n  ").replace(" }", "\n}") + "\n"
                    for line in C_USES.splitlines() if not line.startswith("char *f8"))
     proc = _compile(tmp_path, body + uses)

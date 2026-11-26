@@ -68,10 +68,15 @@ plain `char *` is an error, "plain pointer in yasc: say owned or view".
 The qualifier goes after the `*`, so each level of a pointer to a pointer
 says what it is: `char * owned * view argv`.
 
+One pointer needs no word: a parameter's own (the last `*` before its
+name) is a view unless it says `owned`, since the least a function can do
+with it -- look -- is the default. `int len(const char *s)` borrows `s`;
+writing `view` there anyway draws a warning (-Wredundant-view). Its inner
+levels still say it: `main`'s `const char * view *argv`.
+
 A view parameter is read-only unless it says `inout` or `out`: `main`'s
-`const char * view * view argv` cannot reassign `argv[i]`, and the `const`
-keeps the strings read-only too. A local you only read through is
-`const T * view p`.
+`argv` cannot reassign `argv[i]`, and the `const` keeps the strings
+read-only too. A local you only read through is `const T * view p`.
 
 A string literal, an array decaying to a pointer, and `&x` are views.
 
@@ -140,12 +145,12 @@ spelling in scope (a variable or function called `move`) wins over both.
 A function that only looks takes views:
 
 ```c
-static int count(const struct name * view maybe list, out int * view chars)
+static int count(const struct name * maybe list, out int *chars)
 ```
 
 A view parameter's target is read-only unless the parameter says `inout`
-(or `out`): `T * view p` there means `const T * view p`, and a function
-that changes `*p` says so, `void rename(inout struct name * view n)`.
+(or `out`): `T *p` there means `const T * view p`, and a function that
+changes `*p` says so, `void rename(inout struct name *n)`.
 
 and one that frees says `drop`:
 
@@ -170,7 +175,7 @@ mistakes are errors: the file does not compile, which is the point of it.
 03_mistakes.c:28: note: 's' was freed here
 03_mistakes.c:35: error: 's' may be null where it is dereferenced
 03_mistakes.c:42: error: an owned result is discarded: it is never freed
-03_mistakes.c:47: error: a pointer that owns nothing is stored in an owned pointer
+03_mistakes.c:47: error: the parameter 'borrowed' owns nothing (a view unless it says owned): write '* owned borrowed' when the function takes it over, 'drop' before the type too when it frees it
 03_mistakes.c:52: error: '*n' is read before it is written
 03_mistakes.c:60: error: 'x' may be used uninitialized: yasc wants a value on every path
 03_mistakes.c:66: error: 'local_address' returns the address of a local variable
@@ -275,7 +280,7 @@ group names into sets:
 ```c
 error ParseError { Empty, BadDigit, TooBig };
 
-static !int parse_int(const char * view s)
+static !int parse_int(const char *s)
 {
   if (!*s)
     return error.Empty;   /* fail */
@@ -320,7 +325,7 @@ function that builds something then gives it to the caller on success,
 and frees it on every error path:
 
 ```c
-static !char * owned make_label(const char * view num)
+static !char * owned make_label(const char *num)
 {
   int v = try parse_int(num);
   char * owned maybe buf = mem_new(32);
@@ -417,8 +422,8 @@ struct stack
   int * owned items;
   int len, cap;
 
-  int push(inout struct stack * view self, int v) { ... }
-  int empty(const struct stack * view self) { return self->len == 0; }
+  int push(inout struct stack *self, int v) { ... }
+  int empty(const struct stack *self) { return self->len == 0; }
   void destroy(drop struct stack * owned self) { ... }
   struct stack * owned maybe create(int cap) { ... }
 };
@@ -426,7 +431,7 @@ struct stack
 
 The object is the first parameter, and you write it out, as in Zig. Its
 type says what the method does with the object, with the words of
-chapter 2: a `view` self looks at the fields, an `inout ... view` self
+chapter 2: a plain (view) self looks at the fields, an `inout` self
 changes them, a `drop ... owned` self consumes it. Call a method on an object or through a pointer:
 
 ```c
@@ -439,7 +444,7 @@ s->destroy();       /* s is moved: using it again is an error in the checks */
 `maybe` on `p` count exactly as they would for any call. A self taken by
 value (`struct range self`) gets a copy.
 
-The object's owned fields stay its own across an `inout` view self, and the checks
+The object's owned fields stay its own across an `inout` self, and the checks
 hold both sides to that:
 
 - **The method** may free an owned field, but must give it a new value (or
@@ -449,15 +454,15 @@ hold both sides to that:
   freed (`'s.buf' is freed when its struct is handed to 'touch'`). After
   the call the fields still own memory, so `s.buf` must still be freed (a
   `maybe` one may now be null).
-- **A `drop struct T * view self`** method (a `clear` or `deinit`) frees
+- **A `drop struct T *self`** method (a `clear` or `deinit`) frees
   the owned fields instead. It must free every one before it returns, and the
   caller's fields count as freed after the call, so `defer s.clear();` is
   enough to keep `s` from leaking.
 
 ```c
 struct buf { char * owned maybe data; int len; };
-void buf_fill(inout struct buf * view b);    /* keeps data valid */
-void buf_clear(drop struct buf * view b);    /* frees data */
+void buf_fill(inout struct buf *b);    /* keeps data valid */
+void buf_clear(drop struct buf *b);    /* frees data */
 
 void f(void)
 {
@@ -479,8 +484,8 @@ call every method, whatever the order. A method can also be declared in
 the struct and defined outside it under its full name:
 
 ```c
-struct vec { int x, y; int area(const struct vec * view self); };
-int vec__area(const struct vec * view self) { return self->x * self->y; }
+struct vec { int x, y; int area(const struct vec *self); };
+int vec__area(const struct vec *self) { return self->x * self->y; }
 ```
 
 A struct with methods needs a tag, and must be defined at file scope (not
@@ -537,7 +542,7 @@ strings, then the entry, and `errdefer` frees what is already made when a
 later step fails. On success they move into the entry:
 
 ```c
-!int add(inout struct config * view self, const char * view s, int n)
+!int add(inout struct config *self, const char *s, int n)
 {
   ...
   char * owned key = try copy(s, key_end);
@@ -554,7 +559,7 @@ later step fails. On success they move into the entry:
 
 The caller reports a bad line and goes on:
 `self->add(p, n) catch |e| { say("line %d: %s\n", line, error_name(e)); };`.
-`clear` takes a `drop struct config * view self` (chapter 7): it frees every
+`clear` takes a `drop struct config *self` (chapter 7): it frees every
 entry, and `main` gives the list a `defer cfg.clear();` in a block of its
 own, so the entries are freed before the program prints `blocks left: 0`.
 
@@ -563,7 +568,7 @@ own, so the entries are freed before the program prints `blocks left: 0`.
 
 ```c
 #pragma tcc diagnostic error "-Wformat"
-static void say(const char * view fmt, ...) __attribute__((format(printf, 1, 2)));
+static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 ```
 
 The `format` attribute has tcc check every call of `say()` the way it checks
@@ -694,9 +699,9 @@ into it is checked as usual. An owned member in a union is an error.
 
 ```c
 union val { char * view s; uintptr_t addr; };
-int count(const char * view s);
+int count(const char *s);
 
-int len(union val * view v)
+int len(union val *v)
 {
   return count(unsafe(v->s));   /* without unsafe: an error */
 }
@@ -719,7 +724,7 @@ struct value {
   } u;
 };
 
-int show(struct value * view v)
+int show(struct value *v)
 {
   switch (v->k) {
   case V_INT: return printf("%ld\n", v->u.i);
@@ -728,7 +733,7 @@ int show(struct value * view v)
   return printf("%s\n", v->u.s);   /* error: 'u.s' is used where 'k' may not be V_STR */
 }
 
-void set_int(inout struct value * view v, long n)
+void set_int(inout struct value *v, long n)
 {
   v->k = V_INT;          /* the tag first ... */
   v->u.i = n;            /* ... then the member */
@@ -752,7 +757,7 @@ struct name {
   } u;
 };
 
-void name_clear(inout struct name * view n)
+void name_clear(inout struct name *n)
 {
   if (n->k == N_HEAP)
     free(n->u.heap);     /* without it: 'u.heap' may still own memory when 'k' changes */
@@ -810,7 +815,7 @@ return error.NAME;   fail
 try f()              pass f's error up
 f() catch X          f's value, or X if it failed (also: catch |e| ...)
 errdefer STMT;       run STMT only if the function fails
-struct s { ... int m(struct s * view self); };   a method: s__m
+struct s { ... int m(struct s *self); };   a method: s__m
 obj.m(x)  p->m(x)    call it: s__m(&obj, x), s__m(p, x)
 s.f(x)               a method without self (or any method, by name)
 module a.b;          this file is module a.b

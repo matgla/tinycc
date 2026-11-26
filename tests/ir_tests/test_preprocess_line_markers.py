@@ -123,16 +123,17 @@ def test_yasc_dialect_through_output(tmp_path, opt):
     (tmp_path / "y.h").write_text("#pragma yasc\nchar * owned yalloc(void);\n")
     (tmp_path / "m.c").write_text(
         '#include "c.h"\n#include "y.h"\n'
-        "static inline int k(char * view p) { return p[0]; }\n"
-        "int f(char * view p) { return view(helper(1)) + k(p) + k(p); }\n"
+        "static inline int k(char *p) { return p[0]; }\n"
+        "int f(char *p) { return view(helper(1)) + k(p) + k(p); }\n"
     )
     assert _tcc(tmp_path, "-std=yasc", "-E", "m.c", "-o", "m.i").returncode == 0
     a = _tcc(tmp_path, "-std=yasc", opt, "-c", "m.c", "-o", "a.o")
     b = _tcc(tmp_path, "-std=yasc", opt, "-c", "m.i", "-o", "b.o")
     assert a.returncode == 0, a.stderr
     assert b.returncode == 0, b.stderr
-    # the main file is yasc again after the headers
-    (tmp_path / "m.c").write_text('#include "c.h"\nint g(char *p) { return p != 0; }\n')
+    # the main file is yasc again after the headers (a global's plain pointer
+    # says so: a parameter's own is a view)
+    (tmp_path / "m.c").write_text('#include "c.h"\nchar *gp;\n')
     assert _tcc(tmp_path, "-std=yasc", "-E", "m.c", "-o", "m.i").returncode == 0
     b = _tcc(tmp_path, "-std=yasc", opt, "-c", "m.i", "-o", "b.o")
     assert b.returncode != 0 and "plain pointer in yasc" in b.stderr, b.stderr

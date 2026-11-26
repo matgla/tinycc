@@ -18,7 +18,7 @@ static !int parse_digit(char c)
   return c - '0';
 }
 
-static !int parse_u8(const char * view s)
+static !int parse_u8(const char *s)
 {
   int v = 0;
   if (!*s)
@@ -33,7 +33,7 @@ static !int parse_u8(const char * view s)
 }
 
 /* called from yasc_errors+abi.c */
-!int yasc_parse(const char * view s)
+!int yasc_parse(const char *s)
 {
   return parse_u8(s);
 }
@@ -117,12 +117,12 @@ static void t_void(void)
   printf("counter %d\n", counter);
 }
 
-static !int forward(const char * view s)
+static !int forward(const char *s)
 {
   return parse_u8(s);
 }
 
-static !int with_cleanup(const char * view s)
+static !int with_cleanup(const char *s)
 {
   errdefer printf("forward failed\n");
   defer printf("forward done\n");

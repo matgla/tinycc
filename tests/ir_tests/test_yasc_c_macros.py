@@ -78,21 +78,21 @@ def test_arguments_and_nesting(tmp_path, opt):
 
 def test_yasc_macro_inside_c_macro_is_c(tmp_path):
     """YPTR's `view` inside ID(...) is a name: so `char * view u` is a syntax error."""
-    proc = _run(tmp_path, "void g(char * view s) { ID(YPTR(char) u = s;) }\n")
+    proc = _run(tmp_path, "void g(char *s) { ID(YPTR(char) u = s;) }\n")
     assert proc.returncode != 0
     assert "m.c:3: error: ';' expected" in proc.stderr, proc.stderr
 
 
 def test_yasc_macro_alone_is_yasc(tmp_path):
-    proc = _run(tmp_path, "void g(char * view s) { YPTR(char) u = s; (void)u; }\n")
+    proc = _run(tmp_path, "void g(char *s) { YPTR(char) u = s; (void)u; }\n")
     assert proc.returncode == 0, proc.stderr
 
 
 @pytest.mark.parametrize("opt", ["-O0", "-O2"])
 def test_star_from_c_macro(tmp_path, opt):
     body = """\
-void use(char * view);
-void g(inout char * view s)
+void use(char *);
+void g(inout char *s)
 {
   PTR(char) a = s;       /* the '*' is regular C */
   CHARP b = s;
@@ -156,8 +156,8 @@ def test_code_unchanged(tmp_path, opt):
 ROUND_TRIP = [
     NESTED,
     """\
-void use(char * view);
-void g(char * view s)
+void use(char *);
+void g(char *s)
 {
   PTR(char) a = s;
   CHARP b = s;
@@ -179,7 +179,7 @@ int f(int n, ...)
 }
 """,
     "void g(void) { ALIAS(char * p = 0;) (void)p; }\n",
-    "void g(char * view s) { ID(YPTR(char) u = s;) }\n",
+    "void g(char *s) { ID(YPTR(char) u = s;) }\n",
     "int g(int a)\n{\n  PTR(char) p = CAST(char *, &a);\n  CHARP q = p;\n  return ID(q[0]) + a;\n}\n"
     "#define N 3\nint h(int view) { return view + N\n#include \"y.h\"\n; }\n",
     "static int w(int x) { return (int)(PTR(char))x + ID(1 << 40); }\nint u(void) { return w(1) + w(2); }\n",

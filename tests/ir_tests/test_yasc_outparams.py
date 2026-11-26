@@ -25,10 +25,10 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 PRELUDE = """\
 #pragma yasc
 void free(drop void * owned maybe p);
-long getl(inout char * owned maybe * view lineptr, inout unsigned long * view n);
-int pma(out void * owned maybe * view memptr, unsigned long sz);
-int aspr(out char * owned maybe * view strp, const char * view fmt);
-void g(inout char * view maybe * view p);
+long getl(inout char * owned maybe *lineptr, inout unsigned long *n);
+int pma(out void * owned maybe *memptr, unsigned long sz);
+int aspr(out char * owned maybe *strp, const char *fmt);
+void g(inout char * view maybe *p);
 """
 PRELUDE_LINES = PRELUDE.count("\n")
 LEVELS = ["-O0", "-O1", "-O2", "-Os"]

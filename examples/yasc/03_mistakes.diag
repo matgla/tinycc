@@ -5,7 +5,7 @@
 03_mistakes.c:28: note: 's' was freed here
 03_mistakes.c:35: error: 's' may be null where it is dereferenced
 03_mistakes.c:42: error: an owned result is discarded: it is never freed
-03_mistakes.c:47: error: a pointer that owns nothing is stored in an owned pointer
+03_mistakes.c:47: error: the parameter 'borrowed' owns nothing (a view unless it says owned): write '* owned borrowed' when the function takes it over, 'drop' before the type too when it frees it
 03_mistakes.c:52: error: '*n' is read before it is written
 03_mistakes.c:60: error: 'x' may be used uninitialized: yasc wants a value on every path
 03_mistakes.c:66: error: 'local_address' returns the address of a local variable

@@ -2685,6 +2685,7 @@ static void unary_funcall_body(void)
           pv = anon_sym++;
         Sym *psym = sym_push(pv, &param_sym->type, VT_LOCAL | VT_LVAL, loc);
         psym->a.param_array = param_sym->a.param_array; /* -Wsizeof-array-argument */
+        psym->yasc = YASC_BODY_PARAM;
         /* -Wlifetime: the callee's parameter, its compile reports what the
            body does with it; binding the argument is the call's */
         if (tcc_state->ir->lt_on)

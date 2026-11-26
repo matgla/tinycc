@@ -29,9 +29,9 @@ LEVELS = ["-O0", "-O2"]
 SYS_HEADER = """\
 #pragma yasc
 void free(drop void * owned maybe p);
-void qsort(inout void * view maybe base, unsigned n, unsigned sz, int (*cmp)(const void * view, const void * view));
-void lib_note(const char * view s);
-void * view memset(inout void * view d, int c, unsigned n);
+void qsort(inout void * maybe base, unsigned n, unsigned sz, int (*cmp)(const void *, const void *));
+void lib_note(const char *s);
+void * view memset(inout void *d, int c, unsigned n);
 struct libstate { char * owned maybe buf; };
 extern struct libstate lib_g;
 """
@@ -44,7 +44,7 @@ static struct s sg;
 void user_fn(void);
 __attribute__((leaf)) void leaf_fn(void);
 void (*hook)(void);
-static int cmp(const void * view a, const void * view b) { free(g.p); return 0; }
+static int cmp(const void *a, const void *b) { free(g.p); return 0; }
 """
 PRELUDE_LINES = PRELUDE.count("\n")
 
@@ -108,10 +108,10 @@ FORGOTTEN = {
         "void f(void)\n{\n  struct s * view gp = &g;\n  free(g.p);\n  memset(gp, 0, sizeof *gp);\n  free(g.p);\n}\n"
     ),
     "libc_through_a_parameter": (
-        "void f(inout struct s * view sp)\n{\n  free(g.p);\n  memset(sp, 0, sizeof *sp);\n  free(g.p);\n}\n"
+        "void f(inout struct s *sp)\n{\n  free(g.p);\n  memset(sp, 0, sizeof *sp);\n  free(g.p);\n}\n"
     ),
     "leaf_through_an_alias": (
-        "void leaf_w(inout struct s * view d) __attribute__((leaf));\n"
+        "void leaf_w(inout struct s *d) __attribute__((leaf));\n"
         "void f(void)\n{\n  struct s * view sp = &sg;\n  free(sg.p);\n  leaf_w(sp);\n  free(sg.p);\n}\n"
     ),
 }
@@ -165,7 +165,7 @@ def test_tagged_union_global_through_an_alias(tmp_path):
         "enum vk { V_INT, V_STR };\n"
         "struct value { enum vk k; union(k) { long i when(V_INT); char * view s when(V_STR); } u; };\n"
         "struct value gv;\n"
-        "long f(inout struct value * view vp)\n{\n  if (gv.k != V_INT)\n    return 0;\n  memset(vp, 1, sizeof *vp);\n"
+        "long f(inout struct value *vp)\n{\n  if (gv.k != V_INT)\n    return 0;\n  memset(vp, 1, sizeof *vp);\n"
         "  return gv.u.i;\n}\n"
     )
     proc = _compile(tmp_path, body)

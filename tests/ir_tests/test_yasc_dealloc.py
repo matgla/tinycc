@@ -24,9 +24,9 @@ PRELUDE = """\
 typedef struct FILE FILE;
 void free(drop void * owned maybe p);
 int fclose(drop FILE * owned(fclose) f);
-FILE * owned(fclose) maybe fopen(const char * view p, const char * view m);
+FILE * owned(fclose) maybe fopen(const char *p, const char *m);
 void * owned maybe malloc(unsigned n);
-void mem_free(void * view p);
+void mem_free(void *p);
 void * owned maybe mem_new(unsigned n) __attribute__((malloc, malloc(mem_free, 1)));
 void release(drop void * owned maybe p);
 """
@@ -83,5 +83,5 @@ def test_right_deallocator(tmp_path, name, opt):
 
 
 def test_declarators(tmp_path):
-    body = "char * owned (*fp)(void);\nchar * owned(free) maybe g(void);\nvoid h(char * owned(x) * view p);\n"
+    body = "char * owned (*fp)(void);\nchar * owned(free) maybe g(void);\nvoid h(char * owned(x) *p);\n"
     assert _diags(tmp_path, body) == []

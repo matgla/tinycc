@@ -191,8 +191,8 @@ void * owned malloc(unsigned n);
 void free(drop void * owned maybe p);
 struct node { int v; };
 struct node * borrows(static) maybe find(int k);
-char * view first(char * view s);
-int use(char * view p);
+char * view first(char *s);
+int use(char *p);
 """
 PRELUDE_LINES = PRELUDE.count("\n")
 
@@ -235,7 +235,7 @@ def test_auto_maybe_tested_is_clean(tmp_path):
 
 
 def test_auto_view_owns_nothing(tmp_path):
-    proc, diags = _yasc(tmp_path, "void f(char * view s)\n{\n  auto v = first(s);\n  free(v);\n}\n")
+    proc, diags = _yasc(tmp_path, "void f(char *s)\n{\n  auto v = first(s);\n  free(v);\n}\n")
     assert proc.returncode == 0, proc.stderr
     assert (4, "warning", "a pointer that owns nothing is stored in an owned pointer") in diags
 
@@ -252,7 +252,7 @@ def test_auto_pointer_satisfies_the_plain_pointer_rule(tmp_path):
 def test_auto_copy_of_an_owned_pointer_is_an_error(tmp_path, init):
     body = (
         "struct box { char * owned buf; };\n"
-        "void f(char * owned p, struct box * view s)\n{\n  auto q = " + init + ";\n  free(q);\n  free(p);\n}\n"
+        "void f(char * owned p, struct box *s)\n{\n  auto q = " + init + ";\n  free(q);\n  free(p);\n}\n"
     )
     proc, diags = _yasc(tmp_path, body)
     assert proc.returncode != 0
