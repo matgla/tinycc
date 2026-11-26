@@ -150,6 +150,25 @@ def test_unsafe_keeps_a_local_a_view(tmp_path):
     assert "t.c:11: error: plain pointer in yasc: 'p' owns what it points at, say owned" in proc.stderr, proc.stderr
 
 
+FOR_INIT = """\
+char * borrows(s) maybe next(char * maybe s);
+void free(drop void * owned maybe p);
+void * owned(free) maybe malloc(unsigned long n);
+int f(char * maybe s) { int n = 0; for (char *t = next(s); t; t = next(nullptr)) n += *t; return n; }
+int g(void) { for (char *p = malloc(4); p; ) { free(p); break; } return 0; }
+int h(char * maybe s) { for (char * view maybe t = s; t; t = nullptr) return *t; return 0; }"""
+
+
+def test_for_init_local_is_a_local(tmp_path):
+    """a pointer declared in a for-init is a local like any other: a view
+    maybe by default, owned when its function owns it, `view maybe` redundant"""
+    proc = _compile(tmp_path, FOR_INIT, "-std=yasc")
+    assert proc.returncode != 0, proc.stderr
+    assert "t.c:4:" not in proc.stderr, proc.stderr
+    assert "t.c:5: error: plain pointer in yasc: 'p' owns what it points at, say owned" in proc.stderr, proc.stderr
+    assert "t.c:6: warning: a local's pointer is a view that may be null unless the function owns it: drop 'view'" in proc.stderr, proc.stderr
+
+
 def test_local_view_is_redundant(tmp_path):
     """`view maybe` on a local pointer's own '*' says what it is anyway
     (-Wredundant-view, fix-it: `* maybe`); `view` alone says more (never

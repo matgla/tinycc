@@ -70,7 +70,7 @@ int main(void)
     list = push(move(list), move(text));
   }
   printf("%d names, %d chars\n", count(list, &chars), chars);
-  for (const struct name * view maybe p = list; p; p = p->next)
+  for (const struct name *p = list; p; p = p->next)
     printf("  %s\n", p->text);
   free_all(list);
   printf("blocks left: %d\n", mem_live());

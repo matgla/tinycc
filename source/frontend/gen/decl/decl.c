@@ -1425,8 +1425,9 @@ int decl(int l)
       /* a deprecated declaration names deprecated things quietly */
       if (adbase.attr_deprecated)
         attr_deprecated_suppress++;
-      /* yasc: a local's plain pointer waits for its body (plain_param.c) */
-      const int pp_local = l == VT_LOCAL && tcc_state->yasc ? yasc_pp_local_begin() : -1;
+      /* yasc: a local's plain pointer waits for its body (plain_param.c); a
+         for-init declaration (VT_JMP) declares locals too */
+      const int pp_local = (l == VT_LOCAL || l == VT_JMP) && tcc_state->yasc ? yasc_pp_local_begin() : -1;
       if (dl)
         dl->init_base = init_brace_depth;
       /* an error in the declarator still declares its name (core/recover.c) */

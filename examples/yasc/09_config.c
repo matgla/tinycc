@@ -116,7 +116,7 @@ struct config
 
   const char * view maybe text(const struct config *self, const char *key)
   {
-    for (const struct entry * view maybe e = self->first; e; e = e->next)
+    for (const struct entry *e = self->first; e; e = e->next)
       if (same(e->key, key))
         return e->value;
     return nullptr;
