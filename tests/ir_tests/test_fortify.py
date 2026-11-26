@@ -272,7 +272,7 @@ def test_run(tmp_path, opt, level):
 def _libc_dir():
     env = os.environ.get("YASOS_LIBC_DIR")
     d = Path(env) if env else ROOT.parent / "libc"
-    return d if (d / "sys" / "_fortify.h").exists() else None
+    return d if (d / "include" / "sys" / "_fortify.h").exists() else None
 
 
 LIBC_SRC = """\
@@ -294,7 +294,7 @@ void *(*fp)(void *, const void *, size_t) = memcpy;
 def test_yasos_libc_headers(tmp_path, opt):
     libc = _libc_dir()
     sysinc = libc.parent.parent / "source" / "sys" / "include"
-    inc = ["-nostdinc", f"-I{libc}", f"-I{sysinc}", f"-I{ROOT / 'include'}"]
+    inc = ["-nostdinc", f"-I{libc / 'include'}", f"-I{sysinc}", f"-I{ROOT / 'include'}"]
     outs = {}
     for level in [None, 0, 1, 2, 3]:
         flags = [] if level is None else [f"-D_FORTIFY_SOURCE={level}"]

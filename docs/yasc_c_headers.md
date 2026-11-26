@@ -3,7 +3,8 @@
 A library's header is written once, in yasc. `tcc -yasc-c-header yasc/x.h -o x.h`
 writes the regular C header that gcc, clang and tcc's C units read. Nobody edits
 the C header; yasos libc commits both and checks them in CI (`make headers` /
-`make headers-check` in libs/libc).
+`make headers-check` in libs/libc, where both live in `include/`: the sources
+in `include/yasc/`, the C headers beside them).
 
 Why: before, each libc function with a yasc contract was declared twice, once in the
 C header (GCC attributes) and once in `sys/yasc/<h>.h`, and nothing compared the

@@ -30,7 +30,7 @@ def _libgen(tmp_path, opt):
     libc = _libc_dir()
     sysinc = libc.parent.parent / "source" / "sys" / "include"
     obj = tmp_path / f"libgen{opt}.o"
-    proc = subprocess.run([str(TCC), "-Wall", "-Werror", "-nostdinc", f"-I{libc}", f"-I{sysinc}",
+    proc = subprocess.run([str(TCC), "-Wall", "-Werror", "-nostdinc", f"-I{libc / 'include'}", f"-I{sysinc}",
                            f"-I{ROOT / 'include'}", "-U_FORTIFY_SOURCE", *BASE_FLAGS, opt, "-c",
                            str(libc / "libgen.c"), "-o", str(obj)], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr

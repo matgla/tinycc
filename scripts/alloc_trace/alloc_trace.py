@@ -65,7 +65,7 @@ def cmd_build(a):
     shutil.copy(src / "config.h", src / "config.h.cross")
     log = out / "build.log"
     with open(log, "w") as f:
-        r = subprocess.run(["make", f"-j{os.cpu_count()}", "AR=ar", f"CROSS_FLAGS=-I{YASOS}/libs/libc",
+        r = subprocess.run(["make", f"-j{os.cpu_count()}", "AR=ar", f"CROSS_FLAGS=-I{YASOS}/libs/libc/include",
                             f"INC-armv8m={sysroot}/usr/include:{{B}}/include", "armv8m-tcc"],
                            cwd=src, stdout=f, stderr=subprocess.STDOUT)
     if r.returncode:
