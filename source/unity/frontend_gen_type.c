@@ -9,6 +9,7 @@
 #undef YC_ALIGN
 #undef YC_AS
 #undef YC_BITS
+#undef YC_CONST
 #undef YC_ENUM
 #undef YC_FLOAT
 #undef YC_FN

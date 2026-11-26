@@ -129,6 +129,20 @@ nothing special where a variable `undefined` is in scope.
 
 A view result with no view parameter is an error: write `borrows(static)`.
 
+### The C API beside the yasc one: `c_api(T)`
+
+`c_api(T)` after a `*` is what C callers see in place of everything to its left;
+the rest of the declarator stays (docs/yasc_c_api.md):
+
+| Write | yasc sees | the C header says |
+|---|---|---|
+| `const char * borrows(static) maybe c_api(char *) dlerror(void)` | `const char *` | `char *dlerror(void)` |
+| `int execv(const char *p, const char * view const c_api(char * const) argv[])` | `const char * const argv[]` | `char * const argv[]` |
+| `out const char * borrows(s) c_api(char *) * maybe endptr` | `const char **` | `char **endptr` |
+
+T differs in const and volatile only (never a pointer for an int, int for long);
+C code that writes through what such a function hands it is `-Wyasc-c-api`.
+
 ## Deallocators and handles
 
 ```c

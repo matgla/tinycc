@@ -1155,6 +1155,11 @@ typedef struct SymLocalFacts
     unsigned char decl;           /* (also) a declared object's address: lo/hi its bytes from there */
   } os_heap;
   unsigned char flags; /* SYMF_*: 1-bit facts SymAttr has no room for (sym_flag_set) */
+  /* yasc c_api(T) (decl/c_api.c), on a function type Sym: in a yasc
+     declaration the function type C callers see; in regular C, from
+     yasc_c_api(n, T) attributes, the type the yasc declaration says */
+  struct Sym *c_api_ref;
+  struct Sym *yasc_api_ref;
 } SymLocalFacts;
 typedef struct ObjHeap ObjHeap;
 /* SymLocalFacts.flags (SYMF_x (1u << n) as they come) */
@@ -1173,6 +1178,12 @@ typedef struct ObjHeap ObjHeap;
 #define ATTR_FMT_STRFMON 5  /* %i / %n take a double (L: long double) */
 
 SymLocalFacts *sym_facts_peek(const struct Sym *s);
+/* yasc c_api(...) as regular C sees it (decl/c_api.c): a yasc_c_api attribute was
+   met in this unit; what a call to function type FTYPE hands back read-only
+   (ret: its result, out: bit k what argument k's target is set to) and which
+   arguments it may write through (wr: bit k, a pointer to non-const) */
+extern int yasc_capi_c_seen;
+void yasc_capi_call_masks(struct Sym *ftype, int *ret, uint32_t *out, uint32_t *wr);
 int objsize_alloc_size_args(struct Sym *fsym, int *a, int *b); /* ir/bounds.c: an allocator's size arguments */
 int objsize_dealloc_arg(struct Sym *fsym); /* ir/bounds.c: the argument a deallocator releases */
 void type_to_str(char *buf, int buf_size, CType *type, const char *varstr); /* gen/type: gcc's spelling of a type */
@@ -2059,6 +2070,7 @@ struct TCCState
   unsigned char warn_shadow;                    /* a local hiding a local, a parameter or a global */
   unsigned char warn_cross_tu;                  /* a global's types differ between units (at the link) */
   unsigned char warn_tainted_format;            /* a printf format from untrusted input (ir/taint.c) */
+  unsigned char warn_yasc_c_api;                /* writes through what a yasc function's c_api(...) handed C (ir/capi_check.c) */
   /* -Wunused-* (frontend/gen/core/unused.c) */
   unsigned char warn_unused;                    /* -Wunused: the name of the group below */
   unsigned char warn_unused_variable;           /* a local, or a file-scope static, never used */

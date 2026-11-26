@@ -29,7 +29,7 @@ typedef struct YhTok
   int start, end;
   int del;
   const char *repl;
-  char ins[160];
+  char ins[256];
 } YhTok;
 
 TCC_VECTOR_DEFINE(YhToks, YhTok);
@@ -390,11 +390,165 @@ static void yh_append(char *buf, size_t size, const char *text)
     strcpy(buf + n, text);
 }
 
+static int yh_storage_word(YhState *st, YhTok *t)
+{
+  return yh_is(st, t, "extern") || yh_is(st, t, "static") || yh_is(st, t, "inline") || yh_is(st, t, "__inline") ||
+         yh_is(st, t, "__inline__") || yh_is(st, t, "_Noreturn") || yh_is(st, t, "register") ||
+         yh_is(st, t, "typedef");
+}
+
+/* After a group-taking word at i (owned, borrows, an attribute, c_api): the index past its group, if any */
+static int yh_past_group(YhState *st, YhToks *v, int i, int b)
+{
+  int n = yh_next(v, i + 1, b);
+  if (n < b && yh_is(st, &v->data[n], "(")) {
+    int c = yh_close(st, v, n, b);
+    /* __attribute__((...)): one group holds the other */
+    return c < b ? c + 1 : b;
+  }
+  return i + 1;
+}
+
+/* The yasc type of slot [a, b) as C text (no yasc words, no c_api(...), no name), for __yl_c_api */
+static void yh_capi_text(YhState *st, YhToks *v, int a, int b, int param, char *buf, size_t size)
+{
+  int i, last_star = -1, name = -1, depth = 0;
+  for (i = a; i < b; i++) {
+    YhTok *t = &v->data[i];
+    if (yh_is(st, t, "(") || yh_is(st, t, "["))
+      depth++;
+    else if (yh_is(st, t, ")") || yh_is(st, t, "]"))
+      depth--;
+    else if (depth == 0 && yh_is(st, t, "*"))
+      last_star = i;
+  }
+  if (param && last_star >= 0)
+    for (i = last_star + 1, depth = 0; i < b; i++) {
+      YhTok *t = &v->data[i];
+      if (yh_is(st, t, "(") || yh_is(st, t, "["))
+        depth++;
+      else if (yh_is(st, t, ")") || yh_is(st, t, "]"))
+        depth--;
+      else if (depth == 0 && t->kind == YH_ID && !yh_type_word(st, t) && !yh_word_alone(st, t) &&
+               !yh_word_with_group(st, t) && !yh_attr_word(st, t) && !yh_is(st, t, "c_api"))
+        name = i;
+    }
+  buf[0] = 0;
+  for (i = a; i < b; i++) {
+    YhTok *t = &v->data[i];
+    char word[96];
+    int n;
+    if (!yh_sig(t) || i == name || yh_word_alone(st, t) || (param && yh_is(st, t, "in")))
+      continue;
+    if (yh_word_with_group(st, t) || yh_attr_word(st, t) || yh_is(st, t, "c_api")) {
+      i = yh_past_group(st, v, i, b) - 1;
+      continue;
+    }
+    n = t->end - t->start;
+    if (n >= (int)sizeof word)
+      n = sizeof word - 1;
+    memcpy(word, st->src + t->start, n);
+    word[n] = 0;
+    if (buf[0] && strcmp(word, "]") && strcmp(word, ")") && buf[strlen(buf) - 1] != '[' && buf[strlen(buf) - 1] != '(')
+      yh_append(buf, size, " ");
+    yh_append(buf, size, word);
+  }
+}
+
+/* c_api(T) in declaration [a, b): T replaces what is left of it in its declarator.  A prototype (name >= 0,
+   parameters in (lp, rp)) gets __yl_c_api(n, yasc type) in ATTRS for each, n 0 the result, else parameter n. */
+static void yh_capi(YhState *st, YhToks *v, int a, int b, int name, int lp, int rp, char *attrs, size_t asize)
+{
+  int i, k;
+  for (i = a; i < b; i++) {
+    YhTok *t = &v->data[i];
+    int g, c, start, depth, boundary = -1, slot = -1, slot_end = -1;
+    if (t->del || !yh_is(st, t, "c_api"))
+      continue;
+    g = yh_next(v, i + 1, b);
+    if (g >= b || !yh_is(st, &v->data[g], "("))
+      continue;
+    c = yh_close(st, v, g, b);
+    for (k = i - 1, depth = 0; k >= a; k--) {
+      YhTok *u = &v->data[k];
+      if (yh_is(st, u, ")") || yh_is(st, u, "]") || yh_is(st, u, "}"))
+        depth++;
+      else if (yh_is(st, u, "(") || yh_is(st, u, "[") || yh_is(st, u, "{")) {
+        if (depth == 0) {
+          boundary = k;
+          break;
+        }
+        depth--;
+      } else if (depth == 0 && (yh_is(st, u, ",") || yh_is(st, u, ";"))) {
+        boundary = k;
+        break;
+      }
+    }
+    if (boundary >= 0 && yh_is(st, &v->data[boundary], "(") && boundary != lp) {
+      yh_error(st, t->start, "c_api(...) in a nested parameter list has no C header form", NULL);
+      continue;
+    }
+    if (boundary >= 0 && yh_is(st, &v->data[boundary], ",") && !(lp >= 0 && boundary > lp && boundary < rp)) {
+      yh_error(st, t->start, "c_api(...) in a declarator list: declare it on its own", NULL);
+      continue;
+    }
+    start = boundary + 1 > a ? boundary + 1 : a;
+    /* storage classes, attributes and the parameter words stay where they are */
+    for (start = yh_next(v, start, i); start < i;) {
+      YhTok *u = &v->data[start];
+      if (yh_storage_word(st, u) || yh_word_alone(st, u) || yh_is(st, u, "in"))
+        start = yh_next(v, start + 1, i);
+      else if (yh_attr_word(st, u))
+        start = yh_next(v, yh_past_group(st, v, start, i), i);
+      else
+        break;
+    }
+    if (name >= 0 && attrs) {
+      if (i < name)
+        slot = 0, slot_end = name;
+      else if (i > lp && i < rp) {
+        int n = 1, e;
+        for (k = lp + 1, depth = 0; k < i; k++) {
+          if (yh_is(st, &v->data[k], "(") || yh_is(st, &v->data[k], "["))
+            depth++;
+          else if (yh_is(st, &v->data[k], ")") || yh_is(st, &v->data[k], "]"))
+            depth--;
+          else if (depth == 0 && yh_is(st, &v->data[k], ","))
+            n++;
+        }
+        for (e = i, depth = 0; e < rp; e++) {
+          if (yh_is(st, &v->data[e], "(") || yh_is(st, &v->data[e], "["))
+            depth++;
+          else if (yh_is(st, &v->data[e], ")") || yh_is(st, &v->data[e], "]"))
+            depth--;
+          else if (depth == 0 && yh_is(st, &v->data[e], ","))
+            break;
+        }
+        slot = n, slot_end = e;
+      }
+      if (slot >= 0) {
+        char text[160], one[200];
+        yh_capi_text(st, v, start, slot_end, slot > 0, text, sizeof text);
+        snprintf(one, sizeof one, " __yl_c_api(%d, %s)", slot, text);
+        if (strlen(attrs) + strlen(one) >= asize)
+          yh_error(st, t->start, "too many attributes on one declaration", NULL);
+        yh_append(attrs, asize, one);
+      }
+    }
+    for (k = start; k < i; k++)
+      v->data[k].del = 1;
+    for (k = i; k <= g; k++)
+      v->data[k].del = 1;
+    v->data[c].del = 1;
+    i = c;
+  }
+}
+
 /* A prototype: its name at name, its parameters in (lp, rp); the attributes go before the ';' at semi. */
 static void yh_prototype(YhState *st, YhToks *v, int a, int name, int lp, int rp, int semi)
 {
   YhLevel res;
-  char attrs[160] = "", num[96], cstr[64] = "";
+  char attrs[240] = "", num[96], cstr[64] = "";
   int i, start = lp + 1, depth = 0, index = 0, drop_arg = 0;
   yh_level(st, v, a, name, 0, &res);
   for (i = lp + 1; i <= rp; i++) {
@@ -435,6 +589,7 @@ static void yh_prototype(YhState *st, YhToks *v, int a, int name, int lp, int rp
     yh_append(attrs, sizeof attrs, num);
   }
   yh_append(attrs, sizeof attrs, cstr);
+  yh_capi(st, v, a, semi, name, lp, rp, attrs, sizeof attrs);
   if (attrs[0]) {
     yh_append(v->data[semi].ins, sizeof v->data[semi].ins, attrs);
     st->need_attrs = 1;
@@ -455,6 +610,7 @@ static void yh_members(YhState *st, YhToks *v, int a, int b)
       YhLevel lv;
       int first = yh_next(v, start, i);
       if (first < i && !yh_has_word(st, v, first, i, "{")) {
+        yh_capi(st, v, start, i, -1, -1, -1, NULL, 0);
         yh_level(st, v, start, i, 0, &lv);
         if (lv.pointer && lv.view) {
           yh_append(t->ins, sizeof t->ins, lv.maybe ? " __yl_view_maybe" : " __yl_view");
@@ -484,7 +640,7 @@ static void yh_declaration(YhState *st, int a, int b)
     if (depth == 0 && yh_is(st, t, "{") && brace < 0)
       brace = i;
     if (depth == 0 && name < 0 && brace < 0 && t->kind == YH_ID && !yh_type_word(st, t) && !yh_attr_word(st, t) &&
-        !yh_word_with_group(st, t)) {
+        !yh_word_with_group(st, t) && !yh_is(st, t, "c_api")) {
       int n = yh_next(v, i + 1, b);
       if (n < b && yh_is(st, &v->data[n], "(")) {
         int g = yh_next(v, n + 1, b);
@@ -519,7 +675,8 @@ static void yh_declaration(YhState *st, int a, int b)
     int after = yh_next(v, rp + 1, b);
     if (semi >= 0 && yh_is(st, &v->data[semi], ";") && !(after < b && yh_is(st, &v->data[after], "(")))
       yh_prototype(st, v, a, name, lp, rp, semi);
-  }
+  } else
+    yh_capi(st, v, a, b, -1, -1, -1, NULL, 0);
   yh_strip(st, v, a, b, 0);
 }
 

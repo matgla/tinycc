@@ -43,6 +43,7 @@ for nothing.
 | `owned`, `owned(D)`, `view`, `maybe`, `drop`, `borrows(...)`, `takes(...)`, `in`/`out`/`inout`, `[maybe]` / `[owned]` in a parameter's brackets | left out (`T * view s` reads `T *s`) |
 | a parameter `T p[maybe :0]` (NUL inside the buffer) | `T p[]` and `__yl_cstr(N)` |
 | a result `T * owned(D) ...` (`owned` alone: `free`) | `__yl_dealloc(D, N)`, N: D's `drop` parameter when D is declared above in the same header, else 1 |
+| `c_api(T)` after a `*` (docs/yasc_c_api.md) | T in place of what is left of it; on a prototype also `__yl_c_api(n, yasc type)`, n 0 the result, else parameter n |
 | a struct member `T * view m` / `T * view maybe m` | `T *m __yl_view` / `__yl_view_maybe` |
 | attributes written on a declaration (`__yl_nonnull(1)`, `__yl_alloc_size(2)`, `__yl_malloc`, ...) | as written, before the derived ones |
 

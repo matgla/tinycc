@@ -2585,6 +2585,7 @@ LIBTCCAPI TCCState *tcc_new(void)
   s->warn_implicit_move = 1; /* yasc only: nothing else has owned pointers */
   s->warn_unused_result = 1;
   s->warn_deprecated_declarations = 1;
+  s->warn_yasc_c_api = 1; /* only a yasc_c_api attribute (a header written from yasc) brings it */
   s->ms_extensions = 1;
   s->max_errors = 8; /* -fmax-errors=8: the first errors, then stop */
   s->unwind_tables = 1;
@@ -3655,6 +3656,7 @@ static const FlagDef options_W[] = {
     /* Not in -Wall (gcc has no such check): a CFG walk in a function with a
        printf-style call and an untrusted source (ir/taint.c) */
     {offsetof(TCCState, warn_tainted_format), WD_SAFE, "tainted-format"},
+    {offsetof(TCCState, warn_yasc_c_api), WD_ALL | WD_SAFE, "yasc-c-api"},
     {offsetof(TCCState, warn_implicit_function_declaration), WD_ALL | WD_SAFE_ERR, "implicit-function-declaration"},
     {offsetof(TCCState, warn_discarded_qualifiers), WD_ALL | WD_SAFE_ERR, "discarded-qualifiers"},
     /* Not in -Wall: a CFG walk per function, yasc only; the safe default has it. */

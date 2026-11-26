@@ -336,6 +336,13 @@ static int parse_checked_attribute(AttributeDef *ad, int t)
     ad->attr_yasc_ptr |= YASC_MAYBE;
     return 1;
   }
+  /* yasc_c_api(n, T): the yasc declaration says T where this one says what
+     its c_api(...) gave (decl/c_api.c, -Wyasc-c-api) */
+  if (attr_named(t, "yasc_c_api"))
+  {
+    yasc_capi_attr_parse(ad);
+    return 1;
+  }
   /* -Wtainted-format's sources (ir/taint.c): the result, or what argument n
      points to after the call, is untrusted input */
   if (attr_named(t, "tainted_result"))
@@ -577,7 +584,7 @@ ST_FUNC int tcc_attribute_supported(int t)
              attr_named(t, "deprecated") || attr_named(t, "tainted_result") || attr_named(t, "tainted_arg") ||
              attr_named(t, "warn_unused_result") || attr_named(t, "fallthrough") ||
              attr_named(t, "stack_protect") || attr_named(t, "no_stack_protector") || attr_named(t, "yasc_view") ||
-             attr_named(t, "yasc_maybe");
+             attr_named(t, "yasc_maybe") || attr_named(t, "yasc_c_api");
     return 0;
   }
 }
@@ -985,6 +992,8 @@ void attr_apply_decl_facts(Sym *s, AttributeDef *ad)
 void attr_apply_decl_facts_at(Sym *s, AttributeDef *ad, int line)
 {
   SymLocalFacts *f;
+  if (s)
+    yasc_capi_attr_apply(&s->type, ad);
   if (!s || !(ad->attr_deprecated | ad->attr_unused_result | ad->attr_fmt_kind | ad->attr_fmt_arg | ad->attr_alloc_a |
                ad->attr_malloc | ad->attr_tainted_result | ad->attr_tainted_args | ad->attr_ssp | ad->attr_cstr_args |
                ad->attr_access_n))

@@ -92,6 +92,7 @@ UNITY_MEMBERS_frontend_gen_core = \
 UNITY_MEMBERS_frontend_gen_decl = \
 	source/frontend/gen/decl/attribute.c \
 	source/frontend/gen/decl/btype.c \
+	source/frontend/gen/decl/c_api.c \
 	source/frontend/gen/decl/declarator.c \
 	source/frontend/gen/decl/method.c \
 	source/frontend/gen/decl/module.c \
@@ -150,6 +151,7 @@ UNITY_MEMBERS_frontend_gen_value = \
 UNITY_GROUPS_ir = ir ir_frame ir_gen ir_regalloc ir_regalloc_ssa
 UNITY_MEMBERS_ir = \
 	source/ir/bounds.c \
+	source/ir/capi_check.c \
 	source/ir/cfg.c \
 	source/ir/dead_def.c \
 	source/ir/dump.c \

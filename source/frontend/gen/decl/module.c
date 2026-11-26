@@ -667,6 +667,9 @@ static void yasc_export_finish(void)
     if (!c_drop)
       ptr_quals = t == '*' || (ptr_quals && yasc_ptr_qual(t));
     prev2 = prev_c;
+    if (yasc_cheader && t == TOK_c_api && ptr_quals)
+      tcc_error("-fmodule-header: c_api(...) in an exported declaration has no C header form here: declare it in "
+                "a yasc header (tcc -yasc-c-header)");
     if (yasc_cheader && !c_drop && !(c_proto && (in_body || yasc_is_inline_kw(t))) &&
         !(t >= TOK_owned && t <= TOK_drop) && !(t == TOK_in && was_pstart && at_plist))
     {

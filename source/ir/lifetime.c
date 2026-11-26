@@ -62,6 +62,7 @@ void tcc_ir_lt_begin(TCCIRState *ir)
 {
   ir->lt_on = tcc_ir_lt_active();
   tcc_ir_taint_begin(ir);
+  tcc_ir_capi_begin(ir);
   tcc_ir_ab_begin(ir);
 }
 
@@ -971,6 +972,7 @@ void tcc_ir_lt_note_call(TCCIRState *ir, int call_id, Sym *ftype, Sym *callee)
 void tcc_ir_lt_copy_call(TCCIRState *ir, int from, int to)
 {
   IRLtCall rec, *c;
+  tcc_ir_capi_copy_call(ir, from, to); /* -Wyasc-c-api: the same */
   if (from < 0 || from >= ir->lt_nb_calls || !ir->lt_calls[from].noted)
     return;
   rec = ir->lt_calls[from];
@@ -10100,6 +10102,7 @@ void tcc_ir_flow_checks(TCCIRState *ir, Sym *func)
   {
     tcc_ir_lt_free(ir);
     tcc_ir_taint_free(ir);
+    tcc_ir_capi_free(ir);
     return;
   }
   /* the checks hold their scratch until they return: -fmax-errors stops
@@ -10109,6 +10112,8 @@ void tcc_ir_flow_checks(TCCIRState *ir, Sym *func)
     tcc_ir_ab_check(ir);
   if (ir->taint_on)
     tcc_ir_taint_check(ir, func);
+  if (ir->capi_on)
+    tcc_ir_capi_check(ir, func);
   tcc_ir_w1c_check(ir); /* yasc register fields (regaccess.c); frees its records */
   LtCalls calls = {NULL, 0};
   if (ir->lt_on && ir->lt_nb_calls)

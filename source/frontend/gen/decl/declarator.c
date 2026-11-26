@@ -295,6 +295,8 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
         s->yasc = pp_in_c() ? YASC_PARAM_C : 0;
         s->a.param_volatile = param_volatile;
         s->a.param_array = param_array;
+        if (yasc_capi_pending)
+          yasc_capi_param(s);
         if (tcc_state->unused_on)
         {
           if (l != FUNC_OLD && ad1.attr_unused)
@@ -384,6 +386,8 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
     type->ref = s;
     if (first)
       sym_params_track(s, first->prev);
+    if (yasc_capi_pending)
+      yasc_capi_function(s);
   }
   else if (tok == '[')
   {
@@ -999,6 +1003,13 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
       unget_tok(0);
       goto redo;
     }
+    if (tcc_state->yasc && tok == TOK_c_api)
+    {
+      /* the C type in place of what is left of it (decl/c_api.c) */
+      yasc_capi_word(nstar);
+      unget_tok(0);
+      goto redo;
+    }
     if (tcc_state->yasc && tok == TOK_borrows)
     {
       if (yq & (YASC_OWNED | YASC_VIEW))
@@ -1150,6 +1161,8 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
         type->ref = sym_pointer_node_b(&type->ref->type, yq, YASC_OBJ_MARK | ad->yobj_dealloc);
     }
     type->t |= qualifiers;
+    if (yasc_capi_pending)
+      yasc_capi_star(nstar, type);
     if (ret == type)
       /* innermost pointed to type is the one for the first derivation */
       ret = pointed_type(type);
@@ -1278,6 +1291,8 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
   /* the suffix is on: the nested declarator's pointers know their target */
   if (nested && yasc_plain_nb > plain_from)
     yasc_plain_check(plain_from);
+  if (yasc_capi_pending)
+    yasc_capi_declarator(type, td, nested);
   parse_attribute(ad);
   type->t |= storage;
   if (su_tok)

@@ -25,6 +25,7 @@ IR_SRC = \
 	source/ir/ssa.c \
 	source/ir/lifetime.c \
 	source/ir/bounds.c \
+	source/ir/capi_check.c \
 	source/ir/taint.c \
 	source/ir/regaccess.c \
 	source/ir/regalloc.c \

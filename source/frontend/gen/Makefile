@@ -29,6 +29,7 @@ GEN_SRC = \
 	source/frontend/gen/core/unused.c \
 	source/frontend/gen/decl/attribute.c \
 	source/frontend/gen/decl/btype.c \
+	source/frontend/gen/decl/c_api.c \
 	source/frontend/gen/decl/decl.c \
 	source/frontend/gen/decl/declarator.c \
 	source/frontend/gen/decl/method.c \

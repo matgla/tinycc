@@ -207,6 +207,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/ir/cfg.c \
 	$(TOP)/source/ir/lifetime.c \
 	$(TOP)/source/ir/bounds.c \
+	$(TOP)/source/ir/capi_check.c \
 	$(TOP)/source/ir/taint.c \
 	$(TOP)/source/ir/regaccess.c \
 	$(TOP)/source/opt/flat/loop/loop_ir_mutate.c \
@@ -410,6 +411,7 @@ UT_COVERAGE_ONLY_SRCS := \
 	$(TOP)/source/frontend/gen/core/unused.c \
 	$(TOP)/source/frontend/gen/decl/attribute.c \
 	$(TOP)/source/frontend/gen/decl/btype.c \
+	$(TOP)/source/frontend/gen/decl/c_api.c \
 	$(TOP)/source/frontend/gen/decl/decl.c \
 	$(TOP)/source/frontend/gen/decl/declarator.c \
 	$(TOP)/source/frontend/gen/decl/method.c \

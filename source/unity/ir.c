@@ -12,6 +12,12 @@
 #undef AB_TOP
 #undef AB_UNROLL
 #undef USING_GLOBALS
+#include "../ir/capi_check.c"
+#undef CAPI_MAX_ARGS
+#undef CK_FRAME
+#undef CK_NONE
+#undef CK_VREG
+#undef USING_GLOBALS
 #include "../ir/cfg.c"
 #undef USING_GLOBALS
 #include "../ir/dead_def.c"

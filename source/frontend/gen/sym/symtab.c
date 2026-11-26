@@ -896,7 +896,7 @@ ST_FUNC void sym_park_proto(Sym *s, Sym *stack_before)
       (s->type.t & (VT_STATIC | VT_INLINE | VT_TYPEDEF)) || s->r != (VT_CONST | VT_SYM) || s->c || s->sym_scope ||
       s->vreg || s->asm_label || s->a.attr_facts)
     return;
-  if (f->v != SYM_FIELD || f->r || f->c || f->vreg != -1 || f->prev_tok || !park_type_ok(&f->type))
+  if (f->v != SYM_FIELD || f->r || f->c || f->vreg != -1 || f->prev_tok || f->a.attr_facts || !park_type_ok(&f->type))
     return;
   for (p = f->next; p; p = p->next, n++)
     if (!(p->v & SYM_FIELD) || p->r != (VT_LOCAL | VT_LVAL) || p->c || (unsigned)p->sym_scope > 1 ||

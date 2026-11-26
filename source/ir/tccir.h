@@ -1004,6 +1004,10 @@ typedef struct TCCIRState
   int taint_nb_fobjs;
   struct IRTaintInl *taint_inl; /* the inline expansions (outermost), calls for the summaries */
   int taint_nb_inl;
+  /* -Wyasc-c-api (capi_check.c): the calls' facts by call_id, a source among them */
+  uint8_t capi_on, capi_sources;
+  struct IRCapiCall *capi_calls;
+  int capi_nb_calls;
   uint8_t lt_nonnull_calls; /* a call passes something to a parameter that may not be null */
   uint8_t lt_maybe_calls;   /* a call's result may be null (dereferenced without a name) */
   /* -Wlifetime: the temps a LOAD gave a pointer (a bit per temp position):
@@ -1298,6 +1302,12 @@ void tcc_ir_ab_said(TCCIRState *ir, int line, long long idx);
 void tcc_ir_ab_add_local(TCCIRState *ir, struct Sym *sym);
 void tcc_ir_ab_check(TCCIRState *ir);
 void tcc_ir_ab_free(TCCIRState *ir);
+/* -Wyasc-c-api (capi_check.c) */
+void tcc_ir_capi_begin(TCCIRState *ir);
+void tcc_ir_capi_note_call(TCCIRState *ir, int call_id, int callee, struct Sym *ftype);
+void tcc_ir_capi_check(TCCIRState *ir, struct Sym *func);
+void tcc_ir_capi_free(TCCIRState *ir);
+void tcc_ir_capi_copy_call(TCCIRState *ir, int from, int to);
 /* -Wtainted-format (taint.c) */
 int tcc_ir_taint_active(void);
 void tcc_ir_taint_begin(TCCIRState *ir);

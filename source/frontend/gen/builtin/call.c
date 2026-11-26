@@ -1435,6 +1435,10 @@ static void unary_funcall_body(void)
     if (tcc_state->ir->taint_on)
       tcc_ir_taint_note_call(tcc_state->ir, call_id, call_func_sym && call_func_sym->type.ref == s ? call_func_sym : NULL,
                              s);
+    /* -Wyasc-c-api: what a yasc function hands back read-only, who may write */
+    if (tcc_state->ir->capi_on)
+      tcc_ir_capi_note_call(tcc_state->ir, call_id, call_func_sym && call_func_sym->type.ref == s ? call_func_sym->v : 0,
+                            s);
     /* -fcallgraph-info: the type an indirect call is resolved by */
     if (tcc_state->callgraph_info)
       tcc_stack_usage_note_call(tcc_state, call_id, s);

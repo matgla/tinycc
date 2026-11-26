@@ -594,6 +594,23 @@ void convert_parameter_type(CType *pt);
 int post_type(CType *type, AttributeDef *ad, int storage, int td);
 CType *type_decl(CType *type, AttributeDef *ad, int *v, int td);
 
+/* --- decl/c_api.c --- */
+extern int yasc_capi_pending; /* a c_api(...) waits for the declarator, parameter or list that said it */
+int yasc_capi_levels(CType *type);
+void yasc_capi_word(int nstar);
+void yasc_capi_star(int nstar, CType *type);
+void yasc_capi_param(Sym *s);
+void yasc_capi_function(Sym *f);
+void yasc_capi_declarator(CType *type, int td, int nested);
+Sym *yasc_capi_of(Sym *fref);
+int yasc_capi_redecl(Sym *sym, CType *type);
+void yasc_capi_merge(Sym *sym, Sym *ca_old, Sym *ca_new, Sym *ya_old, Sym *ya_new);
+int yasc_capi_fnptr_ok(CType *dst, CType *src);
+void yasc_capi_attr_parse(AttributeDef *ad);
+void yasc_capi_attr_forget(AttributeDef *ad);
+void yasc_capi_attr_apply(CType *type, AttributeDef *ad);
+Sym *yasc_capi_yasc_type(Sym *f);
+
 /* --- decl/struct.c --- */
 Sym *find_field(CType *type, int v, int *cumofs);
 void struct_decl(CType *type, int u);

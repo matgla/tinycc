@@ -63,6 +63,7 @@ static int parse_btype_body(CType *type, AttributeDef *ad, int ignore_label)
   CType type1;
 
   memset(ad, 0, sizeof(AttributeDef));
+  yasc_capi_attr_forget(ad);
   type_found = 0;
   typespec_found = 0;
   t = VT_INT;

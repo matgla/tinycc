@@ -248,11 +248,22 @@ static void patch_type(Sym *sym, CType *type)
       sym->r |= VT_LVAL;
   }
 
+  Sym *capi_old = NULL, *capi_new = NULL, *yapi_old = NULL, *yapi_new = NULL;
   /* first: a yasc difference also makes the C types differ (in / out) */
   if ((sym->type.t & VT_BTYPE) == VT_FUNC && (type->t & VT_BTYPE) == VT_FUNC)
+  {
     yasc_redecl_check(sym, type);
+    capi_old = yasc_capi_of(sym->type.ref);
+    capi_new = yasc_capi_of(type->ref);
+    yapi_old = yasc_capi_yasc_type(sym->type.ref);
+    yapi_new = yasc_capi_yasc_type(type->ref);
+  }
   if (!is_compatible_types(&sym->type, type))
   {
+    /* a regular-C declaration of a function whose yasc one says c_api(...):
+       the C type it says (decl/c_api.c) */
+    if ((capi_old || capi_new) && (type->t & VT_BTYPE) == VT_FUNC && yasc_capi_redecl(sym, type))
+      return;
     tcc_error("incompatible types for redefinition of '%s'", get_tok_str(sym->v, NULL));
   }
   else if ((sym->type.t & VT_BTYPE) == VT_FUNC)
@@ -331,6 +342,8 @@ static void patch_type(Sym *sym, CType *type)
       else
         sym->type.ref = type->ref;
     }
+    if (capi_old || capi_new || yapi_old || yapi_new)
+      yasc_capi_merge(sym, capi_old, capi_new, yapi_old, yapi_new);
   }
   else
   {

@@ -63,6 +63,7 @@ SELFHOST_COMPILE_SOURCES = [
     "source/ir/ssa.c",
     "source/ir/lifetime.c",
     "source/ir/bounds.c",
+    "source/ir/capi_check.c",
     "source/ir/taint.c",
     "source/ir/regaccess.c",
     "source/ir/stack.c",
@@ -158,6 +159,7 @@ SELFHOST_COMPILE_SOURCES = [
     # source/frontend/gen/decl/
     "source/frontend/gen/decl/attribute.c",
     "source/frontend/gen/decl/btype.c",
+    "source/frontend/gen/decl/c_api.c",
     "source/frontend/gen/decl/decl.c",
     "source/frontend/gen/decl/declarator.c",
     "source/frontend/gen/decl/method.c",

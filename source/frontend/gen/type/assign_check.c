@@ -968,6 +968,9 @@ void verify_assign_cast(CType *dt)
     rodata_rel_check_targets(type1, type2, st, dt);
     if (is_compatible_types(type1, type2))
       break;
+    /* a function whose yasc declaration says c_api(...): its C type too */
+    if (yasc_capi_fnptr_ok(type1, type2))
+      break;
     for (qualwarn = lvl = 0;; ++lvl)
     {
       qualwarn |= type2->t & ~type1->t & (VT_CONSTANT | VT_VOLATILE);

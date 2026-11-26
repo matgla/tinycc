@@ -484,6 +484,9 @@ DEF(TOK_undefined, "undefined")
 DEF(TOK_borrows, "borrows")
 /* yasc `T * owned takes(p)`: on a function's result */
 DEF(TOK_takes, "takes")
+/* yasc `const char * c_api(char *) f(void)`: what C callers see in place of
+   the type to its left (decl/c_api.c) */
+DEF(TOK_c_api, "c_api")
 /* yasc `T m when(K, ...);` in a tagged union `union(k) { ... }` */
 DEF(TOK_when, "when")
 /* yasc register fields: `uint32_t irq:1 w1c;` after a member's declarator */
