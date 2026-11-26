@@ -46,7 +46,7 @@ CLEAN = {
     "inout_to_inout": "void g(inout int *p);\nvoid f(inout int *p) { g(p); }\n",
     "in_to_in": "int g(int *p);\nint f(int *p) { return g(p); }\n",
     "owned_writable": "void f(char * owned p) { p[0] = 0; free(p); }\n",
-    "handle_untouched": "int f(int view fd) { return (int)fd; }\n",
+    "handle_untouched": "int f(int view fd) { return cast<as(int)>(fd); }\n",
     # `in` is a name everywhere but where a parameter's declaration starts
     "in_as_name": "int f(int in) { int out_ = in; return out_; }\nint g(void) { int in = 2; return in; }\n",
     "free_member_inout": "void f(inout struct box *b) { free(b->s); b->s = nullptr; }\n",

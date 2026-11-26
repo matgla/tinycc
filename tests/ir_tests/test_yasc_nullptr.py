@@ -58,7 +58,7 @@ WARNS = [
     ("int f(char * maybe p) { return 0 == p; }", ZERO_MSG),
     ("char * view maybe f(inout char * maybe p, int c) { return c ? p : 0; }", ZERO_MSG),
     ("char * view maybe f(inout char * maybe p, int c) { return c ? 0 : p; }", ZERO_MSG),
-    ("void f(void) { take((char * view maybe)0); }", ZERO_MSG),
+    ("void f(void) { char * view maybe q = 0; take(q); }", ZERO_MSG),
     ("void f(char * maybe p) { p = '\\0'; take(p); }", ZERO_MSG),
     ("void f(char * maybe p) { p = 1 - 1; take(p); }", ZERO_MSG),
     ("int f(void) { struct S s = {0}; return s.n; }", ZERO_MSG),
@@ -81,7 +81,7 @@ QUIET = [
     "int f(char * maybe p) { return p && *p; }",
     "char * view maybe f(inout char * maybe p) { return p + 0; }",
     "long f(char *p, char *q) { return p - q; }",
-    "int f(void) { int x = 0; long y = 0; return x + (int)y; }",
+    "int f(void) { int x = 0; long y = 0; return x + cast<int(int)>(y); }",
     "int f(void) { struct S s = {}; return s.n; }",
     "struct T { int n; char * view maybe p; };\nint f(void) { struct T t = {0}; return t.n; }",
     # a system header's macros

@@ -70,7 +70,7 @@ int case_offset(int x)
 {
   int arr[8] = {0};
   arr[2] = x;
-  int r = use((const struct P * view)(arr + 1)) + say(4);
+  int r = use(cast<ptr(const struct P * view)>(arr + 1)) + say(4);
   return r + arr[2] + arr[1];
 }
 
@@ -213,10 +213,10 @@ int case_scalar_twice(int n)
 /* a 64-bit scalar */
 int case_scalar_ll(int n)
 {
-  long long v = (long long)n << 33;
+  long long v = cast<as(long long)>(n) << 33;
   long long r = peekll(&v);
   r += say(7);
-  return (int)(r >> 20) + (int)(v >> 32);
+  return cast<trunc(int)>(r >> 20) + cast<trunc(int)>(v >> 32);
 }
 
 /* ---- O1 in dead_local_slot: stores no later call can read ---- */

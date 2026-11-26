@@ -138,7 +138,8 @@ UNITY_MEMBERS_frontend_gen_sym = \
 UNITY_MEMBERS_frontend_gen_type = \
 	source/frontend/gen/type/assign_check.c \
 	source/frontend/gen/type/cast.c \
-	source/frontend/gen/type/size.c
+	source/frontend/gen/type/size.c \
+	source/frontend/gen/type/yasc_cast.c
 UNITY_MEMBERS_frontend_gen_value = \
 	source/frontend/gen/value/load.c \
 	source/frontend/gen/value/longlong.c \

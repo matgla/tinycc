@@ -640,6 +640,8 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
    function is exempt (it can only borrow).  A pointer in a nested declarator
    (`(*fp)(int)`) gets its target from the suffix the caller applies after
    it, so it waits here until then (yasc_plain_check). */
+/* >= 0 while a cast<...>'s type is parsed: its plain pointers, counted */
+int yasc_cast_type_plain = -1;
 #define YASC_PLAIN_MAX 16
 static Sym *yasc_plain[YASC_PLAIN_MAX];
 static int yasc_plain_line[YASC_PLAIN_MAX];
@@ -1111,7 +1113,9 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
     {
       /* a parameter's '*' that is plain is an inner level (its own is a view):
          said at once, the body decides nothing about it */
-      if (plain && (type->t & VT_BTYPE) != VT_FUNC)
+      if (plain && (type->t & VT_BTYPE) != VT_FUNC && yasc_cast_type_plain >= 0)
+        yasc_cast_type_plain++; /* a cast<...>'s type: its outermost pointer takes the operand's (yasc_cast.c) */
+      else if (plain && (type->t & VT_BTYPE) != VT_FUNC)
         yasc_plain_error(file ? file->line_num : 0,
                          (td & TYPE_PARAM) ? 0 : !(td & (TYPE_ABSTRACT | TYPE_NESTDECL)) ? 2 : 0);
       mk_pointer_yasc(type, yq);

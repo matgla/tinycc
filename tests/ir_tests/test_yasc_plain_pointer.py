@@ -59,7 +59,7 @@ ANNOTATED = {
     "parameter_restrict": "int f(char * restrict s, const char * restrict t);",
     "parameter_inner_said": "int f(char * view *s);",
     "function_type_parameter": "typedef int cmp(const void *, const void *);",
-    "cast": "int f(void) { return (char * view)0 == 0; }",
+    "cast": "int f(char * view maybe p) { return cast<as(const char * view maybe)>(p) == nullptr; }",
     "sizeof": "int f(void) { return sizeof(char * owned); }",
     "typedef_use": "typedef char * view str;\nstr s;",
     "function_pointer": "void (*fp)(int);",

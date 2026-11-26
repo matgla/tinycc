@@ -498,6 +498,10 @@ DEF(TOK_catch, "catch")
 /* yasc `unreachable`: a checked point control never reaches (op/ubsan.c gen_unreachable) */
 DEF(TOK_unreachable, "unreachable")
 DEF(TOK_error_from, "error_from")
+/* yasc cast<...>(x) / unsafe_cast<...>(x) (type/yasc_cast.c), unless a name
+   of that spelling is in scope */
+DEF(TOK_cast, "cast")
+DEF(TOK_unsafe_cast, "unsafe_cast")
 DEF(TOK_error_name, "error_name")
 DEF(TOK___yasc_error_name, "__yasc_error_name")
 /* yasc modules: keywords only where a file-scope declaration starts (decl/module.c) */

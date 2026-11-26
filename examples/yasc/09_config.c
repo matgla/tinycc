@@ -36,7 +36,7 @@ static void say(const char *fmt, ...)
 /* s[0..n) as a new string */
 static !char * owned copy(const char *s, int n)
 {
-  char * owned maybe buf = mem_new((size_t)n + 1);
+  char * owned maybe buf = mem_new(cast<int(size_t)>(n) + 1);
   if (!buf)
     return error.ENOMEM;
   for (int i = 0; i < n; i++)

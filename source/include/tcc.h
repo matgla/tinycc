@@ -1599,6 +1599,7 @@ typedef struct AttributeDef
 #define SAN_BOUNDS 0x0080          /* bounds: an index outside an array of known size */
 #define SAN_TRAPV 0x0100           /* -ftrapv: signed + - * and negation only */
 #define SAN_UNREACHABLE 0x0200     /* unreachable: a __builtin_unreachable() reached (yasc's unreachable always is) */
+#define SAN_CAST 0x0400            /* cast: yasc cast<...>'s value checks (on unless -fno-sanitize=cast) */
 #define SAN_ARITH_ALL (SAN_SIGNED_OVERFLOW | SAN_SHIFT_BASE | SAN_SHIFT_EXP | SAN_DIV_ZERO)
 #define SAN_UNDEFINED (SAN_ARITH_ALL | SAN_NULL | SAN_ALIGN | SAN_VLA | SAN_BOUNDS | SAN_UNREACHABLE)
 /* TCCState.stack_protector */
@@ -2025,6 +2026,7 @@ struct TCCState
   unsigned char warn_pointer_arith;             /* arithmetic on void * / function pointers, sizeof(void) */
   unsigned char warn_cast_qual;                 /* a cast dropping const/volatile from the pointed-to type */
   unsigned char warn_cast_align;                /* a cast raising the pointed-to alignment */
+  unsigned char warn_old_style_cast;            /* yasc: a C cast `(T)x` (cast<...>(x) says what may change) */
   unsigned char warn_address_of_packed_member;  /* &packed->member converted to an over-aligned pointer */
   unsigned char warn_frame_larger_than;         /* -Wframe-larger-than=N: a frame over N bytes (stack_usage.c) */
   unsigned char warn_stack_usage;               /* -Wstack-usage=N: the same, and any dynamic frame */
@@ -2175,6 +2177,7 @@ struct TCCState
   /* -fsanitize=... (frontend/gen/op/ubsan.c) and -ftrapv: SAN_* bits, 0 =
      off */
   unsigned short sanitize;
+  unsigned char cast_checks_off; /* -fno-sanitize=cast: yasc cast<...> without its runtime checks */
   /* the checks that call libc's __ubsan_handle_* instead of trapping:
      asked for by -fno-sanitize-trap / -fsanitize-recover /
      -fno-sanitize-recover, unless -fsanitize-trap names them; _abort

@@ -335,12 +335,18 @@ __attribute__((noinline)) int unary_paren(void)
     {
       /* GCC extension: (union_type) expr */
       unary();
+      if (tcc_state->yasc && tcc_warn_wanted(warn_old_style_cast))
+        tcc_warning_once(warn_old_style_cast, "C cast to a union: write a compound literal");
       unary_union_cast(&type);
     }
     else if (k == PAREN_CAST)
     {
       unary();
-      if ((type.t & VT_BTYPE) == VT_PTR)
+      /* yasc: cast<...>(x) says what may change; (void)x stays.  Said, it
+         is the C cast's diagnostic: the older cast checks would repeat it */
+      if (tcc_state->yasc && (type.t & VT_BTYPE) != VT_VOID && tcc_warn_wanted(warn_old_style_cast))
+        yasc_old_style_cast(&type);
+      else if ((type.t & VT_BTYPE) == VT_PTR)
         explicit_cast_checks(&type);
       gen_cast(&type);
     }
@@ -491,6 +497,25 @@ static void packed_member_note(CType *struct_type, Sym *field, int cumofs, int b
   packed_member_last.st = *named;
   packed_member_last.align = align;
   packed_member_last.set = 1;
+}
+
+PackedMember array_member_last;
+
+/* After an array member access, for -Wcast-align: the alignment its place
+   guarantees -- the struct's (1 when the base is under-aligned already),
+   less where the offset is not a multiple of it.  A member's own _Alignas
+   raised the struct's. */
+static __attribute__((noinline)) void array_member_note(CType *struct_type, int cumofs, int base_underaligned)
+{
+  int align;
+  type_size(struct_type, &align);
+  if (base_underaligned)
+    align = 1;
+  if (cumofs & (align - 1))
+    align = cumofs & -cumofs;
+  array_member_last.sv = *vtop;
+  array_member_last.align = align;
+  array_member_last.set = 1;
 }
 
 /* Set by '&' for the unary() that parses its operand (see unary()). */
@@ -778,6 +803,7 @@ static __attribute__((noinline)) int unary_member(int addr_operand)
    * mark is consumed by svalue_to_iroperand to keep 64-bit accesses off
    * the LDRD/STRD path, which faults on unaligned addresses. */
   int member_underaligned;
+  const int base_underaligned = vtop->underaligned;
   {
     int salign;
     type_size(&struct_type, &salign);
@@ -1004,6 +1030,8 @@ static __attribute__((noinline)) int unary_member(int addr_operand)
       }
   if (member_underaligned && tcc_warn_wanted(warn_address_of_packed_member))
     packed_member_note(&struct_type, s, cumofs, pm_base_align, &pm_base_st);
+  if (s && (s->type.t & VT_ARRAY) && !(s->type.t & VT_VLA) && tcc_warn_wanted(warn_cast_align))
+    array_member_note(&struct_type, cumofs, base_underaligned);
   if (member_flex && tcc_state->warn_array_bounds)
     fe_note_flex_member(); /* `s.tail + 4` is not checked either */
   if (uu_base)
@@ -1200,6 +1228,7 @@ ST_FUNC HOT void unary(void)
   indir_keep_lvalue = addr_operand;
   /* a new operand: the last packed member access is not what it will leave */
   packed_member_last.set = 0;
+  array_member_last.set = 0;
 
   /* generate line number info */
   if (debug_modes)
@@ -1211,6 +1240,12 @@ ST_FUNC HOT void unary(void)
       yasc_unary())
   {
     uv_effects++, uv_last = UV_EFFECT;
+    goto postfix;
+  }
+  /* yasc: cast<...>(x), unsafe_cast<...>(x) (type/yasc_cast.c) */
+  if (tcc_state->yasc && (tok == TOK_cast || tok == TOK_unsafe_cast) && yasc_cast_expr())
+  {
+    uv_last = UV_VALUE;
     goto postfix;
   }
   /* yasc: move(p), borrow(p) */

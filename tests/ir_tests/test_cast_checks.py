@@ -48,7 +48,7 @@ def _diags(proc, kind="warning"):
 
 
 DISCARD = "cast discards '%s' qualifier from pointer target type"
-ALIGN = "cast increases required alignment of target type"
+ALIGN = "cast to '%s' from '%s' increases required alignment from %d to %d"
 
 BODY = """\
 typedef unsigned char u8; typedef unsigned int u32; typedef unsigned long long u64;
@@ -86,7 +86,13 @@ QUAL = [
     (11, DISCARD % "const"),
     (21, DISCARD % "const volatile"),
 ]
-ALIGNS = [(12, ALIGN), (14, ALIGN), (16, ALIGN), (18, ALIGN), (20, ALIGN)]
+ALIGNS = [
+    (12, ALIGN % ("unsigned int *", "unsigned char *", 1, 4)),
+    (14, ALIGN % ("unsigned int *", "struct P *", 1, 4)),
+    (16, ALIGN % ("int *", "short *", 2, 4)),
+    (18, ALIGN % ("unsigned long long *", "short *", 2, 8)),
+    (20, ALIGN % ("unsigned int *", "unsigned char *", 1, 4)),
+]
 
 
 @pytest.mark.parametrize("opt", LEVELS)
@@ -109,7 +115,7 @@ def test_switches(tmp_path):
 
 def test_werror(tmp_path):
     proc = _run(tmp_path, BODY, "-Werror=cast-align")
-    assert proc.returncode != 0 and f"error: {ALIGN}" in proc.stderr, proc.stderr
+    assert proc.returncode != 0 and f"error: {ALIGNS[0][1]}" in proc.stderr, proc.stderr
     proc = _run(tmp_path, BODY, "-Wcast-qual", "-Werror", "-Wno-error=cast-qual")
     assert proc.returncode == 0 and _diags(proc) == QUAL, proc.stderr
 
@@ -135,9 +141,10 @@ def test_pragma(tmp_path):
 
 
 def test_safe_default(tmp_path):
-    # on in the safe default; in yasc, dropping const needs unsafe(...), which
-    # says it was meant: no -Wcast-qual inside it
-    body = "char * view f(const char *s)\n{\n  return unsafe((char * view)s);\n}\n"
+    # on in the safe default; in yasc the cast that drops const is
+    # unsafe_cast<qual(...)> (test_yasc_casts.py), which says it was meant:
+    # no -Wcast-qual for it
+    body = "char * view f(const char *s)\n{\n  return unsafe_cast<qual(char * view)>(s);\n}\n"
     proc = _run(tmp_path, body, compat=False)
     assert proc.returncode == 0 and _diags(proc) == [], proc.stderr
     proc = _run(tmp_path, body, "-Wno-cast-qual", compat=False)
@@ -160,7 +167,8 @@ def test_once_in_an_inlined_function(tmp_path):
         "unsigned g(unsigned char *p) { return w(p) + w(p + 4); }\n"
     )
     for opt in LEVELS:
-        assert _diags(_run(tmp_path, body, "-Wcast-align", opt)) == [(1, ALIGN)]
+        assert _diags(_run(tmp_path, body, "-Wcast-align", opt)) == [
+            (1, ALIGN % ("unsigned int *", "unsigned char *", 1, 4))]
 
 
 @pytest.mark.parametrize("opt", LEVELS)
@@ -169,3 +177,31 @@ def test_code_unchanged(tmp_path, opt):
     b = _run(tmp_path, BODY, opt, "-Wcast-qual", "-Wcast-align", out="b.o")
     assert a.returncode == 0 and b.returncode == 0
     assert (tmp_path / "a.o").read_bytes() == (tmp_path / "b.o").read_bytes()
+
+
+def test_aligned_places_are_not_reported(tmp_path):
+    """an array whose place is aligned enough: its _Alignas, or a member at an
+    aligned offset of an aligned struct (as clang); `buf + n` is not known"""
+    body = (
+        "struct d { int fd; int pos; char buf[16]; char odd; char tail[8]; };\n"
+        "struct __attribute__((packed)) pk { char c; char buf[8]; };\n"
+        "static unsigned char gbuf[8];\n"
+        "static _Alignas(4) unsigned char gabuf[8];\n"
+        "void use(void *);\n"
+        "void f(struct d *d, struct pk *p) {\n"
+        "  _Alignas(8) char abuf[16]; char pbuf[16];\n"
+        "  use((unsigned *)d->buf); use((unsigned *)gabuf); use((unsigned *)abuf);\n"  # 8: none
+        "  use((unsigned *)(d->buf + d->pos));\n"                                     # 9
+        "  use((unsigned *)d->tail);\n"                                               # 10: offset 25
+        "  use((unsigned *)p->buf);\n"                                                # 11: packed
+        "  use((unsigned *)gbuf); use((unsigned *)pbuf);\n"                           # 12
+        "}\n"
+    )
+    for opt in ("-O0", "-O2"):
+        assert [d[0] for d in _diags(_run(tmp_path, body, "-Wcast-align", opt))] == [9, 10, 11, 12, 12]
+
+
+def test_two_casts_on_one_line_are_two_reports(tmp_path):
+    body = "void use(void *, void *);\nvoid f(char *a, short *b) { use((int *)a, (int *)b); }\n"
+    assert _diags(_run(tmp_path, body, "-Wcast-align")) == [
+        (2, ALIGN % ("int *", "char *", 1, 4)), (2, ALIGN % ("int *", "short *", 2, 4))]

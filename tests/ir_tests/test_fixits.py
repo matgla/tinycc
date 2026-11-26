@@ -341,12 +341,12 @@ def test_default_view_param_body_says_owned(tmp_path):
 def test_plain_param_error_order(tmp_path):
     # the parameter's error comes after the body's own diagnostics, before
     # the function's flow checks; each note and fix-it stays with its error
-    # (a cast's plain pointer is said at once); the body's parameters and
+    # (a sizeof's plain pointer is said at once); the body's parameters and
     # locals in line order
     src = """\
 int f(char *s)
 {
-  int z = (char *)nullptr == nullptr;
+  int z = sizeof(char *) == 4;
   char *loc = s;
   return loc[0] + z;
 }

@@ -83,7 +83,7 @@ GOOD = {
     "reopen": "void f(inout struct conn *c) { close(c->fd); c->fd = open(\"y\", 0); close(c->fd); c->fd = -1; }",
     "closed_and_cleared": "void f(inout struct conn *c) { close(c->fd); c->fd = -1; }",
     "local_closed": "void f(void) { struct conn c = undefined; c.fd = open(\"x\", 0); close(c.fd); }",
-    "method": "int m__get(struct m *self) { return (int)self->fd; }",  # its number
+    "method": "int m__get(struct m *self) { return cast<as(int)>(self->fd); }",  # its number
 }
 
 

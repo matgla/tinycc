@@ -6968,6 +6968,17 @@ static int yasc_tok_matters(int t)
   return t == '*' || (t >= TOK_owned && t <= TOK_error_name);
 }
 
+/* T, after a '(': a type starts there -- a C cast, which yasc spells
+   cast<...>(x): the macro's own is regular C */
+static int yasc_tok_type_start(int t)
+{
+  Sym *s;
+  /* (void)x is yasc too */
+  if ((t >= TOK_UNSIGNED && t <= TOK_SIGNED3) || (t > TOK_VOID && t <= TOK_ENUM))
+    return 1;
+  return t >= TOK_UIDENT && (s = sym_find(t)) && (s->type.t & VT_TYPEDEF);
+}
+
 /* do macro substitution of current token with macro 's' and add
    result to (tok_str,tok_len). 'nested_list' is the list of all
    macros we got inside to avoid recursing. Return non zero if no
@@ -6999,13 +7010,15 @@ static int macro_subst_tok(TokenString *tok_str, Sym **nested_list, Sym *s)
   if (outer && tok_str->len > start)
   {
     const int *p = tok_str_buf(tok_str) + start, *end = tok_str_buf(tok_str) + tok_str->len;
-    int matters = 0;
+    int matters = 0, prev = 0;
     while (p < end && !matters)
     {
       int t;
       CValue cv;
       tok_get(&t, &p, &cv);
-      matters = yasc_tok_matters(t & ~SYM_FIELD);
+      t &= ~SYM_FIELD;
+      matters = yasc_tok_matters(t) || (prev == '(' && yasc_tok_type_start(t));
+      prev = t;
     }
     if (matters)
     {

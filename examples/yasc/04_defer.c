@@ -34,7 +34,7 @@ static int shout(const char *s)
   defer mem_free(buf);
   for (char * view p = buf; *p; p++)
     if (*p >= 'a' && *p <= 'z')
-      *p = (char)(*p - 'a' + 'A');
+      *p = cast<int(char)>(*p - 'a' + 'A');
   if (buf[0] == 'Q')
     return 1; /* still freed */
   printf("%s\n", buf);

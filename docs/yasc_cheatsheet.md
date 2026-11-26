@@ -129,7 +129,7 @@ A view result with no view parameter is an error: write `borrows(static)`.
 FILE * owned(fclose) maybe f = fopen(path, "r");    /* released by fclose, not free */
 int owned(close) maybe fd = open(path, O_RDONLY);    /* an int handle; invalid = < 0 */
 int slot_read(int view h);                           /* borrows a handle */
-int n = (int)fd;                                     /* its number: a copy that owns nothing */
+int n = cast<as(int)>(fd);                           /* its number: a copy that owns nothing */
 regex_t owned(regfree) re;                           /* an object owned as a whole */
 ```
 
@@ -140,7 +140,7 @@ An `int` is a number: it points at nothing, so it is never a view by default.
 A handle goes only where the type says it is one -- `int view fd` (borrowed),
 `int owned(close) fd` (taken), `int view maybe dirfd` (AT_FDCWD or -1 fine).
 Storing one in a plain `int` (a parameter, a local, a member, a global, a
-result) is an error; `(int)fd` takes its number on purpose. A regular-C
+result) is an error; `cast<as(int)>(fd)` takes its number on purpose. A regular-C
 parameter cannot say it: an owned handle goes there as `borrow(fd)` or
 `move(fd)`, a view as it is.
 
@@ -266,6 +266,46 @@ A path that falls off the end of a non-void function is reported
 with no exit, a `noreturn` call, `__builtin_trap()` and `unreachable` end a
 path.
 
+## Casts: what may change
+
+A C cast `(T)x` is an error in yasc (`-Wold-style-cast`, which names the cast
+to write).  `cast<...>(x)` lists what may change; anything else is an error.
+One permission carries the type; `align` and `qual` add to a pointer cast.
+
+```c
+uint16_t port = cast<int(uint16_t)>(atoi(a));          /* the value must fit: a trap if not */
+uint8_t  lo   = cast<trunc(uint8_t)>(w >> 8);          /* the low bits, on purpose */
+uint32_t bits = cast<bits(uint32_t)>(f);               /* the same bytes, the same size */
+float    avg  = cast<float(float)>(sum) / n;           /* rounding allowed */
+enum op  o    = cast<enum(enum op)>(byte);             /* must be an enumerator */
+long long w   = cast<as(long long)>(x);                /* lossless only */
+auto de = cast<ptr(struct dirent *), align>(buf + pos); /* pointee changes, alignment checked */
+uintptr_t a   = cast<addr(uintptr_t)>(p);
+char * view hit = unsafe_cast<qual(char *)>(s);        /* drops const: strchr */
+volatile uint32_t * view reg = unsafe_cast<addr(volatile uint32_t *)>(0x40070000u);
+(void)unused;                                          /* stays */
+```
+
+| Permission | Allows | Check |
+|---|---|---|
+| `as(T)` | nothing lost (widening, adding const) | compile time |
+| `int(T)` | to an integer, keeping the value (also from a float, toward zero) | the value fits, NaN traps |
+| `trunc(T)` | integer to integer, the low bits | none |
+| `bits(T)` | the bytes as T, the same size | the sizes |
+| `float(T)` | to a floating type, rounding | none |
+| `enum(E)` | integer to enum | an enumerator |
+| `ptr(T *)` | the pointee type | the alignment may not rise unproven |
+| `align`, `align(N)` | the alignment rises to N (`align`: the `ptr` type's) | proven, or a runtime test |
+| `addr(T)` | pointer to integer; integer to pointer (`unsafe_cast`) | the integer is wide enough |
+| `qual(T *)`, `qual` | drops const/volatile (`unsafe_cast`) | not from a const/volatile object |
+| `fn(T)` | another function pointer type (`unsafe_cast`) | none |
+
+The outermost `*` of the cast's type may say nothing: it takes the operand's
+`owned`/`view`/`maybe`/`borrows`.  A cast is checked where the types do not
+prove it (a constant at compile time; the optimizer drops what it proves);
+`-fno-sanitize=cast` drops the runtime checks.  A cast in a regular-C
+header's macro is regular C.  Details: `docs/yasc_casts.md`.
+
 ## Builtins: @min, @max
 
 ```c
@@ -325,7 +365,7 @@ import lib.vec;                                  /* instead of #include */
 | owned result ignored | `an owned result is discarded` |
 | a view kept | `'s' is a view: it cannot leave the function` |
 | a view parameter freed or kept | `the parameter 'p' owns nothing (a view unless it says owned): write '* owned p' ...` |
-| a handle in a plain int | `a handle is stored in a plain int: where it goes says 'int view' or 'int owned', or (int)fd takes its number` |
+| a handle in a plain int | `a handle is stored in a plain int: where it goes says 'int view' or 'int owned', or cast<as(int)>(fd) takes its number` |
 | `view` on a parameter | `a parameter's pointer is a view unless it says owned: drop 'view'` (-Wredundant-view) |
 | a borrow outliving its owner | `'tail' is used after 's', which it borrows from, was freed` |
 | `out` read first | `'*n' is read before it is written` |

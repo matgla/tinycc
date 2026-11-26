@@ -946,6 +946,9 @@ typedef struct PackedMember
 } PackedMember;
 extern PackedMember packed_member_last, packed_member_addr;
 int packed_member_is_vtop(void);
+/* -Wcast-align (expr/unary.c): the array member accessed last and what its
+   place guarantees (`align`), for `(u32 *)s->buf` */
+extern PackedMember array_member_last;
 void packed_conversion_check(CType *dt);
 void explicit_cast_checks(CType *dt);
 
@@ -998,6 +1001,17 @@ extern int yasc_sentinel_live;  /* a [:0] slice's element is noted: vstore check
 void yasc_sentinel_store(void); /* vstore: no non-zero over the sentinel */
 void yasc_sentinel_reset(void); /* a function's start */
 void fe_trap_if(void); /* op/ubsan.c: vtop a condition -> popped, a trap on its true side */
+/* yasc cast<...> runtime checks (op/ubsan.c) */
+void yasc_cast_check_int(long long lo, unsigned long long hi);
+void yasc_cast_check_float(long double lo, int lo_strict, long double hi);
+void yasc_cast_check_enum(const long long *vals, int n);
+void yasc_cast_check_align(int n);
+/* type/yasc_cast.c */
+int yasc_cast_expr(void);
+extern int yasc_cast_type_plain; /* decl/declarator.c */
+void yasc_old_style_cast(CType *dt);
+/* type/assign_check.c */
+int cast_source_place_align(CType *st);
 void yasc_errunion_discarded(void);
 void yasc_verify_errors_assign(CType *dt);
 void yasc_try(void);

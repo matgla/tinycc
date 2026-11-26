@@ -102,7 +102,7 @@ def test_what_needs_no_unsafe(tmp_path):
         "void f(inout union val *v, inout union agg *a, char * maybe p)\n{\n"
         "  v->addr = 0x20000000;\n"
         "  a->h.n = 3;\n"
-        "  int n = v->i + a->h.n + a->raw[1] + (int)sizeof(v->s) + (int)sizeof(a->h);\n"
+        "  int n = v->i + a->h.n + a->raw[1] + cast<int(int)>(sizeof(v->s)) + cast<int(int)>(sizeof(a->h));\n"
         "  c_keep(v->s);\n"
         "  (void)(v->s == p);\n"
         "  (void)n;\n"

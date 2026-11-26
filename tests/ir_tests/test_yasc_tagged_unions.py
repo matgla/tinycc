@@ -76,7 +76,7 @@ def _msg(member, values):
 
 GOOD = {
     "switch": (
-        "int f(struct value *v)\n{\n  switch (v->k) {\n  case V_INT: return (int)v->u.i;\n"
+        "int f(struct value *v)\n{\n  switch (v->k) {\n  case V_INT: return cast<int(int)>(v->u.i);\n"
         "  case V_STR: return use(v->u.s);\n  case V_D: case V_E: return v->u.de;\n  default: return 0;\n  }\n}\n"
     ),
     "early_return": "int f(struct value *v)\n{\n  if (v->k != V_STR)\n    return 0;\n  return use(v->u.s);\n}\n",
@@ -100,7 +100,7 @@ GOOD = {
         "int f(struct value *v)\n{\n  enum vkind k = v->k;\n  if (k != V_STR)\n    return 0;\n  return use(v->u.s);\n}\n"
     ),
     "switch_on_copy": (
-        "int f(struct value *v)\n{\n  enum vkind k = v->k;\n  switch (k) {\n  case V_INT: return (int)v->u.i;\n"
+        "int f(struct value *v)\n{\n  enum vkind k = v->k;\n  switch (k) {\n  case V_INT: return cast<int(int)>(v->u.i);\n"
         "  case V_STR: return use(v->u.s);\n  default: return 0;\n  }\n}\n"
     ),
     "global_pointer": "struct value * view gp;\nlong f(void)\n{\n  if (gp->k == V_INT)\n    return gp->u.i;\n  return 0;\n}\n",
@@ -245,7 +245,7 @@ def test_regular_c_has_no_tagged_union(tmp_path):
 
 def test_switch_misses_a_variant(tmp_path):
     body = (
-        "int f(struct value *v)\n{\n  switch (v->k) {\n  case V_INT: return (int)v->u.i;\n"
+        "int f(struct value *v)\n{\n  switch (v->k) {\n  case V_INT: return cast<int(int)>(v->u.i);\n"
         "  case V_STR: return use(v->u.s);\n  }\n  return 0;\n}\n"
     )
     proc = _compile(tmp_path, body, "-Wno-switch")
@@ -256,8 +256,8 @@ def test_switch_misses_a_variant(tmp_path):
 @pytest.mark.parametrize("copy", ["  enum vkind k = v->k;\n", "  enum vkind k;\n  k = v->k;\n"], ids=["init", "assign"])
 def test_switch_on_a_copy_misses_a_variant(tmp_path, copy):
     body = (
-        "int f(struct value *v)\n{\n" + copy + "  switch (k) {\n  case V_INT: return (int)v->u.i;\n"
-        "  case V_STR: return use(v->u.s);\n  case V_ADDR: return (int)v->u.a;\n  }\n  return 0;\n}\n"
+        "int f(struct value *v)\n{\n" + copy + "  switch (k) {\n  case V_INT: return cast<int(int)>(v->u.i);\n"
+        "  case V_STR: return use(v->u.s);\n  case V_ADDR: return cast<int(int)>(v->u.a);\n  }\n  return 0;\n}\n"
     )
     proc = _compile(tmp_path, body, "-Wno-switch")
     line = 3 + copy.count("\n")
@@ -308,8 +308,8 @@ def test_switch_on_a_plain_int_is_not_checked(tmp_path):
 
 def test_switch_handles_every_variant(tmp_path):
     body = (
-        "int f(struct value *v)\n{\n  switch (v->k) {\n  case V_INT: return (int)v->u.i;\n"
-        "  case V_STR: return use(v->u.s);\n  case V_ADDR: return (int)v->u.a;\n  case V_D: case V_E: return v->u.de;\n"
+        "int f(struct value *v)\n{\n  switch (v->k) {\n  case V_INT: return cast<int(int)>(v->u.i);\n"
+        "  case V_STR: return use(v->u.s);\n  case V_ADDR: return cast<int(int)>(v->u.a);\n  case V_D: case V_E: return v->u.de;\n"
         "  }\n  return 0;\n}\n"
     )
     proc = _compile(tmp_path, body, "-Wno-switch")
@@ -447,8 +447,8 @@ def test_tagged_union_inside_a_member_of_another(tmp_path, prelude):
     """The inner union's entry grows the table while the outer's body is
     parsed: the outer's later when(...)s still land in its own entry."""
     body = NESTED + (
-        "int f(struct N *n)\n{\n  switch (n->k) {\n  case 1: return n->u.s.j;\n  case 2: return (int)n->u.i;\n"
-        "  case 3: return (int)n->u.q;\n  }\n  return 0;\n}\n"
+        "int f(struct N *n)\n{\n  switch (n->k) {\n  case 1: return n->u.s.j;\n  case 2: return cast<int(int)>(n->u.i);\n"
+        "  case 3: return cast<int(int)>(n->u.q);\n  }\n  return 0;\n}\n"
         "long h(struct P *p)\n{\n  return p->w.b;\n}\n"
     )
     if prelude:

@@ -140,12 +140,21 @@ def test_safe_default(tmp_path):
     body = (
         "struct __attribute__((packed)) P { char c; int u; };\n"
         "int * view f(inout struct P *p) { return &p->u; }\n"
-        "int * view g(inout struct P *p) { int * view q = (int * view)&p->u; return q; }\n"
+        "int * view g(inout struct P *p) { int * view q = cast<align(4)>(&p->u); return q; }\n"
         "void * view h(inout struct P *p) { return &p->u; }\n"
     )
     proc = _run(tmp_path, body, compat=False)
     assert proc.returncode == 0, proc.stderr
-    assert _diags(proc) == [(2, MSG), (3, MSG)], proc.stderr
+    assert _diags(proc) == [(2, MSG)], proc.stderr  # cast<align(4)> is checked: g says nothing
+
+
+def test_yasc_cast_says_the_alignment(tmp_path):
+    """yasc: cast<align(4)> raises it (checked at run time); the C cast names it"""
+    pre = "struct __attribute__((packed)) P { char c; int u; };\n"
+    proc = _run(tmp_path, pre + "int * view g(inout struct P *p) { return (int * view)&p->u; }\n", compat=False)
+    assert "C cast: write cast<align(4)>(...)" in proc.stderr, proc.stderr
+    proc = _run(tmp_path, pre + "int * view g(inout struct P *p) { return cast<ptr(int *)>(&p->u); }\n", compat=False)
+    assert "the alignment rises from 1 to 4" in proc.stderr, proc.stderr
 
 
 def test_not_in_a_system_header(tmp_path):

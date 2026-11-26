@@ -3698,6 +3698,9 @@ static const FlagDef options_W[] = {
     {offsetof(TCCState, warn_pointer_arith), WD_SAFE, "pointer-arith"},
     {offsetof(TCCState, warn_cast_qual), WD_SAFE, "cast-qual"},
     {offsetof(TCCState, warn_cast_align), WD_SAFE, "cast-align"},
+    /* yasc only: a C cast does whatever it takes; cast<...>(x) names what may
+       change (docs/yasc_casts.md).  An error in the safe default. */
+    {offsetof(TCCState, warn_old_style_cast), WD_SAFE_ERR, "old-style-cast"},
     /* gcc has it on by default */
     {offsetof(TCCState, warn_address_of_packed_member), WD_ALL, "address-of-packed-member"},
     /* Not in -Wall (nor in gcc's): they take a limit, -Wframe-larger-than=N
@@ -3885,6 +3888,7 @@ static int sanitize_names(TCCState *s1, const char *list, unsigned *bits, int le
                {"bounds", SAN_BOUNDS},
                {"array-bounds", SAN_BOUNDS},
                {"unreachable", SAN_UNREACHABLE},
+               {"cast", SAN_CAST},
                {"all", SAN_UNDEFINED}};
   *bits = 0;
   while (*list)
@@ -3913,7 +3917,9 @@ static int tcc_runtime_check_option(TCCState *s, const char *opt)
   {
     if (sanitize_names(s, opt, &bits, 0) < 0)
       return -1;
-    s->sanitize |= bits;
+    s->sanitize |= bits & ~SAN_CAST;
+    if (bits & SAN_CAST)
+      s->cast_checks_off = 0;
     return 1;
   }
   if (strstart("no-sanitize=", &opt))
@@ -3921,6 +3927,8 @@ static int tcc_runtime_check_option(TCCState *s, const char *opt)
     if (sanitize_names(s, opt, &bits, 0) < 0)
       return -1;
     s->sanitize &= ~bits;
+    if (bits & SAN_CAST)
+      s->cast_checks_off = 1;
     return 1;
   }
   /* The mode of the checks (gcc's and clang's options, without a list: all).

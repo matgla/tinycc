@@ -4,3 +4,17 @@
 #undef ALLOW_SUBTYPE_ACCESS
 #undef gen_cvt_itof1
 #include "../frontend/gen/type/size.c"
+#include "../frontend/gen/type/yasc_cast.c"
+#undef YC_ADDR
+#undef YC_ALIGN
+#undef YC_AS
+#undef YC_BITS
+#undef YC_ENUM
+#undef YC_FLOAT
+#undef YC_FN
+#undef YC_INT
+#undef YC_POINTER
+#undef YC_PTR
+#undef YC_QUAL
+#undef YC_TRUNC
+#undef YC_VALUE

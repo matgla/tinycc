@@ -74,6 +74,7 @@ GEN_SRC = \
 	source/frontend/gen/type/cast.c \
 	source/frontend/gen/type/compare.c \
 	source/frontend/gen/type/size.c \
+	source/frontend/gen/type/yasc_cast.c \
 	source/frontend/gen/value/load.c \
 	source/frontend/gen/value/longlong.c \
 	source/frontend/gen/value/rodata_rel.c \

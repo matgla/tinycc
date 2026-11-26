@@ -864,6 +864,188 @@ void fe_trap_if(void)
   ubsan_trap_if(NULL);
 }
 
+/* ---- yasc cast<...> checks (type/yasc_cast.c, docs/yasc_casts.md) -----
+ * Always on in yasc, as the slices' checks, unless -fno-sanitize=cast: a
+ * condition and a trap (`udf #254`).  Each takes the operand on top of the
+ * stack, emits its test and leaves the operand there, safe to read again. */
+
+/* a constant of type T: an integer's bits */
+static void yc_push_int(int t, unsigned long long v)
+{
+  if ((t & VT_BTYPE) == VT_LLONG)
+    vpush64(t, v);
+  else
+  {
+    vpushi((int)v);
+    ubsan_cast(t);
+  }
+}
+
+/* the operand's integer type after the promotions, for the tests */
+static int yc_promoted(const CType *type)
+{
+  int bt = type->t & VT_BTYPE, u = type->t & VT_UNSIGNED;
+  if (bt == VT_LLONG)
+    return VT_LLONG | u;
+  if (bt == VT_INT)
+    return VT_INT | u;
+  return VT_INT; /* char, short, bool: all of them fit an int */
+}
+
+/* vtop, an integer: a trap unless lo <= v <= hi, the limits of type
+   ST_SIGNED's range (both inside the operand's promoted type) */
+static void yc_check_range(int pt, long long lo, unsigned long long hi_minus_lo)
+{
+  const int ut = pt | VT_UNSIGNED;
+  SValue v;
+  ubsan_cast(pt);
+  ubsan_fix(pt);
+  v = *vtop;
+  vpushv(&v);
+  ubsan_cast(ut);
+  if (lo)
+  {
+    yc_push_int(ut, (unsigned long long)lo);
+    gen_op('-');
+  }
+  yc_push_int(ut, hi_minus_lo);
+  gen_op(TOK_UGT);
+  fe_trap_if();
+}
+
+/* cast<int(T)> of an integer: the value must be a T.  LO/HI: T's range */
+void yasc_cast_check_int(long long lo, unsigned long long hi)
+{
+  const int pt = yc_promoted(&vtop->type);
+  const int s_unsigned = pt & VT_UNSIGNED;
+  const unsigned long long umax = (pt & VT_BTYPE) == VT_LLONG ? ~0ull : 0xffffffffull;
+  if (s_unsigned)
+    yc_check_range(pt, 0, hi < umax ? hi : umax);      /* v <= hi */
+  else if (lo < 0)
+    yc_check_range(pt, lo, hi - (unsigned long long)lo); /* lo <= v <= hi */
+  else
+    yc_check_range(pt, 0, hi < umax >> 1 ? hi : umax >> 1); /* 0 <= v <= hi: a negative one is huge */
+}
+
+/* a float constant of type T */
+static void yc_push_float(CType *t, long double v)
+{
+  CValue c;
+  memset(&c, 0, sizeof c);
+  if ((t->t & VT_BTYPE) == VT_FLOAT)
+    c.f = (float)v;
+  else if ((t->t & VT_BTYPE) == VT_DOUBLE)
+    c.d = (double)v;
+  else
+    c.ld = v;
+  vsetc(t, VT_CONST, &c);
+}
+
+/* cast<int(T)> of a float: a trap unless LO < v (LO_STRICT) or LO <= v,
+   and v < HI -- false for a NaN, as both tests are > / >= */
+void yasc_cast_check_float(long double lo, int lo_strict, long double hi)
+{
+  CType ft = vtop->type;
+  SValue v;
+  ft.t &= VT_BTYPE;
+  ft.ref = NULL;
+  ubsan_fix(ft.t);
+  v = *vtop;
+  vpushv(&v);
+  yc_push_float(&ft, lo);
+  ubsan_cmp(lo_strict ? TOK_GT : TOK_GE);
+  yc_push_float(&ft, hi);
+  vpushv(&v);
+  ubsan_cmp(TOK_GT);
+  gen_op('&');
+  vpushi(0);
+  gen_op(TOK_EQ);
+  fe_trap_if();
+}
+
+/* cast<enum(E)>: the value must be one of the N enumerators VALS */
+void yasc_cast_check_enum(const long long *vals, int n)
+{
+  const int pt = yc_promoted(&vtop->type), ut = pt | VT_UNSIGNED;
+  long long lo = vals[0], hi = vals[0];
+  int distinct = 0;
+  for (int i = 1; i < n; i++)
+  {
+    if (vals[i] < lo)
+      lo = vals[i];
+    if (vals[i] > hi)
+      hi = vals[i];
+  }
+  for (int i = 0; i < n; i++)
+  {
+    int seen = 0;
+    for (int j = 0; j < i && !seen; j++)
+      seen = vals[j] == vals[i];
+    distinct += !seen;
+  }
+  if ((unsigned long long)(hi - lo) + 1 == (unsigned long long)distinct)
+  {
+    yc_check_range(pt, lo, (unsigned long long)(hi - lo)); /* lo..hi, every one an enumerator */
+    return;
+  }
+  ubsan_cast(pt);
+  ubsan_fix(pt);
+  SValue v = *vtop;
+  if (hi - lo < 32)
+  {
+    /* (v - lo) > hi - lo || !(mask >> ((v - lo) & 31) & 1) */
+    unsigned mask = 0;
+    for (int i = 0; i < n; i++)
+      mask |= 1u << (vals[i] - lo);
+    vpushv(&v);
+    ubsan_cast(ut);
+    yc_push_int(ut, (unsigned long long)lo);
+    gen_op('-');
+    ubsan_cast(VT_INT | VT_UNSIGNED);
+    ubsan_fix(VT_INT | VT_UNSIGNED);
+    SValue d = *vtop;
+    yc_push_int(VT_INT | VT_UNSIGNED, (unsigned long long)(hi - lo));
+    ubsan_cmp(TOK_UGT);
+    yc_push_int(VT_INT | VT_UNSIGNED, mask);
+    vpushv(&d);
+    vpushi(31);
+    gen_op('&');
+    gen_op(TOK_SHR);
+    vpushi(1);
+    gen_op('&');
+    vpushi(0);
+    ubsan_cmp(TOK_EQ);
+    gen_op('|');
+    fe_trap_if();
+    return;
+  }
+  /* v != e1 && v != e2 ...: the AND of the inequalities */
+  vpushi(1);
+  for (int i = 0; i < n; i++)
+  {
+    vpushv(&v);
+    yc_push_int(pt, (unsigned long long)vals[i]);
+    ubsan_cmp(TOK_NE);
+    gen_op('&');
+  }
+  fe_trap_if();
+}
+
+/* cast<align(N)>: vtop, a pointer, must be N-aligned */
+void yasc_cast_check_align(int n)
+{
+  CType pt = vtop->type;
+  SValue v;
+  ubsan_fix(VT_PTR);
+  v = *vtop;
+  vpushv(&v);
+  ubsan_cast(VT_INT | VT_UNSIGNED);
+  vpushi(n - 1);
+  gen_op('&');
+  fe_trap_if();
+  vtop->type = pt;
+}
+
 /* ---- -fsanitize=bounds through an array parameter ----------------------
  * A parameter declared as an array of N elements (`char s[16]`,
  * `int p[n]`: C99's syntax, which C itself ignores -- the parameter is a

@@ -398,7 +398,7 @@ static void yasc_verify_assign(CType *dt)
        where a handle goes says what it is -- `int view fd` borrows it, `int
        owned(close) fd` takes it.  A regular-C parameter cannot say it: an
        owned handle goes there as borrow(fd) or move(fd), a view as it is.
-       `(int)fd` is the number, on purpose: a copy that owns nothing. */
+       `cast<as(int)>(fd)` is the number, on purpose: a copy that owns nothing. */
     if (!type_is_handle(dt))
     {
       if (yasc_argument && yasc_argument_c)
@@ -411,8 +411,8 @@ static void yasc_verify_assign(CType *dt)
       {
         Sym *v = yasc_vtop_var();
         const char *name = v ? get_tok_str(v->v, NULL) : "...";
-        tcc_yasc_rule("a handle is stored in a plain int: where it goes says 'int view' or 'int owned', or (int)%s "
-                      "takes its number", name);
+        tcc_yasc_rule("a handle is stored in a plain int: where it goes says 'int view' or 'int owned', or "
+                      "cast<as(int)>(%s) takes its number", name);
         return;
       }
     }
@@ -549,21 +549,58 @@ static void cast_qual_check(CType *dt, CType *st)
   }
 }
 
+/* What the place of the array vtop is guarantees, past its element type:
+   an array variable's _Alignas, an array member's offset in an aligned
+   struct.  0 when unknown (a pointer, `buf + n`, an element of an array of
+   arrays). */
+int cast_source_place_align(CType *st)
+{
+  const SValue *a = &array_member_last.sv;
+  Sym *sym = vtop->sym;
+  int align;
+  if (!(st->t & VT_ARRAY) || (st->t & VT_VLA) || (vtop->r & VT_VALMASK) == VT_CMP)
+    return 0;
+  if (array_member_last.set && a->r == vtop->r && a->vr == vtop->vr && a->type.t == vtop->type.t &&
+      a->type.ref == vtop->type.ref && a->c.i == vtop->c.i && (!(a->r & VT_SYM) || a->sym == vtop->sym))
+    return array_member_last.align;
+  /* the array variable itself */
+  if (!sym || sym->type.ref != st->ref || !(sym->type.t & VT_ARRAY) || (vtop->r & VT_LVAL))
+    return 0;
+  if ((vtop->r & VT_VALMASK) == VT_LOCAL ? vtop->c.i != sym->c
+                                          : (vtop->r & (VT_VALMASK | VT_SYM)) != (VT_CONST | VT_SYM) || vtop->c.i)
+    return 0;
+  type_size(&sym->type, &align);
+  if (sym->a.aligned && (1 << (sym->a.aligned - 1)) > align)
+    align = 1 << (sym->a.aligned - 1);
+  return sym->a.packed && !sym->a.aligned ? 1 : align;
+}
+
 /* -Wcast-align: the cast raises the alignment the target needs -- from a
    char buffer or a packed struct to a word, which an unaligned address
    faults on (ARMv8-M Baseline on every access, Mainline on LDRD/LDM).  Not
    from void * (as gcc: what it points to is unknown), not to or from an
-   incomplete type. */
+   incomplete type.  An array whose place is aligned enough (_Alignas, a
+   member at an aligned offset) is not reported, as clang does.  The target
+   type is named first: the caret goes under it in the cast. */
 static void cast_align_check(CType *dt, CType *st)
 {
   CType *t1 = pointed_type(dt), *t2 = pointed_type(st);
-  int a1, a2, b1 = t1->t & VT_BTYPE, b2 = t2->t & VT_BTYPE;
+  int a1, a2, pa, b1 = t1->t & VT_BTYPE, b2 = t2->t & VT_BTYPE;
+  char n1[256], n2[256];
   if (b1 == VT_VOID || b1 == VT_FUNC || b2 == VT_VOID || b2 == VT_FUNC)
     return;
   if (type_size(t1, &a1) < 0 || type_size(t2, &a2) < 0)
     return;
-  if (a1 > a2)
-    tcc_warning_once(warn_cast_align, "cast increases required alignment of target type");
+  if (a1 <= a2 || (pa = cast_source_place_align(st)) >= a1)
+    return;
+  {
+    CType from = *st;
+    from.t &= ~(VT_ARRAY | VT_STORAGE); /* `char [1024]` is `char *` here, `static` is not a type */
+    type_to_str(n1, sizeof n1, dt, NULL);
+    type_to_str(n2, sizeof n2, &from, NULL);
+  }
+  tcc_warning_once(warn_cast_align, "cast to '%s' from '%s' increases required alignment from %d to %d", n1, n2,
+                   pa > a2 ? pa : a2, a1);
 }
 
 /* yasc: `*p`, `p->m`, `p[i]` with p a regular-C (unchecked) pointer: what

@@ -290,15 +290,23 @@ def test_ccompat_converts_silently(tmp_path):
     assert proc.returncode == 0 and _diags(proc) == [], proc.stderr
 
 
-# ---- S2: explicit casts to owned / view / borrows pointers ----
+# ---- S2: casts to owned / view / borrows pointers ----
+# A cast<...> changes no owned/view/maybe word unless it spells one of its
+# own; spelled, what the types cannot check needs unsafe(...) as an explicit
+# cast did.  Dropping const and an integer made a pointer are unsafe_cast's
+# (test_yasc_casts.py).
 
 CASTS = {
-    "integer": ("unsigned * view r = (unsigned * view)0x40000000;", "a cast makes an integer a pointer: write unsafe(...)"),
-    "from_c": ("char * view a = (char * view)c_find(s);", FROM_C % "a view"),
-    "drops_maybe": ("char * view b = (char * view)m;", "a cast drops maybe: test the pointer, or write unsafe(...)"),
-    "makes_owned": ("char * owned c = (char * owned)v;", "a cast makes a pointer that owns nothing owned: write unsafe(...)"),
-    "drops_const": ("char * view d = (char * view)s;", "a cast drops const: write unsafe(...)"),
-    "owned_to_view": ("char * view e = (char * view)o;", "a cast makes an owned pointer a view: write borrow(...)"),
+    "from_c": ("char * view a = cast<as(char * view)>(c_find(s));", FROM_C % "a view"),
+    "drops_maybe": ("char * view b = cast<as(char * view)>(m);", "a cast drops maybe: test the pointer, or write unsafe(...)"),
+    "makes_owned": ("char * owned c = cast<as(char * owned)>(v);", "a cast makes a pointer that owns nothing owned: write unsafe(...)"),
+    "owned_to_view": ("char * view e = cast<as(char * view)>(o);", "a cast makes an owned pointer a view: write borrow(...)"),
+}
+UNSAFE_CASTS = {
+    "integer": ("unsigned * view r = cast<addr(unsigned * view)>(0x40000000);",
+                "unsafe_cast<addr(unsigned * view)>(0x40000000)", "is unsafe: write unsafe_cast"),
+    "drops_const": ("char * view d = cast<ptr(char * view)>(s);", "unsafe_cast<qual(char * view)>(s)",
+                    "drops 'const': this needs qual (unsafe_cast)"),
 }
 CAST_FN = "void f(const char *s, inout char * maybe m, inout char *v, char * owned o)\n{\n  %s\n  free(o);\n}\n"
 
@@ -319,10 +327,20 @@ def test_cast_in_unsafe(tmp_path, name):
     assert not any("cast" in m or "regular C" in m for _, _, m in _diags(proc)), proc.stderr
 
 
+@pytest.mark.parametrize("name", sorted(UNSAFE_CASTS))
+def test_unsafe_cast_needs_its_keyword(tmp_path, name):
+    stmt, fixed, msg = UNSAFE_CASTS[name]
+    proc = _compile(tmp_path, C_DECLS + CAST_FN % stmt)
+    assert proc.returncode != 0 and msg in proc.stderr, proc.stderr
+    lhs = stmt.split(" = ", 1)[0]
+    proc = _compile(tmp_path, C_DECLS + CAST_FN % f"{lhs} = {fixed};")
+    assert not any("cast" in m for _, _, m in _diags(proc)), proc.stderr
+
+
 def test_casts_that_need_nothing(tmp_path):
     body = (
-        "int f(char *v)\n{\n  char buf[4] = {0};\n  char * view maybe z = (char * view maybe)nullptr;\n"
-        "  const char * view c = (const char * view)v;\n  char * view b = (char * view)buf;\n"
+        "int f(char *v)\n{\n  char buf[4] = {0};\n  char * view maybe z = nullptr;\n"
+        "  const char * view c = cast<as(const char * view)>(v);\n  char * view b = cast<as(char * view)>(buf);\n"
         "  return (z != nullptr) + *c + *b;\n}\n"
     )
     proc = _compile(tmp_path, body)

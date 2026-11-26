@@ -11,7 +11,7 @@ say it; a pointer to a function stays exempt.
 
 An int is a number: it points at nothing, so it is never a view by default.
 A handle (`int owned(close) fd`, `int view fd`) stored in a plain int -- a
-parameter, a local, a global, a member, a result -- is an error; `(int)fd`
+parameter, a local, a global, a member, a result -- is an error; `cast<as(int)>(fd)`
 takes its number on purpose.  A regular-C parameter cannot say it: an owned
 handle goes there as borrow(fd) / move(fd), a view as it is (also through a
 prototype parked in a header's regular-C section).
@@ -30,7 +30,7 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 LEVELS = ["-O0", "-O2"]
 PLAIN = "plain pointer in yasc: say owned or view"
 REDUNDANT = "a parameter's pointer is a view unless it says owned: drop 'view'"
-HANDLE = "a handle is stored in a plain int: where it goes says 'int view' or 'int owned', or (int)fd takes its number"
+HANDLE = "a handle is stored in a plain int: where it goes says 'int view' or 'int owned', or cast<as(int)>(fd) takes its number"
 
 
 def _param_owns_nothing(name):
@@ -88,7 +88,7 @@ CLEAN = {
     "fn_pointer_view_not_redundant": "int f(int (* view cb)(int)) { return cb(1); }\n",
     "slice_element_said": "int f([]char * view a) { return a.len > 0; }\n",
     "int_view_handle": "int f(int view fd) { return rd(fd); }\n",
-    "handle_number": "int f(int view fd) { return num((int)fd); }\n",
+    "handle_number": "int f(int view fd) { return num(cast<as(int)>(fd)); }\n",
 }
 
 
@@ -176,7 +176,7 @@ def test_handle_returned_as_a_plain_int(tmp_path):
 
 def test_handle_number_and_view_parameter(tmp_path):
     src = ("void f(void)\n{\n  int owned(close) maybe fd = open(\"a\", 0);\n  if (fd < 0)\n    return;\n"
-           "  int n = (int)fd;\n  rd(fd);\n  num(n + (int)fd);\n  close(fd);\n}\n")
+           "  int n = cast<as(int)>(fd);\n  rd(fd);\n  num(n + cast<as(int)>(fd));\n  close(fd);\n}\n")
     proc = _run(tmp_path, src)
     assert proc.returncode == 0 and _diags(proc) == [], proc.stderr
 

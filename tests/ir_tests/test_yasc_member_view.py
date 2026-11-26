@@ -60,8 +60,8 @@ def test_view_member_needs_no_unsafe(tmp_path, opt):
     body = """\
 void consume(const void *args)
 {
-  const ctx * view c = (const ctx * view)args;
-  *c->result = (long)c->fd;
+  const ctx * view c = cast<ptr(const ctx * view)>(args);
+  *c->result = cast<as(long)>(c->fd);
   if (c->opt)
     *c->opt = 2;
   *c->a = 3;

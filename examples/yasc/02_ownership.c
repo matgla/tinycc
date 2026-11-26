@@ -39,7 +39,7 @@ static int count(const struct name * maybe list, out int *chars)
   for (; list; list = list->next)
   {
     n++;
-    *chars += (int)strlen(list->text);
+    *chars += cast<int(int)>(strlen(list->text));
   }
   return n;
 }
