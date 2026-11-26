@@ -48,6 +48,12 @@ struct rec {
   char buf[8];
 };
 
+typedef struct ctx {
+  const char * view maybe path;
+  long * view result;
+} ctx;
+typedef char ctx_fits[(sizeof(ctx) <= 16) ? 1 : -1];
+
 void rec_free(int flags, drop rec * owned maybe r);
 rec * owned(rec_free) maybe rec_new(const char *name) __yl_nonnull(1);
 char * borrows(s) maybe rec_find(const char *s, int c);
@@ -85,6 +91,12 @@ struct rec {
   int *next __yl_view_maybe;
   char buf[8];
 };
+
+typedef struct ctx {
+  const char *path __yl_view_maybe;
+  long *result __yl_view;
+} ctx;
+typedef char ctx_fits[(sizeof(ctx) <= 16) ? 1 : -1];
 
 void rec_free(int flags, rec *r);
 rec *rec_new(const char *name) __yl_nonnull(1) __yl_dealloc(rec_free, 2);

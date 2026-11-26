@@ -260,8 +260,13 @@ static void yh_strip(YhState *st, YhToks *v, int a, int b, int body)
       int c = yh_close(st, v, i, b);
       p = yh_prev(v, i, a);
       if (p >= 0 && (v->data[p].kind == YH_ID || yh_is(st, &v->data[p], ")") || yh_is(st, &v->data[p], "]"))) {
+        int pending_q = 0; /* a ':' that closes a '?' is a conditional, not a sentinel */
         for (k = i + 1; k < c; k++)
-          if (yh_is(st, &v->data[k], ":")) {
+          if (yh_is(st, &v->data[k], "?"))
+            pending_q++;
+          else if (yh_is(st, &v->data[k], ":") && pending_q > 0)
+            pending_q--;
+          else if (yh_is(st, &v->data[k], ":")) {
             v->data[k].del = 1;
             n = yh_next(v, k + 1, c);
             if (n < c)
@@ -656,6 +661,9 @@ static void yh_declaration(YhState *st, int a, int b)
       depth--;
   }
   if (yh_is(st, &v->data[first], "typedef")) {
+    /* typedef struct s { ... } s; -- the members still carry their view */
+    if (brace >= 0)
+      yh_members(st, v, brace + 1, yh_close(st, v, brace, b));
     yh_strip(st, v, a, b, 0);
     return;
   }
