@@ -1133,15 +1133,17 @@ static void unused_decl_var(int l, CType *type, AttributeDef *ad, int v, int lin
    for its type, as typeof reads its operand, and the declaration then goes
    on as if the type had been written: tok is '=' again, its tokens follow,
    and the ',' or ';' after them.  In yasc the pointer's qualifiers (owned,
-   maybe, view) come with the type; a copy of an owned pointer is an error,
-   since nothing says whether it moves or is borrowed. */
+   maybe, view) come with the type; a copy of an owned variable, member or
+   dereference is an error, since nothing says whether it moves or is
+   borrowed.  Any other owned value (a call's result, a cast of one) is taken
+   as `T * owned q = ...` takes it. */
 static void decl_auto_infer(CType *type, CType *btype, AttributeDef *ad, int v, int first)
 {
   const char *kw = get_tok_str(ad->auto_tok, NULL);
   TokenString *init, *view;
   CType it;
   Sym *src;
-  int q, *buf;
+  int q, lval, *buf;
 
   if (type->t & VT_TYPEDEF)
     tcc_error("'%s' declares a variable, not a typedef", kw);
@@ -1167,6 +1169,7 @@ static void decl_auto_infer(CType *type, CType *btype, AttributeDef *ad, int v, 
     expect("',' or ';'");
   it = vtop->type;
   src = yasc_vtop_var();
+  lval = vtop->r & VT_LVAL;
   vpop();
   unevaluated_operand--;
   nocode_wanted--;
@@ -1186,7 +1189,7 @@ static void decl_auto_infer(CType *type, CType *btype, AttributeDef *ad, int v, 
   it.t &= ~(VT_STORAGE | VT_CONSTANT | VT_VOLATILE | VT_RODATA_REL);
 
   q = type_yasc(&it);
-  if ((q & YASC_OWNED) && !(q & (YASC_FRESH | YASC_UNCHECKED)))
+  if ((q & YASC_OWNED) && !(q & (YASC_FRESH | YASC_UNCHECKED)) && lval)
   {
     if (src)
       tcc_error("'%s' would copy the owned pointer '%s': write move(%s) or borrow(%s)", kw, get_tok_str(src->v, NULL),

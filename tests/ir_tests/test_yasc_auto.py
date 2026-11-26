@@ -262,3 +262,21 @@ def test_auto_copy_of_an_owned_pointer_is_an_error(tmp_path, init):
         else "'auto' would copy an owned pointer: write move(...) or borrow(...)"
     )
     assert diags[0][1:] == ("error", msg)
+
+
+# an owned value that is not a variable, a member or a dereference (a cast of
+# a call's result) is taken by auto as an explicit declaration takes it: only
+# a copy of an lvalue needs move(...) or borrow(...)
+@pytest.mark.parametrize("opt", LEVELS)
+def test_auto_takes_an_owned_rvalue(tmp_path, opt):
+    body = "void f(void)\n{\n  auto q = (char * owned)malloc(4);\n  use(q);\n  free(q);\n}\n"
+    proc, diags = _yasc(tmp_path, body, opt)
+    assert proc.returncode == 0 and diags == [], proc.stderr
+    proc, explicit = _yasc(tmp_path, body.replace("auto q", "char * owned q"), opt)
+    assert proc.returncode == 0 and explicit == diags, proc.stderr
+
+
+def test_auto_owned_rvalue_still_owns(tmp_path):
+    proc, diags = _yasc(tmp_path, "void f(void)\n{\n  auto q = (char * owned)malloc(4);\n  use(q);\n}\n")
+    assert proc.returncode == 0, proc.stderr
+    assert diags == [(5, "warning", "'q' leaks: it still owns memory at the end of its scope")]
