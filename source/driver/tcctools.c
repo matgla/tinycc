@@ -536,3 +536,5 @@ ST_FUNC int gen_makedeps(TCCState *s1, const char *target, const char *filename)
 }
 
 /* -------------------------------------------------------------- */
+
+#include "yasc_cheader.c"

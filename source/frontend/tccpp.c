@@ -3241,7 +3241,7 @@ ST_FUNC void pp_apply_pack_replay(TCCState *s1, int code)
     s1->pack_stack_ptr--;
     break;
   case TCC_PCH_REPLAY_YASC:
-    s1->yasc = value;
+    s1->yasc = value & 1;
     break;
   case TCC_PCH_REPLAY_ERROR:
     tcc_error_stash_raise(s1, value);
@@ -3250,7 +3250,8 @@ ST_FUNC void pp_apply_pack_replay(TCCState *s1, int code)
 }
 
 /* Apply every deferred #pragma pack action in the saved tokens [P, END) to the
-   live pack state. */
+   live pack state.  Not a c_begin / c_end (value bit 2): it took effect where it
+   was read (pp_yasc_pragma), and the parse may be in another file by now. */
 ST_FUNC void pp_apply_pack_replays(TCCState *s1, const int *p, const int *end)
 {
   while (p < end)
@@ -3258,7 +3259,8 @@ ST_FUNC void pp_apply_pack_replays(TCCState *s1, const int *p, const int *end)
     int t;
     CValue cv;
     tok_get(&t, &p, &cv);
-    if (t == TOK_PACK_REPLAY && (cv.i >> 16) != TCC_PCH_REPLAY_ERROR)
+    if (t == TOK_PACK_REPLAY && (cv.i >> 16) != TCC_PCH_REPLAY_ERROR &&
+        !((cv.i >> 16) == TCC_PCH_REPLAY_YASC && (cv.i & 2)))
       pp_apply_pack_replay(s1, cv.i);
   }
 }
@@ -4557,14 +4559,14 @@ static void pp_yasc_marks_flush(TCCState *s1, int lead)
 static void pp_yasc_pragma(TCCState *s1, int on)
 {
   CValue cv;
-  cv.i = (TCC_PCH_REPLAY_YASC << 16) | on;
+  cv.i = (TCC_PCH_REPLAY_YASC << 16) | 2 | on;
   if (pp_pragma_capture)
     tok_str_add2(pp_pragma_capture, TOK_PACK_REPLAY, &cv); /* a body saved: at its replay */
-  else
-  {
-    pp_apply_pack_replay(s1, cv.i);
-    pp_yasc_pragma_set = on;
-  }
+  /* now too: it may come in the lookahead past a saved body, before an #include */
+  pp_apply_pack_replay(s1, cv.i);
+  pp_yasc_pragma_set = on;
+  if (file)
+    file->yasc = on; /* an #include in between returns to it */
 }
 
 static int pragma_parse(TCCState *s1)

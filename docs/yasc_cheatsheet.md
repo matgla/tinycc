@@ -11,6 +11,8 @@ design and its limits are in `docs/static_analysis_todo.md`.
 | `tcc -ccompat old.c` | regular C; the yasc words are identifiers |
 | `#pragma yasc` | this file is yasc, even under `-ccompat` |
 | `-iyasc DIR` | headers found there are yasc |
+| `#pragma tcc c_begin` / `c_end` | a regular-C section of a yasc file (an `#include` in it stays C) |
+| `tcc -yasc-c-header yasc/x.h -o x.h` | the C header of a yasc header (docs/yasc_c_headers.md) |
 | `tcc -fsyntax-only f.c` | every check, no output |
 
 The dialect belongs to a file: an `#include`d header is regular C unless it

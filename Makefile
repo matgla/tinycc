@@ -633,7 +633,7 @@ $(ARCH_LIB): FORCE
 
 # additional dependencies
 # tcctools.c is #included by tcc.c rather than compiled on its own.
-$(DRIVER_MAIN_OBJ) : source/driver/tcctools.c
+$(DRIVER_MAIN_OBJ) : source/driver/tcctools.c source/driver/yasc_cheader.c
 $(DRIVER_MAIN_OBJ) : DEFINES += $(DEF_GITHASH)
 
 # Host Tiny C Compiler

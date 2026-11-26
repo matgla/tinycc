@@ -3478,6 +3478,7 @@ enum
   TCC_OPTION_x,
   TCC_OPTION_ar,
   TCC_OPTION_impdef,
+  TCC_OPTION_yasc_c_header,
   TCC_OPTION_dynamiclib,
   TCC_OPTION_flat_namespace,
   TCC_OPTION_two_levelnamespace,
@@ -3596,6 +3597,7 @@ static const TCCOption tcc_options[] = {
     {"x", TCC_OPTION_x, TCC_OPTION_HAS_ARG},
     {"T", TCC_OPTION_T, TCC_OPTION_HAS_ARG},
     {"ar", TCC_OPTION_ar, 0},
+    {"yasc-c-header", TCC_OPTION_yasc_c_header, 0},
     /* ignored (silently, except after -Wunsupported) */
     {"arch", 0, TCC_OPTION_HAS_ARG},
     {"C", 0, 0},
@@ -5141,6 +5143,9 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
       goto extra_action;
     case TCC_OPTION_impdef:
       x = OPT_IMPDEF;
+      goto extra_action;
+    case TCC_OPTION_yasc_c_header:
+      x = OPT_YASC_C_HEADER;
       goto extra_action;
     case TCC_OPTION_ar:
       x = OPT_AR;

@@ -3461,6 +3461,7 @@ ST_FUNC int normalized_PATHCMP(const char *f1, const char *f2);
 #define OPT_PRINT_DIRS 4
 #define OPT_AR 5
 #define OPT_IMPDEF 6
+#define OPT_YASC_C_HEADER 7
 #define OPT_M32 32
 #define OPT_M64 64
 
@@ -4431,6 +4432,7 @@ ST_FUNC void tcc_run_free(TCCState *s1);
 /* ------------ tcctools.c ----------------- */
 #if 0 /* included in tcc.c */
 ST_FUNC int tcc_tool_ar(TCCState *s, int argc, char **argv);
+ST_FUNC int tcc_tool_yasc_c_header(TCCState *s, int argc, char **argv);
 #ifdef TCC_TARGET_PE
 ST_FUNC int tcc_tool_impdef(TCCState *s, int argc, char **argv);
 #endif
