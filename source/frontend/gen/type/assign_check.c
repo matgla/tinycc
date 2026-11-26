@@ -188,6 +188,10 @@ int yasc_argument_c; /* yasc_argument: the parameter is regular C's (YASC_PARAM_
 int yasc_stmt_bol, yasc_unsafe_expr_line, yasc_rbrace_line;
 
 static BufferedFile *yasc_unsafe_expr_file;
+/* the value unsafe(expr) left on the stack, until the next statement: the
+   plain-pointer inference (plain_param.c) learns nothing from it */
+SValue yasc_unsafe_value;
+const SValue *yasc_unsafe_value_at;
 
 /* a statement begins at LINE (block.c): on the line of the last unsafe(expr)
    of this file it is an error; past it the line is forgotten */
@@ -195,6 +199,7 @@ __attribute__((noinline)) void yasc_unsafe_line_check(int line)
 {
   int same = file == yasc_unsafe_expr_file && line == yasc_unsafe_expr_line;
   yasc_unsafe_expr_line = 0;
+  yasc_unsafe_value_at = NULL;
   if (same)
     tcc_error_noabort("unsafe(...) takes its whole line: put this statement on a line of its own");
 }
@@ -319,6 +324,8 @@ __attribute__((noinline)) int yasc_unsafe_expr(void)
   next();
   expr_eq();
   skip(')');
+  yasc_unsafe_value = *vtop;
+  yasc_unsafe_value_at = vtop;
   tcc_unsafe_end(tcc_state, fn, yasc_unsafe_end_line(begin));
   /* ... and no statement follows it there (block.c) */
   yasc_unsafe_expr_line = yasc_unsafe_end_line(begin) - 1;

@@ -1092,6 +1092,8 @@ extern int yasc_argument_c;
 extern int yasc_stmt_bol, yasc_unsafe_expr_line; /* the statement read now begins its line; unsafe(expr)'s line */
 extern int yasc_rbrace_line;                     /* the line of the last compound statement's '}' */
 void yasc_unsafe_line_check(int line);
+extern SValue yasc_unsafe_value;           /* what the last unsafe(expr) left on the stack ... */
+extern const SValue *yasc_unsafe_value_at; /* ... at this slot, NULL: none since the statement began */
 Sym *yasc_vtop_var(void);
 int yasc_move_borrow(void);
 int yasc_unsafe_expr(void);

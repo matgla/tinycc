@@ -516,12 +516,20 @@ static int pp_same_local(int i, int vr, int c)
   return pp[i].local_vr >= 0 ? pp[i].local_vr == vr : pp[i].local_c == c;
 }
 
+/* SV is the value of an unsafe(expr) of this statement: what it does says
+   nothing of what a variable in it owns (a view returned as owned) */
+static int pp_unsafe(const SValue *sv)
+{
+  return sv == yasc_unsafe_value_at && sv->sym == yasc_unsafe_value.sym && sv->r == yasc_unsafe_value.r &&
+         sv->c.i == yasc_unsafe_value.c.i && sv->type.ref == yasc_unsafe_value.type.ref;
+}
+
 /* the entry of the followed variable SV is the value of, or -1 (the newest:
    a popped local's Sym may be reused, its vreg not) */
 static int pp_find(const SValue *sv)
 {
   if (!(sv->r & VT_LVAL) || !sv->sym || (sv->type.t & (VT_BTYPE | VT_ARRAY)) != VT_PTR ||
-      tcc_state->in_inline_expansion || sv->type.ref != sv->sym->type.ref)
+      tcc_state->in_inline_expansion || sv->type.ref != sv->sym->type.ref || pp_unsafe(sv))
     return -1;
   for (int i = pp_nb; i-- > 0;)
     if ((pp[i].state == PPS_BODY || pp[i].state == PPS_ALIAS) && pp[i].local == sv->sym &&
@@ -620,7 +628,7 @@ void yasc_pp_store(const SValue *dst, const SValue *val)
       pp[d].flags |= PP_CONSTSRC;
     /* an owned result (`malloc(n)`), not an owned variable or member, which
        a view borrows */
-    if (i < 0 && pp[d].is_local && (type_yasc(&val->type) & YASC_OWNED) && !(val->r & VT_LVAL))
+    if (i < 0 && pp[d].is_local && (type_yasc(&val->type) & YASC_OWNED) && !(val->r & VT_LVAL) && !pp_unsafe(val))
       pp_set(d, PP_OWNSRC);
     if (i < 0 && pp[d].is_local && ((type_yasc(&val->type) & YASC_MAYBE) || pp_null(val)))
       pp_set(d, PP_MAYBESRC);

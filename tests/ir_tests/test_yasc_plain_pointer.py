@@ -123,6 +123,33 @@ def test_owned_local_says_owned(tmp_path):
     assert "t.c:3: note: the function gives 'p' an owned value that may be null (line 3): write '* owned maybe'" in proc.stderr, proc.stderr
 
 
+UNSAFE_LOCAL = """\
+typedef struct ctx { void * view maybe * view result; } ctx;
+int fill(const ctx * c);
+int dlclose(drop void * h);
+void * owned(dlclose) maybe f(void) {
+  void *maybe result = nullptr;
+  const ctx c = {.result = &result};
+  if (fill(&c) != 0) return nullptr;
+  return unsafe(result);
+}
+void * owned(dlclose) maybe g(void) {
+  void *p = nullptr;
+  const ctx c = {.result = &p};
+  fill(&c);
+  return p;
+}"""
+
+
+def test_unsafe_keeps_a_local_a_view(tmp_path):
+    """a local returned as owned through unsafe(...) stays the view it is by
+    default (libc dl.c dlopen): only the plain return says it owns"""
+    proc = _compile(tmp_path, UNSAFE_LOCAL, "-std=yasc")
+    assert proc.returncode != 0, proc.stderr
+    assert "'result' owns" not in proc.stderr, proc.stderr
+    assert "t.c:11: error: plain pointer in yasc: 'p' owns what it points at, say owned" in proc.stderr, proc.stderr
+
+
 def test_local_view_is_redundant(tmp_path):
     """`view maybe` on a local pointer's own '*' says what it is anyway
     (-Wredundant-view, fix-it: `* maybe`); `view` alone says more (never
