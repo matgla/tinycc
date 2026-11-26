@@ -14,6 +14,10 @@ Decided in the first round:
 - the C cast is an error in yasc from the start;
 - `qual` gets static checks.
 
+Added later (2026-11-26): the `const` modifier, for a const object handed out
+through a `char *` that POSIX fixed before `const` existed (`dlerror`,
+`strerror`, `getenv`). See [`const`: a const object behind `char *`](#const-a-const-object-behind-char-).
+
 ## Why
 
 A C cast `(T)x` does whatever it takes to turn `x` into a `T`: widen,
@@ -47,12 +51,13 @@ char * view hit = unsafe_cast<qual(char *)>(s);
 
 - **The type.** At most one permission carries the target type in
   parentheses. With none, the type stays as it is: `cast<align(4)>(p)`.
-- **Modifiers.** `align`, `align(N)` and `qual` are permissions added to a
-  pointer cast; they take no type.
+- **Modifiers.** `align`, `align(N)`, `qual` and `const` are permissions
+  added to a pointer cast; they take no type (`qual(T *)` and `const(T *)`
+  carry it when nothing else does).
 - **The result** is an rvalue, like a C cast. The operand is an
   assignment-expression in parentheses.
 - **No stale modifiers.** A modifier must be needed. `align` on an operand
-  that is already aligned enough, or `qual` that drops nothing, is an error
+  that is already aligned enough, or a `qual` or `const` that drops nothing, is an error
   ("align is not needed: the operand is already 4-aligned"). A cast that
   outlived its reason is found this way. A typed permission that changes
   nothing is fine: `cast<int(size_t)>(n)` stays portable when `size_t` is
@@ -79,14 +84,15 @@ char * view hit = unsafe_cast<qual(char *)>(s);
 | `align`, `align(N)` | the known alignment rises to N (a power of two). `N` is a constant or a type (its alignment); bare `align` means `alignof(*T)` of the `ptr` type | proven: free. Otherwise a runtime check, `tst p,#N-1` then trap |
 | `addr(T)` | pointer to integer (`uintptr_t`, `intptr_t` or wider), or **integer to pointer** | integer to pointer is unsafe |
 | `qual(T *)`, or `qual` beside `ptr` | drops `const` / `volatile` from the pointee, or adds `const` below a non-const level (`char **` to `const char **`) | unsafe; static checks below |
+| `const(T *)`, or `const` beside `ptr` | drops `const`, and only `const`, from the pointee, from a const object too | unsafe; no object check (see below) |
 | `fn(T)` | function pointer to another signature | unsafe |
 
 **Mixing.** Value and pointer permissions never mix in one cast. A conversion
 that needs both is two casts.
 
 **`unsafe_cast`.**
-- Needed exactly when a cast uses an unsafe permission: `qual`, `fn`, or
-  `addr` from integer to pointer.
+- Needed exactly when a cast uses an unsafe permission: `qual`, `const`,
+  `fn`, or `addr` from integer to pointer.
 - `cast` with one of these is an error, and so is `unsafe_cast` without one.
 - `unsafe(...)` and `unsafe { }` do not stand in for it. The keyword itself
   says it, so `grep unsafe_cast` finds every one.
@@ -135,6 +141,31 @@ MMIO accesses. Static checks in front of the cast make it safer than today's
 4. **Nested levels.** Adding `const` below a non-const level
    (`char **` to `const char **`) is a `qual` cast. A store of a
    `const char *` through the result is an error.
+
+## `const`: a const object behind `char *`
+
+Some interfaces return `char *` to memory the caller must not write. POSIX
+kept the old signatures (`dlerror`, `strerror`, `getenv`, `strchr`), so the
+type says "writable" while the object is const, often a string literal in
+flash. `qual` refuses that by check 1, which is right for every other cast.
+
+`const` says it outright: the object is const and stays const; only its type
+loses the `const` for the interface.
+
+```c
+char * borrows(static) maybe dlerror(void) {
+  return unsafe_cast<ptr(char *), const>("");     /* or unsafe_cast<const(char *)>("") */
+}
+```
+
+- It drops `const` and nothing else. Dropping `volatile`, or adding `const`
+  below a non-const level, still needs `qual`.
+- Check 1 does not apply: that is the point of the word. Checks 2 and 4
+  (stores through the result) apply as for `qual`, once they exist.
+- `const` that drops no `const` is an error, and so is `const` with `qual`
+  in one cast.
+- `qual` refusing a const object names `const` in its message, so the
+  choice is made where the cast is written.
 
 There is no runtime check. A store-address test against the flash range on
 every store through such a pointer would cost more than the bug it catches,
@@ -241,7 +272,8 @@ cast<ptr(T *), align>(p)    ->  error: align is not needed: 'p' is already 4-ali
 - **Keywords.** `cast` and `unsafe_cast` are keywords in yasc only. Under
   `-ccompat` they are identifiers. The permission names (`as`, `int`,
   `trunc`, `bits`, `float`, `enum`, `ptr`, `align`, `addr`, `qual`, `fn`)
-  mean something only inside `<` `>`, so they need no new keywords.
+  mean something only inside `<` `>`, so they need no new keywords. `const`
+  is a C keyword already; inside `<` `>` it is the modifier.
 - **Inside the brackets.** The type is an abstract declarator, as in
   `sizeof(T)`. The `align(N)` argument is a constant expression or a type.
   Every argument is in parentheses, so a `>` or a `>>` inside them is never

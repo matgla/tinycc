@@ -4,10 +4,11 @@
  *
  *  A C cast does whatever it takes to turn a value into a type.  A yasc cast
  *  lists what may change -- one permission carries the target type, the
- *  modifiers (align, qual) add to a pointer cast -- and any other change is
- *  an error.  The value checks (int, enum, align) are a test and a trap
- *  where the types do not prove them (op/ubsan.c yasc_cast_check_*).  The
- *  unsafe permissions (qual, fn, addr from an integer) need unsafe_cast.
+ *  modifiers (align, qual, const) add to a pointer cast -- and any other
+ *  change is an error.  The value checks (int, enum, align) are a test and a
+ *  trap where the types do not prove them (op/ubsan.c yasc_cast_check_*).
+ *  The unsafe permissions (qual, const, fn, addr from an integer) need
+ *  unsafe_cast.
  *
  *  In yasc a C cast is -Wold-style-cast (an error in the safe default),
  *  whose message names the cast to write: the same classification.
@@ -29,8 +30,9 @@
 #define YC_ADDR 0x100
 #define YC_QUAL 0x200
 #define YC_FN 0x400
+#define YC_CONST 0x800 /* drops const from a const object: an interface's `char *` (dlerror) */
 #define YC_VALUE (YC_AS | YC_INT | YC_TRUNC | YC_BITS | YC_FLOAT | YC_ENUM)
-#define YC_POINTER (YC_PTR | YC_ALIGN | YC_ADDR | YC_QUAL | YC_FN)
+#define YC_POINTER (YC_PTR | YC_ALIGN | YC_ADDR | YC_QUAL | YC_FN | YC_CONST)
 
 static const struct
 {
@@ -38,7 +40,7 @@ static const struct
   int bit;
 } yc_names[] = {{"as", YC_AS},       {"int", YC_INT},     {"trunc", YC_TRUNC}, {"bits", YC_BITS},
                 {"float", YC_FLOAT}, {"enum", YC_ENUM},   {"ptr", YC_PTR},     {"align", YC_ALIGN},
-                {"addr", YC_ADDR},   {"qual", YC_QUAL},   {"fn", YC_FN}};
+                {"addr", YC_ADDR},   {"qual", YC_QUAL},   {"fn", YC_FN},       {"const", YC_CONST}};
 
 static const char *yc_name(int bit)
 {
@@ -619,6 +621,17 @@ static void yc_apply(int is_unsafe, int perms, int typed, CType *type, int align
     tcc_error_noabort("cast<>: '%s' needs %d-byte alignment, align(%d) is less", tn, need.to_al, align_n);
   {
     int missing = need.perms & ~YC_AS & ~perms;
+    /* const: drops const and nothing else (volatile, a nested const added
+       are qual's) */
+    if ((perms & YC_CONST) && (perms & YC_QUAL))
+      tcc_error_noabort("cast<>: const and qual: write one (const for a const object, qual for the rest)");
+    else if (perms & YC_CONST)
+    {
+      if (!(need.perms & YC_QUAL) || !(need.dropped & VT_CONSTANT))
+        tcc_error_noabort("cast<>: const is not needed: no const is dropped");
+      else if (need.dropped == VT_CONSTANT)
+        missing &= ~YC_QUAL;
+    }
     /* a value permission is the conversion itself: int stands for as, and
        for trunc (the low bits of what fits are the value) */
     if (value_perms && need.perms & YC_VALUE)
@@ -689,10 +702,11 @@ static void yc_apply(int is_unsafe, int perms, int typed, CType *type, int align
     if (missing & YC_QUAL)
     {
       if (need.dropped)
-        tcc_error_noabort("cast<>: '%s' to '%s' drops '%s': this needs qual (unsafe_cast)", sn, tn,
+        tcc_error_noabort("cast<>: '%s' to '%s' drops '%s': this needs qual (unsafe_cast)%s", sn, tn,
                           (need.dropped & VT_CONSTANT) && (need.dropped & VT_VOLATILE) ? "const volatile"
                           : (need.dropped & VT_CONSTANT)                              ? "const"
-                                                                                      : "volatile");
+                                                                                      : "volatile",
+                          (perms & YC_CONST) ? "; const drops only const" : "");
       else
         tcc_error_noabort("cast<>: '%s' to '%s' adds const below a level that is not const: this needs qual "
                           "(unsafe_cast)",
@@ -719,16 +733,21 @@ static void yc_apply(int is_unsafe, int perms, int typed, CType *type, int align
   {
     int oq = yc_object_quals(&st);
     if ((oq & VT_CONSTANT) && (need.dropped & VT_CONSTANT))
-      tcc_error_noabort("cast<>: '%s' points at a const object: qual does not make it writable", sn);
+      tcc_error_noabort("cast<>: '%s' points at a const object: qual does not make it writable (const says the "
+                        "object stays const: unsafe_cast<..., const>)",
+                        sn);
     if ((oq & VT_VOLATILE) && (need.dropped & VT_VOLATILE))
       tcc_error_noabort("cast<>: '%s' points at a volatile object: it stays volatile", sn);
   }
   /* unsafe_cast exactly for the unsafe permissions */
   {
-    int unsafe_used = (perms & (YC_QUAL | YC_FN)) || ((perms & YC_ADDR) && yc_is_ptr(&dt));
+    int unsafe_used = (perms & (YC_QUAL | YC_CONST | YC_FN)) || ((perms & YC_ADDR) && yc_is_ptr(&dt));
     if (unsafe_used && !is_unsafe)
       tcc_error_noabort("cast<>: %s is unsafe: write unsafe_cast",
-                        (perms & YC_QUAL) ? "qual" : (perms & YC_FN) ? "fn" : "an integer made a pointer (addr)");
+                        (perms & YC_QUAL)    ? "qual"
+                        : (perms & YC_CONST) ? "const"
+                        : (perms & YC_FN)    ? "fn"
+                                             : "an integer made a pointer (addr)");
     else if (!unsafe_used && is_unsafe)
       tcc_error_noabort("unsafe_cast<>: nothing unsafe here: write cast");
   }
@@ -782,7 +801,8 @@ int yasc_cast_expr(void)
   {
     int bit = yc_bit_of(tok);
     if (!bit)
-      tcc_error("'%s' is not a cast permission: as, int, trunc, bits, float, enum, ptr, align, addr, qual or fn",
+      tcc_error("'%s' is not a cast permission: as, int, trunc, bits, float, enum, ptr, align, addr, qual, const "
+                "or fn",
                 get_tok_str(tok, NULL));
     if (perms & bit)
       tcc_error("cast<>: '%s' twice", yc_name(bit));
@@ -829,7 +849,7 @@ int yasc_cast_expr(void)
       skip(')');
       typed = bit;
     }
-    else if (bit != YC_QUAL)
+    else if (bit != YC_QUAL && bit != YC_CONST)
       tcc_error("cast<>: '%s' needs its type: %s(T)", yc_name(bit), yc_name(bit));
     perms |= bit;
     if (tok == TOK_GT)
@@ -839,8 +859,8 @@ int yasc_cast_expr(void)
     next();
   }
   next();
-  if (perms == YC_QUAL && !typed)
-    tcc_error("cast<>: qual alone needs its type: qual(T *)");
+  if ((perms == YC_QUAL || perms == YC_CONST) && !typed)
+    tcc_error("cast<>: %s alone needs its type: %s(T *)", yc_name(perms), yc_name(perms));
   skip('(');
   expr_eq();
   skip(')');

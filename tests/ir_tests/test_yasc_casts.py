@@ -138,6 +138,20 @@ ERRORS = {
                              "points at a volatile object"),
     "qual_nested": ("void f(inout char * view * view p) { const char * view * view q = cast<ptr(const char * view *)>(p); use(q); }",
                     "adds const below a level that is not const"),
+    "const_safe_cast": ("void f(void) { char * view p = cast<ptr(char *), const>(\"\"); use(p); }",
+                        "const is unsafe: write unsafe_cast"),
+    "const_unneeded": ("char * view f(inout char * view s) { return unsafe_cast<const(char *)>(s); }",
+                       "const is not needed"),
+    "const_volatile": ("uint32_t * view f(inout volatile uint32_t * view r) { return unsafe_cast<const(uint32_t *)>(r); }",
+                       "const is not needed"),
+    "const_drops_volatile": ("char * view f(const volatile char * view s) { return unsafe_cast<const(char *)>(s); }",
+                             "drops 'const volatile': this needs qual (unsafe_cast); const drops only const"),
+    "const_and_qual": ("void f(void) { char * view p = unsafe_cast<ptr(char *), const, qual>(\"\"); use(p); }",
+                       "const and qual: write one"),
+    "const_untyped": ("void f(void) { char * view p = unsafe_cast<const>(\"\"); use(p); }",
+                      "const alone needs its type"),
+    "qual_literal_hint": ("void f(void) { char * view p = unsafe_cast<qual(char *)>(\"lit\"); use(p); }",
+                          "unsafe_cast<..., const>"),
     "addr_int_to_ptr_safe": ("void f(void) { uint32_t * view p = cast<addr(uint32_t *)>(0x40000000u); use(p); }",
                              "is unsafe: write unsafe_cast"),
     "addr_narrow": ("uint16_t f(int * view p) { return cast<addr(uint16_t)>(p); }", "does not fit that integer"),
@@ -184,6 +198,8 @@ void f(struct d * view s, const char * view str, char * view * view argv, uint8_
   char * view hit = unsafe_cast<qual(char *)>(str);
   const char * view * view cc = unsafe_cast<qual(const char * view *)>(argv);
   uint32_t * view dst = unsafe_cast<ptr(uint32_t *), qual, align>(str);
+  char * view lit = unsafe_cast<ptr(char *), const>("");                      /* const object: POSIX char * */
+  char * view msg = unsafe_cast<const(char *)>(g_msg);
   volatile uint32_t * view reg = unsafe_cast<addr(volatile uint32_t *)>(0x40070000u);
   uintptr_t ad = cast<addr(uintptr_t)>(str);
   cmp_t cmp = unsafe_cast<fn(cmp_t)>(c2);
@@ -198,7 +214,7 @@ void f(struct d * view s, const char * view str, char * view * view argv, uint8_
   size_t len = cast<int(size_t)>(s->pos);
   long long wide = cast<as(long long)>(s->pos);
   uint16_t same = cast<int(uint16_t)>(lo);                                      /* lossless: no check */
-  use(a); use(b); use(w); use(w2); use(hit); use(cc); use(dst); use(reg); use(cmp); use(back);
+  use(a); use(b); use(w); use(w2); use(hit); use(cc); use(dst); use(lit); use(msg); use(reg); use(cmp); use(back);
   (void)ad; (void)lo; (void)n; (void)fb; (void)db; (void)fl; (void)o; (void)len; (void)wide; (void)same;
 }
 """)

@@ -276,7 +276,7 @@ path.
 
 A C cast `(T)x` is an error in yasc (`-Wold-style-cast`, which names the cast
 to write).  `cast<...>(x)` lists what may change; anything else is an error.
-One permission carries the type; `align` and `qual` add to a pointer cast.
+One permission carries the type; `align`, `qual` and `const` add to a pointer cast.
 
 ```c
 uint16_t port = cast<int(uint16_t)>(atoi(a));          /* the value must fit: a trap if not */
@@ -288,6 +288,7 @@ long long w   = cast<as(long long)>(x);                /* lossless only */
 auto de = cast<ptr(struct dirent *), align>(buf + pos); /* pointee changes, alignment checked */
 uintptr_t a   = cast<addr(uintptr_t)>(p);
 char *hit = unsafe_cast<qual(char *)>(s);               /* drops const: strchr */
+char *err = unsafe_cast<ptr(char *), const>("");        /* a const object as char *: dlerror */
 volatile uint32_t *reg = unsafe_cast<addr(volatile uint32_t *)>(0x40070000u);
 (void)unused;                                          /* stays */
 ```
@@ -304,6 +305,7 @@ volatile uint32_t *reg = unsafe_cast<addr(volatile uint32_t *)>(0x40070000u);
 | `align`, `align(N)` | the alignment rises to N (`align`: the `ptr` type's) | proven, or a runtime test |
 | `addr(T)` | pointer to integer; integer to pointer (`unsafe_cast`) | the integer is wide enough |
 | `qual(T *)`, `qual` | drops const/volatile (`unsafe_cast`) | not from a const/volatile object |
+| `const(T *)`, `const` | drops only const, from a const object too (`unsafe_cast`) | none: the object stays const |
 | `fn(T)` | another function pointer type (`unsafe_cast`) | none |
 
 The outermost `*` of the cast's type may say nothing: it takes the operand's
