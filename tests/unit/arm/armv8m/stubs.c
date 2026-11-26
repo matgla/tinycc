@@ -439,6 +439,13 @@ typedef struct CType
 /* From tccgen.c / tccpp.c — global state touched by tcc_ir_put(). */
 int nocode_wanted = 0;
 int yasc_nreg; /* yasc register types in the unit: none */
+/* init/initializer.c: no initializer is being parsed */
+int init_self_on;
+struct SValue;
+void init_self_ir(int op, const struct SValue *src1, const struct SValue *src2, const struct SValue *dest)
+{
+  (void)op, (void)src1, (void)src2, (void)dest;
+}
 struct BufferedFile *file = NULL;
 CType func_old_type;
 

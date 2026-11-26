@@ -248,6 +248,9 @@ typedef struct
    * init_putv writes its scalars byte-reversed.  Set per member by
    * decl_designator from the field's own mark. */
   int sso_be;
+  /* -Woverride-init: the bits each designator has initialized so far
+   * (decl_designator), allocated on first use; init_ovr_free releases it. */
+  struct InitOvr *ovr;
 } init_params;
 
 /* Stack of saved by-value call arguments for a funcall in progress
@@ -642,6 +645,16 @@ void init_assert(init_params *p, int offset);
 void init_putv(init_params *p, CType *type, unsigned long c, int vreg);
 void init_putz(init_params *p, unsigned long c, int size);
 void parse_init_elem(int expr_type);
+void init_ovr_free(init_params *p);
+void init_ovr_quiet(init_params *p);
+extern struct InitOvr *init_ovr_top;
+void init_ovr_unwind(struct InitOvr *to);
+/* -Wuninitialized: the local whose initializer is being parsed, [lo, hi) of
+ * the frame or its vreg (init_self_on in tcc.h: ir/gen/put.c reports an operand read
+ * from it while its initializer expression is parsed) */
+extern int init_self_lo, init_self_hi, init_self_tok, init_self_vreg, init_self_depth;
+void init_self_push(int addr, int size, int tok, int vreg);
+void init_self_pop(void);
 void skip_or_save_block(TokenString **str);
 extern int skip_save_stop_semicolon; /* skip_or_save_block: a ';' ends the block (a static's initializer) */
 

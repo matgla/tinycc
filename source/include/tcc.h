@@ -2014,6 +2014,7 @@ struct TCCState
   unsigned char warn_register_access;           /* yasc: a register field marked ro written, wo read, w1c written back */
   unsigned char warn_strict_prototypes;         /* a function declarator without parameter types */
   unsigned char warn_missing_prototypes;        /* a global function defined with no prototype before it */
+  unsigned char warn_override_init;             /* an initializer element replacing an earlier one (a union's other member) */
   unsigned char warn_pointer_arith;             /* arithmetic on void * / function pointers, sizeof(void) */
   unsigned char warn_cast_qual;                 /* a cast dropping const/volatile from the pointed-to type */
   unsigned char warn_cast_align;                /* a cast raising the pointed-to alignment */
@@ -3751,6 +3752,10 @@ ST_DATA int rsym, anon_sym, ind, loc;
 ST_DATA char debug_modes;
 
 ST_DATA int nocode_wanted; /* true if no code generation wanted for an expression */
+/* -Wuninitialized: a local's initializer expression is being parsed, and an
+   IR operand read from that local is reported (init/initializer.c) */
+extern int init_self_on;
+void init_self_ir(int op, const SValue *src1, const SValue *src2, const SValue *dest);
 ST_DATA int yasc_decl_undefined; /* yasc: the local being declared said `= undefined` */
 ST_DATA int unevaluated_operand; /* inside the operand of sizeof/typeof/_Generic (expr_type) */
 ST_DATA SValue *discarded_call_vtop; /* vtop where an expression statement began, while its

@@ -138,9 +138,145 @@ void skip_or_save_block(TokenString **str)
 #define EXPR_CONST 1
 #define EXPR_ANY 2
 
+int init_self_lo, init_self_hi, init_self_tok, init_self_vreg = -1, init_self_on, init_self_depth;
+
+/* the enclosing initializers' states (a statement expression or a compound
+   literal inside one); past the last, nothing is checked */
+static struct
+{
+  int lo, hi, tok, vreg, on;
+} init_self_saved[16];
+
+void init_self_push(int addr, int size, int tok, int vreg)
+{
+  if (init_self_depth < (int)(sizeof init_self_saved / sizeof *init_self_saved))
+  {
+    init_self_saved[init_self_depth].lo = init_self_lo;
+    init_self_saved[init_self_depth].hi = init_self_hi;
+    init_self_saved[init_self_depth].tok = init_self_tok;
+    init_self_saved[init_self_depth].vreg = init_self_vreg;
+    init_self_saved[init_self_depth].on = init_self_on;
+  }
+  else
+    size = 0;
+  init_self_depth++;
+  init_self_on = 0;
+  init_self_lo = addr, init_self_hi = addr + size, init_self_tok = tok, init_self_vreg = vreg;
+}
+
+void init_self_pop(void)
+{
+  if (--init_self_depth < (int)(sizeof init_self_saved / sizeof *init_self_saved))
+  {
+    init_self_lo = init_self_saved[init_self_depth].lo;
+    init_self_hi = init_self_saved[init_self_depth].hi;
+    init_self_tok = init_self_saved[init_self_depth].tok;
+    init_self_vreg = init_self_saved[init_self_depth].vreg;
+    init_self_on = init_self_saved[init_self_depth].on;
+  }
+  else
+    init_self_on = 0, init_self_lo = init_self_hi = 0;
+}
+
+/* The initializer of the local in [init_self_lo, init_self_hi) reads it:
+   `int x = x + 1;`, `u = { .a = v, .b = -u.b }` (that member is not set yet,
+   and the order the elements are evaluated in is unspecified).  Once per
+   declaration.  yasc enforces initialization: there, -Wlifetime. */
+static void init_self_read(void)
+{
+  const char *name = get_tok_str(init_self_tok, NULL);
+  init_self_on = 0;
+  init_self_hi = init_self_lo; /* once */
+  if (tcc_state->yasc && tcc_ir_lt_active())
+    tcc_warning_c(warn_lifetime)("'%s' is used uninitialized: read in its own initializer", name);
+  else
+    tcc_warning_c(warn_uninitialized)("'%s' is used uninitialized: read in its own initializer", name);
+}
+
+/* SV is the variable being initialized, or a part of it, as an lvalue (not
+   an array: that is its address) */
+static int init_self_in(const SValue *sv)
+{
+  /* a scalar register candidate has no slot of its own (its offset is the
+     frame's top, shared): it is its vreg */
+  if (init_self_vreg >= 0)
+    return sv->vr == init_self_vreg;
+  /* another variable's vreg is never this one, whatever its offset */
+  if (sv->vr >= 0 && TCCIR_DECODE_VREG_TYPE(sv->vr) == TCCIR_VREG_TYPE_VAR)
+    return 0;
+  const long long o = (long long)sv->c.i; /* c.i is unsigned: frame offsets are negative */
+  return o >= init_self_lo && o < init_self_hi;
+}
+
+static int init_self_lvalue(const SValue *sv)
+{
+  return init_self_on && !nocode_wanted && (sv->r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) &&
+         !(sv->type.t & (VT_ARRAY | VT_VLA)) && init_self_in(sv);
+}
+
+/* Vregs holding an address inside the variable: a member access computes
+   &v + offset into a temporary and loads through it.  A few at a time,
+   cleared per initializer element (parse_init_elem). */
+static int init_self_ptr[8], init_self_nptr;
+
+static int init_self_is_ptr(const SValue *sv)
+{
+  int i;
+  if ((sv->r & VT_VALMASK) >= VT_CONST || sv->vr < 0)
+    return 0;
+  for (i = 0; i < init_self_nptr; i++)
+    if (init_self_ptr[i] == sv->vr)
+      return 1;
+  return 0;
+}
+
+/* SV is the variable's address, or a vreg holding one */
+static int init_self_addr(const SValue *sv)
+{
+  if (sv->r & VT_LVAL)
+    return 0;
+  if ((sv->r & VT_VALMASK) == VT_LOCAL)
+    return init_self_in(sv);
+  return init_self_is_ptr(sv);
+}
+
+/* An IR instruction emitted while the initializer expression is parsed: an
+   operand read from the variable (directly, or through an address of it
+   computed into a vreg) is reported; such an address is followed. */
+void init_self_ir(int op, const SValue *src1, const SValue *src2, const SValue *dest)
+{
+  if (nocode_wanted & ~0x20000000)
+    return;
+  if ((src1 && (init_self_lvalue(src1) || ((src1->r & VT_LVAL) && init_self_is_ptr(src1)))) ||
+      (src2 && (init_self_lvalue(src2) || ((src2->r & VT_LVAL) && init_self_is_ptr(src2)))))
+  {
+    init_self_read();
+    return;
+  }
+  if (dest && dest->vr >= 0 && !(dest->r & VT_LVAL) &&
+      (op == TCCIR_OP_LEA || op == TCCIR_OP_ASSIGN || op == TCCIR_OP_ADD || op == TCCIR_OP_SUB) &&
+      ((src1 && init_self_addr(src1)) || (op == TCCIR_OP_ADD && src2 && init_self_addr(src2))))
+  {
+    if (init_self_nptr < (int)(sizeof init_self_ptr / sizeof *init_self_ptr))
+      init_self_ptr[init_self_nptr++] = dest->vr;
+  }
+}
+
+/* the value of an initializer element is the variable itself */
+static void init_self_value(void)
+{
+  if (init_self_lvalue(vtop) || ((vtop->r & VT_LVAL) && !(vtop->type.t & (VT_ARRAY | VT_VLA)) && init_self_is_ptr(vtop)))
+    init_self_read();
+}
+
 void parse_init_elem(int expr_type)
 {
   int saved_global_expr;
+  /* an IR operand read from the variable is reported while its own
+     initializer expression is parsed (init_self_ir) -- not while the value
+     is stored (a range designator's copy, a bit-field's read-modify-write) */
+  init_self_on = init_self_hi > init_self_lo;
+  init_self_nptr = 0;
   switch (expr_type)
   {
   case EXPR_CONST:
@@ -172,6 +308,12 @@ void parse_init_elem(int expr_type)
       expr_eq();
     break;
   }
+  /* `int x = x;`, `struct S s = s;`: the value itself is the variable */
+  if (init_self_on)
+    init_self_value();
+  /* off again: an initializer met inside this one's expression (a statement
+     expression's, a compound literal) brings it back (init_self_pop) */
+  init_self_on = 0;
 }
 
 #if 1
@@ -350,6 +492,280 @@ void decl_design_flex(init_params *p, Sym *ref, int index)
   }
 }
 
+/* -Woverride-init: the bit ranges [lo, hi) initialized so far, unordered and
+   disjoint; most initializers are one range, grown at its end. */
+struct InitOvr
+{
+  struct InitOvr *prev; /* the live ones, innermost first (init_ovr_top) */
+  int n, cap;
+  int warned; /* the const-template probe already reported this initializer */
+  long long hw; /* no range ends above this */
+  long long (*r)[2]; /* signed: a local's offsets are negative */
+  /* the element decl_designator is at: its field (or none), and its array
+     index, or -1 a struct's field, OVR_UNION a union's, OVR_SWITCHED a
+     union member that replaced another */
+  Sym *leaf_f;
+  int leaf;
+  int leaf_is_field; /* the designator ends at a field (its size is its type's) */
+  /* per element in progress: its bits, and where its sub-elements' ranges start */
+  int nstk, capstk;
+  struct
+  {
+    long long lo, hi;
+    int n0;
+  } *stk;
+  /* the member each union (at bit offset off, of type u) was given last */
+  int nu, capu;
+  struct
+  {
+    long long off;
+    Sym *u, *m;
+  } *um;
+};
+
+/* every allocated InitOvr, so that error recovery can free the ones whose
+   initializer it left (init_ovr_unwind) */
+struct InitOvr *init_ovr_top;
+
+static __attribute__((noinline)) struct InitOvr *ovr_get(init_params *p)
+{
+  if (!p->ovr)
+  {
+    p->ovr = tcc_mallocz(sizeof *p->ovr);
+    p->ovr->hw = -((long long)1 << 62); /* below every offset */
+    p->ovr->prev = init_ovr_top;
+    init_ovr_top = p->ovr;
+  }
+  return p->ovr;
+}
+
+static void ovr_release(struct InitOvr *o)
+{
+  tcc_free(o->r);
+  tcc_free(o->um);
+  tcc_free(o->stk);
+  tcc_free(o);
+}
+
+/* error recovery: free what the initializers the longjmp left allocated */
+void init_ovr_unwind(struct InitOvr *to)
+{
+  while (init_ovr_top && init_ovr_top != to)
+  {
+    struct InitOvr *o = init_ovr_top;
+    init_ovr_top = o->prev;
+    ovr_release(o);
+  }
+}
+
+void init_ovr_free(init_params *p)
+{
+  struct InitOvr **pp;
+  if (!p->ovr)
+    return;
+  for (pp = &init_ovr_top; *pp; pp = &(*pp)->prev)
+    if (*pp == p->ovr)
+    {
+      *pp = p->ovr->prev;
+      break;
+    }
+  ovr_release(p->ovr);
+  p->ovr = NULL;
+}
+
+/* the warnings were given already: record, report nothing */
+void init_ovr_quiet(init_params *p)
+{
+  ovr_get(p)->warned = 1;
+}
+
+static void ovr_push(struct InitOvr *o, long long lo, long long hi)
+{
+  if (o->n && o->r[o->n - 1][0] <= lo && o->r[o->n - 1][1] >= lo)
+  {
+    if (o->r[o->n - 1][1] < hi)
+      o->r[o->n - 1][1] = hi;
+  }
+  else
+  {
+    if (o->n == o->cap)
+    {
+      o->cap = o->cap ? o->cap * 2 : 8;
+      o->r = tcc_realloc(o->r, o->cap * sizeof *o->r);
+    }
+    o->r[o->n][0] = lo;
+    o->r[o->n][1] = hi;
+    o->n++;
+  }
+  if (hi > o->hw)
+    o->hw = hi;
+}
+
+/* Take [lo, hi) out of the set; nonzero if any of it was there. */
+static int ovr_cut(struct InitOvr *o, long long lo, long long hi)
+{
+  int i, hit = 0;
+  if (lo >= o->hw)
+    return 0;
+  for (i = 0; i < o->n; i++)
+  {
+    long long a = o->r[i][0], b = o->r[i][1];
+    if (b <= lo || a >= hi)
+      continue;
+    hit = 1;
+    if (a < lo && b > hi)
+    {
+      o->r[i][1] = lo;
+      ovr_push(o, hi, b); /* appended: i + 1 .. are the rest, still scanned */
+    }
+    else if (a < lo)
+      o->r[i][1] = lo;
+    else if (b > hi)
+      o->r[i][0] = hi;
+    else
+    {
+      o->r[i][0] = o->r[o->n - 1][0];
+      o->r[i][1] = o->r[o->n - 1][1];
+      o->n--, i--;
+    }
+  }
+  /* what the unions in there were given is gone with it */
+  if (hit)
+    for (i = 0; i < o->nu; i++)
+      if (o->um[i].off >= lo && o->um[i].off < hi)
+        o->um[i] = o->um[--o->nu], i--;
+  return hit;
+}
+
+/* Member M of union U at byte C gets a value: nonzero if the union was
+   given another member before (whose bits, all of the union's, are gone) */
+static __attribute__((noinline)) int ovr_union_member(init_params *p, unsigned long c, Sym *u, Sym *m)
+{
+  struct InitOvr *o = p->ovr;
+  const long long off = (long long)(long)c * 8;
+  int i, align, switched = 0;
+  for (i = 0; i < o->nu; i++)
+    if (o->um[i].off == off && o->um[i].u == u)
+    {
+      CType ut = {VT_UNION, u};
+      if (o->um[i].m == m)
+        return 0;
+      o->um[i] = o->um[--o->nu];
+      ovr_cut(o, off, off + (long long)type_size(&ut, &align) * 8);
+      switched = 1;
+      break;
+    }
+  if (o->nu == o->capu)
+  {
+    o->capu = o->capu ? o->capu * 2 : 4;
+    o->um = tcc_realloc(o->um, o->capu * sizeof *o->um);
+  }
+  o->um[o->nu].off = off;
+  o->um[o->nu].u = u;
+  o->um[o->nu].m = m;
+  o->nu++;
+  return switched;
+}
+
+/* the bits an element of TYPE at C (SIZE bytes) takes */
+static void ovr_range(const CType *type, unsigned long c, int size, long long *lo, long long *hi)
+{
+  *lo = (long long)(long)c * 8; /* c: a section offset, or a (negative) frame offset */
+  if (type->t & VT_BITFIELD)
+    *lo += BIT_POS(type->t), *hi = *lo + BIT_SIZE(type->t);
+  else
+    *hi = *lo + (long long)size * 8;
+}
+
+/* decl_designator's step to field F of struct or union TYPE at C (TYPE
+   null: F is inside an anonymous member, not followed).  A union records
+   its member; once one switched, the rest of the designator is inside what
+   replaced the other.  Out of line, and the state in p->ovr: decl_designator
+   recurses with nested initializers (the parser's stack budget). */
+#define OVR_UNION (-2)
+#define OVR_SWITCHED (-3)
+static __attribute__((noinline)) void ovr_field(init_params *p, const CType *type, unsigned long c, Sym *f)
+{
+  struct InitOvr *o = p->ovr;
+  const int in_union = type && IS_UNION(type->t);
+  const int sw = in_union && ovr_union_member(p, c, type->ref, f);
+  if (o->leaf != OVR_SWITCHED)
+    o->leaf_f = f, o->leaf = sw ? OVR_SWITCHED : in_union ? OVR_UNION : -1;
+  o->leaf_is_field = 1;
+}
+
+/* find_field() for decl_designator, and its step recorded (ovr_field):
+   one call in its loop, not two (the parser's stack budget) */
+static __attribute__((noinline)) Sym *ovr_find_field(init_params *p, CType *type, int v, int *cumofs, unsigned long c)
+{
+  Sym *f = find_field(type, v, cumofs);
+  if (p->ovr)
+    ovr_field(p, *cumofs ? NULL : type, c, f);
+  return f;
+}
+
+/* decl_designator's step to element INDEX of an array */
+static __attribute__((noinline)) void ovr_index(init_params *p, int index)
+{
+  if (p->ovr->leaf != OVR_SWITCHED)
+    p->ovr->leaf_f = NULL, p->ovr->leaf = index;
+  p->ovr->leaf_is_field = 0;
+}
+
+/* decl_design_flex() for decl_designator's step to elements INDEX ..
+   INDEX_LAST of an array, and the step recorded */
+static __attribute__((noinline)) void ovr_design_flex(init_params *p, Sym *ref, int index, int index_last)
+{
+  decl_design_flex(p, ref, index_last);
+  if (p->ovr)
+    ovr_index(p, index);
+}
+
+/* What the element (p->ovr->leaf) takes, SIZE bytes of TYPE at C: an
+   earlier element holding any of it loses that now. */
+static __attribute__((noinline)) void ovr_before(init_params *p, const CType *type, unsigned long c, int size)
+{
+  long long lo, hi;
+  Sym *f = p->ovr->leaf_f;
+  const int leaf = p->ovr->leaf;
+  int align;
+  /* `[1].x`: decl_designator's elem_size is still the array element's */
+  if (p->ovr->leaf_is_field)
+    size = type_size(type, &align);
+  ovr_range(type, c, size, &lo, &hi);
+  if ((ovr_cut(p->ovr, lo, hi) || leaf == OVR_SWITCHED) && !p->ovr->warned)
+  {
+    const char *why = leaf <= OVR_UNION ? ": a union keeps only the member initialized last" : "";
+    if (f && (f->v & ~SYM_FIELD) < SYM_FIRST_ANOM)
+      tcc_warning_c(warn_override_init)("initializer for '%s' overrides an earlier one%s", get_tok_str(f->v & ~SYM_FIELD, NULL), why);
+    else if (!f && leaf >= 0)
+      tcc_warning_c(warn_override_init)("initializer for element [%d] overrides an earlier one", leaf);
+    else
+      tcc_warning_c(warn_override_init)("initializer overrides an earlier one%s", why);
+  }
+  if (p->ovr->nstk == p->ovr->capstk)
+  {
+    p->ovr->capstk = p->ovr->capstk ? p->ovr->capstk * 2 : 8;
+    p->ovr->stk = tcc_realloc(p->ovr->stk, p->ovr->capstk * sizeof *p->ovr->stk);
+  }
+  p->ovr->stk[p->ovr->nstk].lo = lo;
+  p->ovr->stk[p->ovr->nstk].hi = hi;
+  p->ovr->stk[p->ovr->nstk++].n0 = p->ovr->n;
+}
+
+/* The element is done: recorded whole (a brace list sets every bit, the
+   unnamed ones to zero) in place of its sub-elements.  Nothing pushed: the
+   warning came on inside it (a pragma). */
+static __attribute__((noinline)) void ovr_after(init_params *p)
+{
+  struct InitOvr *o = p->ovr;
+  if (!o->nstk)
+    return;
+  o->nstk--;
+  o->n = o->stk[o->nstk].n0;
+  ovr_push(o, o->stk[o->nstk].lo, o->stk[o->nstk].hi);
+}
+
 /* t is the array or struct type. c is the array or struct
    address. cur_field is the pointer to the current
    field, for arrays the 'c' member contains the current start
@@ -361,6 +777,11 @@ int decl_designator(init_params *p, CType *type, unsigned long c, Sym **cur_fiel
   Sym *s, *f;
   int index, index_last, align, l, nb_elems, elem_size;
   unsigned long corig = c;
+  /* -Woverride-init: what this element is goes to p->ovr (ovr_before) */
+  /* a size-only pass runs before any element is recorded: p->ovr is null in it */
+#define OVR_ON (p->ovr)
+  if (!(flags & DIF_SIZE_ONLY) && tcc_state->warn_override_init)
+    ovr_get(p)->leaf_f = NULL, p->ovr->leaf = -1, p->ovr->leaf_is_field = 0;
   /* an array element keeps the byte order of its array; a member takes its
      own (big-endian scalar_storage_order marks every member) */
   int sso_be = p->sso_be;
@@ -395,7 +816,7 @@ int decl_designator(init_params *p, CType *type, unsigned long c, Sym **cur_fiel
       }
       skip(']');
       s = type->ref;
-      decl_design_flex(p, s, index_last);
+      ovr_design_flex(p, s, index, index_last);
       if (index < 0 || index_last >= s->c || index_last < index)
         tcc_error("index exceeds array bounds or range is empty");
       if (cur_field)
@@ -412,7 +833,7 @@ int decl_designator(init_params *p, CType *type, unsigned long c, Sym **cur_fiel
       l = tok;
     struct_field:
       next();
-      f = find_field(type, l, &cumofs);
+      f = ovr_find_field(p, type, l, &cumofs, c);
       if (cur_field)
         *cur_field = f;
       type = &f->type;
@@ -442,6 +863,8 @@ int decl_designator(init_params *p, CType *type, unsigned long c, Sym **cur_fiel
       decl_design_flex(p, s, index);
       if (index >= s->c)
         tcc_error("too many initializers");
+      if (OVR_ON)
+        ovr_index(p, index);
       type = pointed_type(type);
       elem_size = type_size(type, &align);
       c += index * elem_size;
@@ -454,6 +877,8 @@ int decl_designator(init_params *p, CType *type, unsigned long c, Sym **cur_fiel
         *cur_field = f = f->next;
       if (!f)
         tcc_error("too many initializers");
+      if (OVR_ON)
+        ovr_field(p, type, c, f);
       type = &f->type;
       c += f->c;
       sso_be = f->a.sso_be;
@@ -472,10 +897,21 @@ int decl_designator(init_params *p, CType *type, unsigned long c, Sym **cur_fiel
     flags &= ~DIF_CLEAR; /* mark stack dirty too */
   }
 
+  /* -Woverride-init.  The element's bits: an earlier element holding any of
+     them loses them now.  Its own sub-elements are checked against the
+     rest (they are added after this cut), and once they are done the
+     element is recorded whole. */
+  if (OVR_ON)
+    ovr_before(p, type, c, elem_size * nb_elems);
+
   const int sso_be_outer = p->sso_be;
   p->sso_be = sso_be;
   decl_initializer(p, type, c, flags & ~DIF_FIRST, -1);
   p->sso_be = sso_be_outer;
+
+  if (OVR_ON)
+    ovr_after(p);
+#undef OVR_ON
 
   if (!(flags & DIF_SIZE_ONLY) && nb_elems > 1)
   {

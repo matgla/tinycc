@@ -1158,6 +1158,10 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
         nocode_wanted++;
         decl_initializer(&pp, type, addr, DIF_FIRST, -1);
         nocode_wanted--;
+        /* the probe reported what the designators override: the per-element
+           pass below, if it runs, parses the same list again */
+        const int probe_checked = pp.ovr != NULL;
+        init_ovr_free(&pp);
         /* Density gate: the per-element path costs ~memset + a store per
          * non-zero element, while the template costs a fixed memcpy plus the
          * full initializer in .rodata.  Only template when enough of the array
@@ -1214,6 +1218,8 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
           /* Not all-constant: rewind the macro for a normal per-element pass. */
           macro_ptr = tok_str_buf(saved);
           next();
+          if (probe_checked)
+            init_ovr_quiet(&p);
         }
         tcc_free(tmpl_buf);
       }
@@ -1226,7 +1232,18 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
       sym_facts_peek(p.const_init_sym)->const_init_valid = 0;
 
     if (!templated)
+    {
+      /* -Wuninitialized: a named local's initializer reading it (parse_init_elem,
+         init_self_ir).  The enclosing one's state waits on a static stack: no
+         frame growth on the recursive parse path. */
+      if (!sec && v && !(type->t & VT_VLA) && size > 0)
+        init_self_push(addr, size, v, vreg);
+      else
+        init_self_push(0, 0, 0, -1);
       decl_initializer(&p, type, addr, DIF_FIRST, vreg);
+      init_self_pop();
+    }
+    init_ovr_free(&p);
 
     if (p.const_init_sym)
       sym_facts_peek(p.const_init_sym)->const_init_in_progress = 0;

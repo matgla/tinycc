@@ -113,6 +113,9 @@ struct TCCRecover
   RecoverDeclList *decl_list;
   TokenString *pp_capture;
   int diag_anchor, init_depth;
+  /* the initializer being parsed (init/initializer.c) */
+  int self_lo, self_hi, self_tok, self_vreg, self_on, self_depth;
+  struct InitOvr *ovr_top;
   int dr_braces; /* the initializer braces the error was in */
   unsigned char decl_resume;
   RecoverDeclResume dr;
@@ -182,6 +185,9 @@ static void recover_save(TCCRecover *r, int body)
   r->pp_capture = pp_pragma_capture;
   r->diag_anchor = s1->diag_anchor;
   r->init_depth = init_brace_depth;
+  r->self_lo = init_self_lo, r->self_hi = init_self_hi, r->self_tok = init_self_tok;
+  r->self_vreg = init_self_vreg, r->self_on = init_self_on, r->self_depth = init_self_depth;
+  r->ovr_top = init_ovr_top;
 }
 
 /* What the frames the longjmp left would have put back on their way out. */
@@ -233,6 +239,9 @@ static void recover_restore(TCCRecover *r)
   recover_decl_resume.on = 0;
   pp_pragma_capture = r->pp_capture;
   init_brace_depth = r->init_depth;
+  init_self_lo = r->self_lo, init_self_hi = r->self_hi, init_self_tok = r->self_tok;
+  init_self_vreg = r->self_vreg, init_self_on = r->self_on, init_self_depth = r->self_depth;
+  init_ovr_unwind(r->ovr_top);
   if (r->body != RECOVER_FILE)
     s1->diag_anchor = r->diag_anchor; /* the file-scope loop's is the declaration's */
   if (s1->asm_inline)

@@ -1073,6 +1073,7 @@ static void check_dropped_deferred_data_replay(void *arg)
   begin_macro_kept(a->init);
   next();
   decl_initializer(&p, &a->d->type, addr, DIF_FIRST, -1);
+  init_ovr_free(&p);
   if (tok != TOK_EOF)
     expect("';'");
   end_macro();

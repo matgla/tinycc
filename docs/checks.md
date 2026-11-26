@@ -128,7 +128,7 @@ stringop-overflow, format-overflow, format-truncation,
 alloc-size-larger-than, free-nonheap-object, mismatched-dealloc.
 
 **`-Wextra`**: sign-compare, type-limits, implicit-fallthrough, empty-body,
-and with `-Wall` or `-Wunused` also unused-parameter and
+override-init, and with `-Wall` or `-Wunused` also unused-parameter and
 unused-but-set-parameter.
 
 **`-Wunused`**: the unused-* checks of `-Wall`.
@@ -150,6 +150,7 @@ unused-but-set-parameter.
 | `conversion`, `sign-conversion` | an implicit conversion that may change the value or its sign | warning |
 | `shadow` | a declaration hiding another of the same name | warning |
 | `missing-prototypes` | a global function defined with no declaration before it | warning |
+| `override-init` | an initializer element replacing an earlier one (a union's other member) | warning |
 | `pointer-arith`, `cast-qual`, `cast-align` | `void *` arithmetic, a cast dropping `const`, a cast to a stricter alignment | warning |
 | `write-strings` | a string literal is `const char[]`: `char *p = "x"` is a discarded-qualifiers error | warning |
 | `alloc-mul-overflow` | an allocation size that is a multiplication which may overflow | warning |
@@ -845,6 +846,11 @@ init.c:14: error: 'x' may be used uninitialized: yasc wants a value on every pat
   is only stored through (`ckd_add(&r, a, b)`), which writes it.
 - An array, a struct, a union or a complex value, whose later stores the
   check does not follow, needs an initializer.
+- An initializer may not read the variable it initializes: `int x = x + 1;`
+  and `u = { .value = v, .parts = { .imag = -u.parts.imag } }` are errors
+  (the member is not set yet, and the elements are evaluated in no set
+  order). Its address (`void *p = &p;`), `sizeof`, and a call whose result
+  the callee writes straight into it are not reads.
 - `T x = undefined;` declares an automatic local with no value on purpose
   and emits no code: the array or struct is filled later, or the scalar's
   address may go somewhere before it has a value (`sscanf(s, "%d", &n)`).
@@ -902,7 +908,18 @@ flow.c:27: warning: a null pointer is dereferenced
 certain one; a local whose address is taken is not followed. The safe
 default is yasc, which enforces initialization (above): there both are
 errors. A variable declared in a loop body
-is uninitialised again at each iteration.
+is uninitialised again at each iteration. A local read in its own initializer
+(`int n = n + 1;`, `struct pt p = { .x = 1, .y = p.x };`) is reported by
+`-Wuninitialized` too.
+
+**`-Woverride-init`** (in `-Wextra` and the safe default): an initializer
+element naming bits an earlier one already set loses the earlier value:
+`{ .x = 1, .x = 2 }`, `{ [2] = 1, [1] = 2, 3 }` (the `3` lands on `[2]`). A
+union holds only the member initialized last, so `{ .i = v, .p.hi = 3 }`
+drops `.i` although the two share no byte, and in
+`{ .value = v, .parts = { .imag = 1 } }` `.parts.real` is zero, not
+`v`'s real part. Bit-fields count bits: `{ .a = 1, .b = 2 }` in one storage
+unit is fine.
 
 **`-Wreturn-local-addr`, `-Wdangling-pointer`:** `return &local;` (line 15, `-Wall`) and `saved = &local;` with `saved` a
 global (line 21, the safe default). A store through a parameter

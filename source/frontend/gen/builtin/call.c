@@ -1518,6 +1518,9 @@ static void unary_funcall_body(void)
           nrvo_vreg = tcc_state->nrvo_target_vreg;
         }
         nrvo_claimed = 1;
+        /* the result is the variable being initialized, written by the
+           callee: the initializer (this call, nothing else) reads nothing */
+        init_self_on = 0;
       }
       else
       {

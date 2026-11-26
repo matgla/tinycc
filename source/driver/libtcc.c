@@ -3689,6 +3689,9 @@ static const FlagDef options_W[] = {
        accident. */
     {offsetof(TCCState, warn_strict_prototypes), WD_SAFE, "strict-prototypes"},
     {offsetof(TCCState, warn_missing_prototypes), WD_SAFE, "missing-prototypes"},
+    /* gcc: -Wextra.  A designator naming bits an earlier element already
+       set: the earlier value is lost (in a union, the whole other member). */
+    {offsetof(TCCState, warn_override_init), WD_SAFE | WD_EXTRA, "override-init"},
     {offsetof(TCCState, warn_pointer_arith), WD_SAFE, "pointer-arith"},
     {offsetof(TCCState, warn_cast_qual), WD_SAFE, "cast-qual"},
     {offsetof(TCCState, warn_cast_align), WD_SAFE, "cast-align"},

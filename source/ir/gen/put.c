@@ -165,6 +165,11 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
     if (nocode_wanted & ~0x20000000)
       return -1;
   }
+  /* -Wuninitialized: an operand read from the local whose initializer is
+     being parsed (frontend/gen/init/initializer.c) */
+  if (init_self_on)
+    init_self_ir(op, irop_config[op].has_src1 ? src1 : NULL, irop_config[op].has_src2 ? src2 : NULL,
+                 irop_config[op].has_dest ? dest : NULL);
   /* yasc register fields: a call handed a pointer to volatile memory may
      read a register through it (ir/regaccess.c) -- only in a unit with
      register types (not gated on the warning: unsafe turns it off for a
