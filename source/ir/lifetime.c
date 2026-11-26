@@ -991,8 +991,9 @@ void tcc_ir_lt_note_owned_store(TCCIRState *ir, int from, int to)
   ir->lt_nb_ostores++;
 }
 
-/* move(p) handed to a regular-C (unchecked) parameter: temp `vreg` holds it,
-   and p moves where the temp is passed */
+/* move(p) handed to a regular-C (unchecked) parameter or stored in a
+   regular-C place: temp `vreg` holds it, and p moves where the temp is
+   passed or stored */
 void tcc_ir_lt_note_moved_temp(TCCIRState *ir, int32_t vreg)
 {
   if (!ir->lt_on || vreg < 0 || TCCIR_DECODE_VREG_TYPE(vreg) != TCCIR_VREG_TYPE_TEMP)
@@ -3599,6 +3600,14 @@ static void lt_instr(LtCtx *c, int i)
       lt_move(c, v, 0, line);
       moved = v;
     }
+  }
+
+  /* move(p) stored in a regular-C place: p moves there */
+  if (moved < 0 && q->op == TCCIR_OP_STORE && !defines && ir->lt_nb_mtemps && lt_moved_temp(ir, src1) &&
+      (v = lt_read_value(c, src1)) >= 0 && lt_owned(c, v))
+  {
+    lt_move(c, v, 0, line);
+    moved = v;
   }
 
   /* a store into owned memory moves the owned variable stored */

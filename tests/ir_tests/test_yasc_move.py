@@ -258,6 +258,31 @@ def test_move_to_c_parameter(tmp_path, opt):
     ]
 
 
+C_CTX = "#pragma tcc c_begin\nstruct cctx { char *p; };\n#pragma tcc c_end\nint sink(const struct cctx *c);\n"
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_move_to_c_member(tmp_path, opt):
+    """move(p) into a regular-C member (a context the kernel takes, libc
+    dlclose): p is gone there, as into a C parameter -- by an initializer or
+    an assignment; freeing it afterwards is reported."""
+    init = C_CTX + "int f(void)\n{\n  char * owned p = malloc(1);\n  struct cctx c = {.p = move(p)};\n  return sink(&c);\n}\n"
+    assert _diags(tmp_path, init, opt) == []
+    assign = C_CTX + "int f(void)\n{\n  char * owned p = malloc(1);\n  struct cctx c = undefined;\n  c.p = move(p);\n" \
+        "  return sink(&c);\n}\n"
+    assert _diags(tmp_path, assign, opt) == []
+    freed = C_CTX + "int f(void)\n{\n  char * owned p = malloc(1);\n  struct cctx c = {.p = move(p)};\n  free(p);\n" \
+        "  return sink(&c);\n}\n"
+    assert _diags(tmp_path, freed, opt) == [
+        (9, "warning", "'p' is used after it was moved"),
+        (8, "note", "'p' was moved here"),
+    ]
+    # a drop parameter handed over the same way (libc dlclose)
+    param = C_CTX + "int give(drop char * owned h);\nint give(drop char * owned h)\n{\n  struct cctx c = {.p = move(h)};\n" \
+        "  return sink(&c);\n}\n"
+    assert _diags(tmp_path, param, opt) == []
+
+
 def test_owned_result_to_c_parameter(tmp_path):
     body = "void f(void)\n{\n  c_use(malloc(1));\n}\n"
     assert _diags(tmp_path, body) == []

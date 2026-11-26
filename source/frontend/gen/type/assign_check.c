@@ -435,6 +435,11 @@ static void yasc_verify_assign(CType *dt)
   /* an owned pointer handed to a regular-C parameter: borrow(p) or move(p) */
   if (yasc_argument && (dq & YASC_UNCHECKED) && !(sq & YASC_UNCHECKED) && (sq & YASC_OWNED))
     yasc_owned_to_unchecked(sq);
+  /* move(p) stored in a regular-C place (a member of a context the kernel
+     takes): p moves there, as into a regular-C parameter */
+  else if (!yasc_argument && (dq & YASC_UNCHECKED) && (sq & YASC_FRESH) && !(vtop->r & VT_LVAL) && tcc_state->ir &&
+           vtop->vr >= 0)
+    tcc_ir_lt_note_moved_temp(tcc_state->ir, vtop->vr);
   /* a regular-C pointer becomes an owned / view / borrows one: the code
      vouches for it with unsafe(...) (S2; -Wunchecked, an error in the safe
      default, off under -ccompat).  Null (C's NULL too) is fine. */
