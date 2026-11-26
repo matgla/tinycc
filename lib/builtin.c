@@ -780,14 +780,15 @@ unsigned long __tcc_strlen(const char *s)
 
 #endif /* !defined(__arm__) - strlen */
 
-extern volatile int chk_calls __attribute__((weak));
+/* How many __tcc_*_chk calls ran (gcc's builtins chk tests read it).  Weak, so
+   a program's own definition -- gcc's builtins/lib/chk.c has one -- wins. */
+volatile int chk_calls __attribute__((weak)) = 0;
 extern void __chk_fail(void) __attribute__((weak));
 extern void abort(void);
 
 static void __tcc_chk_record_call(void)
 {
-  if (&chk_calls != 0)
-    ++chk_calls;
+  ++chk_calls;
 }
 
 static void __tcc_chk_fail_or_abort(void)
