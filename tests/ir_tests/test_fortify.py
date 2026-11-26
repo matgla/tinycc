@@ -305,3 +305,37 @@ def test_yasos_libc_headers(tmp_path, opt):
         for f, names in calls.items():
             assert _checked(names) == (bool(level) and f.startswith("chk")), (level, f, names)
     assert outs[None] == outs[0]
+
+
+# --------------------------------------------------------------------------
+# libtcc1 counts its __tcc_*_chk calls in chk_calls, a weak definition of its
+# own (it was yasos libc's bounds.c): a program reads it without defining it,
+# and one that defines it -- gcc's builtins/lib/chk.c -- links and gets the count
+
+CHK_CALLS_SRC = """\
+#include <stdio.h>
+%s
+const char *volatile src = "hi";
+int main(void)
+{
+  char b[16];
+  __builtin___strcpy_chk(b, src, __builtin_object_size(b, 0));
+  printf("chk_calls %%d %%s\\n", chk_calls, b);
+  return 0;
+}
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+@pytest.mark.parametrize("decl,want", [("extern volatile int chk_calls;", 1), ("volatile int chk_calls = 100;", 101)],
+                         ids=["libtcc1", "program"])
+def test_chk_calls_counter(tmp_path, opt, decl, want):
+    src = tmp_path / "src" / "chk_calls.c"  # apart from output_dir, which the first build cleans
+    src.parent.mkdir()
+    src.write_text(CHK_CALLS_SRC % decl)
+    cfg = CompileConfig(extra_cflags=opt, output_dir=tmp_path / "build", output_suffix=opt[1:])
+    res = compile_testcase([src], MACHINE, config=cfg)
+    assert res.success, res.error
+    proc = subprocess.run(build_qemu_command(MACHINE, res.elf_file, []), shell=True, capture_output=True, text=True,
+                          timeout=60)
+    assert f"chk_calls {want} hi" in proc.stdout + proc.stderr, proc.stdout + proc.stderr
