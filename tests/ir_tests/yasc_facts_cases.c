@@ -8,7 +8,7 @@ struct P
   int a, b, c, d;
 };
 
-int use(const struct P *p);   /* reads */
+int use(struct P *p);   /* reads */
 void fill(inout struct P *p, int v); /* writes every member */
 void bump(inout struct P *p);       /* writes one member */
 int say(int x);                     /* touches no P */
@@ -70,7 +70,7 @@ int case_offset(int x)
 {
   int arr[8] = {0};
   arr[2] = x;
-  int r = use(cast<ptr(const struct P * view)>(arr + 1)) + say(4);
+  int r = use(cast<ptr(const struct P *view)>(arr + 1)) + say(4);
   return r + arr[2] + arr[1];
 }
 
@@ -81,7 +81,7 @@ struct B
 };
 
 /* a field reloaded after a store through another pointer */
-int case_restrict_reload(struct B * restrict b, inout int *other, int n)
+int case_restrict_reload(struct B *restrict b, inout int *other, int n)
 {
   int x = b->cap;
   other[2] = n;
@@ -90,7 +90,7 @@ int case_restrict_reload(struct B * restrict b, inout int *other, int n)
 }
 
 /* an element reloaded after a store through another pointer */
-int case_restrict_array(int * restrict d, inout int *s, int n)
+int case_restrict_array(int *restrict d, inout int *s, int n)
 {
   int x = d[3];
   s[1] = n;
@@ -98,7 +98,7 @@ int case_restrict_array(int * restrict d, inout int *s, int n)
 }
 
 /* a store through the restrict pointer itself is seen */
-int case_restrict_self(inout int * restrict d, int n)
+int case_restrict_self(inout int *restrict d, int n)
 {
   int x = d[3];
   d[3] = n;
@@ -106,10 +106,10 @@ int case_restrict_self(inout int * restrict d, int n)
 }
 
 /* through a pointer derived from it */
-int case_restrict_derived(inout int * restrict d, inout int *s, int n)
+int case_restrict_derived(inout int *restrict d, inout int *s, int n)
 {
   int x = d[3];
-  int * view e = d + 2;
+  int *view e = d + 2;
   e[1] = n + 1;
   s[0] = n;
   return x + d[3];
@@ -117,23 +117,23 @@ int case_restrict_derived(inout int * restrict d, inout int *s, int n)
 
 /* through a pointer derived at a run-time offset: no common base, the
    derivation alone says it may be the same memory */
-int case_restrict_runtime_offset(inout int * restrict d, int k, int n)
+int case_restrict_runtime_offset(inout int *restrict d, int k, int n)
 {
   int x = d[3];
-  int * view e = d + k;
+  int *view e = d + k;
   e[0] = n;
   return x * 100 + d[3];
 }
 
 /* ---- O2: a fresh owned result is new memory ---- */
-void * owned maybe malloc(unsigned n);
-void free(drop void * owned maybe p);
-int peek(const int *p);
+void *?owned malloc(unsigned n);
+void free(drop void *?owned p);
+int peek(int *p);
 
 /* reloaded after a store through another pointer, then freed */
 int case_fresh(inout int *other, int n)
 {
-  int * owned maybe p = malloc(32);
+  int *?owned p = malloc(32);
   if (!p)
     return -1;
   p[3] = n;
@@ -145,7 +145,7 @@ int case_fresh(inout int *other, int n)
 }
 
 /* an exclusive parameter handed to a parameter that does not escape it */
-int case_restrict_peeked(int * restrict d, inout int *s, int n)
+int case_restrict_peeked(int *restrict d, inout int *s, int n)
 {
   int x = d[4];
   int z = peek(d);
@@ -154,10 +154,10 @@ int case_restrict_peeked(int * restrict d, inout int *s, int n)
 }
 
 /* ---- O1 for scalars: `int x; f(&x);` with a no-escape parameter ---- */
-int peeki(const int *p);  /* reads */
-void puti(inout int *p, int v); /* writes */
+int peeki(int *p);  /* reads */
+void puti(out int *p, int v); /* writes */
 void bumpi(inout int *p);       /* reads and writes */
-long long peekll(const long long *p);
+long long peekll(long long *p);
 
 /* read by the call, kept across another one */
 int case_scalar_read(int n)
@@ -295,7 +295,7 @@ int case_named_write_in_loop(int n)
 void bumpi(inout int *p);
 
 /* hoisted: the loop stores through another pointer and calls say() */
-int case_licm_field(struct B * restrict b, inout int *dst, int n)
+int case_licm_field(struct B *restrict b, inout int *dst, int n)
 {
   int s = 0;
   for (int i = 0; i < n; i++)
@@ -307,7 +307,7 @@ int case_licm_field(struct B * restrict b, inout int *dst, int n)
 }
 
 /* kept: the loop writes the field through the parameter */
-int case_licm_self(inout struct B * restrict b, inout int *dst, int n)
+int case_licm_self(inout struct B *restrict b, inout int *dst, int n)
 {
   int s = 0;
   for (int i = 0; i < n; i++)
@@ -320,10 +320,10 @@ int case_licm_self(inout struct B * restrict b, inout int *dst, int n)
 }
 
 /* kept: through a pointer derived from it */
-int case_licm_derived(inout int * restrict d, inout int *dst, int k, int n)
+int case_licm_derived(inout int *restrict d, inout int *dst, int k, int n)
 {
   int s = 0;
-  int * view e = d + k;
+  int *view e = d + k;
   for (int i = 0; i < n; i++)
   {
     dst[i & 3] = d[1];
@@ -334,7 +334,7 @@ int case_licm_derived(inout int * restrict d, inout int *dst, int k, int n)
 }
 
 /* kept: handed to a call that writes */
-int case_licm_handed(inout int * restrict d, inout int *dst, int n)
+int case_licm_handed(inout int *restrict d, inout int *dst, int n)
 {
   int s = 0;
   for (int i = 0; i < n; i++)

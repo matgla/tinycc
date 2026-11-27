@@ -84,8 +84,8 @@ def test_off_by_default_in_ccompat(tmp_path):
 
 
 def test_safe_default(tmp_path):
-    body = BODY.replace("char *p =", "char * view p =")  # (use's parameter is a view anyway)
-    body = body.replace("char * view p = __builtin_alloca(n)", "char * view p = cast<ptr(char * view)>(__builtin_alloca(n))")
+    body = BODY.replace("char *p =", "char *view p =")  # (use's parameter is a view anyway)
+    body = body.replace("char *view p = __builtin_alloca(n)", "char *view p = cast<ptr(char *view)>(__builtin_alloca(n))")
     body = body.replace("int a[n]", "inout int a[n]")  # an array parameter written through
     body = body.replace("char b[n];", "char b[n] = undefined;").replace("int m[n][4];", "int m[n][4] = undefined;")
     body = body.replace("char b[16];", "char b[16] = undefined;")

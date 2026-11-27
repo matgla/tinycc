@@ -140,6 +140,7 @@ void tcc_ir_lt_add_var(TCCIRState *ir, int32_t vreg, Sym *sym)
   v->line = file ? file->line_num : 0;
   v->silent = tcc_state->in_inline_expansion != 0;
   v->untracked = 0;
+  v->implicit_view = 0;
   /* a pointer declared in regular C (no owned or view: yasc forbids that) is
      unchecked: a view nothing is checked on (docs/yasc_modules.md, "Legacy
      C"); without the mark (a unit with no yasc file), `view maybe` */
@@ -153,11 +154,24 @@ void tcc_ir_lt_add_var(TCCIRState *ir, int32_t vreg, Sym *sym)
     if (tcc_yasc_unit(tcc_state))
       v->silent = 1;
   }
-  v->kind = (q & YASC_OWNED ? LTV_OWNED : 0) | (q & YASC_MAYBE ? LTV_MAYBE : 0) | (q & YASC_OUT ? LTV_OUT : 0) |
+  v->outarg = ((q | (sym->type.ref ? type_yasc(&sym->type.ref->type) : 0)) & YASC_OUT) != 0;
+  /* out: *p must be written, and not read first -- `out T **p` too, whose
+     out sits on the pointer p points at (the first '*' parsed) */
+  v->kind = (q & YASC_OWNED ? LTV_OWNED : 0) | (q & YASC_MAYBE ? LTV_MAYBE : 0) |
+            ((q & YASC_OUT) || (v->outarg && TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_PARAM) ? LTV_OUT : 0) |
             ((q & (YASC_OWNED | YASC_TAKEN)) == (YASC_OWNED | YASC_TAKEN) && !(q & YASC_UNCHECKED) ? LTV_TAKEN : 0) |
             (handle ? LTV_HANDLE : 0) |
             (sym->type.ref && !(sym->type.ref->type.t & VT_CONSTANT) ? LTV_MUT : 0);
-  v->outarg = ((q | (sym->type.ref ? type_yasc(&sym->type.ref->type) : 0)) & YASC_OUT) != 0;
+  /* `inout T *p` as declared: a view (not owned, out, drop or regular C)
+     whose target is not const -- yasc_param_access makes an `in` one const */
+  v->inout = TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_PARAM && !v->silent && !handle && !v->outarg &&
+             tcc_yasc_unit(tcc_state) && (sym->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && sym->type.ref &&
+             (type_yasc(&sym->type) & (YASC_VIEW | YASC_OWNED | YASC_UNCHECKED | YASC_OUT | YASC_DROP)) == YASC_VIEW &&
+             !(sym->type.ref->type.t & VT_CONSTANT) && (sym->type.ref->type.t & VT_BTYPE) != VT_FUNC &&
+             !type_pointee_owned(&sym->type);
+  /* 2: a struct or union -- one member written, another read, is not out */
+  if (v->inout && (sym->type.ref->type.t & VT_BTYPE) == VT_STRUCT)
+    v->inout = 2;
   v->arg_report = 0;
   v->arg_index = -1;
   v->arg_callee = 0;
@@ -252,6 +266,15 @@ void tcc_ir_lt_silence(TCCIRState *ir, int32_t vreg)
   int v = ir && ir->lt_on && vreg >= 0 ? lt_var_by_vreg(ir, vreg) : -1;
   if (v >= 0)
     ir->lt_vars[v].silent = 1;
+}
+
+/* the local of VREG is a yasc local whose pointer said nothing: a view that
+   is never null.  Null stored into it says `* maybe`. */
+void tcc_ir_lt_implicit_view(TCCIRState *ir, int32_t vreg)
+{
+  int v = ir && ir->lt_on && vreg >= 0 ? lt_var_by_vreg(ir, vreg) : -1;
+  if (v >= 0)
+    ir->lt_vars[v].implicit_view = 1;
 }
 
 
@@ -816,7 +839,7 @@ void tcc_ir_lt_note_call(TCCIRState *ir, int call_id, Sym *ftype, Sym *callee)
   uint32_t owned = 0, drop = 0, nonnull = 0, keep = 0, nonnull_attr = 0;
   int drop_dealloc = 0;
   uint32_t taken = 0, handles = 0, restricts = 0, outown = 0, outown_out = 0, outown_maybe = 0, dropobj = 0, objout = 0;
-  uint32_t vmem = 0, dropmem = 0, tborrow = 0, tbsrc = 0, out = 0;
+  uint32_t vmem = 0, dropmem = 0, tborrow = 0, tbsrc = 0, out = 0, yread = 0;
   int dropobj_dealloc = 0;
   int i = 0;
   for (Sym *pa = sym_first(ftype); pa && i < 32; pa = pa->next, i++)
@@ -844,6 +867,11 @@ void tcc_ir_lt_note_call(TCCIRState *ir, int call_id, Sym *ftype, Sym *callee)
     if (!(q & YASC_UNCHECKED) && (pa->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR &&
         ((q & YASC_OUT) || (pa->type.ref && (type_yasc(&pa->type.ref->type) & YASC_OUT))))
       out |= 1u << i;
+    /* a pointer declared in yasc that is not `out` (in, inout): the callee
+       may read what it points at -- an `= undefined` object needs a value */
+    else if ((q & YASC_VIEW) && !(q & (YASC_UNCHECKED | YASC_OWNED | YASC_DROP)) &&
+             (pa->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR)
+      yread |= 1u << i;
     /* `out T owned(release) * view p` writes such an object, `drop` releases it */
     if (type_pointee_owned(&pa->type))
     {
@@ -940,6 +968,17 @@ void tcc_ir_lt_note_call(TCCIRState *ir, int call_id, Sym *ftype, Sym *callee)
   c->handles = handles;
   c->restricts = restricts;
   c->out = out;
+  /* __attribute__((access(write_only, i))) from regular C: it only writes there */
+  if (callee)
+  {
+    const SymLocalFacts *f = sym_facts_peek(callee);
+    for (int j = 0; f && j < f->fort_n; j++)
+      if (f->fort_access[j][0] == ATTR_ACCESS_WRITE && f->fort_access[j][1] >= 1 && f->fort_access[j][1] <= 32)
+        yread &= ~(1u << (f->fort_access[j][1] - 1));
+  }
+  /* a pointer at an owned pointer (getline's lineptr) is followed as one the
+     callee may replace, not here */
+  c->yread = yread & ~outown;
   c->outown = outown;
   c->outown_out = outown_out;
   c->outown_maybe = outown_maybe;
@@ -991,6 +1030,21 @@ void tcc_ir_lt_note_owned_store(TCCIRState *ir, int from, int to)
   ir->lt_ostores[2 * ir->lt_nb_ostores] = from;
   ir->lt_ostores[2 * ir->lt_nb_ostores + 1] = to;
   ir->lt_nb_ostores++;
+}
+
+void tcc_ir_lt_note_ro(TCCIRState *ir, int from, int to, int kind)
+{
+  /* nothing emitted: the store went into the instruction before (a call's
+     result stored straight into the variable) */
+  if (to <= from)
+    from = to - 1;
+  if (from < 0)
+    return;
+  ir->lt_rostores = lt_grow(ir->lt_rostores, ir->lt_nb_rostores, 3 * sizeof(int));
+  ir->lt_rostores[3 * ir->lt_nb_rostores] = from;
+  ir->lt_rostores[3 * ir->lt_nb_rostores + 1] = to;
+  ir->lt_rostores[3 * ir->lt_nb_rostores + 2] = kind;
+  ir->lt_nb_rostores++;
 }
 
 /* move(p) handed to a regular-C (unchecked) parameter or stored in a
@@ -1234,6 +1288,23 @@ void tcc_ir_lt_note_field_store(TCCIRState *ir, int from, int to, int entry)
   ir->lt_nb_fstores++;
 }
 
+void tcc_ir_lt_note_field_src(TCCIRState *ir, int vreg, int entry)
+{
+  ir->lt_fsrcs = lt_grow(ir->lt_fsrcs, ir->lt_nb_fsrcs, 2 * sizeof(int));
+  ir->lt_fsrcs[2 * ir->lt_nb_fsrcs] = vreg;
+  ir->lt_fsrcs[2 * ir->lt_nb_fsrcs + 1] = entry;
+  ir->lt_nb_fsrcs++;
+}
+
+/* temp VREG holds the address of a member entry E borrows from */
+static int ve_fsrc(TCCIRState *ir, int32_t vreg, int e)
+{
+  for (int k = 0; vreg >= 0 && k < ir->lt_nb_fsrcs; k++)
+    if (ir->lt_fsrcs[2 * k] == vreg && ir->lt_fsrcs[2 * k + 1] == e)
+      return 1;
+  return 0;
+}
+
 void tcc_ir_lt_note_field_load(TCCIRState *ir, int vreg, int entry)
 {
   ir->lt_floads = lt_grow(ir->lt_floads, ir->lt_nb_floads, 2 * sizeof(int));
@@ -1242,8 +1313,44 @@ void tcc_ir_lt_note_field_load(TCCIRState *ir, int vreg, int entry)
   ir->lt_nb_floads++;
 }
 
+/* instructions [from, to) are an initializer's store into a member (TOK; 0:
+   an array element) that is not '?' (frontend: init/alloc.c); TOK -1: an
+   automatic object's zeroing before its initializer (init_putz), no store
+   of null to say */
+void tcc_ir_lt_note_init_store(TCCIRState *ir, int from, int to, int tok)
+{
+  if (to <= from)
+    return;
+  ir->lt_istores = lt_grow(ir->lt_istores, ir->lt_nb_istores, 3 * sizeof(int));
+  ir->lt_istores[3 * ir->lt_nb_istores] = from;
+  ir->lt_istores[3 * ir->lt_nb_istores + 1] = to;
+  ir->lt_istores[3 * ir->lt_nb_istores + 2] = tok;
+  ir->lt_nb_istores++;
+}
+
+/* instructions [from, to) store `a[i] = v` (DEREF 0) or `*p = v` (DEREF 1)
+   into a pointer that is not '?' (frontend: expr/infix.c), TOK the name the
+   left side starts from, 0 for none */
+void tcc_ir_lt_note_assign_store(TCCIRState *ir, int from, int to, int tok, int deref)
+{
+  if (to <= from)
+    return;
+  ir->lt_astores = lt_grow(ir->lt_astores, ir->lt_nb_astores, 4 * sizeof(int));
+  ir->lt_astores[4 * ir->lt_nb_astores] = from;
+  ir->lt_astores[4 * ir->lt_nb_astores + 1] = to;
+  ir->lt_astores[4 * ir->lt_nb_astores + 2] = tok;
+  ir->lt_astores[4 * ir->lt_nb_astores + 3] = deref;
+  ir->lt_nb_astores++;
+}
+
 static void lt_free_records(TCCIRState *ir)
 {
+  tcc_free(ir->lt_istores);
+  ir->lt_istores = NULL;
+  ir->lt_nb_istores = 0;
+  tcc_free(ir->lt_astores);
+  ir->lt_astores = NULL;
+  ir->lt_nb_astores = 0;
   tcc_free(ir->lt_sres);
   ir->lt_sres = NULL;
   ir->lt_nb_sres = 0;
@@ -1262,6 +1369,9 @@ static void lt_free_records(TCCIRState *ir)
   tcc_free(ir->lt_floads);
   ir->lt_floads = NULL;
   ir->lt_nb_floads = 0;
+  tcc_free(ir->lt_fsrcs);
+  ir->lt_fsrcs = NULL;
+  ir->lt_nb_fsrcs = 0;
   tcc_free(ir->lt_fstores);
   ir->lt_fstores = NULL;
   ir->lt_nb_fstores = 0;
@@ -1272,6 +1382,7 @@ static void lt_free_records(TCCIRState *ir)
   tcc_free(ir->lt_events);
   tcc_free(ir->lt_calls);
   tcc_free(ir->lt_ostores);
+  tcc_free(ir->lt_rostores);
   tcc_free(ir->lt_mtemps);
   ir->lt_mtemps = NULL;
   ir->lt_nb_mtemps = 0;
@@ -1306,6 +1417,8 @@ static void lt_free_records(TCCIRState *ir)
   ir->lt_nb_inl = 0;
   ir->lt_ostores = NULL;
   ir->lt_nb_ostores = 0;
+  ir->lt_rostores = NULL;
+  ir->lt_nb_rostores = 0;
   ir->lt_vars = NULL;
   ir->lt_events = NULL;
   ir->lt_calls = NULL;
@@ -1325,6 +1438,9 @@ static void un_free_records(TCCIRState *ir)
   ir->un_vars = NULL;
   ir->un_events = NULL;
   ir->un_nb_vars = ir->un_nb_events = 0;
+  tcc_free(ir->un_aggs);
+  ir->un_aggs = NULL;
+  ir->un_nb_aggs = 0;
 }
 
 void tcc_ir_lt_free(TCCIRState *ir)
@@ -1395,8 +1511,14 @@ typedef struct LtCtx
   int *ev_first;      /* [n + 2]: events before instruction i are ev_first[i]..ev_first[i+1] */
   IRLtEvent *ev;      /* sorted by idx */
   int report;
+  uint8_t *io;        /* [nv]: an inout parameter's target, as the reporting walk saw it (LT_IO_*) */
   int ret_owned;
-  int ret_plain_ptr; /* returns a pointer that is not maybe */
+  int ret_plain_ptr; /* returns a pointer that is not '?' */
+  int ret_mut;       /* returns a pointer whose target is not const: a read-only value may not go there */
+  uint8_t *rok;      /* [n]: LT_RO_* of each instruction (tcc_ir_lt_note_ro) */
+  int32_t *tro;      /* temp position -> the local whose read-only value it holds (or nvars: a
+                        read-only value of no variable), -1 */
+  int32_t *call_ro;  /* [ncall_bsrc]: a call's view result borrows a read-only value: as tro */
   int end_line;
   /* maybe members (paths): path k is state index nvars + k, `base->member`,
      base a variable or another path */
@@ -1443,12 +1565,21 @@ typedef struct LtCtx
   uint8_t *g_known;   /* [nglob]: a definition was seen in this walk */
   int32_t *tline;     /* temp position -> the line of its definition (global temps) */
   int32_t *tderiv;    /* temp position -> the temp it is an offset from (`find(k)->next`), -1 */
+  int32_t *tdeep;     /* temp position -> the inout parameter whose deeper level its value points
+                         into (`*pp`, `pp[i]`, offsets of them), or a call's view result borrowing
+                         it (call_io): a write through it writes the parameter (-Wparam-access), -1 */
+  int32_t *vdeep;     /* the same for a local variable (by its vreg position, [nvdeep]), once
+                         given such a value on any path */
+  int nvdeep;
   int unnamed_lines[8]; /* the last lines a value with no name was reported at: once per line */
   int nunnamed;
   /* a call whose result borrows from an argument (`borrows(s)`): the owned
      variable passed there; -1 none, -2 several */
   int32_t *call_bsrc;
   int ncall_bsrc;
+  int32_t *call_io; /* [ncall_bsrc]: the inout parameter a call's view result may point into (an
+                       argument it borrows is that parameter's pointer, or reaches into it): a
+                       write through the result writes it (-Wparam-access, tdeep); -1 */
   /* `out T * borrows(s) * view p` (call->tborrow): per call, the variable
      whose address went there (-1 none, -2 several) and the owned variable
      passed for s (call_bsrc's rules); [ncall_bsrc] each */
@@ -1541,6 +1672,22 @@ static const char *lt_name(LtCtx *c, int v)
   return get_tok_str(c->ir->lt_vars[v].tok, NULL);
 }
 
+/* the plain local V is given null: the note and fix-it for the error that
+   follows say `* maybe` where it is declared */
+static void lt_maybe_fixit(LtCtx *c, int v)
+{
+  static char note[160], word[72], text[80];
+  const char *name = lt_name(c, v);
+  const int line = c->ir->lt_vars[v].line;
+  if (!line || !tcc_warn_wanted(warn_lifetime))
+    return;
+  snprintf(note, sizeof note, "a local's pointer is never null unless it says '?': write '*?%s'", name);
+  tcc_fixit_next(line, "*", FIXIT_AFTER, "?", note);
+  snprintf(word, sizeof word, "*%s", name);
+  snprintf(text, sizeof text, "*?%s", name);
+  tcc_fixit_next_alt(word, FIXIT_REPLACE, text);
+}
+
 static int lt_silent(LtCtx *c, int v)
 {
   return !c->report || c->ir->lt_vars[v].silent;
@@ -1559,6 +1706,15 @@ static int lt_maybe(LtCtx *c, int v)
 static int lt_out(LtCtx *c, int v)
 {
   return c->ir->lt_vars[v].kind & LTV_OUT;
+}
+
+/* -Wparam-access: what an inout parameter's target went through */
+#define LT_IO_RBW 1     /* read while it may not have been written yet */
+#define LT_IO_WRITTEN 2 /* written (or handed where it may be) */
+#define LT_IO_EXIT 4    /* left the function maybe not written */
+static int lt_inout(LtCtx *c, int v)
+{
+  return v >= 0 && v < c->nvars && c->ir->lt_vars[v].inout;
 }
 
 /* Is what lt_instr recorded for temp POS valid here?  Set in this block, or
@@ -1859,6 +2015,73 @@ static int lt_deref_var(LtCtx *c, IROperand op)
   if (irop_is_none(op) || irop_get_tag(op) != IROP_TAG_VREG || !op.is_lval)
     return -1;
   return lt_pointer_var(c, op);
+}
+
+/* -Wparam-access: the inout parameter whose deeper level the pointer held
+   in OP's vreg points into (tdeep / vdeep), -1 */
+static int lt_deep_ptr(LtCtx *c, IROperand op)
+{
+  int32_t vreg = irop_is_none(op) || !(irop_is_vreg_value(op) || irop_get_tag(op) == IROP_TAG_VREG) ? -1 : irop_get_vreg(op);
+  int v;
+  if (vreg < 0 || !c->tdeep)
+    return -1;
+  if (TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_TEMP)
+    return lt_temp_valid(c, vreg) ? c->tdeep[TCCIR_DECODE_VREG_POSITION(vreg)] : -1;
+  v = TCCIR_DECODE_VREG_POSITION(vreg);
+  return TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_VAR && v < c->nvdeep ? c->vdeep[v] : -1;
+}
+
+/* yasc: a plain local may hold a read-only value (vstore lets it take one):
+   LT_RO in its state -- the write bits, which only an out / inout
+   parameter uses otherwise */
+#define LT_RO LT_W_YES
+static int lt_ro_var(LtCtx *c, int v)
+{
+  if (v < 0 || v >= c->nvars)
+    return 0;
+  const IRLtVar *lv = &c->ir->lt_vars[v];
+  return TCCIR_DECODE_VREG_TYPE(lv->vreg) == TCCIR_VREG_TYPE_VAR && !lv->inout && !lv->outarg && !(lv->kind & LTV_OUT);
+}
+
+/* the local whose read-only value the pointer held in OP's vreg is (nvars:
+   one of no variable), -1 */
+static int lt_ro_ptr(LtCtx *c, IROperand op)
+{
+  int32_t vreg = irop_is_none(op) || !(irop_is_vreg_value(op) || irop_get_tag(op) == IROP_TAG_VREG) ? -1 : irop_get_vreg(op);
+  if (vreg < 0 || !c->tro)
+    return -1;
+  if (TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_TEMP)
+    return lt_temp_valid(c, vreg) ? c->tro[TCCIR_DECODE_VREG_POSITION(vreg)] : -1;
+  int v = lt_map(c, vreg);
+  return lt_ro_var(c, v) && (c->cur[v] & LT_RO) ? v : -1;
+}
+
+/* ... OP's value: that pointer, or what is read through it (read-only all
+   the way down) */
+static int lt_ro_value(LtCtx *c, IROperand op)
+{
+  return lt_ro_ptr(c, op);
+}
+
+static const char *lt_ro_name(LtCtx *c, int r)
+{
+  return r >= 0 && r < c->nvars ? lt_name(c, r) : "a read-only value";
+}
+
+/* ... and the one OP's value points into: read through an inout parameter
+   whose target is a pointer (`*pp`: not a struct's member, which its const
+   leaves writable), or through such a deeper pointer, or a copy of one */
+static int lt_deep_value(LtCtx *c, IROperand op)
+{
+  if (irop_is_none(op) || !(irop_is_vreg_value(op) || irop_get_tag(op) == IROP_TAG_VREG))
+    return -1;
+  if (op.is_lval && irop_get_tag(op) == IROP_TAG_VREG)
+  {
+    int dv = lt_pointer_var(c, op);
+    if (lt_inout(c, dv) && c->ir->lt_vars[dv].inout != 2)
+      return dv;
+  }
+  return lt_deep_ptr(c, op);
 }
 
 /* ---- maybe members --------------------------------------------------------
@@ -2461,10 +2684,10 @@ static int lt_handle_null(LtCtx *c, IROperand op)
 static void lt_null_arg(LtCtx *c, int st, int k, int callee, int line)
 {
   if (callee)
-    tcc_warning_c(warn_lifetime)("%i:%s is passed as argument %d of '%s', which is not maybe", line,
+    tcc_warning_c(warn_lifetime)("%i:%s is passed as argument %d of '%s', which is not '?'", line,
                                  lt_null_what(st), k + 1, get_tok_str(callee, NULL));
   else
-    tcc_warning_c(warn_lifetime)("%i:%s is passed as argument %d, which is not maybe", line, lt_null_what(st), k + 1);
+    tcc_warning_c(warn_lifetime)("%i:%s is passed as argument %d, which is not '?'", line, lt_null_what(st), k + 1);
 }
 
 /* a value with no name dereferenced where it may be null, once per line */
@@ -2533,6 +2756,12 @@ static void lt_deref_value(LtCtx *c, IROperand op, int line)
 static void lt_out_read(LtCtx *c, int v, int line)
 {
   uint8_t st = c->cur[v] & LT_WBITS;
+  if (lt_inout(c, v))
+  {
+    if ((st & LT_W_NO) && c->report && c->io)
+      c->io[v] |= LT_IO_RBW;
+    return;
+  }
   if (!lt_out(c, v) || !(st & LT_W_NO))
     return;
   if (!lt_silent(c, v))
@@ -2544,8 +2773,39 @@ static void lt_out_read(LtCtx *c, int v, int line)
 /* *p written -- or p handed somewhere that may write it */
 static void lt_out_write(LtCtx *c, int v)
 {
-  if (v >= 0 && lt_out(c, v))
+  if (lt_inout(c, v))
+  {
     c->cur[v] = (c->cur[v] & ~LT_WBITS) | LT_W_YES;
+    if (c->report && c->io)
+      c->io[v] |= LT_IO_WRITTEN;
+  }
+  else if (v >= 0 && lt_out(c, v))
+    c->cur[v] = (c->cur[v] & ~LT_WBITS) | LT_W_YES;
+}
+
+/* an inout parameter's pointer handed on (Q: a call's argument, a store, a
+   return): an `out` parameter of the callee writes the target, an `in` one
+   (const target, or no pointer) reads it, anything else may do both */
+static void lt_inout_pass(LtCtx *c, int v, IRQuadCompact *q, IROperand src2, int line)
+{
+  int rd = 1, wr = 1;
+  if (q->op == TCCIR_OP_FUNCPARAMVAL)
+  {
+    int64_t enc = irop_get_imm64_ex(c->ir, src2);
+    int call_id = TCCIR_DECODE_CALL_ID(enc), k = TCCIR_DECODE_PARAM_IDX(enc);
+    IRLtCall *call = call_id >= 0 && call_id < c->ir->lt_nb_calls ? &c->ir->lt_calls[call_id] : NULL;
+    if (call && call->known && (k -= call->implicit) >= 0 && k < 32 && k < call->nparams)
+    {
+      if ((call->out >> k) & 1)
+        rd = 0;
+      else if ((call->keep >> k) & 1)
+        wr = 0;
+    }
+  }
+  if (rd)
+    lt_out_read(c, v, line);
+  if (wr)
+    lt_out_write(c, v);
 }
 
 static void lt_note_move(LtCtx *c, int v)
@@ -3341,6 +3601,109 @@ static void lt_restrict_call(LtCtx *c, int call_id, IRLtCall *call, int line)
   c->nrarg = n;
 }
 
+/* instruction i zeroes an automatic object before its initializer */
+static int lt_in_clear(LtCtx *c, int i)
+{
+  for (int k = 0; k < c->ir->lt_nb_istores; k++)
+    if (c->ir->lt_istores[3 * k + 2] < 0 && i >= c->ir->lt_istores[3 * k] && i < c->ir->lt_istores[3 * k + 1])
+      return 1;
+  return 0;
+}
+
+static __attribute__((noinline)) void lt_init_store(LtCtx *c, int i, IROperand src1, int line)
+{
+  for (int k = 0; k < c->ir->lt_nb_istores; k++)
+  {
+    const int *r = &c->ir->lt_istores[3 * k];
+    if (i < r[0] || i >= r[1] || r[2] < 0)
+      continue;
+    const int st = lt_value_null(c, src1);
+    if (!(st & LT_N_NULL))
+      return;
+    if (r[2])
+    {
+      tcc_warning_c(warn_lifetime)("%i:%s initializes '%s', which is not '?'", line, lt_null_what(st & LT_NULLBITS),
+                                   get_tok_str(r[2], NULL));
+      tcc_note("%i:a member's pointer is never null unless it says '?': write '*?' in its declaration", line);
+    }
+    else
+    {
+      tcc_warning_c(warn_lifetime)("%i:%s initializes an element that is not '?'", line,
+                                   lt_null_what(st & LT_NULLBITS));
+      tcc_note("%i:an element's pointer is never null unless it says '?': write '*?' in the element type", line);
+    }
+    return;
+  }
+}
+
+/* Q stores into a global's or static's own pointer (or an element of an
+   array of them) that is not '?': `char *g;` in yasc, a view */
+static int lt_notmaybe_global(TCCIRState *ir, const IRQuadCompact *q, IROperand dest)
+{
+  Sym *gs;
+  CType *gt;
+  int y;
+  if (q->op != TCCIR_OP_STORE || irop_is_none(dest) || irop_get_tag(dest) != IROP_TAG_SYMREF || !dest.is_lval ||
+      !(gs = irop_get_sym_ex(ir, dest)) || gs->v < TOK_UIDENT)
+    return 0;
+  gt = &gs->type;
+  if ((gt->t & VT_ARRAY) && gt->ref)
+    gt = &gt->ref->type;
+  if ((gt->t & (VT_BTYPE | VT_ARRAY)) != VT_PTR || !gt->ref)
+    return 0;
+  y = type_yasc(gt);
+  return (y & (YASC_VIEW | YASC_OWNED)) && !(y & (YASC_MAYBE | YASC_UNCHECKED));
+}
+
+/* the function stores into such a global: the walk has a check to make
+   though it follows no variable */
+static int lt_stores_notmaybe_global(TCCIRState *ir)
+{
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_STORE && irop_config[q->op].has_dest && lt_notmaybe_global(ir, q, tcc_ir_op_get_dest(ir, q)))
+      return 1;
+  }
+  return 0;
+}
+
+/* `a[i] = v` / `*p = v` at instruction I (tcc_ir_lt_note_assign_store):
+   null into a pointer that is not '?' */
+static __attribute__((noinline)) void lt_assign_store(LtCtx *c, int i, IROperand src1, int line)
+{
+  for (int k = 0; k < c->ir->lt_nb_astores; k++)
+  {
+    const int *r = &c->ir->lt_astores[4 * k];
+    if (i < r[0] || i >= r[1])
+      continue;
+    const int st = lt_value_null(c, src1);
+    if (!(st & LT_N_NULL))
+      return;
+    const char *what = lt_null_what(st & LT_NULLBITS);
+    if (r[3])
+    {
+      if (r[2])
+        tcc_warning_c(warn_lifetime)("%i:%s is stored where '%s' points, which is not '?'", line, what,
+                                     get_tok_str(r[2], NULL));
+      else
+        tcc_warning_c(warn_lifetime)("%i:%s is stored through a pointer at one that is not '?'", line, what);
+      tcc_note("%i:a pointer's target pointer is never null unless it says '?': write '*?' at that level of its type",
+               line);
+    }
+    else
+    {
+      if (r[2])
+        tcc_warning_c(warn_lifetime)("%i:%s is stored in an element of '%s', which is not '?'", line, what,
+                                     get_tok_str(r[2], NULL));
+      else
+        tcc_warning_c(warn_lifetime)("%i:%s is stored in an element that is not '?'", line, what);
+      tcc_note("%i:an element's pointer is never null unless it says '?': write '*?' in the element type", line);
+    }
+    return;
+  }
+}
+
 static void lt_instr(LtCtx *c, int i)
 {
   TCCIRState *ir = c->ir;
@@ -3352,9 +3715,14 @@ static void lt_instr(LtCtx *c, int i)
   IROperand src2 = cfg->has_src2 ? tcc_ir_op_get_src2(ir, q) : irop_make_none();
   int defines = !irop_is_none(dest) && irop_dest_defines_vreg(dest);
   int moved = -1; /* src1's variable, when this instruction moves it */
+  int said = 0;   /* a null stored here is said (a member's, a global's) */
   int v;
 
   c->cur_inl = c->inl ? c->inl[i] : 0;
+  /* an initializer's value for a member that is not '?' (a null constant
+     is the frontend's: yasc_init_null) */
+  if (q->op == TCCIR_OP_STORE && ir->lt_nb_istores && c->report && !c->cur_inl)
+    lt_init_store(c, i, src1, line);
   /* an inlined body starts: what a call would have changed */
   if (c->cur_inl && (i == 0 || !c->inl[i - 1]) && c->npaths)
     lt_forget_globals(c);
@@ -3372,6 +3740,79 @@ static void lt_instr(LtCtx *c, int i)
     lt_deref(c, v, lt_deref_line(c, src2, line)), lt_out_read(c, v, line);
   if (!defines && (v = lt_deref_var(c, dest)) >= 0)
     lt_deref(c, v, lt_deref_line(c, dest, line)), lt_out_write(c, v);
+  /* -Wparam-access: a deeper level of an inout parameter written (`**pp = x`),
+     or handed to a parameter that may write it */
+  if (c->report && c->io)
+  {
+    int dv = -1;
+    if (!defines && dest.is_lval && irop_get_tag(dest) == IROP_TAG_VREG)
+      dv = lt_deep_ptr(c, dest);
+    else if (q->op == TCCIR_OP_FUNCPARAMVAL && (dv = lt_deep_value(c, src1)) >= 0)
+    {
+      int64_t enc = irop_get_imm64_ex(ir, src2);
+      int call_id = TCCIR_DECODE_CALL_ID(enc), k = TCCIR_DECODE_PARAM_IDX(enc);
+      IRLtCall *call = call_id >= 0 && call_id < ir->lt_nb_calls ? &ir->lt_calls[call_id] : NULL;
+      if (call && call->known && (k -= call->implicit) >= 0 && k < 32 && k < call->nparams && ((call->keep >> k) & 1) &&
+          !((call->out >> k) & 1))
+        dv = -1;
+    }
+    if (dv >= 0 && dv < c->nvars)
+      c->io[dv] |= LT_IO_WRITTEN;
+  }
+  /* yasc: a read-only value written through, or handed where it may be */
+  if (c->tro)
+  {
+    int r;
+    if (!defines && dest.is_lval && irop_get_tag(dest) == IROP_TAG_VREG && (r = lt_ro_ptr(c, dest)) >= 0)
+    {
+      if (c->report)
+        tcc_warning_c(warn_lifetime)("%i:writing through '%s', which may hold a read-only value (a const one was "
+                                     "stored in it)",
+                                     line, lt_ro_name(c, r));
+    }
+    else if (q->op == TCCIR_OP_FUNCPARAMVAL && (r = lt_ro_value(c, src1)) >= 0)
+    {
+      int64_t enc = irop_get_imm64_ex(ir, src2);
+      int call_id = TCCIR_DECODE_CALL_ID(enc), k = TCCIR_DECODE_PARAM_IDX(enc);
+      IRLtCall *call = call_id >= 0 && call_id < ir->lt_nb_calls ? &ir->lt_calls[call_id] : NULL;
+      int kk = call ? k - call->implicit : -1;
+      if (call && kk >= 0 && kk < 32 && ((call->borrows >> kk) & 1) && call_id < c->ncall_bsrc)
+        c->call_ro[call_id] = r;
+      if (call && call->known && kk >= 0 && kk < 32 && kk < call->nparams && !((call->keep >> kk) & 1) && c->report)
+        tcc_warning_c(warn_lifetime)("%i:'%s' may hold a read-only value: parameter %d of '%s' may write through it",
+                                     line, lt_ro_name(c, r), kk + 1,
+                                     call->callee ? get_tok_str(call->callee, NULL) : "the function");
+    }
+    else if (q->op == TCCIR_OP_RETURNVALUE && c->ret_mut && (r = lt_ro_value(c, src1)) >= 0)
+    {
+      if (c->report)
+        tcc_warning_c(warn_lifetime)("%i:'%s' may hold a read-only value: the function's result may be written "
+                                     "through",
+                                     line, lt_ro_name(c, r));
+    }
+    else if (q->op == TCCIR_OP_STORE && !defines && !(c->rok && (c->rok[i] & LT_RO_CONSTDEST)) &&
+             (r = lt_ro_value(c, src1)) >= 0 && !src1.is_lval)
+    {
+      if (c->report)
+        tcc_warning_c(warn_lifetime)("%i:'%s' may hold a read-only value: stored where it may be written through",
+                                     line, lt_ro_name(c, r));
+    }
+  }
+  /* a variable given a pointer into a deeper level: so are its copies */
+  if (defines && c->vdeep && TCCIR_DECODE_VREG_TYPE(irop_get_vreg(dest)) == TCCIR_VREG_TYPE_VAR &&
+      (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_FUNCCALLVAL))
+  {
+    int dpos = TCCIR_DECODE_VREG_POSITION(irop_get_vreg(dest)), from = -1;
+    if (q->op != TCCIR_OP_FUNCCALLVAL)
+      from = lt_deep_value(c, src1);
+    else if (c->call_io)
+    {
+      int call_id = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, src2));
+      from = call_id >= 0 && call_id < c->ncall_bsrc ? c->call_io[call_id] : -1;
+    }
+    if (dpos < c->nvdeep && from >= 0)
+      c->vdeep[dpos] = from;
+  }
   lt_deref_value(c, src1, line);
   lt_deref_value(c, src2, line);
   if (!defines)
@@ -3383,7 +3824,39 @@ static void lt_instr(LtCtx *c, int i)
        TCCIR_DECODE_VREG_TYPE(irop_get_vreg(dest)) != TCCIR_VREG_TYPE_TEMP))
     if (irop_is_vreg_value(src1) || irop_get_tag(src1) == IROP_TAG_VREG)
       if (!src1.is_lval)
-        lt_out_write(c, lt_pointer_var(c, src1));
+      {
+        int pv = lt_pointer_var(c, src1);
+        /* `s = s + 1`: an inout or out parameter's own pointer moved, not
+           handed on */
+        if (pv >= 0 && defines && q->op != TCCIR_OP_LOAD &&
+            TCCIR_DECODE_VREG_TYPE(irop_get_vreg(dest)) == TCCIR_VREG_TYPE_PARAM &&
+            lt_map(c, irop_get_vreg(dest)) == pv)
+          ;
+        else if (lt_inout(c, pv))
+          lt_inout_pass(c, pv, q, src2, line);
+        else
+          lt_out_write(c, pv);
+      }
+  /* an inout parameter given another value: what it points at is no longer
+     the caller's, -Wparam-access says nothing of it -- unless the value
+     still points into the caller's target (`s++`, `s += n`, `s = s - 1`):
+     moving the pointer writes nothing */
+  if (defines && c->report && c->io && TCCIR_DECODE_VREG_TYPE(irop_get_vreg(dest)) == TCCIR_VREG_TYPE_PARAM)
+  {
+    int dv = lt_map(c, irop_get_vreg(dest)), from = -1;
+    if (lt_inout(c, dv))
+    {
+      if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_STORE) && !src1.is_lval)
+        from = lt_pointer_var(c, src1);
+      else if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) && !src1.is_lval && !src2.is_lval)
+      {
+        int p1 = lt_pointer_var(c, src1), p2 = q->op == TCCIR_OP_ADD ? lt_pointer_var(c, src2) : -1;
+        from = p1 >= 0 && p2 >= 0 ? -1 : p1 >= 0 ? p1 : p2;
+      }
+      if (from != dv)
+        c->io[dv] |= LT_IO_RBW | LT_IO_WRITTEN;
+    }
+  }
 
   /* getline(&line, ...): the callee may replace the owned pointer in line
      (it is still line's after the call); out: it writes one, whatever was
@@ -3430,6 +3903,23 @@ static void lt_instr(LtCtx *c, int i)
       }
     }
   }
+  /* -Wparam-access: an inout parameter (or what it reaches) passed where
+     the result borrows from: the result writes it when written through */
+  if (q->op == TCCIR_OP_FUNCPARAMVAL && c->call_io)
+  {
+    int64_t enc = irop_get_imm64_ex(ir, src2);
+    int call_id = TCCIR_DECODE_CALL_ID(enc), k = TCCIR_DECODE_PARAM_IDX(enc);
+    IRLtCall *call = call_id >= 0 && call_id < ir->lt_nb_calls ? &ir->lt_calls[call_id] : NULL;
+    if (call && call->borrows && call_id < c->ncall_bsrc && (k -= call->implicit) >= 0 && k < 32 &&
+        ((call->borrows >> k) & 1) && !lt_is_addr(src1))
+    {
+      int o = src1.is_lval ? -1 : lt_pointer_var(c, src1);
+      if (!lt_inout(c, o))
+        o = lt_deep_value(c, src1);
+      if (o >= 0)
+        c->call_io[call_id] = o;
+    }
+  }
   if (q->op == TCCIR_OP_FUNCPARAMVAL && c->call_bsrc)
   {
     /* an owned variable passed where the result borrows from */
@@ -3462,7 +3952,7 @@ static void lt_instr(LtCtx *c, int i)
       int handle = (call->handles >> k) & 1;
       int st = handle ? lt_handle_null(c, src1) : lt_value_null(c, src1);
       if ((st & LT_N_NULL) && handle && call->callee)
-        tcc_warning_c(warn_lifetime)("%i:%s is passed as argument %d of '%s', which is not maybe", line,
+        tcc_warning_c(warn_lifetime)("%i:%s is passed as argument %d of '%s', which is not '?'", line,
                                      st == LT_N_NULL ? "an invalid handle" : "a handle that may be invalid", k + 1,
                                      get_tok_str(call->callee, NULL));
       else if ((call->nonnull_attr >> k) & 1)
@@ -3595,7 +4085,7 @@ static void lt_instr(LtCtx *c, int i)
   {
     int st = c->ret_plain_ptr ? lt_value_null(c, src1) : LT_N_SET;
     if ((st & LT_N_NULL) && c->report)
-      tcc_warning_c(warn_lifetime)("%i:%s is returned from '%s', whose result is not maybe", line, lt_null_what(st),
+      tcc_warning_c(warn_lifetime)("%i:%s is returned from '%s', whose result is not '?'", line, lt_null_what(st),
                                    funcname);
     if (c->ret_owned && (v = lt_read_value(c, src1)) >= 0 && lt_owned(c, v))
     {
@@ -3630,13 +4120,25 @@ static void lt_instr(LtCtx *c, int i)
 
   /* a store into a maybe member through its base sets it from the value;
      any other write there forgets it */
-  int direct = !irop_is_none(dest) && irop_get_tag(dest) != IROP_TAG_VREG && dest.is_lval && c->nobj;
-  if ((!defines || direct) && c->npaths)
+  /* (a global's object is made on its first use: `g.p = v` may be it) */
+  int direct = !irop_is_none(dest) && irop_get_tag(dest) != IROP_TAG_VREG && dest.is_lval &&
+               (c->nobj || (irop_get_tag(dest) == IROP_TAG_SYMREF && ir->lt_nb_gmembers));
+  /* (a direct store makes its member's path: `g.p = v` may be the first) */
+  if ((!defines || direct) && (c->npaths || direct))
   {
     int k = lt_deref_path(c, dest), db, doff;
     if (k >= 0 && q->op == TCCIR_OP_STORE)
     {
       int st = lt_value_null(c, src1);
+      /* a member that is not '?' never gets null (`struct s { char *p; }`:
+         a view, `char * owned p`) */
+      if ((st & LT_N_NULL) && !lt_maybe(c, k) && !lt_handle(c, k) && !lt_silent(c, k) && !lt_in_clear(c, i))
+      {
+        said = 1;
+        tcc_warning_c(warn_lifetime)("%i:%s is stored in '%s', which is not '?'", line, lt_null_what(st & LT_NULLBITS),
+                                     lt_name(c, k));
+        tcc_note("%i:a member's pointer is never null unless it says '?': write '*?' in its declaration", line);
+      }
       lt_forget(c, k, 0);
       lt_unlink(c, k);
       lt_forget_aliases(c, k);
@@ -3660,6 +4162,28 @@ static void lt_instr(LtCtx *c, int i)
         }
     }
   }
+  /* a global's or static's pointer that is not '?' never gets null:
+     `char *g;` / `char *tab[2];` in yasc is a view (declarator.c) */
+  if (c->report && lt_notmaybe_global(ir, q, dest))
+  {
+    Sym *gs = irop_get_sym_ex(ir, dest);
+    said = 1;
+    {
+      int st = lt_value_null(c, src1);
+      if (st & LT_N_NULL)
+      {
+        tcc_warning_c(warn_lifetime)("%i:%s is stored in '%s', which is not '?'", line,
+                                     lt_null_what(st & LT_NULLBITS), get_tok_str(gs->v, NULL));
+        tcc_note("%i:a global's or static's pointer is never null unless it says '?': write '*?' in its "
+                 "declaration",
+                 line);
+      }
+    }
+  }
+  /* `a[i] = v`, `*p = v`: an element or a target pointer that is not '?'
+     (a member or a global said above) */
+  if (!said && q->op == TCCIR_OP_STORE && ir->lt_nb_astores && c->report && !c->cur_inl)
+    lt_assign_store(c, i, src1, line);
   /* a global pointer assigned: its members are not the ones tested */
   if (!irop_is_none(dest) && irop_get_tag(dest) == IROP_TAG_SYMREF && dest.is_lval && c->nobj)
   {
@@ -3822,6 +4346,37 @@ static void lt_instr(LtCtx *c, int i)
           if (lt_tpos_valid(c, r) && (lt_tnull(c, r) & LT_N_NULL))
             c->tderiv[pos] = r;
         }
+      /* -Wparam-access: a value read through an inout parameter's target
+         points at a deeper level of it (an in one's is const all the way
+         down: `**pp = x` needs inout); copies and offsets of it too */
+      /* a read-only value (a local holding one, read through it, a call's
+         view result borrowing one): so is this */
+      c->tro[pos] = -1;
+      if (q->op == TCCIR_OP_FUNCCALLVAL)
+      {
+        int call_id = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, src2));
+        if (call_id >= 0 && call_id < c->ncall_bsrc)
+          c->tro[pos] = c->call_ro[call_id];
+      }
+      else if (is_copy || q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB)
+      {
+        c->tro[pos] = lt_ro_value(c, src1);
+        if (c->tro[pos] < 0 && q->op == TCCIR_OP_ADD)
+          c->tro[pos] = lt_ro_value(c, src2);
+      }
+      c->tdeep[pos] = -1;
+      if (q->op == TCCIR_OP_FUNCCALLVAL && c->call_io)
+      {
+        int call_id = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, src2));
+        if (call_id >= 0 && call_id < c->ncall_bsrc)
+          c->tdeep[pos] = c->call_io[call_id];
+      }
+      else if (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB)
+      {
+        c->tdeep[pos] = lt_deep_value(c, src1);
+        if (c->tdeep[pos] < 0 && q->op == TCCIR_OP_ADD)
+          c->tdeep[pos] = lt_deep_value(c, src2);
+      }
       c->alias[pos] = copy;
       c->palias[pos] = into;
       c->tnull[pos] = null_in;
@@ -3969,12 +4524,31 @@ static void lt_instr(LtCtx *c, int i)
   /* an int handle: a constant (-1, ...) owns nothing; invalid when < 0 */
   if (lt_handle(c, v))
     null_in = is_copy ? lt_handle_null(c, src1) : null_in;
+  /* yasc: a plain local given a read-only value holds one (vstore let it
+     take it); given anything else, it does not */
+  if (lt_ro_var(c, v))
+  {
+    int ro = c->rok && (c->rok[i] & LT_RO_LOCAL);
+    if (!ro && q->op == TCCIR_OP_FUNCCALLVAL)
+    {
+      int call_id = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, src2));
+      ro = call_id >= 0 && call_id < c->ncall_bsrc && c->call_ro[call_id] >= 0;
+    }
+    else if (!ro && (is_copy || q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB))
+      ro = lt_ro_value(c, src1) >= 0 || (q->op == TCCIR_OP_ADD && lt_ro_value(c, src2) >= 0);
+    c->cur[v] = (c->cur[v] & ~LT_RO) | (ro ? LT_RO : 0);
+  }
   /* nullness: a maybe variable takes the value's; any other must not get null */
   if (lt_maybe(c, v))
     c->cur[v] = (c->cur[v] & ~LT_NULLBITS) | null_in;
   else if ((null_in & LT_N_NULL) && !lt_silent(c, v))
-    tcc_warning_c(warn_lifetime)("%i:%s is stored in '%s', which is not maybe", line, lt_null_what(null_in),
+  {
+    /* a plain local: the fix-it says maybe where it is declared */
+    if (ir->lt_vars[v].implicit_view)
+      lt_maybe_fixit(c, v);
+    tcc_warning_c(warn_lifetime)("%i:%s is stored in '%s', which is not '?'", line, lt_null_what(null_in),
                                  lt_name(c, v));
+  }
   else if ((null_in & LT_N_NULL) && c->report && ir->lt_vars[v].arg_report && !c->arg_bound[v])
     /* an inlined callee's parameter bound to its argument: the call's check */
     lt_null_arg(c, null_in, ir->lt_vars[v].arg_index, ir->lt_vars[v].arg_callee, line);
@@ -4058,6 +4632,8 @@ static void lt_exit(LtCtx *c, int at_end, int line)
     if (c->ir->lt_vars[v].untracked)
       continue;
     lt_leak(c, v, line, at_end ? "at the end of the function" : "at return");
+    if (lt_inout(c, v) && (w & LT_W_NO) && c->report && c->io)
+      c->io[v] |= LT_IO_EXIT;
     if (lt_out(c, v) && (w & LT_W_NO) && !lt_silent(c, v))
       tcc_warning_c(warn_lifetime)("%i:'*%s' %s written when '%s' returns", line, lt_name(c, v),
                                    w == LT_W_NO ? "is not" : "may not be", funcname);
@@ -4119,8 +4695,43 @@ static void lt_entry_state(LtCtx *c, uint8_t *in)
   {
     int param = TCCIR_DECODE_VREG_TYPE(c->ir->lt_vars[v].vreg) == TCCIR_VREG_TYPE_PARAM;
     in[v] = (param && lt_owned(c, v) ? LT_OWN : LT_UNINIT) |
-            (param && lt_maybe(c, v) ? LT_N_NULL | LT_N_SET : LT_N_SET) | (param && lt_out(c, v) ? LT_W_NO : 0);
+            (param && lt_maybe(c, v) ? LT_N_NULL | LT_N_SET : LT_N_SET) |
+            (param && (lt_out(c, v) || lt_inout(c, v)) ? LT_W_NO : 0);
   }
+}
+
+/* The tracked variable a test at instruction t (CMP / TEST_ZERO, operand a)
+   tests: the one a reads, or the one the instruction before it (from `first`
+   on) just stored a's temp in -- `if (!(p = f()))`, `while ((p = next()) !=
+   0)` on a parameter or a member store compare the stored value, `p <-- T;
+   CMP T,#0` -- or -1. */
+static int lt_test_var(LtCtx *c, int first, int t, IROperand a, int *also)
+{
+  TCCIRState *ir = c->ir;
+  int v = lt_read_var(c, a);
+  int32_t av;
+  *also = -1;
+  if (t <= first || irop_is_none(a) || !irop_is_vreg_value(a) || a.is_lval || (av = irop_get_vreg(a)) < 0 ||
+      TCCIR_DECODE_VREG_TYPE(av) != TCCIR_VREG_TYPE_TEMP)
+    return v;
+  IRQuadCompact *sq = &ir->compact_instructions[t - 1];
+  if (sq->op != TCCIR_OP_STORE && sq->op != TCCIR_OP_ASSIGN)
+    return v;
+  IROperand d = tcc_ir_op_get_dest(ir, sq), s = tcc_ir_op_get_src1(ir, sq);
+  int32_t dv;
+  if (irop_is_none(d) || !irop_dest_defines_vreg(d) || (dv = irop_get_vreg(d)) < 0 ||
+      (TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_VAR && TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_PARAM))
+    return v;
+  if (irop_is_none(s) || !irop_is_vreg_value(s) || s.is_lval || irop_get_vreg(s) != av)
+    return v;
+  int sv = lt_map(c, dv);
+  if (v < 0)
+    return sv;
+  /* the temp read from one variable and stored in another: `if (!(s =
+     f(s)))` with f inlined reads f's result variable, and s holds it too */
+  if (sv >= 0 && sv != v)
+    *also = sv;
+  return v;
 }
 
 /* The predicate a block's last jump tests, its value on the taken edge in
@@ -4210,6 +4821,9 @@ static void lt_block(LtCtx *c, int b, const uint8_t *in, uint8_t *out)
   /* `if (p)` / `if (p == 0)`: the zero edge owns nothing */
   int target = (lq->op == TCCIR_OP_JUMP || lq->op == TCCIR_OP_JUMPIF) ? (int)tcc_ir_op_dest_imm(ir, lq) : -1;
   int zero_v = -1, zero_taken = 0;
+  /* the variable lt_test_var found and the one the tested temp was also
+     stored in: both hold the value tested */
+  int tested_v = -1, zero_also = -1;
   if (lq->op == TCCIR_OP_JUMPIF && last > bb->start_idx)
   {
     IRQuadCompact *tq = &ir->compact_instructions[last - 1];
@@ -4219,14 +4833,14 @@ static void lt_block(LtCtx *c, int b, const uint8_t *in, uint8_t *out)
     int handle_test = 0;
     if (tq->op == TCCIR_OP_TEST_ZERO)
     {
-      zero_v = lt_read_var(c, a1);
+      zero_v = tested_v = lt_test_var(c, bb->start_idx, last - 1, a1, &zero_also);
       if (zero_v >= 0 && lt_handle(c, zero_v))
         zero_v = -1; /* fd 0 is a valid handle */
     }
     else if (tq->op == TCCIR_OP_CMP)
     {
       IROperand b2 = tcc_ir_op_get_src2(ir, tq);
-      int hv = lt_read_var(c, a1);
+      int hv = tested_v = lt_test_var(c, bb->start_idx, last - 1, a1, &zero_also);
       /* ... or a handle member tested in place: `if (c->fd >= 0)` */
       if (hv < 0 && irop_is_immediate(b2))
       {
@@ -4249,7 +4863,7 @@ static void lt_block(LtCtx *c, int b, const uint8_t *in, uint8_t *out)
         a1 = irop_make_none();
       }
       else if (irop_is_immediate(b2) && irop_get_imm64_ex(ir, b2) == 0 && !(hv >= 0 && lt_handle(c, hv)))
-        zero_v = lt_read_var(c, a1);
+        zero_v = hv;
       else
         a1 = irop_make_none();
     }
@@ -4283,14 +4897,19 @@ static void lt_block(LtCtx *c, int b, const uint8_t *in, uint8_t *out)
         c->cfg->instr_to_block[target] == c->cfg->instr_to_block[bb->end_idx])
       zero_v = -1;
   }
-  if (zero_v >= 0)
+  if (zero_v < 0 || zero_v != tested_v)
+    zero_also = -1;
+  for (int zi = 0; zi < 2; zi++)
   {
+    int zv = zi ? zero_also : zero_v;
+    if (zv < 0)
+      continue;
     int taken_block = target >= 0 && target < c->n ? c->cfg->instr_to_block[target] : -1;
     /* out[num_succs]: the edge out of the function, when the jump leaves it */
     for (int s = 0; s <= bb->num_succs; s++)
     {
       int taken = s < bb->num_succs ? bb->succs[s] == taken_block : target >= c->n;
-      uint8_t *st = &out[s * c->nv + zero_v];
+      uint8_t *st = &out[s * c->nv + zv];
       uint8_t own = *st & LT_OWNBITS;
       uint8_t w = *st & LT_WBITS;
       if (taken == zero_taken)
@@ -4307,7 +4926,7 @@ static void lt_block(LtCtx *c, int b, const uint8_t *in, uint8_t *out)
       }
       /* takes(p): the result null, p is still the caller's; valid, it moved */
       for (int p = 0; p < c->nvars; p++)
-        if (c->taken_by[p] == zero_v && p != zero_v)
+        if (c->taken_by[p] == zv && p != zv)
         {
           uint8_t *ps = &out[s * c->nv + p];
           if (taken == zero_taken)
@@ -4628,6 +5247,44 @@ static void lt_find_preds(LtCtx *c)
     }
 }
 
+/* -Wparam-access: FUNC hands back a pointer the caller may write through
+   that may point into what parameter TOK points at (`char *f(inout char *s)
+   { return strchr(s, c); }`) -- inout then says what the caller may do */
+static int lt_result_writes_through(Sym *func, int tok)
+{
+  CType *rt = func && func->type.ref ? &func->type.ref->type : NULL;
+  int rq, k = 0;
+  if (!rt || (rt->t & (VT_BTYPE | VT_ARRAY)) != VT_PTR || !rt->ref || (rt->ref->type.t & VT_CONSTANT))
+    return 0;
+  rq = type_yasc(rt);
+  if (rq & YASC_OWNED)
+    return 0;
+  if (!(rq & YASC_VIEW) || (rq & YASC_UNCHECKED))
+    return 1;
+  for (Sym *pa = sym_first(func->type.ref); pa; pa = pa->next, k++)
+    if ((pa->v & ~SYM_FIELD) == tok)
+      return k >= YASC_BORROWS_MAX_PARAMS || ((type_borrows(rt) >> k) & 1);
+  return 1;
+}
+
+/* -Wparam-access: parameter TOK of FUNC is `unused` (yasc) or
+   __attribute__((unused)): its signature is someone else's (a callback) */
+static int lt_param_marked_unused(Sym *func, int tok)
+{
+  for (Sym *pa = func && func->type.ref ? sym_first(func->type.ref) : NULL; pa; pa = pa->next)
+    if ((pa->v & ~SYM_FIELD) == tok)
+      return (pa->ymod & SYM_UNUSED_OK) != 0;
+  return 0;
+}
+
+static void lt_param_access_unwritten(TCCIRState *ir, Sym *func, int v)
+{
+  IRLtVar *lv = &ir->lt_vars[v];
+  if (!lt_param_marked_unused(func, lv->tok) && !lt_result_writes_through(func, lv->tok))
+    tcc_warning_c(warn_param_access)("%i:'%s' is inout, but '%s' writes nothing through it: drop inout", lv->line,
+                                     get_tok_str(lv->tok, NULL), funcname);
+}
+
 void tcc_ir_lifetime_check(TCCIRState *ir, Sym *func)
 {
   int end_line = ir->lt_end_line;
@@ -4635,7 +5292,8 @@ void tcc_ir_lifetime_check(TCCIRState *ir, Sym *func)
   int nv = ir->lt_nb_vars;
   int ret_plain_ptr = func && func->type.ref && (func->type.ref->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR &&
                       !(type_yasc(&func->type.ref->type) & YASC_MAYBE);
-  if (!nv && !ret_plain_ptr && !ir->lt_nonnull_calls && !ir->lt_maybe_calls && !ir->lt_nb_members && !ir->lt_nb_gmembers)
+  if (!nv && !ret_plain_ptr && !ir->lt_nonnull_calls && !ir->lt_maybe_calls && !ir->lt_nb_members && !ir->lt_nb_gmembers &&
+      !ir->lt_nb_astores && !(tcc_state->yasc && lt_stores_notmaybe_global(ir)))
   {
     lt_free_records(ir);
     return;
@@ -4652,6 +5310,10 @@ void tcc_ir_lifetime_check(TCCIRState *ir, Sym *func)
     lt_entry_state(&c, st);
     tcc_state->diag_noabort++;
     lt_exit(&c, 1, end_line);
+    /* -Wparam-access: nothing is written through an inout parameter */
+    for (int v = 0; v < nv; v++)
+      if (ir->lt_vars[v].inout && !ir->lt_vars[v].untracked)
+        lt_param_access_unwritten(ir, func, v);
     tcc_state->diag_noabort--;
     tcc_free(st);
     lt_free_records(ir);
@@ -4668,8 +5330,17 @@ void tcc_ir_lifetime_check(TCCIRState *ir, Sym *func)
     if (rt && (rt->t & VT_BTYPE) == VT_LLONG && rt->ref && (rt->ref->yasc & YASC_ERRUNION))
       rt = &rt->ref->type;
     c.ret_owned = rt && (type_yasc(rt) & YASC_OWNED);
+    c.ret_mut = rt && (rt->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && rt->ref && !(rt->ref->type.t & VT_CONSTANT);
   }
   c.ret_plain_ptr = ret_plain_ptr;
+  if (ir->lt_nb_rostores)
+  {
+    c.rok = tcc_mallocz(c.n + 1);
+    for (int k = 0; k < ir->lt_nb_rostores; k++)
+      for (int j = ir->lt_rostores[3 * k]; j < ir->lt_rostores[3 * k + 1] && j < c.n; j++)
+        if (j >= 0)
+          c.rok[j] |= ir->lt_rostores[3 * k + 2];
+  }
 
   /* vreg -> variable */
   for (int v = 0; v < nv; v++)
@@ -4965,11 +5636,17 @@ void tcc_ir_lifetime_check(TCCIRState *ir, Sym *func)
   c.palias = tcc_malloc((c.nalias + 1) * sizeof(int32_t));
   c.tnull = tcc_malloc(c.nalias + 1);
   c.tderiv = tcc_malloc((c.nalias + 1) * sizeof(int32_t));
+  c.tdeep = tcc_malloc((c.nalias + 1) * sizeof(int32_t));
+  c.tro = tcc_malloc((c.nalias + 1) * sizeof(int32_t));
+  c.nvdeep = ir->next_local_variable > 0 ? ir->next_local_variable : 0;
+  c.vdeep = tcc_malloc((c.nvdeep + 1) * sizeof(int32_t));
+  memset(c.vdeep, 0xff, (c.nvdeep + 1) * sizeof(int32_t));
   c.alias_gen = tcc_mallocz((c.nalias + 1) * sizeof(uint32_t));
   c.cur = tcc_malloc(c.nv + 1);
   c.move_line = tcc_mallocz((c.nv + 1) * sizeof(int));
   c.move_drop = tcc_mallocz(c.nv + 1);
   c.arg_bound = tcc_mallocz(c.nv + 1);
+  c.io = tcc_mallocz(c.nv + 1);
   c.borrow = tcc_malloc((c.nv + 1) * sizeof(int32_t));
   memset(c.borrow, 0xff, (c.nv + 1) * sizeof(int32_t));
   /* locals defined once (a status kept in a variable) */
@@ -5075,6 +5752,10 @@ void tcc_ir_lifetime_check(TCCIRState *ir, Sym *func)
   c.ncall_bsrc = ir->next_call_id;
   c.call_bsrc = tcc_malloc((c.ncall_bsrc + 1) * sizeof(int32_t));
   memset(c.call_bsrc, 0xff, (c.ncall_bsrc + 1) * sizeof(int32_t));
+  c.call_io = tcc_malloc((c.ncall_bsrc + 1) * sizeof(int32_t));
+  memset(c.call_io, 0xff, (c.ncall_bsrc + 1) * sizeof(int32_t));
+  c.call_ro = tcc_malloc((c.ncall_bsrc + 1) * sizeof(int32_t));
+  memset(c.call_ro, 0xff, (c.ncall_bsrc + 1) * sizeof(int32_t));
   c.call_tvar = tcc_malloc(2 * (c.ncall_bsrc + 1) * sizeof(int32_t));
   memset(c.call_tvar, 0xff, 2 * (c.ncall_bsrc + 1) * sizeof(int32_t));
   c.call_tsrc = c.call_tvar + c.ncall_bsrc + 1;
@@ -5365,6 +6046,19 @@ void tcc_ir_lifetime_check(TCCIRState *ir, Sym *func)
     lt_block(&c, b, joined, NULL);
     c.exit_mode = 0;
   }
+  /* -Wparam-access: an inout parameter wider than its body */
+  for (int v = 0; v < c.nvars; v++)
+  {
+    IRLtVar *lv = &ir->lt_vars[v];
+    const char *name = get_tok_str(lv->tok, NULL);
+    if (!lv->inout || lv->untracked || !tcc_warn_wanted(warn_param_access))
+      continue;
+    if (!(c.io[v] & LT_IO_WRITTEN))
+      lt_param_access_unwritten(ir, func, v);
+    else if (!(c.io[v] & (LT_IO_RBW | LT_IO_EXIT)) && lv->inout != 2 && !lt_param_marked_unused(func, lv->tok))
+      tcc_warning_c(warn_param_access)("%i:'%s' is inout, but '*%s' is written before it is read: say out", lv->line,
+                                       name, name);
+  }
   tcc_state->diag_noabort--;
 
   tcc_free(joined);
@@ -5384,6 +6078,7 @@ void tcc_ir_lifetime_check(TCCIRState *ir, Sym *func)
   tcc_free(c.move_line);
   tcc_free(c.move_drop);
   tcc_free(c.arg_bound);
+  tcc_free(c.io);
   tcc_free(c.borrow);
   tcc_free(c.vbset);
   tcc_free(c.vbcnt);
@@ -5410,6 +6105,10 @@ void tcc_ir_lifetime_check(TCCIRState *ir, Sym *func)
   tcc_free(c.take_call);
   tcc_free(c.taken_by);
   tcc_free(c.call_bsrc);
+  tcc_free(c.call_io);
+  tcc_free(c.call_ro);
+  tcc_free(c.tro);
+  tcc_free(c.rok);
   tcc_free(c.call_tvar);
   tcc_free(c.vcall);
   tcc_free(c.vdefs);
@@ -5437,6 +6136,8 @@ void tcc_ir_lifetime_check(TCCIRState *ir, Sym *func)
   tcc_free(c.palias);
   tcc_free(c.tnull);
   tcc_free(c.tderiv);
+  tcc_free(c.tdeep);
+  tcc_free(c.vdeep);
   tcc_free(c.alias_gen);
   tcc_free(c.tbase);
   tcc_free(c.toff);
@@ -5499,6 +6200,23 @@ void tcc_ir_un_add_var(TCCIRState *ir, int32_t vreg, Sym *sym)
   e->idx = ir->next_instruction_index;
   e->var = ir->un_nb_vars++;
   e->line = v->line;
+}
+
+/* yasc: an array, struct or union declared `= undefined` (no value): the
+   flow check follows its frame slot until something is written to it */
+void tcc_ir_un_add_agg(TCCIRState *ir, int off, int size, Sym *sym)
+{
+  IRUnAgg *a;
+  if (!ir || size <= 0)
+    return;
+  ir->un_aggs = lt_grow(ir->un_aggs, ir->un_nb_aggs, sizeof(IRUnAgg));
+  a = &ir->un_aggs[ir->un_nb_aggs++];
+  a->off = off;
+  a->size = size;
+  a->tok = sym->v;
+  a->line = file ? file->line_num : 0;
+  a->idx = ir->next_instruction_index;
+  a->silent = tcc_state->in_inline_expansion != 0;
 }
 
 typedef struct UnCtx
@@ -5596,6 +6314,38 @@ static int un_out_arg(UnCtx *c, IRQuadCompact *q)
   return call && call->noted && (k -= call->implicit) >= 0 && k < 32 && k < call->nparams && ((call->out >> k) & 1);
 }
 
+/* FUNCPARAMVAL q's parameter: 1 `out` (the callee writes it), 2 a pointer
+   declared in yasc that is not `out` (in, inout: the callee may read what it
+   points at), 0 anything else -- regular C, varargs, through an unnoted
+   call.  *callee and *argno say which, for a report. */
+static int un_param_kind(TCCIRState *ir, const LtCalls *calls, IRQuadCompact *q, int *callee, int *argno)
+{
+  int64_t enc;
+  int id, k;
+  const IRLtCall *call;
+  if (q->op != TCCIR_OP_FUNCPARAMVAL || !calls)
+    return 0;
+  enc = irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+  id = TCCIR_DECODE_CALL_ID(enc);
+  k = TCCIR_DECODE_PARAM_IDX(enc);
+  call = id >= 0 && id < calls->n ? &calls->v[id] : NULL;
+  if (!call || !call->noted || (k -= call->implicit) < 0 || k >= 32 || k >= call->nparams)
+    return 0;
+  *callee = call->callee;
+  *argno = k + 1;
+  return (call->out >> k) & 1 ? 1 : (call->yread >> k) & 1 ? 2 : 0;
+}
+
+/* NAME, declared `= undefined`, goes to a parameter that may read it while
+   it may have no value */
+static void un_report_param(const char *name, int may, int line, int callee, int argno)
+{
+  tcc_warning_c(warn_lifetime)("%i:'%s' %s no value yet where it goes to parameter %d of '%s', which may read "
+                               "it: write it first, or the parameter should say 'out'",
+                               line, name, may ? "may have" : "has", argno,
+                               callee ? get_tok_str(callee, NULL) : "the function");
+}
+
 /* ASSIGN / STORE q binds its src1 to an inlined callee's `out` parameter */
 static int un_out_bind(UnCtx *c, IRQuadCompact *q, IROperand dest)
 {
@@ -5635,7 +6385,7 @@ static uint32_t un_var_bit(UnCtx *c, int v)
    `out` parameter, which sets it.  1 when it handled the instruction. */
 static int un_addr_insn(UnCtx *c, IRQuadCompact *q, IROperand dest, IROperand src1)
 {
-  int v;
+  int v, callee = 0, argno = 0;
   uint32_t bit;
   if (!c->tvar)
     return 0;
@@ -5646,7 +6396,9 @@ static int un_addr_insn(UnCtx *c, IRQuadCompact *q, IROperand dest, IROperand sr
     int t = TCCIR_DECODE_VREG_POSITION(irop_get_vreg(dest));
     if (t >= c->ntemp || (v = c->tvar[t]) < 0 || un_addr_var(c, q, src1, q->op == TCCIR_OP_LEA) != v)
       return 0;
-    if (c->tuse[t] != 1 && (bit = un_var_bit(c, v)))
+    /* an `= undefined` one whose address only goes to parameters (or is
+       stored through) is checked where it goes */
+    if (c->tuse[t] != 1 && (bit = un_var_bit(c, v)) && !(c->ir->un_vars[v].yundef && !(c->tuse[t] & 2)))
       un_addr(c, bit, v, q->line_num);
     return 1;
   }
@@ -5661,6 +6413,24 @@ static int un_addr_insn(UnCtx *c, IRQuadCompact *q, IROperand dest, IROperand sr
     {
       c->u &= ~bit;
       c->s |= bit;
+    }
+    return 1;
+  }
+  /* &v to a parameter that may read it: an `= undefined` v needs a value by now */
+  if (un_param_kind(c->ir, c->calls, q, &callee, &argno) == 2 && (v = un_addr_var(c, q, src1, 0)) >= 0)
+  {
+    if ((bit = un_var_bit(c, v)))
+    {
+      const IRLtVar *var = &c->ir->un_vars[v];
+      if (!var->yundef)
+        un_addr(c, bit, v, q->line_num);
+      else
+      {
+        if ((c->u & bit) && c->report && !var->silent)
+          un_report_param(get_tok_str(var->tok, NULL), (c->s & bit) != 0, q->line_num, callee, argno);
+        c->u &= ~bit;
+        c->s |= bit;
+      }
     }
     return 1;
   }
@@ -5854,11 +6624,15 @@ static void un_check(TCCIRState *ir, const LtCalls *calls)
         if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP || (t = TCCIR_DECODE_VREG_POSITION(vr)) >= c.ntemp ||
             c.tvar[t] < 0)
           continue;
-        /* 1: it only goes to `out` parameters, or is stored through */
+        int callee, argno;
+        /* 1: it only goes to `out` parameters, or is stored through; 4: to a
+           parameter that may read it (checked there for an `= undefined` one) */
         c.tuse[t] |= (k == 0 && cfg->has_src1 && !ops[k].is_lval && (un_out_arg(&c, q) || un_out_bind(&c, q, d))) ||
                              (k == nops - 1 && q->op == TCCIR_OP_STORE && !irop_is_none(d) && !irop_dest_defines_vreg(d) &&
                               ops[k].is_lval)
                          ? 1
+                     : k == 0 && cfg->has_src1 && !ops[k].is_lval && un_param_kind(ir, calls, q, &callee, &argno) == 2
+                         ? 4
                          : 2;
       }
     }
@@ -5936,6 +6710,285 @@ done:
   tcc_free(c.tvar);
   tcc_free(c.tuse);
   un_free_records(ir);
+}
+
+/* ------------------------------------------------------------------------ */
+/* yasc: arrays, structs and unions declared `= undefined`.  A store into one
+ * (an element, a member, the whole of it), or its address to an `out`
+ * parameter, writes it; a load from it, or its address to a parameter that
+ * may read it (in, inout), before anything was written there is an error.
+ * Any write counts for the whole object: which bytes are set is not followed,
+ * and only a definite case is reported -- nothing written on any path there.
+ * A "may" would be every array a counted loop fills (`for (i = 0; i < N;
+ * i++) a[i] = ...`: the flow sees the path that skips the loop).
+ * Where the address goes anywhere else (a regular-C function, varargs, a
+ * variable, memory), the check stops following it, as for a scalar. */
+
+typedef struct UnAggCtx
+{
+  TCCIRState *ir;
+  const LtCalls *calls;
+  int base, n;    /* the objects of this chunk: [base, base + n) */
+  int32_t *tagg;  /* temp position -> the object whose address (+ offset) it holds, -1 */
+  int ntemp;
+  int report;
+  uint32_t u, s;  /* may have no value yet / may have one */
+} UnAggCtx;
+
+/* the object (of any chunk) whose frame slot holds frame offset fo, -1 none */
+static int ua_of_off(const TCCIRState *ir, int fo)
+{
+  for (int a = 0; a < ir->un_nb_aggs; a++)
+    if (ir->un_aggs[a].size > 0 && fo >= ir->un_aggs[a].off && fo < ir->un_aggs[a].off + ir->un_aggs[a].size)
+      return a;
+  return -1;
+}
+
+static int ua_stackoff(IROperand op)
+{
+  return !irop_is_none(op) && irop_get_tag(op) == IROP_TAG_STACKOFF && irop_is_local(op) && !irop_is_llocal(op) &&
+         !op.is_param && irop_get_vreg(op) < 0;
+}
+
+/* memory of an object named in place (StackLoc[off]), or through a temp
+   holding its address (*t); -1 none */
+static int ua_mem(UnAggCtx *c, IROperand op)
+{
+  int32_t vr;
+  int t;
+  if (irop_is_none(op) || !op.is_lval)
+    return -1;
+  if (ua_stackoff(op))
+    return ua_of_off(c->ir, irop_get_stack_offset(op));
+  vr = irop_get_vreg(op);
+  if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP && (t = TCCIR_DECODE_VREG_POSITION(vr)) < c->ntemp)
+    return c->tagg[t];
+  return -1;
+}
+
+/* an object's address: &s (+ off) in place, LEA of it, or a temp holding it; -1 none */
+static int ua_addr(UnAggCtx *c, const IRQuadCompact *q, IROperand op)
+{
+  int32_t vr;
+  int t;
+  if (irop_is_none(op))
+    return -1;
+  if (ua_stackoff(op) && (lt_is_addr(op) || (q && lt_lea_of_local(q, op))))
+    return ua_of_off(c->ir, irop_get_stack_offset(op));
+  vr = irop_get_vreg(op);
+  if (!op.is_lval && vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP &&
+      (t = TCCIR_DECODE_VREG_POSITION(vr)) < c->ntemp)
+    return c->tagg[t];
+  return -1;
+}
+
+static uint32_t ua_bit(UnAggCtx *c, int a)
+{
+  return a >= c->base && a < c->base + c->n ? 1u << (a - c->base) : 0;
+}
+
+static void ua_set(UnAggCtx *c, int a)
+{
+  uint32_t bit = ua_bit(c, a);
+  c->u &= ~bit;
+  c->s |= bit;
+}
+
+/* read where nothing was written to it on any path? reported once, then it
+   counts as set */
+static void ua_read(UnAggCtx *c, int a, int line)
+{
+  uint32_t bit = ua_bit(c, a);
+  if (!bit)
+    return;
+  if ((c->u & bit) && !(c->s & bit) && c->report && !c->ir->un_aggs[a].silent)
+    tcc_warning_c(warn_lifetime)("%i:'%s' is read before anything is written to it (it is declared '= undefined')",
+                                 line, get_tok_str(c->ir->un_aggs[a].tok, NULL));
+  ua_set(c, a);
+}
+
+/* the declarations before instruction i: those objects have no value (again) */
+static void ua_declare(UnAggCtx *c, int i, uint32_t *u, uint32_t *s)
+{
+  for (int a = c->base; a < c->base + c->n; a++)
+    if (c->ir->un_aggs[a].idx == i && c->ir->un_aggs[a].size > 0)
+    {
+      *u |= 1u << (a - c->base);
+      *s &= ~(1u << (a - c->base));
+    }
+}
+
+/* q derives temp dest from an object's address (t = &s, t = u + k): no event */
+static int ua_derives(UnAggCtx *c, const IRQuadCompact *q, IROperand dest)
+{
+  int32_t vr;
+  int t;
+  if (irop_is_none(dest) || !irop_dest_defines_vreg(dest) || (vr = irop_get_vreg(dest)) < 0 ||
+      TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP || (t = TCCIR_DECODE_VREG_POSITION(vr)) >= c->ntemp)
+    return 0;
+  return c->tagg[t] >= 0 && (q->op == TCCIR_OP_LEA || q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_ADD ||
+                             q->op == TCCIR_OP_SUB);
+}
+
+static void ua_block(UnAggCtx *c, const IRCFG *cfg, int b)
+{
+  TCCIRState *ir = c->ir;
+  const IRBasicBlock *bb = &cfg->blocks[b];
+  for (int i = bb->start_idx; i < bb->end_idx; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    const IRRegistersConfig *rc = &irop_config[q->op];
+    IROperand dest = rc->has_dest ? tcc_ir_op_get_dest(ir, q) : irop_make_none();
+    IROperand src[2];
+    int a, callee = 0, argno = 0;
+    src[0] = rc->has_src1 ? tcc_ir_op_get_src1(ir, q) : irop_make_none();
+    src[1] = rc->has_src2 ? tcc_ir_op_get_src2(ir, q) : irop_make_none();
+    if (i > bb->start_idx)
+      ua_declare(c, i, &c->u, &c->s);
+    /* its address as an argument: `out` writes it, a parameter that may read
+       it needs a value, anything else stops following it */
+    if (q->op == TCCIR_OP_FUNCPARAMVAL && (a = ua_addr(c, q, src[0])) >= 0)
+    {
+      int kind = un_param_kind(ir, c->calls, q, &callee, &argno);
+      uint32_t bit = ua_bit(c, a);
+      if (kind == 2 && bit && (c->u & bit) && !(c->s & bit) && c->report && !ir->un_aggs[a].silent)
+        un_report_param(get_tok_str(ir->un_aggs[a].tok, NULL), 0, q->line_num, callee, argno);
+      ua_set(c, a);
+      continue;
+    }
+    if (ua_derives(c, q, dest))
+      continue;
+    for (int k = 0; k < 2; k++)
+    {
+      if ((a = ua_mem(c, src[k])) >= 0)
+        ua_read(c, a, q->line_num);
+      else if ((a = ua_addr(c, q, src[k])) >= 0)
+        ua_set(c, a); /* the address goes somewhere this does not follow */
+    }
+    if (irop_is_none(dest) || irop_dest_defines_vreg(dest))
+      continue;
+    /* a store into it writes it */
+    if ((a = ua_mem(c, dest)) >= 0)
+      ua_set(c, a);
+  }
+}
+
+static void un_agg_check(TCCIRState *ir, const LtCalls *calls)
+{
+  UnAggCtx c;
+  IRCFG *cfg;
+  int n = ir->next_instruction_index, na = ir->un_nb_aggs;
+  memset(&c, 0, sizeof c);
+  c.ir = ir;
+  c.calls = calls;
+  if (!n)
+    goto done;
+  /* two objects in one slot (sibling scopes): neither is followed */
+  for (int a = 0; a < na; a++)
+    for (int b = a + 1; b < na; b++)
+      if (ir->un_aggs[a].off < ir->un_aggs[b].off + ir->un_aggs[b].size &&
+          ir->un_aggs[b].off < ir->un_aggs[a].off + ir->un_aggs[a].size)
+        ir->un_aggs[a].size = ir->un_aggs[b].size = 0;
+  for (int a = 0; a < na; a++)
+    if (ir->un_aggs[a].idx > n)
+      ir->un_aggs[a].idx = n;
+
+  /* the temps holding an object's address, plus an offset: each defined once */
+  c.ntemp = ir->next_temporary_variable;
+  c.tagg = tcc_malloc((c.ntemp + 1) * sizeof(int32_t));
+  memset(c.tagg, 0xff, (c.ntemp + 1) * sizeof(int32_t));
+  {
+    uint8_t *ndef = tcc_mallocz(c.ntemp + 1);
+    for (int pass = 0; pass < 2; pass++)
+      for (int i = 0; i < n; i++)
+      {
+        IRQuadCompact *q = &ir->compact_instructions[i];
+        const IRRegistersConfig *rc = &irop_config[q->op];
+        IROperand d = rc->has_dest ? tcc_ir_op_get_dest(ir, q) : irop_make_none();
+        int32_t dv;
+        int t, a = -1;
+        if (irop_is_none(d) || !irop_dest_defines_vreg(d) || (dv = irop_get_vreg(d)) < 0 ||
+            TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP || (t = TCCIR_DECODE_VREG_POSITION(dv)) >= c.ntemp)
+          continue;
+        if (!pass && ndef[t] < 2)
+          ndef[t]++;
+        if ((q->op == TCCIR_OP_LEA || q->op == TCCIR_OP_ASSIGN) && rc->has_src1)
+          a = ua_addr(&c, q, tcc_ir_op_get_src1(ir, q));
+        else if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) && rc->has_src1 && rc->has_src2)
+        {
+          int a1 = ua_addr(&c, NULL, tcc_ir_op_get_src1(ir, q));
+          int a2 = q->op == TCCIR_OP_ADD ? ua_addr(&c, NULL, tcc_ir_op_get_src2(ir, q)) : -1;
+          a = a1 >= 0 && a2 < 0 ? a1 : a2 >= 0 && a1 < 0 ? a2 : -1;
+        }
+        if (a >= 0 && ndef[t] == 1)
+          c.tagg[t] = a;
+      }
+    tcc_free(ndef);
+  }
+
+  cfg = tcc_ir_cfg_build(ir);
+  if (!cfg)
+    goto done;
+  tcc_ir_cfg_compute_rpo(cfg);
+  {
+    int nb = cfg->num_blocks;
+    uint32_t *in_u = tcc_malloc(nb * sizeof(uint32_t)), *in_s = tcc_malloc(nb * sizeof(uint32_t));
+    uint8_t *reached = tcc_malloc(nb);
+    tcc_state->diag_noabort++;
+    for (c.base = 0; c.base < na; c.base += 32)
+    {
+      c.n = na - c.base < 32 ? na - c.base : 32;
+      memset(in_u, 0, nb * sizeof(uint32_t));
+      memset(in_s, 0, nb * sizeof(uint32_t));
+      memset(reached, 0, nb);
+      reached[0] = 1;
+      ua_declare(&c, cfg->blocks[0].start_idx, &in_u[0], &in_s[0]);
+      c.report = 0;
+      for (int changed = 1; changed;)
+      {
+        changed = 0;
+        for (int r = 0; r < cfg->rpo_count; r++)
+        {
+          int b = cfg->rpo_order[r];
+          const IRBasicBlock *bb = &cfg->blocks[b];
+          if (!reached[b])
+            continue;
+          c.u = in_u[b];
+          c.s = in_s[b];
+          ua_block(&c, cfg, b);
+          for (int k = 0; k < bb->num_succs; k++)
+          {
+            int t = bb->succs[k];
+            uint32_t eu = c.u, es = c.s;
+            /* a forward edge passes the declarations at the target's start */
+            if (cfg->blocks[t].start_idx > bb->start_idx)
+              ua_declare(&c, cfg->blocks[t].start_idx, &eu, &es);
+            uint32_t nu = in_u[t] | eu, ns = in_s[t] | es;
+            if (nu != in_u[t] || ns != in_s[t] || !reached[t])
+              in_u[t] = nu, in_s[t] = ns, reached[t] = 1, changed = 1;
+          }
+        }
+      }
+      c.report = 1;
+      for (int b = 0; b < nb; b++)
+        if (reached[b])
+        {
+          c.u = in_u[b];
+          c.s = in_s[b];
+          ua_block(&c, cfg, b);
+        }
+    }
+    tcc_state->diag_noabort--;
+    tcc_free(in_u);
+    tcc_free(in_s);
+    tcc_free(reached);
+  }
+  tcc_ir_cfg_free(cfg);
+done:
+  tcc_free(c.tagg);
+  tcc_free(ir->un_aggs);
+  ir->un_aggs = NULL;
+  ir->un_nb_aggs = 0;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -6494,6 +7547,7 @@ done:
 #define VE_OWNED (((1ull << VE_MAX_OWNED) - 1) << VE_OWNED_SHIFT)
 #define VE_SRC (VE_ARGS | VE_OWNED) /* points into what some parameter points at: a lasting destination */
 
+#define VE_NPATH 64
 typedef struct VeCtx
 {
   TCCIRState *ir;
@@ -6526,7 +7580,16 @@ typedef struct VeCtx
   int ret_owned;   /* the function's result is owned */
   /* borrows(member) members: per temp, block-local, the address it holds
      (base vreg + offset) and, for a pointer loaded from memory, where from */
-  int32_t *tab, *tao, *tlb, *tlo;
+  int32_t *tab, *tao, *tlb, *tlo, *tla; /* tla: the address a loaded pointer came from */
+  /* an address at a variable index (tao VE_OFF_ANY): base + tco + var * tis,
+     tix the variable (-1 none, -2 not one variable); an index value:
+     (txv + txa) * txs */
+  int32_t *tix, *tco, *tis, *txv, *txa, *txs;
+  /* a pointer loaded with arithmetic folded in (`T <- p***DEREF*** ADD x`):
+     the added part, tfo a constant, or tfx an index variable (-1 none, -2
+     not one variable) plus tfc */
+  int32_t *tfo, *tfx, *tfc;
+  uint8_t *ltframe; /* per lt_vars entry: a pointer local that only ever holds addresses in this frame */
   /* the state past the followed variables (nw slots in all): for each local
      variable a borrows(member) store reads, where its value came from (two
      slots: a loaded pointer's origin, an address's) */
@@ -6537,19 +7600,57 @@ typedef struct VeCtx
      bit per (base, the object's start from it, entry), in the slot past the
      origins (nv + 2 * nov) */
   int32_t ibase[64], istart[64], ient[64];
+  int32_t iidx[64]; /* the element's index variable: -1 none (a constant offset), -2 not known */
+  int32_t icause[64]; /* killed only as what another item may be: that item (VE_ALIAS) */
+  int ikline[64]; /* where each first went dead */
   int nitems;
   int fent[16], nfent; /* the entries this function stores or reads */
+  /* a source member handed to a drop parameter dies after the call: per
+     pending call (block-local), its object's base and offset */
+  int32_t pk_call[16], pk_base[16], pk_off[16], pk_addr[16], pk_ix[16], pk_ic[16];
+  /* the objects a pending call gets (block-local): call, base */
+  int32_t pa_call[32], pa_base[32];
+  int npa;
+  /* a pointer loaded from (pb, po) -- `z->in` -- is a base of its own: id
+     VE_PATH0 - k; ptk its member's name */
+  int32_t pb[VE_NPATH], po[VE_NPATH], pix[VE_NPATH]; /* pix: an index variable, -1 none, -2 one of its own */
+  int ptk[VE_NPATH], np;
+  int overflow; /* more items or paths than the tables hold: said once */
+  int npk;
+  uint64_t *callall; /* call_id -> the view parameters its arguments point into */
+  const char *fname;
+  int32_t *idone; /* member reports at a call / a way out: (line * 64 + item) * 2 + kind */
+  int nidone;
 } VeCtx;
 
-static int ve_item(VeCtx *c, int32_t base, int32_t start, int e)
+static int ve_item(VeCtx *c, int32_t base, int32_t start, int e, int32_t idx)
 {
   for (int i = 0; i < c->nitems; i++)
-    if (c->ibase[i] == base && c->istart[i] == start && c->ient[i] == e)
+    if (c->ibase[i] == base && c->istart[i] == start && c->ient[i] == e && c->iidx[i] == idx)
       return i;
   if (c->nitems == 64)
+  {
+    c->overflow = 1;
     return -1;
-  c->ibase[c->nitems] = base, c->istart[c->nitems] = start, c->ient[c->nitems] = e;
+  }
+  c->ibase[c->nitems] = base, c->istart[c->nitems] = start, c->ient[c->nitems] = e, c->iidx[c->nitems] = idx;
   return c->nitems++;
+}
+
+static int ve_base_alias(VeCtx *c, int32_t a, int32_t b, int depth);
+static int ve_path_uses(VeCtx *c, int32_t base, int32_t v);
+
+/* items I and J may be the same member of the same element: one of them is
+   at a variable index (or one not known), or their objects are reached
+   through pointers at indexes that may be equal (`o->in[i]`, `o->in[j]`) */
+static int ve_item_alias(VeCtx *c, int i, int j)
+{
+  if (i == j || c->ient[i] != c->ient[j])
+    return 0;
+  if (c->ibase[i] != c->ibase[j])
+    return c->istart[i] == c->istart[j] && c->iidx[i] == c->iidx[j] && ve_base_alias(c, c->ibase[i], c->ibase[j], 0);
+  return (c->iidx[i] != -1 || c->iidx[j] != -1) &&
+         !(c->iidx[i] == c->iidx[j] && c->istart[i] != c->istart[j] && c->iidx[i] >= 0);
 }
 
 /* the temp VREG holds a borrows(member) member's address: its entry */
@@ -6561,23 +7662,252 @@ static int ve_fload(TCCIRState *ir, int32_t vreg)
   return -1;
 }
 
-/* the source member at (base, off) is freed or changed: the members that
-   borrow from it are dead */
-static void ve_kill_sources(VeCtx *c, int32_t base, int32_t off)
+/* the source member at (base, off) is freed or changed (at LINE): the
+   members that borrow from it are dead */
+#define VE_DEAD(c) ((c)->cur[(c)->nv + 2 * (c)->nov])
+/* of them, those killed through a member's address the frontend named as a
+   source (not just any store at that offset): the way-out and call rules */
+#define VE_SURE(c) ((c)->cur[(c)->nv + 2 * (c)->nov + 1])
+/* set to null or static storage: a change of its source leaves it alone */
+#define VE_DET(c) ((c)->cur[(c)->nv + 2 * (c)->nov + 2])
+/* dead, and its base pointer or index variable changed since: no store
+   names it again */
+#define VE_LOST(c) ((c)->cur[(c)->nv + 2 * (c)->nov + 3])
+/* dead only because an item it may be was killed (icause): back with it */
+#define VE_ALIAS(c) ((c)->cur[(c)->nv + 2 * (c)->nov + 4])
+
+/* CAUSE: the item whose kill this is an alias of (-1: killed itself) */
+static void ve_kill_item(VeCtx *c, int it, int line, int sure, int cause)
 {
-  if (base == -1 || base == VE_BASE_LENIENT || off == VE_OFF_ANY)
+  if (it < 0 || ((VE_DET(c) >> it) & 1))
+    return;
+  if (!c->ikline[it])
+    c->ikline[it] = line;
+  if (cause < 0)
+    VE_ALIAS(c) &= ~(1ull << it);
+  else if (!((VE_DEAD(c) >> it) & 1))
+    VE_ALIAS(c) |= 1ull << it, c->icause[it] = cause;
+  VE_DEAD(c) |= 1ull << it;
+  if (sure)
+    VE_SURE(c) |= 1ull << it;
+}
+
+/* the source member at (base, off) -- off VE_OFF_ANY: at base + ic + ix *
+   scale -- is freed or changed (at LINE, through the address in AV): the
+   members that borrow from it are dead, and what an index may make the same */
+static void ve_kill_sources(VeCtx *c, int32_t base, int32_t off, int line, int32_t av, int32_t ix, int32_t ic)
+{
+  if (base == -1 || base == VE_BASE_LENIENT)
     return;
   for (int f = 0; f < c->nfent; f++)
   {
     YascFieldBorrows *e = yasc_field_borrows(c->fent[f]);
+    int sure = ve_fsrc(c->ir, av, c->fent[f]);
     for (int k = 0; e && k < e->nsrc; k++)
       if (e->src_off[k] >= 0)
       {
-        int it = ve_item(c, base, off - e->src_off[k], c->fent[f]);
-        if (it >= 0)
-          c->cur[c->nv + 2 * c->nov] |= 1ull << it;
+        int it;
+        if (off != VE_OFF_ANY)
+          it = ve_item(c, base, off - e->src_off[k], c->fent[f], -1);
+        else if (ix >= 0)
+          it = ve_item(c, base, ic - e->src_off[k], c->fent[f], ix);
+        else if (sure)
+          it = ve_item(c, base, VE_OFF_ANY, c->fent[f], -2); /* some element */
+        else
+          continue;
+        ve_kill_item(c, it, line, sure, -1);
+        if (it >= 0 && (c->iidx[it] == -2 || ve_path_uses(c, c->ibase[it], -2)))
+          VE_LOST(c) |= 1ull << it;
+        for (int j = 0; it >= 0 && j < c->nitems; j++)
+          if (ve_item_alias(c, it, j))
+            ve_kill_item(c, j, line, sure, it);
       }
   }
+}
+
+/* the index part of the address temp VR holds (none: *IX -1) */
+static void ve_addr_ix(VeCtx *c, int32_t vr, int32_t *ix, int32_t *ic)
+{
+  int pos = vr >= 0 ? TCCIR_DECODE_VREG_POSITION(vr) : 0;
+  *ix = -1, *ic = 0;
+  if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP && pos < c->ntemps && c->tgen[pos] == c->gen)
+    *ix = c->tix[pos], *ic = c->tco[pos];
+}
+
+#define VE_PATH0 (-0x40000000)
+#define VE_IS_PATH(b) ((b) <= VE_PATH0 && (b) > VE_PATH0 - VE_NPATH)
+
+/* the pointer loaded from BASE + OFF (+ IDX * scale): its path */
+static int ve_path(VeCtx *c, int32_t base, int32_t off, int32_t idx, int tok)
+{
+  for (int k = 0; k < c->np; k++)
+    if (c->pb[k] == base && c->po[k] == off && c->pix[k] == idx)
+      return VE_PATH0 - k;
+  if (c->np == VE_NPATH)
+  {
+    c->overflow = 1;
+    return -1;
+  }
+  c->pb[c->np] = base, c->po[c->np] = off, c->pix[c->np] = idx, c->ptk[c->np] = tok;
+  return VE_PATH0 - c->np++;
+}
+
+/* bases A and B: 2 the same object, 1 maybe (paths through indexes that
+   may be equal), 0 not as far as the check knows */
+static int ve_base_alias(VeCtx *c, int32_t a, int32_t b, int depth)
+{
+  if (a == b)
+    return 2;
+  if (!VE_IS_PATH(a) || !VE_IS_PATH(b) || depth > 32)
+    return 0;
+  int ka = VE_PATH0 - a, kb = VE_PATH0 - b;
+  if (!ve_base_alias(c, c->pb[ka], c->pb[kb], depth + 1))
+    return 0;
+  if (c->pix[ka] == c->pix[kb] && c->pix[ka] != -2)
+    return c->po[ka] == c->po[kb] ? 1 : 0; /* the same index, another offset: another element */
+  return 1;
+}
+
+/* path P (or one it is reached through) is at index variable V */
+static int ve_path_uses(VeCtx *c, int32_t base, int32_t v)
+{
+  for (int d = 0; VE_IS_PATH(base) && d < VE_NPATH; d++)
+  {
+    if (c->pix[VE_PATH0 - base] == v)
+      return 1;
+    base = c->pb[VE_PATH0 - base];
+  }
+  return 0;
+}
+
+/* the member noted at the address in temp VR: its name */
+static int ve_member_tok(TCCIRState *ir, int32_t vr)
+{
+  for (int k = 0; vr >= 0 && k < ir->lt_nb_members; k++)
+    if (ir->lt_members[k].vreg == vr)
+      return ir->lt_members[k].tok;
+  return 0;
+}
+
+static void ve_resolve_addr(VeCtx *c, int32_t vr, int32_t *base, int32_t *off, int32_t *ix, int32_t *ic, int depth);
+
+/* temp T (this block's) holds a loaded pointer */
+static int ve_loaded(VeCtx *c, int32_t t)
+{
+  int pos = t >= 0 ? TCCIR_DECODE_VREG_POSITION(t) : 0;
+  return t >= 0 && TCCIR_DECODE_VREG_TYPE(t) == TCCIR_VREG_TYPE_TEMP && pos < c->ntemps && c->tgen[pos] == c->gen &&
+         c->tab[pos] == -1 && c->tla[pos] >= 0;
+}
+
+/* the pointer temp T loaded (before any arithmetic folded into the load):
+   the path of the place it came from (`z->in`, `o->in[i]`) -- the same at
+   every load; a place at an index that is not one variable is a path of
+   its own, the same only at that load */
+static int32_t ve_loaded_path(VeCtx *c, int32_t t, int depth)
+{
+  int pos = TCCIR_DECODE_VREG_POSITION(t);
+  int32_t la = c->tla[pos], b, off, ix, ic, idx = -1;
+  ve_resolve_addr(c, la, &b, &off, &ix, &ic, depth + 1);
+  if (b == -1 || b == VE_BASE_LENIENT)
+    return t;
+  if (off == VE_OFF_ANY)
+  {
+    if (ix >= 0)
+      idx = ix, off = ic;
+    else
+      idx = -2, off = la;
+  }
+  int32_t id = ve_path(c, b, off, idx, ve_member_tok(c->ir, la));
+  return id == -1 ? t : id;
+}
+
+/* the address in vreg VR as an object's base and an offset (VE_OFF_ANY:
+   *IX an index variable plus *IC, or -2): a pointer loaded from a known
+   place is that place's path */
+static void ve_resolve_addr(VeCtx *c, int32_t vr, int32_t *base, int32_t *off, int32_t *ix, int32_t *ic, int depth)
+{
+  int pos = vr >= 0 ? TCCIR_DECODE_VREG_POSITION(vr) : 0;
+  *base = vr, *off = 0, *ix = -1, *ic = 0;
+  if (vr < 0 || depth > 8 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP || pos >= c->ntemps ||
+      c->tgen[pos] != c->gen)
+    return;
+  if (c->tab[pos] != -1)
+  {
+    /* an address computed from a base: the base may itself be a loaded pointer */
+    int32_t b = c->tab[pos];
+    if (ve_loaded(c, b))
+    {
+      int32_t lp = ve_loaded_path(c, b, depth + 1), bp = TCCIR_DECODE_VREG_POSITION(b);
+      /* arithmetic folded into that load comes first */
+      if (c->tfx[bp] != -1 || c->tao[pos] == VE_OFF_ANY)
+      {
+        *base = lp, *off = VE_OFF_ANY;
+        if (c->tfx[bp] >= 0 && c->tix[pos] < 0 && c->tao[pos] != VE_OFF_ANY)
+          *ix = c->tfx[bp], *ic = c->tfc[bp] + c->tao[pos];
+        else if (c->tfx[bp] == -1 && c->tix[pos] >= 0)
+          *ix = c->tix[pos], *ic = c->tco[pos] + c->tfo[bp];
+        else
+          *ix = -2;
+        return;
+      }
+      *base = lp, *off = c->tao[pos] + c->tfo[bp];
+      return;
+    }
+    *base = b, *off = c->tao[pos], *ix = c->tix[pos], *ic = c->tco[pos];
+    return;
+  }
+  if (c->tla[pos] >= 0)
+  {
+    /* a loaded pointer, maybe with arithmetic folded in */
+    *base = ve_loaded_path(c, vr, depth + 1);
+    if (c->tfx[pos] == -1)
+      *off = c->tfo[pos];
+    else
+      *off = VE_OFF_ANY, *ix = c->tfx[pos], *ic = c->tfc[pos];
+  }
+}
+
+
+/* the variable or parameter a base (a path's too) starts from */
+static int32_t ve_root(VeCtx *c, int32_t base)
+{
+  for (int d = 0; VE_IS_PATH(base) && d < VE_NPATH; d++)
+    base = c->pb[VE_PATH0 - base];
+  return base;
+}
+
+/* BASE is path P, or reached through it */
+static int ve_under(VeCtx *c, int32_t base, int32_t p)
+{
+  for (int d = 0; VE_IS_PATH(base) && d < VE_NPATH; d++)
+  {
+    if (base == p)
+      return 1;
+    base = c->pb[VE_PATH0 - base];
+  }
+  return 0;
+}
+
+/* an index value: a variable or parameter, or a temp holding (var + a) * s */
+static int ve_index(VeCtx *c, IROperand op, int32_t *v, int32_t *a, int32_t *sc)
+{
+  int32_t r = irop_is_none(op) || !irop_is_vreg_value(op) ? -1 : irop_get_vreg(op);
+  int pos;
+  if (r < 0)
+    return 0;
+  if (TCCIR_DECODE_VREG_TYPE(r) == TCCIR_VREG_TYPE_VAR || TCCIR_DECODE_VREG_TYPE(r) == TCCIR_VREG_TYPE_PARAM)
+  {
+    *v = r, *a = 0, *sc = 1;
+    return 1;
+  }
+  pos = TCCIR_DECODE_VREG_POSITION(r);
+  if (TCCIR_DECODE_VREG_TYPE(r) == TCCIR_VREG_TYPE_TEMP && pos < c->ntemps && c->tgen[pos] == c->gen &&
+      c->txv[pos] >= 0)
+  {
+    *v = c->txv[pos], *a = c->txa[pos], *sc = c->txs[pos];
+    return 1;
+  }
+  return 0;
 }
 
 #define VE_ORIGIN_NONE 0ull     /* nothing reached this point yet */
@@ -6756,7 +8086,8 @@ static uint64_t ve_value(VeCtx *c, IROperand op)
   return ve_vreg(c, vreg);
 }
 
-static void ve_report(VeCtx *c, int line, uint64_t m, const char *how, const char *where)
+/* NOTE: WHERE is a parameter whose target borrows from nothing: suggest borrows */
+static void ve_report(VeCtx *c, int line, uint64_t m, const char *how, const char *where, int note)
 {
   for (int k = 0; k < YASC_BORROWS_MAX_PARAMS; k++)
   {
@@ -6771,7 +8102,188 @@ static void ve_report(VeCtx *c, int line, uint64_t m, const char *how, const cha
     c->done[c->ndone++] = key;
     tcc_warning_c(warn_lifetime)("%i:'%s' is a view: it cannot leave the function (%s%s%s)", line,
                                  get_tok_str(c->ptok[k], NULL), how, where ? where : "", where ? "'" : "");
+    /* through a parameter: what it points at (a view by default) may
+       borrow from this one instead */
+    if (note)
+    {
+      const char *src = get_tok_str(c->ptok[k], NULL);
+      tcc_note("%i:when what '%s' points at comes from '%s', say so: '*borrows(%s) *%s'", line, where, src, src,
+               where);
+    }
   }
+}
+
+/* item IT's object, by its base pointer (its name, a token, in *TOK):
+   0 dies with the function or is not followed; 1 outlives it (a view
+   parameter, a pointer local that may point past this frame): a dead member
+   is said at a way out and at a call; 2 is owned here (an owned parameter
+   or local): said where the object leaves, handed to a call, stored or
+   returned */
+static int ve_item_outlives(VeCtx *c, int it, int *tok)
+{
+  int32_t base = ve_root(c, c->ibase[it]);
+  if (base < 0 || (TCCIR_DECODE_VREG_TYPE(base) != TCCIR_VREG_TYPE_PARAM &&
+                   TCCIR_DECODE_VREG_TYPE(base) != TCCIR_VREG_TYPE_VAR))
+    return 0;
+  for (int i = 0; i < c->ir->lt_nb_vars; i++)
+  {
+    IRLtVar *lv = &c->ir->lt_vars[i];
+    if (lv->vreg == base)
+    {
+      *tok = lv->tok;
+      if (lv->silent || lv->untracked)
+        return 0;
+      if (lv->kind & LTV_OWNED)
+        return 2;
+      return c->ltframe && c->ltframe[i] ? 0 : 1;
+    }
+  }
+  return 0;
+}
+
+static const char *ve_int_name(TCCIRState *ir, int32_t vreg)
+{
+  for (int k = 0; k < ir->lt_nb_inames; k++)
+    if (ir->lt_inames[2 * k] == vreg)
+      return get_tok_str(ir->lt_inames[2 * k + 1], NULL);
+  return "?";
+}
+
+/* argument K (past the hidden ones) of CALL goes to a deallocator's
+   `drop void *` parameter: the block is freed, what is in it never read */
+static int ve_dealloc_arg(IRLtCall *call, int k)
+{
+  Sym *f, *pa;
+  if (!call || !call->known || k < 0 || k >= 32 || !((call->drop >> k) & 1) || !call->callee ||
+      !(f = sym_find(call->callee)) || (f->type.t & VT_BTYPE) != VT_FUNC || !f->type.ref)
+    return 0;
+  pa = sym_first(f->type.ref);
+  for (int i = 0; pa && i < k; i++)
+    pa = pa->next;
+  return pa && (pa->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && pa->type.ref &&
+         (pa->type.ref->type.t & VT_BTYPE) == VT_VOID;
+}
+
+/* per lt_vars entry: a pointer local whose every value is an address in
+   this frame (`struct s *p = &local;`): its object dies with the function */
+static uint8_t *ve_frame_locals(TCCIRState *ir)
+{
+  const int n = ir->next_instruction_index, nl = ir->lt_nb_vars;
+  uint8_t *fr = tcc_mallocz(nl + 1), *other = tcc_mallocz(nl + 1);
+  for (int round = 0; round < 3; round++)
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      const IRRegistersConfig *cfg = &irop_config[q->op];
+      IROperand d = cfg->has_dest ? tcc_ir_op_get_dest(ir, q) : irop_make_none();
+      IROperand s1 = cfg->has_src1 ? tcc_ir_op_get_src1(ir, q) : irop_make_none();
+      int32_t dv, sv;
+      int li = -1, si = -1;
+      if (irop_is_none(d) || !irop_dest_defines_vreg(d) || (dv = irop_get_vreg(d)) < 0 ||
+          TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_VAR)
+        continue;
+      for (int k = 0; k < nl && li < 0; k++)
+        if (ir->lt_vars[k].vreg == dv)
+          li = k;
+      if (li < 0)
+        continue;
+      /* an address in this frame (`p = &local`, whatever op takes it) */
+      if (!irop_is_none(s1) && irop_get_tag(s1) == IROP_TAG_STACKOFF && !s1.is_lval)
+        fr[li] |= 1;
+      else if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD) && irop_is_vreg_value(s1) &&
+               (sv = irop_get_vreg(s1)) >= 0)
+      {
+        for (int k = 0; k < nl && si < 0; k++)
+          if (ir->lt_vars[k].vreg == sv)
+            si = k;
+        if (si >= 0 && fr[si] && !other[si])
+          fr[li] |= 1;
+        else
+          other[li] = 1;
+      }
+      else
+        other[li] = 1;
+    }
+  for (int k = 0; k < nl; k++)
+    fr[k] = fr[k] && !other[k];
+  tcc_free(other);
+  return fr;
+}
+
+static int ve_iseen(VeCtx *c, int key)
+{
+  for (int i = 0; i < c->nidone; i++)
+    if (c->idone[i] == key)
+      return 1;
+  c->idone = lt_grow(c->idone, c->nidone, sizeof(int32_t));
+  c->idone[c->nidone++] = key;
+  return 0;
+}
+
+/* a dead member reached through a view parameter, at a call that may read
+   it (CALLEE: the call's name, NULL at a way out of the function) */
+static void ve_item_report(VeCtx *c, int it, int line, const char *callee)
+{
+  int ptok = 0, kind;
+  YascFieldBorrows *e = yasc_field_borrows(c->ient[it]);
+  /* a way out: an object owned here is freed or leaves (said there) */
+  if (!e || !(kind = ve_item_outlives(c, it, &ptok)) || (!callee && kind != 1) ||
+      ve_iseen(c, (line * 64 + it) * 2 + (callee != NULL)))
+    return;
+  int k = 0;
+  while (k < e->nsrc && e->src_off[k] < 0)
+    k++;
+  char pn[64], base[96], bn[128], on[128];
+  /* the root's name, then each loaded member: `z->in` */
+  {
+    int32_t chain[VE_NPATH];
+    int nc = 0;
+    for (int32_t b = c->ibase[it]; VE_IS_PATH(b) && nc < VE_NPATH; b = c->pb[VE_PATH0 - b])
+      chain[nc++] = VE_PATH0 - b;
+    pstrcpy(pn, sizeof pn, get_tok_str(ptok, NULL));
+    while (nc--)
+    {
+      int k = chain[nc];
+      /* a member (`->in`), or an element of what the path so far points at (`[i]`) */
+      if (c->ptk[k])
+      {
+        pstrcat(pn, sizeof pn, "->");
+        pstrcat(pn, sizeof pn, get_tok_str(c->ptk[k], NULL));
+      }
+      else if (c->pix[k] == -1)
+        pstrcat(pn, sizeof pn, c->po[k] ? "->?" : "[0]");
+      if (c->pix[k] >= 0)
+      {
+        pstrcat(pn, sizeof pn, "[");
+        pstrcat(pn, sizeof pn, ve_int_name(c->ir, c->pix[k]));
+        pstrcat(pn, sizeof pn, "]");
+      }
+      else if (c->pix[k] == -2)
+        pstrcat(pn, sizeof pn, "[?]");
+    }
+  }
+  if (c->iidx[it] == -1)
+    snprintf(base, sizeof base, "%s->", pn);
+  else if (c->iidx[it] == -2)
+    snprintf(base, sizeof base, "%s[?].", pn);
+  else
+    snprintf(base, sizeof base, "%s[%s].", pn, ve_int_name(c->ir, c->iidx[it]));
+  pstrcpy(bn, sizeof bn, base);
+  pstrcat(bn, sizeof bn, get_tok_str(e->self_tok, NULL));
+  pstrcpy(on, sizeof on, base);
+  pstrcat(on, sizeof on, k < e->nsrc ? get_tok_str(e->src_tok[k], NULL) : "?");
+  if (callee)
+    tcc_warning_c(warn_lifetime)("%i:'%s' borrows from '%s', which was freed or changed at line %d: set '%s' "
+                                 "again (or to nullptr) before %s",
+                                 line, bn, on, c->ikline[it], bn, callee);
+  else
+    tcc_warning_c(warn_lifetime)("%i:'%s' borrows from '%s', which is freed or changed here: set '%s' again "
+                                 "(or to nullptr) before '%s' returns",
+                                 line, bn, on, bn, c->fname);
+  if (c->iidx[it] == -2 || ve_path_uses(c, c->ibase[it], -2))
+    tcc_note("%i:an element at an index that is not one variable is never the same twice: put the index in a "
+             "variable",
+             line);
 }
 
 static void ve_block(VeCtx *c, int b)
@@ -6779,6 +8291,8 @@ static void ve_block(VeCtx *c, int b)
   TCCIRState *ir = c->ir;
   IRBasicBlock *bb = &c->cfg->blocks[b];
   c->gen++;
+  c->npk = 0;
+  c->npa = 0;
   for (int i = bb->start_idx; i < bb->end_idx; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -6789,6 +8303,82 @@ static void ve_block(VeCtx *c, int b)
     uint64_t v1 = ve_value(c, src1), v2 = ve_value(c, src2);
     int call_id, k;
     IRLtCall *call;
+
+    /* the view parameters a call's arguments point into, and the owned
+       variables it gets (not a deallocator's `drop void *`: it frees the
+       block without reading what is in it) */
+    if (q->op == TCCIR_OP_FUNCPARAMVAL && c->nfent && (call = ve_call(c, src2, &call_id, &k)))
+    {
+      int dealloc = ve_dealloc_arg(call, k - call->implicit);
+      int32_t av = irop_is_none(src1) || !irop_is_vreg_value(src1) ? -1 : irop_get_vreg(src1), ab2, ao2;
+      c->callall[call_id] |= v1 & (VE_ARGS | (dealloc ? 0 : VE_OWNED));
+      /* the object the argument points at, by its base (`z`, `z->in`) */
+      if (av >= 0 && !dealloc && c->npa < 32)
+      {
+        int32_t ax2, ac2;
+        ve_resolve_addr(c, av, &ab2, &ao2, &ax2, &ac2, 0);
+        c->pa_call[c->npa] = call_id, c->pa_base[c->npa++] = ab2;
+      }
+    }
+    /* a call: a dead member of a caller's object it may read (it gets the
+       object, or is not a system header's -- the object may be reachable
+       from elsewhere); then what its drop arguments freed */
+    if ((q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID) && cfg->has_src2 && c->nfent)
+    {
+      call_id = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, src2));
+      call = call_id >= 0 && call_id < ir->lt_nb_calls ? &ir->lt_calls[call_id] : NULL;
+      uint64_t dead = VE_SURE(c), args = call_id >= 0 && call_id < c->ncalls ? c->callall[call_id] : 0;
+      for (int it = 0; c->report && dead && it < c->nitems; it++)
+      {
+        int v, ptok, kind;
+        if (!((dead >> it) & 1) || !(kind = ve_item_outlives(c, it, &ptok)))
+          continue;
+        int32_t root = ve_root(c, c->ibase[it]);
+        uint64_t mine = kind == 2 ? ((v = ve_owned(c, root)) >= 0 ? 1ull << (VE_OWNED_SHIFT + v) : 0)
+                        : (v = ve_var(c, root)) >= 0 ? c->cur[v] & VE_ARGS
+                                                      : 0;
+        /* the call gets the object: a pointer into it, from its base or
+           from one it is reached through */
+        int gets = (args & mine) != 0;
+        for (int p = 0; !gets && p < c->npa; p++)
+          gets = c->pa_call[p] == call_id &&
+                 (c->pa_base[p] == c->ibase[it] || c->pa_base[p] == root || ve_under(c, c->ibase[it], c->pa_base[p]));
+        if (gets || (kind == 1 && lt_call_gkeep(call) != LT_GKEEP_SYS))
+        {
+          char callee[64];
+          if (call && call->callee)
+            snprintf(callee, sizeof callee, "calling '%s'", get_tok_str(call->callee, NULL));
+          else
+            snprintf(callee, sizeof callee, "this call");
+          ve_item_report(c, it, q->line_num, callee);
+        }
+      }
+      for (int p = 0; p < c->npk; p++)
+        if (c->pk_call[p] == call_id)
+        {
+          ve_kill_sources(c, c->pk_base[p], c->pk_off[p], q->line_num, c->pk_addr[p], c->pk_ix[p], c->pk_ic[p]);
+          c->pk_call[p] = -1;
+        }
+      if (call_id >= 0 && call_id < c->ncalls)
+        c->callall[call_id] = 0;
+    }
+
+    /* an owned object leaves with a dead member: returned, or stored */
+    if (c->report && c->nfent && VE_SURE(c) && (v1 & VE_OWNED) &&
+        (q->op == TCCIR_OP_RETURNVALUE ||
+         (q->op == TCCIR_OP_STORE && !irop_is_none(dest) && dest.is_lval && !irop_dest_defines_vreg(dest))))
+      for (int it = 0; it < c->nitems; it++)
+      {
+        int v, ptok;
+        if (((VE_SURE(c) >> it) & 1) && ve_item_outlives(c, it, &ptok) == 2 &&
+            (v = ve_owned(c, ve_root(c, c->ibase[it]))) >= 0 && (v1 & (1ull << (VE_OWNED_SHIFT + v))))
+        {
+          char how[64];
+          snprintf(how, sizeof how, "%s '%s'", q->op == TCCIR_OP_RETURNVALUE ? "returning" : "storing",
+                   get_tok_str(ptok, NULL));
+          ve_item_report(c, it, q->line_num, how);
+        }
+      }
 
     /* borrows(member) members going dead and read while dead */
     for (int so = 0; so < 2 && c->nfent; so++)
@@ -6801,9 +8391,15 @@ static void ve_block(VeCtx *c, int b)
       if (irop_is_none(mo) || !mo.is_lval || irop_get_tag(mo) != IROP_TAG_VREG || (mv = irop_get_vreg(mo)) < 0 ||
           (fe = ve_fload(ir, mv)) < 0 || !(e = yasc_field_borrows(fe)))
         continue;
-      ve_addr(c, mv, &mb, &moff);
-      int it = moff != VE_OFF_ANY ? ve_item(c, mb, moff - e->self_off, fe) : -1;
-      if (c->report && it >= 0 && (c->cur[c->nv + 2 * c->nov] >> it) & 1)
+      int32_t rix, ric;
+      ve_resolve_addr(c, mv, &mb, &moff, &rix, &ric, 0);
+      int it = moff != VE_OFF_ANY ? ve_item(c, mb, moff - e->self_off, fe, -1)
+               : rix >= 0         ? ve_item(c, mb, ric - e->self_off, fe, rix)
+                                  : -1;
+      int dead = it >= 0 && ((VE_DEAD(c) >> it) & 1);
+      for (int j = 0; it >= 0 && !dead && j < c->nitems; j++)
+        dead = ((VE_DEAD(c) >> j) & 1) && ve_item_alias(c, it, j);
+      if (c->report && dead)
         tcc_warning_c(warn_lifetime)("%i:'%s' may be used after '%s', which it borrows from, was freed or changed",
                                      q->line_num, get_tok_str(e->self_tok, NULL), get_tok_str(e->src_tok[0], NULL));
     }
@@ -6814,28 +8410,67 @@ static void ve_block(VeCtx *c, int b)
         int32_t db, doff;
         int se = ve_fstore(ir, i);
         YascFieldBorrows *se_e = se >= 0 ? yasc_field_borrows(se) : NULL;
-        ve_addr(c, irop_get_vreg(dest), &db, &doff);
+        int32_t dix, dic;
+        ve_resolve_addr(c, irop_get_vreg(dest), &db, &doff, &dix, &dic, 0);
+        /* into a pointer an object is reached through (`z->in = w`): its
+           dead members stay dead, detached ones may be another's now */
+        for (int pk = 0; pk < c->np && doff != VE_OFF_ANY; pk++)
+          if (c->pb[pk] == db && c->po[pk] == doff)
+            for (int it2 = 0; it2 < c->nitems; it2++)
+              if (ve_under(c, c->ibase[it2], VE_PATH0 - pk))
+              {
+                if ((VE_DEAD(c) >> it2) & 1)
+                  VE_LOST(c) |= 1ull << it2;
+                VE_DET(c) &= ~(1ull << it2);
+              }
         /* into a source member: what borrows from it is dead */
-        ve_kill_sources(c, db, doff);
-        /* into the member itself: alive again */
-        if (se_e && doff != VE_OFF_ANY)
+        ve_kill_sources(c, db, doff, q->line_num, irop_get_vreg(dest), dix, dic);
+        /* into the member itself: alive again through the same address, and
+           detached when what it holds is null or static storage */
+        int it = !se_e                ? -1
+                 : doff != VE_OFF_ANY ? ve_item(c, db, doff - se_e->self_off, se, -1)
+                 : dix >= 0           ? ve_item(c, db, dic - se_e->self_off, se, dix)
+                                      : -1;
+        if (it >= 0)
         {
-          int it = ve_item(c, db, doff - se_e->self_off, se);
-          if (it >= 0)
-            c->cur[c->nv + 2 * c->nov] &= ~(1ull << it);
+          if (!((VE_LOST(c) >> it) & 1))
+          {
+            VE_DEAD(c) &= ~(1ull << it), VE_SURE(c) &= ~(1ull << it), VE_ALIAS(c) &= ~(1ull << it);
+            /* what died only as what this may be: either it is this, alive
+               again, or it was never touched */
+            for (int j = 0; j < c->nitems; j++)
+              if (((VE_ALIAS(c) & VE_DEAD(c)) >> j) & 1 && c->icause[j] == it && !((VE_LOST(c) >> j) & 1))
+                VE_DEAD(c) &= ~(1ull << j), VE_SURE(c) &= ~(1ull << j), VE_ALIAS(c) &= ~(1ull << j);
+          }
+          if (!((VE_DEAD(c) >> it) & 1) &&
+              (irop_is_none(src1) || irop_get_tag(src1) == IROP_TAG_IMM32 ||
+               (irop_get_tag(src1) == IROP_TAG_SYMREF && !src1.is_lval)))
+            VE_DET(c) |= 1ull << it;
+          else
+            VE_DET(c) &= ~(1ull << it);
         }
       }
       /* a source member handed to a drop parameter (freed) */
       if (q->op == TCCIR_OP_FUNCPARAMVAL && c->nfent && (call = ve_call(c, src2, &call_id, &k)) && call->known &&
           (k -= call->implicit) >= 0 && k < 32 && (call->drop & (1u << k)))
       {
-        int32_t s1v = irop_is_none(src1) ? -1 : irop_get_vreg(src1), lb = -1, lo = 0;
+        int32_t s1v = irop_is_none(src1) ? -1 : irop_get_vreg(src1), lb = -1, lo = 0, la = -1, pix, pic;
         if (s1v >= 0 && src1.is_lval && irop_get_tag(src1) == IROP_TAG_VREG)
-          ve_addr(c, s1v, &lb, &lo); /* free(c->buf) with the load folded in */
+          ve_addr(c, s1v, &lb, &lo), la = s1v; /* free(c->buf) with the load folded in */
         else if (s1v >= 0 && TCCIR_DECODE_VREG_TYPE(s1v) == TCCIR_VREG_TYPE_TEMP &&
                  TCCIR_DECODE_VREG_POSITION(s1v) < c->ntemps && c->tgen[TCCIR_DECODE_VREG_POSITION(s1v)] == c->gen)
-          lb = c->tlb[TCCIR_DECODE_VREG_POSITION(s1v)], lo = c->tlo[TCCIR_DECODE_VREG_POSITION(s1v)];
-        ve_kill_sources(c, lb, lo);
+          lb = c->tlb[TCCIR_DECODE_VREG_POSITION(s1v)], lo = c->tlo[TCCIR_DECODE_VREG_POSITION(s1v)],
+          la = c->tla[TCCIR_DECODE_VREG_POSITION(s1v)];
+        if (la >= 0)
+          ve_resolve_addr(c, la, &lb, &lo, &pix, &pic, 0);
+        else
+          pix = -1, pic = 0;
+        /* dead once the call has freed it */
+        if (c->npk < 16)
+          c->pk_call[c->npk] = call_id, c->pk_base[c->npk] = lb, c->pk_off[c->npk] = lo, c->pk_addr[c->npk] = la,
+          c->pk_ix[c->npk] = pix, c->pk_ic[c->npk++] = pic;
+        else
+          ve_kill_sources(c, lb, lo, q->line_num, la, pix, pic);
       }
     }
 
@@ -6872,7 +8507,7 @@ static void ve_block(VeCtx *c, int b)
 
     if (c->report && q->op == TCCIR_OP_RETURNVALUE && (v1 & VE_ARGS & ~c->allowed))
       ve_report(c, q->line_num, v1 & VE_ARGS & ~c->allowed, "it is returned, and the result does not borrow from it",
-                NULL);
+                NULL, 0);
     if (c->report && q->op == TCCIR_OP_STORE && (v1 & VE_OWNED) && !irop_is_none(dest) &&
         !irop_dest_defines_vreg(dest) && dest.is_lval)
     {
@@ -6906,7 +8541,7 @@ static void ve_block(VeCtx *c, int b)
       if (irop_get_tag(dest) == IROP_TAG_SYMREF)
       {
         Sym *sym = irop_get_sym_ex(ir, dest);
-        ve_report(c, q->line_num, v1 & VE_ARGS, "it is stored in global '", sym ? get_tok_str(sym->v, NULL) : "?");
+        ve_report(c, q->line_num, v1 & VE_ARGS, "it is stored in global '", sym ? get_tok_str(sym->v, NULL) : "?", 0);
       }
       else if (irop_get_tag(dest) == IROP_TAG_VREG && (dv = irop_get_vreg(dest)) >= 0 && (ve_vreg(c, dv) & VE_PARAM))
       {
@@ -6925,9 +8560,9 @@ static void ve_block(VeCtx *c, int b)
         while (k < YASC_BORROWS_MAX_PARAMS && !((dm >> k) & 1))
           k++;
         if (m && k < YASC_BORROWS_MAX_PARAMS && c->ptok[k])
-          ve_report(c, q->line_num, m, "it is stored through '", get_tok_str(c->ptok[k], NULL));
+          ve_report(c, q->line_num, m, "it is stored through '", get_tok_str(c->ptok[k], NULL), !tb);
         else if (m)
-          ve_report(c, q->line_num, m, "it is stored through a parameter", NULL);
+          ve_report(c, q->line_num, m, "it is stored through a parameter", NULL, 0);
       }
     }
 
@@ -6935,6 +8570,18 @@ static void ve_block(VeCtx *c, int b)
       continue;
     int32_t vreg = irop_get_vreg(dest);
     uint64_t val = 0;
+    /* a base pointer or an index variable changes: a dead member it names
+       stays dead (no store through the new value names the old object), a
+       detached one may be another object's now */
+    if (c->nfent && (TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_VAR ||
+                     TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_PARAM))
+      for (int it = 0; it < c->nitems; it++)
+        if (ve_root(c, c->ibase[it]) == vreg || c->iidx[it] == vreg || ve_path_uses(c, c->ibase[it], vreg))
+        {
+          if ((VE_DEAD(c) >> it) & 1)
+            VE_LOST(c) |= 1ull << it;
+          VE_DET(c) &= ~(1ull << it);
+        }
     if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD)
     {
       /* a load through a pointer is what it points at: a pointer read
@@ -6956,14 +8603,30 @@ static void ve_block(VeCtx *c, int b)
     }
     int v = ve_var(c, vreg);
     /* the address it holds, and where a loaded pointer came from */
-    int32_t ab = -1, ao = 0, lb = -1, lo = 0, s1 = irop_is_none(src1) ? -1 : irop_get_vreg(src1), sp = -1;
+    int32_t ab = -1, ao = 0, lb = -1, lo = 0, la = -1, aix = -1, aic = 0, ffo = 0, ffx = -1, ffc = 0,
+            s1 = irop_is_none(src1) ? -1 : irop_get_vreg(src1), sp = -1;
     int s1temp = s1 >= 0 && TCCIR_DECODE_VREG_TYPE(s1) == TCCIR_VREG_TYPE_TEMP &&
                  (sp = TCCIR_DECODE_VREG_POSITION(s1)) < c->ntemps && c->tgen[sp] == c->gen;
     int s1ov = s1 >= 0 && TCCIR_DECODE_VREG_TYPE(s1) == TCCIR_VREG_TYPE_VAR ? ve_ovar(c, s1) : -1;
     if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB || q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD) &&
         s1 >= 0 && src1.is_lval && irop_get_tag(src1) == IROP_TAG_VREG)
+    {
       /* a pointer loaded from memory, maybe with arithmetic folded in */
-      ve_addr(c, s1, &lb, &lo);
+      ve_addr(c, s1, &lb, &lo), la = s1;
+      if (q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB)
+      {
+        int32_t xv, xa, xs;
+        if (irop_get_tag(src2) == IROP_TAG_IMM32)
+        {
+          int64_t imm = irop_get_imm64_ex(ir, src2);
+          ffo = q->op == TCCIR_OP_ADD ? (int32_t)imm : -(int32_t)imm;
+        }
+        else if (q->op == TCCIR_OP_ADD && ve_index(c, src2, &xv, &xa, &xs))
+          ffx = xv, ffc = xa * xs;
+        else
+          ffx = -2;
+      }
+    }
     else if (!irop_is_none(src1) && irop_get_tag(src1) == IROP_TAG_STACKOFF && !src1.is_lval)
     {
       /* an address in this frame: &local, a local struct's member */
@@ -6980,7 +8643,22 @@ static void ve_block(VeCtx *c, int b)
     }
     else if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) && s1 >= 0 && irop_is_vreg_value(src1))
     {
+      int32_t xv, xa, xs, pix, pic;
       ve_addr(c, s1, &ab, &ao);
+      ve_addr_ix(c, s1, &pix, &pic);
+      /* an element at a variable index: base + constant + var * scale */
+      if (pix != -1 && irop_get_tag(src2) == IROP_TAG_IMM32)
+      {
+        int64_t imm = irop_get_imm64_ex(ir, src2);
+        aix = pix, aic = pic + (q->op == TCCIR_OP_ADD ? (int32_t)imm : -(int32_t)imm);
+      }
+      else if (pix != -1)
+        aix = -2;
+      else if (q->op == TCCIR_OP_ADD && ao != VE_OFF_ANY && irop_get_tag(src2) != IROP_TAG_IMM32 &&
+               ve_index(c, src2, &xv, &xa, &xs))
+        aix = xv, aic = ao + xa * xs;
+      else if (irop_get_tag(src2) != IROP_TAG_IMM32)
+        aix = -2;
       if (irop_get_tag(src2) == IROP_TAG_IMM32 && ao != VE_OFF_ANY)
       {
         int64_t imm = irop_get_imm64_ex(ir, src2);
@@ -6991,9 +8669,11 @@ static void ve_block(VeCtx *c, int b)
       if (s1temp)
         lb = c->tlb[sp], lo = c->tlo[sp] != VE_OFF_ANY && irop_get_tag(src2) == IROP_TAG_IMM32 ? c->tlo[sp] : VE_OFF_ANY;
     }
-    else if (q->op == TCCIR_OP_ASSIGN && s1 >= 0 && irop_is_vreg_value(src1))
+    else if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD) && s1 >= 0 && irop_is_vreg_value(src1))
     {
+      /* a copy (a pointer local in its frame slot at -O0 is a load) */
       ve_addr(c, s1, &ab, &ao);
+      ve_addr_ix(c, s1, &aix, &aic);
       if (s1temp)
         lb = c->tlb[sp], lo = c->tlo[sp];
     }
@@ -7002,7 +8682,24 @@ static void ve_block(VeCtx *c, int b)
       int pos = TCCIR_DECODE_VREG_POSITION(vreg);
       if (pos < c->ntemps)
       {
-        c->tab[pos] = ab, c->tao[pos] = ao, c->tlb[pos] = lb, c->tlo[pos] = lo;
+        int32_t xv = -1, xa = 0, xs = 1, k2;
+        /* an index value: var, var + k, (var + k) << n, (var + k) * m */
+        if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD) && ve_index(c, src1, &xv, &xa, &xs))
+          ;
+        else if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) && irop_get_tag(src2) == IROP_TAG_IMM32 &&
+                 ve_index(c, src1, &xv, &xa, &xs) && xs == 1)
+          k2 = (int32_t)irop_get_imm64_ex(ir, src2), xa += q->op == TCCIR_OP_ADD ? k2 : -k2;
+        else if (q->op == TCCIR_OP_SHL && irop_get_tag(src2) == IROP_TAG_IMM32 && ve_index(c, src1, &xv, &xa, &xs) &&
+                 (k2 = (int32_t)irop_get_imm64_ex(ir, src2)) >= 0 && k2 < 24)
+          xs <<= k2;
+        else if (q->op == TCCIR_OP_MUL && irop_get_tag(src2) == IROP_TAG_IMM32 && ve_index(c, src1, &xv, &xa, &xs))
+          xs *= (int32_t)irop_get_imm64_ex(ir, src2);
+        else
+          xv = -1;
+        c->txv[pos] = xv, c->txa[pos] = xa, c->txs[pos] = xs;
+        c->tix[pos] = aix, c->tco[pos] = aic, c->tis[pos] = 0;
+        c->tfo[pos] = ffo, c->tfx[pos] = ffx, c->tfc[pos] = ffc;
+        c->tab[pos] = ab, c->tao[pos] = ao, c->tlb[pos] = lb, c->tlo[pos] = lo, c->tla[pos] = la;
         c->tmask[pos] = val;
         c->tgen[pos] = c->gen;
       }
@@ -7019,6 +8716,19 @@ static void ve_block(VeCtx *c, int b)
       c->cur[c->nv + 2 * ov] = lk ? ve_origin(lb, lo) : ak && lb == -1 ? VE_ORIGIN_NOTHING : VE_ORIGIN_UNKNOWN;
       c->cur[c->nv + 2 * ov + 1] = ak ? ve_origin(ab, ao) : lk && ab == -1 ? VE_ORIGIN_NOTHING : VE_ORIGIN_UNKNOWN;
     }
+  }
+
+  /* leaving the function (not by a noreturn call or a trap): a caller's
+     object keeps no dead member */
+  uint64_t dead = c->nfent ? VE_SURE(c) : 0;
+  if (c->report && dead && bb->num_succs == 0 && bb->end_idx > bb->start_idx)
+  {
+    IRQuadCompact *lq = &ir->compact_instructions[bb->end_idx - 1];
+    if (lq->op == TCCIR_OP_IJUMP || lq->op == TCCIR_OP_SWITCH_TABLE || tcc_ir_cfg_instr_ends_flow(ir, lq))
+      return;
+    for (int it = 0; it < c->nitems; it++)
+      if ((dead >> it) & 1)
+        ve_item_report(c, it, c->ikline[it], NULL);
   }
 }
 
@@ -7069,12 +8779,16 @@ void tcc_ir_view_escape_check(TCCIRState *ir, Sym *func)
       c.otok[c.no++] = lv->tok;
     }
   }
-  if (!entry_bits && !c.no && !ir->lt_nb_fstores && !ir->lt_nb_floads)
+  if (!entry_bits && !c.no && !ir->lt_nb_fstores && !ir->lt_nb_floads && !ir->lt_nb_fsrcs)
     goto done;
-  /* the borrows(member) entries the function stores or reads */
-  for (int i = 0; i < ir->lt_nb_fstores + ir->lt_nb_floads; i++)
+  /* the borrows(member) entries the function stores or reads, or whose
+     source member it touches */
+  for (int i = 0; i < ir->lt_nb_fstores + ir->lt_nb_floads + ir->lt_nb_fsrcs; i++)
   {
-    int e = i < ir->lt_nb_fstores ? ir->lt_fstores[3 * i + 2] : ir->lt_floads[2 * (i - ir->lt_nb_fstores) + 1], seen = 0;
+    int e = i < ir->lt_nb_fstores                      ? ir->lt_fstores[3 * i + 2]
+            : i < ir->lt_nb_fstores + ir->lt_nb_floads ? ir->lt_floads[2 * (i - ir->lt_nb_fstores) + 1]
+                                                       : ir->lt_fsrcs[2 * (i - ir->lt_nb_fstores - ir->lt_nb_floads) + 1],
+        seen = 0;
     for (int f = 0; f < c.nfent && !seen; f++)
       seen = c.fent[f] == e;
     if (!seen && c.nfent < 16)
@@ -7094,14 +8808,27 @@ void tcc_ir_view_escape_check(TCCIRState *ir, Sym *func)
   c.ntemps = ir->next_temporary_variable;
   c.tmask = tcc_mallocz((c.ntemps + 1) * sizeof(uint64_t));
   c.tgen = tcc_mallocz((c.ntemps + 1) * sizeof(uint32_t));
-  c.tab = tcc_malloc((c.ntemps + 1) * 4 * sizeof(int32_t));
+  c.tab = tcc_malloc((c.ntemps + 1) * 14 * sizeof(int32_t));
   int32_t *tsrc = tcc_malloc((c.ntemps + 1) * sizeof(int32_t));
   memset(tsrc, 0xff, (c.ntemps + 1) * sizeof(int32_t));
   c.tao = c.tab + c.ntemps + 1;
   c.tlb = c.tao + c.ntemps + 1;
   c.tlo = c.tlb + c.ntemps + 1;
+  c.tla = c.tlo + c.ntemps + 1;
+  c.tix = c.tla + c.ntemps + 1;
+  c.tco = c.tix + c.ntemps + 1;
+  c.tis = c.tco + c.ntemps + 1;
+  c.txv = c.tis + c.ntemps + 1;
+  c.txa = c.txv + c.ntemps + 1;
+  c.txs = c.txa + c.ntemps + 1;
+  c.tfo = c.txs + c.ntemps + 1;
+  c.tfx = c.tfo + c.ntemps + 1;
+  c.tfc = c.tfx + c.ntemps + 1;
+  c.ltframe = ve_frame_locals(ir);
   c.ncalls = ir->lt_nb_calls;
   c.callarg = tcc_mallocz((c.ncalls + 1) * sizeof(uint64_t));
+  c.callall = tcc_mallocz((c.ncalls + 1) * sizeof(uint64_t));
+  c.fname = get_tok_str(func->v, NULL);
   c.tmulti = tcc_mallocz(c.ntemps + 1);
   for (int i = 0; i < n; i++)
   {
@@ -7207,10 +8934,18 @@ void tcc_ir_view_escape_check(TCCIRState *ir, Sym *func)
   tcc_ir_cfg_compute_rpo(c.cfg);
   nb = c.cfg->num_blocks;
   {
-    c.nw = c.nv + 2 * c.nov + 1; /* + the dead borrows(member) members */
+    c.nw = c.nv + 2 * c.nov + 5; /* + the dead borrows(member) members, the sure ones, detached, lost, alias-only */
     uint64_t *in = tcc_mallocz((size_t)nb * c.nw * sizeof(uint64_t));
     uint8_t *reached = tcc_mallocz(nb);
     c.cur = tcc_malloc((c.nw + 1) * sizeof(uint64_t));
+    /* the members and paths are found as the blocks are walked; what joins
+       by AND (detached, alias-only) is only right with all of them known
+       from the start: once more while new ones turn up */
+    for (int round = 0; round < 8; round++)
+    {
+      const int items0 = c.nitems, paths0 = c.np;
+      memset(in, 0, (size_t)nb * c.nw * sizeof(uint64_t));
+      memset(reached, 0, nb);
     memcpy(in, init, c.nv * sizeof(uint64_t));
     reached[0] = 1;
     for (int changed = 1; changed;)
@@ -7231,9 +8966,15 @@ void tcc_ir_view_escape_check(TCCIRState *ir, Sym *func)
           for (int v = 0; v < c.nv; v++)
             if ((ti[v] | c.cur[v]) != ti[v])
               ti[v] |= c.cur[v], changed = 1;
-          if ((ti[c.nw - 1] | c.cur[c.nw - 1]) != ti[c.nw - 1])
-            ti[c.nw - 1] |= c.cur[c.nw - 1], changed = 1;
-          for (int v = c.nv; v < c.nw - 1; v++)
+          for (int v = c.nw - 5; v < c.nw; v++)
+          {
+            /* detached and alias-only on every path in; the others on any */
+            int all = v == c.nw - 3 || v == c.nw - 1;
+            uint64_t j = all ? (reached[t] ? ti[v] & c.cur[v] : c.cur[v]) : ti[v] | c.cur[v];
+            if (j != ti[v])
+              ti[v] = j, changed = 1;
+          }
+          for (int v = c.nv; v < c.nw - 5; v++)
           {
             uint64_t j = ve_origin_join(ti[v], c.cur[v]);
             if (j != ti[v])
@@ -7244,6 +8985,9 @@ void tcc_ir_view_escape_check(TCCIRState *ir, Sym *func)
         }
       }
     }
+      if (c.nitems == items0 && c.np == paths0)
+        break;
+    }
     c.report = 1;
     tcc_state->diag_noabort++;
     for (int b = 0; b < nb; b++)
@@ -7252,6 +8996,12 @@ void tcc_ir_view_escape_check(TCCIRState *ir, Sym *func)
         memcpy(c.cur, in + (size_t)b * c.nw, c.nw * sizeof(uint64_t));
         ve_block(&c, b);
       }
+    /* more than the tables hold: nothing past them is followed, so say so
+       rather than pass it */
+    if (c.overflow && n)
+      tcc_warning_c(warn_lifetime)("%i:'%s' names more borrowing members than the check follows (64 members, %d "
+                                   "objects reached through pointers): split it",
+                                   ir->compact_instructions[0].line_num, c.fname, VE_NPATH);
     /* a view of an owned variable that stays where it outlives the function,
        while the variable itself is freed or dropped there */
     for (int i = 0; i < c.ncand; i++)
@@ -7287,6 +9037,9 @@ done:
   tcc_free(c.tgen);
   tcc_free(c.done);
   tcc_free(c.callarg);
+  tcc_free(c.callall);
+  tcc_free(c.idone);
+  tcc_free(c.ltframe);
   tcc_free(c.tmulti);
   tcc_free(c.cand);
   tcc_free(c.tab);
@@ -8394,7 +10147,7 @@ static void sc_block(ScCtx *c, int b, uint8_t *out)
           {
             sc_use(c, x, line);
             if (c->report && !c->it[x].silent && ((call->nonnull >> k) & 1) && sc_null_said(c, x) && call->callee)
-              tcc_warning_c(warn_lifetime)("%i:'%s' %s %s, and is passed as argument %d of '%s', which is not maybe",
+              tcc_warning_c(warn_lifetime)("%i:'%s' %s %s, and is passed as argument %d of '%s', which is not '?'",
                                            line, c->it[x].name, (c->cur[x] & SC_N_SET) ? "may be" : "is",
                                            (c->it[x].kind & LTV_HANDLE) ? "invalid" : "null", k + 1,
                                            get_tok_str(call->callee, NULL));
@@ -10103,6 +11856,1054 @@ void tcc_ir_tag_check(TCCIRState *ir)
   tcc_ir_cfg_free(cfg);
 }
 
+/* yasc `static T *?borrows(zfile) ztrans;` (declarator.c yasc_gborrows): a
+ * global that points into what another global owns, and the borrows(member)
+ * members of a global struct (`g.trans` borrows `g.file`).  The rule holds at
+ * every function's boundary: on entry each such item points into its owners'
+ * current memory, or is null.  Where an owner is freed, moved out or assigned
+ * (a store into it, directly or through its address; an owned or drop
+ * argument; an owned store or result made of its value), the items borrowing
+ * from it are dead until they are stored again -- unless they were set to null
+ * or static storage first (detached).  Read while dead, they are said, and so
+ * they are where the function returns or calls something that may read them
+ * (tcc_ir_call_writes_global).  A store into one takes a pointer into its
+ * owners' memory, null, or static storage.  An owner's address may go to a
+ * call only with its borrowers detached, and may not be stored or returned.
+ *
+ * An item is an address in a global: &g + off + idx * scale, idx a variable
+ * or parameter (an element at a variable index, `arr[i].trans`) or none.  A
+ * kill through one index kills what another index may name; only a store
+ * through the same index brings an item back, and a dead one whose index
+ * variable changes stays dead.  Values are followed flow-insensitively
+ * through temps and pointer locals; a pointer loaded through memory or
+ * returned by a call is not known. */
+
+#define GB_MAX 64
+#define GB_OMAX 60
+#define GB_UNKNOWN (1ull << 63) /* an origin that is not known */
+#define GB_PARAM (1ull << 62)   /* from a parameter: the view escape check says it */
+#define GB_NAME 64
+#define GB_IDX_NONE (-1)    /* a constant address */
+#define GB_IDX_UNKNOWN (-2) /* an index that is not one variable (plus a constant) */
+
+typedef struct GbAddr
+{
+  Sym *s;
+  int32_t off, idx, scale;
+} GbAddr;
+
+/* an index temp: (var + add) * scale */
+typedef struct GbIdx
+{
+  int32_t var, add, scale;
+} GbIdx;
+
+typedef struct GbCtx
+{
+  TCCIRState *ir;
+  IRCFG *cfg;
+  GbAddr ba[GB_MAX]; /* the borrowing items ... */
+  uint64_t bown[GB_MAX]; /* ... their owners' bits */
+  int nb;
+  GbAddr oa[GB_OMAX];
+  uint64_t obor[GB_OMAX]; /* an owner's own borrowers */
+  uint64_t kmask[GB_OMAX]; /* the borrowers a change of the owner may kill (an aliasing index too) */
+  int no;
+  GbAddr walked[64]; /* the struct elements whose members were looked at */
+  int nwalked;
+  int overflow; /* more items than the tables hold: said once */
+  char (*bnm)[GB_NAME], (*onm)[GB_NAME];
+  GbAddr *tform; /* [ntemps] a temp holding an address in a global (s NULL: none) */
+  GbIdx *tidx;   /* [ntemps] a temp holding an index (var -1: none) */
+  uint64_t *torig; /* [ntemps] a pointer temp's origins (owner bits, GB_*) */
+  uint64_t *taddr; /* [ntemps] owners whose address it may hold */
+  int8_t *tload;   /* [ntemps] owner + 1 when the temp is that owner's value */
+  int ntemps;
+  int32_t *vvreg; /* pointer locals ... */
+  uint64_t *vorig, *vaddr; /* ... their origins, the owners whose address they may hold */
+  uint8_t *vown;   /* ... and which of them own (LTV_OWNED) */
+  int nvv;
+  uint64_t *callorig; /* [ncalls] a call's view result: its borrowed arguments' origins */
+  uint64_t *pend;     /* [ncalls] owners its arguments release or may change (after the call) */
+  int ncalls;
+  /* walking a block: the dead borrowers, those set to null or static storage
+     (a change of their owner leaves them alone), those whose index changed
+     while dead (no store brings them back); where each went dead and why */
+  uint64_t dead, detached, lost, alias;
+  int kline[GB_MAX], kown[GB_MAX];
+  int report, ret_owned;
+  const char *fname;
+  int32_t *done;
+  int ndone;
+} GbCtx;
+
+static int gb_same(const GbAddr *a, const GbAddr *b)
+{
+  return a->s == b->s && a->off == b->off && a->idx == b->idx && (a->idx == GB_IDX_NONE || a->scale == b->scale);
+}
+
+/* A and B may be the same memory: the same offset, or with an index the
+   same member of some element (the array's element size) */
+static int gb_may_alias(const GbAddr *a, const GbAddr *b)
+{
+  int align, e;
+  if (a->s != b->s)
+    return 0;
+  if (a->idx == GB_IDX_NONE && b->idx == GB_IDX_NONE)
+    return a->off == b->off;
+  if (!(a->s->type.t & VT_ARRAY) || !a->s->type.ref || (e = type_size(&a->s->type.ref->type, &align)) <= 0)
+    return 1;
+  int32_t d = a->off - b->off;
+  return ((d % e) + e) % e == 0;
+}
+
+static int gb_borrower(GbCtx *c, const GbAddr *a)
+{
+  for (int j = 0; j < c->nb; j++)
+    if (gb_same(&c->ba[j], a))
+      return j;
+  return -1;
+}
+
+static int gb_owner(GbCtx *c, const GbAddr *a)
+{
+  for (int o = 0; o < c->no; o++)
+    if (gb_same(&c->oa[o], a))
+      return o;
+  return -1;
+}
+
+static int gb_temp_pos(GbCtx *c, int32_t v)
+{
+  int pos = v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_TEMP ? TCCIR_DECODE_VREG_POSITION(v) : -1;
+  return pos >= 0 && pos < c->ntemps ? pos : -1;
+}
+
+/* OP names memory in a global (a symbol, or an lvalue through a temp that
+   holds such an address): where, in *A */
+static int gb_ref(GbCtx *c, IROperand op, GbAddr *a)
+{
+  IRPoolSymref *r;
+  int pos;
+  if (irop_is_none(op))
+    return 0;
+  if (irop_get_tag(op) == IROP_TAG_SYMREF)
+  {
+    if (!(r = irop_get_symref_ex(c->ir, op)) || !r->sym)
+      return 0;
+    a->s = r->sym, a->off = r->addend, a->idx = GB_IDX_NONE, a->scale = 0;
+    return 1;
+  }
+  if (irop_get_tag(op) == IROP_TAG_VREG && op.is_lval && (pos = gb_temp_pos(c, irop_get_vreg(op))) >= 0 &&
+      c->tform[pos].s)
+  {
+    *a = c->tform[pos];
+    return 1;
+  }
+  return 0;
+}
+
+static void gb_set_name(char *dst, const char *prefix, int tok)
+{
+  pstrcpy(dst, GB_NAME, prefix);
+  if (tok)
+  {
+    pstrcat(dst, GB_NAME, ".");
+    pstrcat(dst, GB_NAME, get_tok_str(tok, NULL));
+  }
+}
+
+static int gb_add_owner(GbCtx *c, const GbAddr *a, int tok, const char *prefix);
+
+static int gb_new_borrower(GbCtx *c, const GbAddr *a, int tok, const char *prefix)
+{
+  if (gb_borrower(c, a) >= 0)
+    return -1;
+  if (c->nb == GB_MAX)
+  {
+    c->overflow = 1;
+    return -1;
+  }
+  int j = c->nb++;
+  c->ba[j] = *a, c->bown[j] = 0;
+  gb_set_name(c->bnm[j], prefix, tok);
+  return j;
+}
+
+static void gb_add_borrower(GbCtx *c, Sym *s)
+{
+  const YascGlobalBorrows *e = yasc_gborrow_of(s);
+  GbAddr a = {s, 0, GB_IDX_NONE, 0};
+  int j;
+  if (!e || (j = gb_new_borrower(c, &a, 0, get_tok_str(s->v, NULL))) < 0)
+    return;
+  for (int k = 0; k < e->nowner; k++)
+  {
+    GbAddr oa = {e->owner[k], 0, GB_IDX_NONE, 0};
+    int o = gb_add_owner(c, &oa, 0, get_tok_str(e->owner[k]->v, NULL));
+    if (o >= 0)
+      c->bown[j] |= 1ull << o;
+  }
+}
+
+/* an owner: every global that borrows from it, named in this function or
+   not, may be left dead here (a member owner's borrowers are its struct's,
+   added with it) */
+static int gb_add_owner(GbCtx *c, const GbAddr *a, int tok, const char *prefix)
+{
+  int o = gb_owner(c, a);
+  if (o >= 0)
+    return o;
+  if (c->no == GB_OMAX)
+  {
+    c->overflow = 1;
+    return -1;
+  }
+  o = c->no++;
+  c->oa[o] = *a;
+  gb_set_name(c->onm[o], prefix, tok);
+  if (!tok)
+    for (int i = 0; i < yasc_ngborrows; i++)
+      for (int k = 0; k < yasc_gborrows[i].nowner; k++)
+        if (yasc_gborrows[i].owner[k] == a->s)
+          gb_add_borrower(c, yasc_gborrows[i].self);
+  return o;
+}
+
+/* a struct at BASE (the address of its start) in a global: its
+   borrows(member) members and the members they name, nested ones included */
+static void gb_walk_struct(GbCtx *c, CType *t, const GbAddr *base, const char *prefix)
+{
+  for (Sym *f = sym_first(t->ref); f; f = f->next)
+  {
+    GbAddr at = *base;
+    int fe;
+    YascFieldBorrows *e;
+    at.off += (int32_t)f->c;
+    if ((f->type.t & (VT_BTYPE | VT_ARRAY)) == VT_STRUCT && f->type.ref)
+    {
+      char sub[GB_NAME];
+      gb_set_name(sub, prefix, (f->v & ~SYM_FIELD) < SYM_FIRST_ANOM ? f->v & ~SYM_FIELD : 0);
+      gb_walk_struct(c, &f->type, &at, sub);
+    }
+    else if ((fe = type_borrows_field(&f->type)) >= 0 && (e = yasc_field_borrows(fe)))
+    {
+      int j = gb_new_borrower(c, &at, f->v & ~SYM_FIELD, prefix);
+      for (int k = 0; j >= 0 && k < e->nsrc; k++)
+        if (e->src_off[k] >= 0) /* a pointer member (an array one is part of the object) */
+        {
+          GbAddr oa = *base;
+          oa.off += e->src_off[k];
+          int o = gb_add_owner(c, &oa, e->src_tok[k], prefix);
+          if (o >= 0)
+            c->bown[j] |= 1ull << o;
+        }
+    }
+  }
+}
+
+/* an int variable's name (lt_inames), for `arr[i]` */
+static const char *gb_var_name(TCCIRState *ir, int32_t vreg)
+{
+  for (int k = 0; k < ir->lt_nb_inames; k++)
+    if (ir->lt_inames[2 * k] == vreg)
+      return get_tok_str(ir->lt_inames[2 * k + 1], NULL);
+  return "?";
+}
+
+/* memory A in a global of a struct type, or an array of them: the members
+   of the element it is in */
+static void gb_walk(GbCtx *c, const GbAddr *a)
+{
+  CType *t = &a->s->type;
+  GbAddr base = *a;
+  char prefix[GB_NAME];
+  int align, esize;
+  if ((t->t & VT_ARRAY) && t->ref)
+  {
+    t = &t->ref->type;
+    if ((t->t & (VT_BTYPE | VT_ARRAY)) != VT_STRUCT || !t->ref || (esize = type_size(t, &align)) <= 0)
+      return;
+    int32_t k = a->off >= 0 ? a->off / esize : -((-a->off + esize - 1) / esize);
+    base.off = k * esize;
+    if (a->idx != GB_IDX_NONE && a->idx != GB_IDX_UNKNOWN && a->scale != esize)
+      base.idx = GB_IDX_UNKNOWN;
+    if (base.idx == GB_IDX_NONE)
+      snprintf(prefix, sizeof prefix, "%s[%d]", get_tok_str(a->s->v, NULL), k);
+    else if (base.idx == GB_IDX_UNKNOWN)
+      snprintf(prefix, sizeof prefix, "%s[?]", get_tok_str(a->s->v, NULL));
+    else if (k)
+      snprintf(prefix, sizeof prefix, "%s[%s%+d]", get_tok_str(a->s->v, NULL), gb_var_name(c->ir, base.idx), k);
+    else
+      snprintf(prefix, sizeof prefix, "%s[%s]", get_tok_str(a->s->v, NULL), gb_var_name(c->ir, base.idx));
+  }
+  else if ((t->t & (VT_BTYPE | VT_ARRAY)) == VT_STRUCT && t->ref && a->idx == GB_IDX_NONE)
+  {
+    base.off = 0;
+    pstrcpy(prefix, sizeof prefix, get_tok_str(a->s->v, NULL));
+  }
+  else
+    return;
+  for (int i = 0; i < c->nwalked; i++)
+    if (gb_same(&c->walked[i], &base))
+      return;
+  if (c->nwalked == 64)
+  {
+    c->overflow = 1;
+    return;
+  }
+  c->walked[c->nwalked++] = base;
+  gb_walk_struct(c, t, &base, prefix);
+}
+
+/* the type of what lies at OFF in a global of type T, else NULL */
+static CType *gb_type_at(CType *t, int32_t off)
+{
+  int align, esize;
+  if ((t->t & VT_ARRAY) && t->ref && (esize = type_size(&t->ref->type, &align)) > 0)
+    return gb_type_at(&t->ref->type, ((off % esize) + esize) % esize);
+  if ((t->t & (VT_BTYPE | VT_ARRAY)) != VT_STRUCT || !t->ref)
+    return off == 0 ? t : NULL;
+  for (Sym *f = sym_first(t->ref); f; f = f->next)
+  {
+    int sz = type_size(&f->type, &align);
+    if (off >= (int32_t)f->c && off < (int32_t)f->c + (sz > 0 ? sz : 1))
+      return gb_type_at(&f->type, off - (int32_t)f->c);
+  }
+  return NULL;
+}
+
+static int gb_var(GbCtx *c, int32_t vreg)
+{
+  for (int k = 0; k < c->nvv; k++)
+    if (c->vvreg[k] == vreg)
+      return k;
+  return -1;
+}
+
+/* the value at A: where it may point */
+static uint64_t gb_gval(GbCtx *c, const GbAddr *a)
+{
+  int o = gb_owner(c, a), j;
+  CType *t;
+  if (o >= 0)
+    return 1ull << o;
+  if ((j = gb_borrower(c, a)) >= 0)
+    return c->bown[j];
+  /* another owner's memory: not this one's; any other global points into
+     what lives as long (a global's pointer is a view of lasting memory) */
+  t = gb_type_at(&a->s->type, a->off);
+  return t && (t->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && (type_yasc(t) & YASC_OWNED) ? GB_UNKNOWN : 0;
+}
+
+static uint64_t gb_value(GbCtx *c, IROperand op)
+{
+  GbAddr a;
+  int pos, k;
+  if (irop_is_none(op))
+    return 0;
+  int tag = irop_get_tag(op);
+  if (op.is_lval && gb_ref(c, op, &a))
+    return gb_gval(c, &a);
+  if (tag == IROP_TAG_SYMREF)
+    return 0; /* an address of static storage */
+  int32_t v = irop_get_vreg(op);
+  /* a variable's value, in a register or in its frame slot (-O0) */
+  if (!irop_is_vreg_value(op))
+  {
+    if (tag == IROP_TAG_VREG && op.is_lval && (pos = gb_temp_pos(c, v)) >= 0 && c->taddr[pos])
+      return c->taddr[pos]; /* loaded through an owner's address: its value */
+    return tag == IROP_TAG_STACKOFF || (tag == IROP_TAG_VREG && op.is_lval && v >= 0)
+               ? GB_UNKNOWN /* this frame, or loaded through a pointer */
+               : 0;         /* a constant: null */
+  }
+  pos = TCCIR_DECODE_VREG_POSITION(v);
+  switch (TCCIR_DECODE_VREG_TYPE(v))
+  {
+  case TCCIR_VREG_TYPE_TEMP:
+    return pos < c->ntemps ? (c->tform[pos].s ? 0 : c->torig[pos]) : GB_UNKNOWN;
+  case TCCIR_VREG_TYPE_VAR:
+    return (k = gb_var(c, v)) >= 0 ? c->vorig[k] : 0; /* not a pointer local */
+  case TCCIR_VREG_TYPE_PARAM:
+    return GB_PARAM;
+  }
+  return GB_UNKNOWN;
+}
+
+/* the owners whose address the value OP may be */
+static uint64_t gb_addr(GbCtx *c, IROperand op)
+{
+  GbAddr a;
+  int pos, k, o;
+  /* a variable in its frame slot (-O0) is an lvalue too */
+  if (irop_is_none(op) || (op.is_lval && !irop_is_vreg_value(op)))
+    return 0;
+  if (irop_get_tag(op) == IROP_TAG_SYMREF)
+    return gb_ref(c, op, &a) && (o = gb_owner(c, &a)) >= 0 ? 1ull << o : 0;
+  int32_t v = irop_is_vreg_value(op) ? irop_get_vreg(op) : -1;
+  if ((pos = gb_temp_pos(c, v)) >= 0)
+  {
+    if (c->tform[pos].s)
+      return (o = gb_owner(c, &c->tform[pos])) >= 0 ? 1ull << o : 0;
+    return c->taddr[pos];
+  }
+  if (v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR && (k = gb_var(c, v)) >= 0)
+    return c->vaddr[k];
+  return 0;
+}
+
+/* OP is owner O's own value (a load of it, folded in or in a temp): O, else -1 */
+static int gb_owner_value(GbCtx *c, IROperand op)
+{
+  GbAddr a;
+  if (irop_is_none(op))
+    return -1;
+  if (op.is_lval)
+    return gb_ref(c, op, &a) ? gb_owner(c, &a) : -1;
+  int32_t v = irop_is_vreg_value(op) ? irop_get_vreg(op) : -1;
+  int pos = gb_temp_pos(c, v);
+  return pos >= 0 ? c->tload[pos] - 1 : -1;
+}
+
+static IRLtCall *gb_call(GbCtx *c, IROperand enc_op, int *call_id, int *k)
+{
+  int64_t enc = irop_get_imm64_ex(c->ir, enc_op);
+  *call_id = TCCIR_DECODE_CALL_ID(enc);
+  *k = TCCIR_DECODE_PARAM_IDX(enc);
+  return *call_id >= 0 && *call_id < c->ir->lt_nb_calls && *call_id < c->ncalls ? &c->ir->lt_calls[*call_id] : NULL;
+}
+
+/* an index value: a variable or parameter (scale 1), or a temp holding one */
+static int gb_index(GbCtx *c, IROperand op, GbIdx *x)
+{
+  int32_t v = irop_is_vreg_value(op) ? irop_get_vreg(op) : -1;
+  int pos;
+  if (v < 0)
+    return 0;
+  if (TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR || TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_PARAM)
+  {
+    x->var = v, x->add = 0, x->scale = 1;
+    return 1;
+  }
+  if ((pos = gb_temp_pos(c, v)) >= 0 && c->tidx[pos].var >= 0)
+  {
+    *x = c->tidx[pos];
+    return 1;
+  }
+  return 0;
+}
+
+static int gb_imm(GbCtx *c, IROperand op, int32_t *k)
+{
+  if (irop_is_none(op) || irop_get_tag(op) != IROP_TAG_IMM32)
+    return 0;
+  *k = (int32_t)irop_get_imm64_ex(c->ir, op);
+  return 1;
+}
+
+/* the addresses and indexes temps hold (temps are defined before they are
+   used, in order) */
+static void gb_forms(GbCtx *c)
+{
+  TCCIRState *ir = c->ir;
+  const int n = ir->next_instruction_index;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    const IRRegistersConfig *cfg = &irop_config[q->op];
+    IROperand dest = cfg->has_dest ? tcc_ir_op_get_dest(ir, q) : irop_make_none();
+    IROperand src1 = cfg->has_src1 ? tcc_ir_op_get_src1(ir, q) : irop_make_none();
+    IROperand src2 = cfg->has_src2 ? tcc_ir_op_get_src2(ir, q) : irop_make_none();
+    int pos, p1;
+    int32_t k;
+    GbIdx x;
+    if (irop_is_none(dest) || !irop_dest_defines_vreg(dest) || (pos = gb_temp_pos(c, irop_get_vreg(dest))) < 0)
+      continue;
+    GbAddr *f = &c->tform[pos];
+    IROperand other = src2;
+    p1 = irop_is_vreg_value(src1) ? gb_temp_pos(c, irop_get_vreg(src1)) : -1;
+    /* an address: &g, a copy, plus a constant, plus an index */
+    if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_ADD) &&
+        irop_get_tag(src1) == IROP_TAG_SYMREF && !src1.is_lval)
+      gb_ref(c, src1, f);
+    else if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) && p1 >= 0 &&
+             c->tform[p1].s)
+      *f = c->tform[p1];
+    else if (q->op == TCCIR_OP_ADD && !irop_is_none(src2) && irop_get_tag(src2) == IROP_TAG_SYMREF &&
+             !src2.is_lval)
+    {
+      gb_ref(c, src2, f);
+      other = src1;
+    }
+    if (f->s && q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LOAD)
+    {
+      if (gb_imm(c, other, &k))
+        f->off += q->op == TCCIR_OP_SUB ? -k : k;
+      else if (q->op == TCCIR_OP_ADD && f->idx == GB_IDX_NONE && gb_index(c, other, &x))
+        f->idx = x.var, f->scale = x.scale, f->off += x.add * x.scale;
+      else
+        f->idx = GB_IDX_UNKNOWN;
+      continue;
+    }
+    if (f->s)
+      continue;
+    /* an index: var, var + k, (var + k) << s, (var + k) * m */
+    GbIdx *t = &c->tidx[pos];
+    if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD) && gb_index(c, src1, &x))
+      *t = x;
+    else if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) && gb_index(c, src1, &x) && x.scale == 1 &&
+             gb_imm(c, src2, &k))
+      *t = x, t->add += q->op == TCCIR_OP_SUB ? -k : k;
+    else if (q->op == TCCIR_OP_SHL && gb_index(c, src1, &x) && gb_imm(c, src2, &k) && k >= 0 && k < 24)
+      *t = x, t->scale <<= k;
+    else if (q->op == TCCIR_OP_MUL && gb_index(c, src1, &x) && gb_imm(c, src2, &k))
+      *t = x, t->scale *= k;
+  }
+}
+
+/* where every pointer temp and pointer local may point, and whose address
+   it may hold, over the whole body */
+static void gb_origins(GbCtx *c)
+{
+  TCCIRState *ir = c->ir;
+  const int n = ir->next_instruction_index;
+  for (int changed = 1; changed;)
+  {
+    changed = 0;
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      const IRRegistersConfig *cfg = &irop_config[q->op];
+      IROperand src1 = cfg->has_src1 ? tcc_ir_op_get_src1(ir, q) : irop_make_none();
+      IROperand src2 = cfg->has_src2 ? tcc_ir_op_get_src2(ir, q) : irop_make_none();
+      int call_id, k;
+      IRLtCall *call;
+      if (q->op == TCCIR_OP_FUNCPARAMVAL && (call = gb_call(c, src2, &call_id, &k)) && call->borrows &&
+          (k -= call->implicit) >= 0 && k < 32 && ((call->borrows >> k) & 1))
+      {
+        uint64_t o = gb_value(c, src1);
+        if ((c->callorig[call_id] | o) != c->callorig[call_id])
+          c->callorig[call_id] |= o, changed = 1;
+      }
+      IROperand dest = cfg->has_dest ? tcc_ir_op_get_dest(ir, q) : irop_make_none();
+      if (irop_is_none(dest) || !irop_dest_defines_vreg(dest))
+        continue;
+      int32_t dv = irop_get_vreg(dest);
+      int pos = gb_temp_pos(c, dv), kv = -1;
+      if (pos >= 0)
+      {
+        if (c->tform[pos].s)
+          continue; /* an address in a global: gb_addr */
+        if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD)
+        {
+          int o = gb_owner_value(c, src1);
+          if (o >= 0 && src1.is_lval)
+            c->tload[pos] = (int8_t)(o + 1);
+          /* loaded through a pointer that is one owner's address: its value */
+          else if (src1.is_lval && irop_get_tag(src1) == IROP_TAG_VREG)
+          {
+            int ap = gb_temp_pos(c, irop_get_vreg(src1));
+            uint64_t m = ap >= 0 ? c->taddr[ap] : 0;
+            if (m && !(m & (m - 1)))
+              for (int b = 0; b < c->no; b++)
+                if (m == 1ull << b)
+                  c->tload[pos] = (int8_t)(b + 1);
+          }
+        }
+        /* an owner's address, whatever the temp's type says */
+        if (!lt_ptr_temp(ir, dv))
+        {
+          uint64_t am = q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_ADD ||
+                                q->op == TCCIR_OP_SUB
+                            ? gb_addr(c, src1)
+                            : 0;
+          if ((c->taddr[pos] | am) != c->taddr[pos])
+            c->taddr[pos] |= am, changed = 1;
+          continue;
+        }
+      }
+      else if (TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_VAR || (kv = gb_var(c, dv)) < 0)
+        continue;
+      uint64_t o, am;
+      if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD)
+        o = gb_value(c, src1), am = gb_addr(c, src1);
+      else if (q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB)
+      {
+        /* pointer arithmetic: the pointer comes first (gen_op swaps it there) */
+        o = gb_value(c, src1), am = gb_addr(c, src1);
+        if (!o && !am && q->op == TCCIR_OP_ADD)
+          o = gb_value(c, src2), am = gb_addr(c, src2);
+      }
+      else if (q->op == TCCIR_OP_FUNCCALLVAL && cfg->has_src2 && (call = gb_call(c, src2, &call_id, &k)))
+        o = call->borrows ? c->callorig[call_id] : GB_UNKNOWN, am = 0;
+      else
+        o = GB_UNKNOWN, am = 0;
+      uint64_t *slot = kv >= 0 ? &c->vorig[kv] : &c->torig[pos];
+      uint64_t *aslot = kv >= 0 ? &c->vaddr[kv] : &c->taddr[pos];
+      if ((*slot | o) != *slot)
+        *slot |= o, changed = 1;
+      if ((*aslot | am) != *aslot)
+        *aslot |= am, changed = 1;
+    }
+  }
+}
+
+static int gb_seen(GbCtx *c, int key)
+{
+  for (int i = 0; i < c->ndone; i++)
+    if (c->done[i] == key)
+      return 1;
+  c->done = lt_grow(c->done, c->ndone, sizeof(int32_t));
+  c->done[c->ndone++] = key;
+  return 0;
+}
+
+/* owner O is freed or changed at LINE: what may borrow from it is dead,
+   unless it was set to null or static storage */
+static void gb_kill_as(GbCtx *c, int o, int line, int only_alias)
+{
+  uint64_t m = c->kmask[o] & ~c->detached;
+  for (int j = 0; j < c->nb; j++)
+    if ((m >> j) & 1)
+    {
+      /* o is its owner, not one an index may make it */
+      int own = !only_alias && ((c->bown[j] >> o) & 1) != 0;
+      if (!((c->dead >> j) & 1))
+      {
+        c->kline[j] = line, c->kown[j] = o; /* where it went dead first */
+        if (own)
+          c->alias &= ~(1ull << j);
+        else
+          c->alias |= 1ull << j;
+      }
+      else if (own)
+        c->alias &= ~(1ull << j);
+    }
+  c->dead |= m;
+}
+
+static void gb_kill(GbCtx *c, int o, int line)
+{
+  gb_kill_as(c, o, line, 0);
+}
+
+static void gb_read(GbCtx *c, IROperand op, int line)
+{
+  GbAddr a;
+  if (!c->report || !op.is_lval || !c->dead || !gb_ref(c, op, &a))
+    return;
+  /* once, by the item read: the one at this address, else one it may be */
+  int j = gb_borrower(c, &a), hit = -1;
+  if (j >= 0 && ((c->dead >> j) & 1))
+    hit = j;
+  for (int k = 0; hit < 0 && k < c->nb; k++)
+    if (((c->dead >> k) & 1) && gb_may_alias(&c->ba[k], &a))
+      hit = k;
+  if (hit < 0 || gb_seen(c, line * 8 + 7))
+    return;
+  tcc_warning_c(warn_lifetime)("%i:'%s' may be used after '%s', which it borrows from, was freed or changed "
+                               "(line %d)",
+                               line, c->bnm[j >= 0 ? j : hit], c->onm[c->kown[hit]], c->kline[hit]);
+}
+
+/* the address of owners M goes where it outlives the instruction (HOW) */
+static void gb_escape(GbCtx *c, uint64_t m, int line, const char *how)
+{
+  for (int o = 0; c->report && o < c->no; o++)
+    if (((m >> o) & 1) && c->obor[o] && !gb_seen(c, (line * GB_MAX + o) * 8 + 5))
+    {
+      int j = 0;
+      while (j < c->nb && !((c->obor[o] >> j) & 1))
+        j++;
+      tcc_warning_c(warn_lifetime)("%i:the address of '%s' is %s: '%s', which borrows from it, can no longer be "
+                                   "followed",
+                                   line, c->onm[o], how, j < c->nb ? c->bnm[j] : "?");
+    }
+}
+
+static void gb_block(GbCtx *c, int b)
+{
+  TCCIRState *ir = c->ir;
+  IRBasicBlock *bb = &c->cfg->blocks[b];
+  for (int i = bb->start_idx; i < bb->end_idx; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    const IRRegistersConfig *cfg = &irop_config[q->op];
+    IROperand dest = cfg->has_dest ? tcc_ir_op_get_dest(ir, q) : irop_make_none();
+    IROperand src1 = cfg->has_src1 ? tcc_ir_op_get_src1(ir, q) : irop_make_none();
+    IROperand src2 = cfg->has_src2 ? tcc_ir_op_get_src2(ir, q) : irop_make_none();
+    const int line = q->line_num;
+    int call_id, k, o, j;
+    IRLtCall *call;
+    uint64_t am;
+    GbAddr da;
+
+    gb_read(c, src1, line);
+    if (q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
+      gb_read(c, src2, line);
+
+    /* a call that may read them sees them dead; then what its arguments
+       released or changed */
+    if ((q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID) && cfg->has_src2)
+    {
+      call_id = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, src2));
+      call = call_id >= 0 && call_id < ir->lt_nb_calls ? &ir->lt_calls[call_id] : NULL;
+      for (j = 0; c->report && c->dead && j < c->nb; j++)
+        if (((c->dead >> j) & 1) && tcc_ir_call_writes_global(lt_call_gkeep(call), c->ba[j].s) &&
+            !gb_seen(c, (line * GB_MAX + j) * 8 + 1))
+        {
+          char callee[64];
+          if (call && call->callee)
+            snprintf(callee, sizeof callee, "calling '%s'", get_tok_str(call->callee, NULL));
+          else
+            snprintf(callee, sizeof callee, "this call");
+          tcc_warning_c(warn_lifetime)("%i:'%s' borrows from '%s', which was freed or changed at line %d: set '%s' "
+                                       "again (or to nullptr) before %s",
+                                       line, c->bnm[j], c->onm[c->kown[j]], c->kline[j], c->bnm[j], callee);
+        }
+      if (call_id >= 0 && call_id < c->ncalls && c->pend[call_id])
+      {
+        for (o = 0; o < c->no; o++)
+          if ((c->pend[call_id] >> o) & 1)
+            gb_kill(c, o, line);
+        c->pend[call_id] = 0;
+      }
+    }
+    if (q->op == TCCIR_OP_FUNCPARAMVAL && (call = gb_call(c, src2, &call_id, &k)))
+    {
+      /* an owner handed to an owned (or drop) parameter: released by the call */
+      if ((o = gb_owner_value(c, src1)) >= 0 && call->known && k - call->implicit >= 0 && k - call->implicit < 32 &&
+          ((call->owned >> (k - call->implicit)) & 1))
+        c->pend[call_id] |= 1ull << o;
+      /* an owner's address: the callee may free or replace it, so what
+         borrows from it is detached first */
+      if ((am = gb_addr(c, src1)))
+      {
+        for (o = 0; o < c->no; o++)
+          if ((am >> o) & 1)
+          {
+            uint64_t bad = c->kmask[o] & ~c->detached & ~c->dead;
+            for (j = 0; c->report && j < c->nb; j++)
+              if (((bad >> j) & 1) && !gb_seen(c, (line * GB_MAX + j) * 8 + 4))
+                tcc_warning_c(warn_lifetime)("%i:'%s' points into '%s', whose address goes to %s%s%s: set it to "
+                                             "nullptr (or static storage) first",
+                                             line, c->bnm[j], c->onm[o], call->callee ? "'" : "a call",
+                                             call->callee ? get_tok_str(call->callee, NULL) : "",
+                                             call->callee ? "'" : "");
+          }
+        c->pend[call_id] |= am;
+      }
+    }
+    /* moved out: into an owned destination, or returned as an owned result */
+    if (ve_ostore(ir, i))
+    {
+      if ((o = gb_owner_value(c, src1)) >= 0)
+        gb_kill(c, o, line);
+      if ((o = gb_owner_value(c, src2)) >= 0)
+        gb_kill(c, o, line);
+    }
+    if (q->op == TCCIR_OP_RETURNVALUE && c->ret_owned && (o = gb_owner_value(c, src1)) >= 0)
+      gb_kill(c, o, line);
+    if (q->op == TCCIR_OP_RETURNVALUE && (am = gb_addr(c, src1)))
+      gb_escape(c, am, line, "returned");
+    /* ... or into an owned local (`T *owned p = move(zfile);`) */
+    if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD) && !irop_is_none(dest) && irop_dest_defines_vreg(dest) &&
+        TCCIR_DECODE_VREG_TYPE(irop_get_vreg(dest)) == TCCIR_VREG_TYPE_VAR && (j = gb_var(c, irop_get_vreg(dest))) >= 0 &&
+        c->vown[j] && (o = gb_owner_value(c, src1)) >= 0)
+      gb_kill(c, o, line);
+    /* an index variable changes: a dead item it names stays dead (no store
+       through the new value names the old element), a detached one may be
+       another element now */
+    if (!irop_is_none(dest) && irop_dest_defines_vreg(dest))
+    {
+      int32_t dv = irop_get_vreg(dest);
+      if (TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_VAR || TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_PARAM)
+        for (j = 0; j < c->nb; j++)
+          if (c->ba[j].idx == dv)
+          {
+            if ((c->dead >> j) & 1)
+              c->lost |= 1ull << j;
+            c->detached &= ~(1ull << j);
+          }
+    }
+    if (q->op != TCCIR_OP_STORE || irop_is_none(dest) || !dest.is_lval)
+      continue;
+    /* a store: an owner's address stored away cannot be followed */
+    if ((am = gb_addr(c, src1)))
+      gb_escape(c, am, line, "stored where it outlives the call");
+    /* through a pointer that may be an owner's address */
+    if (irop_get_tag(dest) == IROP_TAG_VREG && !gb_ref(c, dest, &da))
+    {
+      int dp = gb_temp_pos(c, irop_get_vreg(dest));
+      uint64_t m = dp >= 0 ? c->taddr[dp] : 0;
+      int32_t dv = irop_get_vreg(dest);
+      if (!m && dv >= 0 && TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_VAR && (k = gb_var(c, dv)) >= 0)
+        m = c->vaddr[k];
+      for (o = 0; o < c->no; o++)
+        if ((m >> o) & 1)
+          gb_kill(c, o, line);
+      continue;
+    }
+    if (!gb_ref(c, dest, &da))
+      continue;
+    /* into an owner (its kmask holds what an index may make the same), or,
+       when it is none named here, into what may be one */
+    if ((o = gb_owner(c, &da)) >= 0)
+      gb_kill(c, o, line);
+    else
+      for (o = 0; o < c->no; o++)
+        if (gb_may_alias(&c->oa[o], &da))
+          gb_kill_as(c, o, line, 1);
+    /* into a borrower: alive again through the same address */
+    if ((j = gb_borrower(c, &da)) >= 0)
+    {
+      uint64_t v = gb_value(c, src1);
+      if (c->report && !(v & GB_PARAM) && (v & ~c->bown[j]) && !gb_seen(c, (line * GB_MAX + j) * 8 + 2))
+      {
+        int o0 = 0;
+        while (o0 < c->no && !((c->bown[j] >> o0) & 1))
+          o0++;
+        if (o0 < c->no)
+          tcc_warning_c(warn_lifetime)("%i:'%s' borrows from '%s': it can hold only a pointer into what '%s' owns, "
+                                       "null or static storage",
+                                       line, c->bnm[j], c->onm[o0], c->onm[o0]);
+        else
+          tcc_warning_c(warn_lifetime)("%i:'%s' borrows from its own object: it can hold only a pointer into it, "
+                                       "null or static storage",
+                                       line, c->bnm[j]);
+      }
+      /* through an index that is not one variable no store names it again */
+      if (da.idx == GB_IDX_UNKNOWN)
+        c->lost |= ((c->dead >> j) & 1) << j;
+      if (!((c->lost >> j) & 1))
+      {
+        c->dead &= ~(1ull << j), c->alias &= ~(1ull << j);
+        /* what died only as what this one's owner may be: either it is
+           this one, alive again, or it was never touched */
+        for (int k2 = 0; k2 < c->nb; k2++)
+          if (((c->alias & c->dead) >> k2) & 1 && ((c->bown[j] >> c->kown[k2]) & 1) && !((c->lost >> k2) & 1) &&
+              gb_may_alias(&c->ba[k2], &c->ba[j]))
+            c->dead &= ~(1ull << k2), c->alias &= ~(1ull << k2);
+      }
+      /* null or static storage: its owners' changes leave it alone */
+      if (!v && !((c->dead >> j) & 1))
+        c->detached |= 1ull << j;
+      else
+        c->detached &= ~(1ull << j);
+    }
+  }
+
+  /* leaving the function (not by a noreturn call or a trap) */
+  if (c->report && c->dead && bb->num_succs == 0 && bb->end_idx > bb->start_idx)
+  {
+    IRQuadCompact *lq = &ir->compact_instructions[bb->end_idx - 1];
+    if (lq->op == TCCIR_OP_IJUMP || lq->op == TCCIR_OP_SWITCH_TABLE || tcc_ir_cfg_instr_ends_flow(ir, lq))
+      return;
+    for (int j = 0; j < c->nb; j++)
+      if (((c->dead >> j) & 1) && !gb_seen(c, (c->kline[j] * GB_MAX + j) * 8 + 3))
+      {
+        tcc_warning_c(warn_lifetime)("%i:'%s' borrows from '%s', which is freed or changed here: set '%s' again "
+                                     "(or to nullptr) before '%s' returns",
+                                     c->kline[j], c->bnm[j], c->onm[c->kown[j]], c->bnm[j], c->fname);
+        if (c->ba[j].idx == GB_IDX_UNKNOWN || c->oa[c->kown[j]].idx == GB_IDX_UNKNOWN)
+          tcc_note("%i:an element at an index that is not one variable is never the same twice: put the index in a "
+                   "variable",
+                   c->kline[j]);
+      }
+  }
+}
+
+/* per block on entry: dead, detached, lost, alias-only, then kline[], kown[] */
+#define GB_W (4 + 2 * GB_MAX)
+
+static void gb_load_state(GbCtx *c, const uint64_t *bi)
+{
+  c->dead = bi[0], c->detached = bi[1], c->lost = bi[2], c->alias = bi[3];
+  for (int j = 0; j < GB_MAX; j++)
+    c->kline[j] = (int)bi[4 + j], c->kown[j] = (int)bi[4 + GB_MAX + j];
+}
+
+static void gb_check(TCCIRState *ir, Sym *func)
+{
+  const int n = ir->next_instruction_index;
+  if ((!yasc_ngborrows && !yasc_field_borrows(0)) || !n || !func)
+    return;
+  GbCtx c;
+  memset(&c, 0, sizeof c);
+  c.ir = ir;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    const IRRegistersConfig *cfg = &irop_config[q->op];
+    IROperand d = cfg->has_dest ? tcc_ir_op_get_dest(ir, q) : irop_make_none();
+    int32_t dv;
+    if (!irop_is_none(d) && irop_dest_defines_vreg(d) && (dv = irop_get_vreg(d)) >= 0 &&
+        TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP && TCCIR_DECODE_VREG_POSITION(dv) >= c.ntemps)
+      c.ntemps = TCCIR_DECODE_VREG_POSITION(dv) + 1;
+  }
+  c.tform = tcc_mallocz((c.ntemps + 1) * sizeof(GbAddr));
+  c.tidx = tcc_malloc((c.ntemps + 1) * sizeof(GbIdx));
+  for (int t = 0; t <= c.ntemps; t++)
+    c.tidx[t].var = -1;
+  c.bnm = tcc_malloc(GB_MAX * sizeof *c.bnm);
+  c.onm = tcc_malloc(GB_OMAX * sizeof *c.onm);
+  gb_forms(&c);
+  /* the globals named here that borrow, or own what others borrow, and the
+     struct elements named here */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    const IRRegistersConfig *cfg = &irop_config[q->op];
+    IROperand ops[3] = {cfg->has_dest ? tcc_ir_op_get_dest(ir, q) : irop_make_none(),
+                        cfg->has_src1 ? tcc_ir_op_get_src1(ir, q) : irop_make_none(),
+                        cfg->has_src2 ? tcc_ir_op_get_src2(ir, q) : irop_make_none()};
+    /* the base of an address computation (`&arr + i * 8`) names no element:
+       the temp it makes does, where it is used */
+    const int base_op = q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB;
+    for (int s = 0; s < 3; s++)
+    {
+      GbAddr a;
+      int pos;
+      if (s && base_op && !irop_is_none(ops[s]) && !ops[s].is_lval && irop_get_tag(ops[s]) == IROP_TAG_SYMREF &&
+          !yasc_gborrow_of(irop_get_sym_ex(ir, ops[s])) && !yasc_gborrow_is_owner(irop_get_sym_ex(ir, ops[s])))
+        continue;
+      if (!gb_ref(&c, ops[s], &a))
+      {
+        /* an address value through a temp (`&arr[i].file` handed on) */
+        if (irop_is_none(ops[s]) || ops[s].is_lval || !irop_is_vreg_value(ops[s]) ||
+            (pos = gb_temp_pos(&c, irop_get_vreg(ops[s]))) < 0 || !c.tform[pos].s)
+          continue;
+        a = c.tform[pos];
+      }
+      if (yasc_gborrow_of(a.s))
+        gb_add_borrower(&c, a.s);
+      else if (yasc_gborrow_is_owner(a.s))
+      {
+        GbAddr w = {a.s, 0, GB_IDX_NONE, 0};
+        gb_add_owner(&c, &w, 0, get_tok_str(a.s->v, NULL));
+      }
+      else if (yasc_field_borrows(0) && ((a.s->type.t & VT_BTYPE) == VT_STRUCT || (a.s->type.t & VT_ARRAY)))
+        gb_walk(&c, &a);
+    }
+  }
+  if (!c.nb)
+    goto out;
+  for (int j = 0; j < c.nb; j++)
+    for (int o = 0; o < c.no; o++)
+      if ((c.bown[j] >> o) & 1)
+      {
+        c.obor[o] |= 1ull << j;
+        for (int o2 = 0; o2 < c.no; o2++)
+          if (gb_may_alias(&c.oa[o2], &c.oa[o]))
+            c.kmask[o2] |= 1ull << j;
+      }
+  for (int i = 0; i < ir->lt_nb_vars; i++)
+  {
+    IRLtVar *lv = &ir->lt_vars[i];
+    if (lv->vreg >= 0 && TCCIR_DECODE_VREG_TYPE(lv->vreg) == TCCIR_VREG_TYPE_VAR && !(lv->kind & LTV_HANDLE) &&
+        !lv->untracked && gb_var(&c, lv->vreg) < 0)
+    {
+      c.vvreg = lt_grow(c.vvreg, c.nvv, sizeof(int32_t));
+      c.vown = lt_grow(c.vown, c.nvv, 1);
+      c.vown[c.nvv] = (lv->kind & LTV_OWNED) != 0;
+      c.vvreg[c.nvv++] = lv->vreg;
+    }
+  }
+  c.torig = tcc_mallocz((c.ntemps + 1) * sizeof(uint64_t));
+  c.taddr = tcc_mallocz((c.ntemps + 1) * sizeof(uint64_t));
+  c.tload = tcc_mallocz(c.ntemps + 1);
+  c.vorig = tcc_mallocz((c.nvv + 1) * sizeof(uint64_t));
+  c.vaddr = tcc_mallocz((c.nvv + 1) * sizeof(uint64_t));
+  c.ncalls = ir->lt_nb_calls;
+  c.callorig = tcc_mallocz((c.ncalls + 1) * sizeof(uint64_t));
+  c.pend = tcc_mallocz((c.ncalls + 1) * sizeof(uint64_t));
+  c.ret_owned = func->type.ref && (type_yasc(&func->type.ref->type) & YASC_OWNED);
+  c.fname = get_tok_str(func->v, NULL);
+  gb_origins(&c);
+
+  c.cfg = tcc_ir_cfg_build(ir);
+  if (c.cfg)
+  {
+    tcc_ir_cfg_compute_rpo(c.cfg);
+    const int nb = c.cfg->num_blocks;
+    uint64_t *in = tcc_mallocz((size_t)nb * GB_W * sizeof(uint64_t));
+    uint8_t *reached = tcc_mallocz(nb);
+    reached[0] = 1;
+    for (int changed = 1; changed;)
+    {
+      changed = 0;
+      for (int r = 0; r < c.cfg->rpo_count; r++)
+      {
+        int b = c.cfg->rpo_order[r];
+        IRBasicBlock *bb = &c.cfg->blocks[b];
+        if (!reached[b])
+          continue;
+        gb_load_state(&c, in + (size_t)b * GB_W);
+        memset(c.pend, 0, (c.ncalls + 1) * sizeof(uint64_t));
+        gb_block(&c, b);
+        for (int s = 0; s < bb->num_succs; s++)
+        {
+          int t = bb->succs[s];
+          uint64_t *ti = in + (size_t)t * GB_W;
+          if (!reached[t])
+          {
+            /* the first path in: its state */
+            ti[0] = c.dead, ti[1] = c.detached, ti[2] = c.lost, ti[3] = c.alias;
+            for (int j = 0; j < GB_MAX; j++)
+              ti[4 + j] = (uint64_t)c.kline[j], ti[4 + GB_MAX + j] = (uint64_t)c.kown[j];
+            reached[t] = 1, changed = 1;
+            continue;
+          }
+          if ((ti[0] | c.dead) != ti[0])
+            ti[0] |= c.dead, changed = 1;
+          if ((ti[1] & c.detached) != ti[1])
+            ti[1] &= c.detached, changed = 1;
+          if ((ti[2] | c.lost) != ti[2])
+            ti[2] |= c.lost, changed = 1;
+          if ((ti[3] & c.alias) != ti[3])
+            ti[3] &= c.alias, changed = 1;
+          for (int j = 0; j < c.nb; j++)
+            if (((c.dead >> j) & 1) && (uint64_t)c.kline[j] > ti[4 + j])
+              ti[4 + j] = (uint64_t)c.kline[j], ti[4 + GB_MAX + j] = (uint64_t)c.kown[j], changed = 1;
+        }
+      }
+    }
+    c.report = 1;
+    tcc_state->diag_noabort++;
+    for (int b = 0; b < nb; b++)
+      if (reached[b])
+      {
+        gb_load_state(&c, in + (size_t)b * GB_W);
+        memset(c.pend, 0, (c.ncalls + 1) * sizeof(uint64_t));
+        gb_block(&c, b);
+      }
+    /* nothing past the tables is followed: say so rather than pass it */
+    if (c.overflow)
+      tcc_warning_c(warn_lifetime)("%i:'%s' names more borrowing globals and members than the check follows (%d "
+                                   "borrowers, %d owners, 64 elements): split it",
+                                   ir->compact_instructions[0].line_num, c.fname, GB_MAX, GB_OMAX);
+    tcc_state->diag_noabort--;
+    tcc_free(in);
+    tcc_free(reached);
+    tcc_ir_cfg_free(c.cfg);
+  }
+out:
+  tcc_free(c.tform);
+  tcc_free(c.tidx);
+  tcc_free(c.torig);
+  tcc_free(c.taddr);
+  tcc_free(c.tload);
+  tcc_free(c.vorig);
+  tcc_free(c.vaddr);
+  tcc_free(c.vvreg);
+  tcc_free(c.vown);
+  tcc_free(c.callorig);
+  tcc_free(c.pend);
+  tcc_free(c.done);
+  tcc_free(c.bnm);
+  tcc_free(c.onm);
+}
+
 void tcc_ir_flow_checks(TCCIRState *ir, Sym *func)
 {
   /* once per function: a body compiled again (late re-optimisation at the
@@ -10135,6 +12936,7 @@ void tcc_ir_flow_checks(TCCIRState *ir, Sym *func)
   {
     /* before the lifetime check, which frees the variables' records */
     tcc_ir_view_escape_check(ir, func);
+    gb_check(ir, func); /* globals that borrow from globals */
     tcc_ir_dealloc_check(ir);
     tcc_ir_restrict_check(ir);
     tcc_ir_tag_check(ir);
@@ -10143,6 +12945,8 @@ void tcc_ir_flow_checks(TCCIRState *ir, Sym *func)
       un_note_outparams(ir);
     tcc_ir_lifetime_check(ir, func);
   }
+  if (ir->un_nb_aggs)
+    un_agg_check(ir, &calls);
   if (ir->un_nb_vars)
     un_check(ir, &calls);
   if ((tcc_state->warn_return_local_addr & WARN_ON) && !tcc_state->warn_none && func && func->type.ref &&

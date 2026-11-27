@@ -89,6 +89,38 @@ void yasc_capi_word(int nstar)
   capi_update();
 }
 
+/* type_decl: `c_api` where a declarator's name goes, in regular C.  C reads
+   `const char * c_api(char *) name` as a function `c_api` and then fails on
+   something else ("invalid type for 'c_api'", "';' expected"); say what is
+   wrong instead, and read past `c_api(...)` so the declarator goes on with
+   its name.  Off the parser's recursive path: its frame stays out of
+   type_decl's. */
+__attribute__((noinline)) void yasc_capi_in_c(void)
+{
+  int depth = 0;
+  const int word = tok;
+  next();
+  const int is_call = tok == '(';
+  unget_tok(word);
+  if (!is_call)
+    return; /* a name `c_api` that is only a name */
+  if (file && tcc_yasc_file(tcc_state, file->filename))
+    tcc_error_noabort("'c_api(...)' is a yasc word, and this is regular C (a '#pragma tcc c_begin' section): "
+                      "put the declaration after '#pragma tcc c_end'");
+  else
+    tcc_error_noabort("'c_api(...)' is a yasc word, and this is regular C (this file does not say '#pragma yasc'): "
+                      "a C declaration writes the C type alone");
+  next(); /* c_api */
+  do
+  {
+    if (tok == '(')
+      depth++;
+    else if (tok == ')')
+      depth--;
+    next();
+  } while (depth > 0 && tok != TOK_EOF);
+}
+
 /* type_decl: the NSTAR-th '*' is complete, TYPE what it made */
 void yasc_capi_star(int nstar, CType *type)
 {

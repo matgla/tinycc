@@ -8,7 +8,9 @@ char / short / bit-field promoted, a comparison result; `x == 3u` with a
 constant that fits as signed is quiet too.
 -Wconversion: an implicit conversion (assignment, initializer, argument,
 return) that may change a value: to a narrower integer, float <-> integer,
-double to float; for a constant only when the value does change.
+double to float; for a constant only when the value does change.  An
+argument's warning ends with which one: `(argument 3 of 'memcpy')`, or
+`(argument 1)` through a function pointer.
 -Wsign-conversion (implied by -Wconversion unless given): the sign may
 change (`unsigned u = x;`, `int x = u;`, `u = -1`).  A compound assignment
 `c += y` checks y against c, so `c += 1` is quiet, as in gcc.  tcc has no
@@ -55,7 +57,7 @@ CASES = {
         "  sc = 200; /* W: changes value from '200' to '-56' */\n"
         "  g = 3.5; /* W: changes value from '3.5' to '3' */\n"
         "  c += x; /* W: conversion from 'int' to 'char' may change value */\n"
-        "  take(x); /* W: may change value */\n"
+        "  take(x); /* W: may change value (argument 1 of 'take') */\n"
         "  return x; /* W: may change value */\n}\n",
         DECLS + "char f1(int x)\n{\n  g = c;\n  sh = sc;\n  d = g;\n  fl = sh;\n  c = 100;\n  fl = 1.5;\n  g = 3.0;\n"
         "  c += 1;\n  c <<= 1;\n  sh += sh;\n  g = (char)x;\n  ll = g;\n  return 'a';\n}\n",
@@ -71,7 +73,7 @@ CASES = {
         "  u = -1; /* W: unsigned conversion from 'int' to 'unsigned int' changes value from '-1' to '4294967295' */\n"
         "  g = 0xFFFFFFFFu; /* W: signed conversion from 'unsigned int' to 'int' changes value */\n"
         "  u += x; /* W: may change the sign */\n"
-        "  take(x); /* W: may change the sign */\n"
+        "  take(x); /* W: may change the sign of the result (argument 1 of 'take') */\n"
         "  return x;\n}\n",
         DECLS + "int f1(int x)\n{\n  ll = u;\n  u = uc;\n  u = 5;\n  g = 7u;\n  u = (unsigned)x;\n  u = x < g;\n"
         "  return x;\n}\n",
@@ -161,3 +163,10 @@ def test_value_ranges_as_gcc(tmp_path, opt):
     assert proc.returncode == 0, proc.stderr
     lines = sorted({int(l.split(":")[1]) for l in proc.stderr.splitlines() if ": warning: " in l})
     assert lines == [8, 9, 16, 17, 18, 19, 24, 25, 31, 37], proc.stderr
+
+
+def test_argument_named(tmp_path):
+    body = DECLS + "void (*fp)(unsigned);\nint f1(int x)\n{\n  fp(x);\n  u = x;\n  return x;\n}\n"
+    proc = run(tmp_path, body, "-Wsign-conversion")
+    matches(proc, [(14, "may change the sign of the result (argument 1)"), (15, "may change the sign of the result")])
+    assert "(argument" not in [l for l in proc.stderr.splitlines() if ":15:" in l][0]

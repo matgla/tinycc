@@ -1418,7 +1418,8 @@ static void check_stringop(ObjCall *oc)
   int sl;
   const char *s;
 
-  if (!tcc_warn_wanted(warn_stringop_overflow))
+  /* the call's -ffortify check said it already (objsize_call_overflow_said) */
+  if (!tcc_warn_wanted(warn_stringop_overflow) || oc->overflow_seen)
     return;
   switch (oc->kind)
   {
@@ -1708,6 +1709,20 @@ void objsize_call_end(ObjCall *oc, int discarded)
  * __builtin___memcpy_chk and kin (chk.c): a constant length over a known
  * object size is a sure overflow -- unless the plain function's check (OC,
  * objsize_call_begin_named) already said so */
+/* OC's call is of FSYM, a deprecated / yasc-unsafe function named at LINE:
+   reported with the arguments in (chk.c's implicit sprintf) */
+void objsize_call_dep(ObjCall *oc, Sym *fsym, int line)
+{
+  oc->dep = fsym;
+  oc->dep_line = line;
+}
+
+/* a sure overflow of OC's call was reported by its -ffortify check */
+void objsize_call_overflow_said(ObjCall *oc)
+{
+  oc->overflow_seen = 1;
+}
+
 void objsize_chk_overflow(ObjCall *oc, const char *name, unsigned long long n, unsigned long long size)
 {
   if (oc && oc->overflow_seen)

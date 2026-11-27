@@ -619,13 +619,28 @@ static __attribute__((noinline)) void expr_eq_objsize_rhs(void)
  * out of line, as its locals (the NRVO and objsize state) would sit in
  * expr_eq()'s frame on every level of the recursion through nested
  * parentheses. */
+/* vstore() for `a[i] = v` / `*p = v` (LVAL: fe_lval_tok << 2 | fe_lval_kind)
+   into a pointer that is not '?': the lifetime check looks at the value */
+static __attribute__((noinline)) void expr_eq_assign_store(int lval)
+{
+  const int from = tcc_state->ir->next_instruction_index;
+  vstore();
+  tcc_ir_lt_note_assign_store(tcc_state->ir, from, tcc_state->ir->next_instruction_index, lval >> 2,
+                              (lval & 3) == FE_LVAL_DEREF);
+}
+
 static __attribute__((noinline)) void expr_eq_assign(int t)
 {
   Sym *lhs;
+  /* yasc: `a[i] = v`, `*p = v` into a pointer that is not '?': T becomes
+     -(the left side's shape) for the store (no local: this frame is on the
+     parse's recursion, `a = b = c`) */
+  if (t == '=' && fe_lval_kind && yasc_store_flow_wanted(&vtop->type))
+    t = -(fe_lval_tok << 2 | fe_lval_kind);
   test_lvalue();
-  lhs = t == '=' ? unused_lhs_assign() : unused_lhs(); /* -Wunused-but-set-variable */
+  lhs = t == '=' || t < 0 ? unused_lhs_assign() : unused_lhs(); /* -Wunused-but-set-variable */
   next();
-  if (t == '=')
+  if (t == '=' || t < 0)
   {
     /* NRVO for plain assignment `dest = sret_call(...)`: hint that the
      * first composite-returning call in the RHS may write its result
@@ -695,7 +710,10 @@ static __attribute__((noinline)) void expr_eq_assign(int t)
       fe_compound_rhs = *vtop, fe_compound_pending = aop == TOK_SHL || aop == TOK_SAR ? 2 : 1;
     gen_op_checked(aop);
   }
-  vstore();
+  if (t < 0)
+    expr_eq_assign_store(-t);
+  else
+    vstore();
   fe_compound_pending = 0;
   unused_assigned_to(lhs);
 }

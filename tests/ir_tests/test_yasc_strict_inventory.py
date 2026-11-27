@@ -27,15 +27,15 @@ LEVELS = ["-O0", "-O2"]
 
 PRELUDE = """\
 #pragma yasc
-void * owned malloc(unsigned n);
-void free(drop void * owned maybe p);
+void *owned malloc(unsigned n);
+void free(drop void *?owned p);
 int use(char *p);
-struct node { int v; struct node * view maybe next; };
-struct buf { char * owned maybe p; };
+struct node { int v; struct node *?next; };
+struct buf { char *?owned p; };
 struct node gn;
 void reset(void);
-void put(char * owned maybe *pp);
-struct buf * borrows(static) holder(void);
+void put(char *?owned *pp);
+struct buf *borrows(static) holder(void);
 """
 PRELUDE_LINES = PRELUDE.count("\n")
 

@@ -349,6 +349,8 @@ void gen_late_reopt_functions(TCCState *s)
     tok_str_sys_copy(fn->func_str, compile_ts);
 
     int saved_outer_tok = tok;
+
+    const int saved_outer_yasc = tcc_state->yasc; /* the replay sets its own dialect */
     CValue saved_outer_tokc = tokc;
     Section *saved_text = cur_text_section;
     cur_text_section = late_reopt_sec;
@@ -381,6 +383,8 @@ void gen_late_reopt_functions(TCCState *s)
     }
 
     tok = saved_outer_tok;
+
+    tcc_state->yasc = saved_outer_yasc;
     tokc = saved_outer_tokc;
     cur_text_section = saved_text;
 

@@ -22,14 +22,14 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 
 PRELUDE = """\
 #pragma yasc
-void free(drop void * owned maybe p);
-void * owned maybe malloc(unsigned n);
-void * owned maybe takes(p) grow(void * owned p, unsigned n);
-void * owned takes(p) wrap(void * owned p);
+void free(drop void *?owned p);
+void *?owned malloc(unsigned n);
+void *?@(owned, takes(p)) grow(void *owned p, unsigned n);
+void *@(owned, takes(p)) wrap(void *owned p);
 int use(void *p);
 """
 PRELUDE_LINES = PRELUDE.count("\n")
-START = "void f(unsigned n)\n{\n  void * owned maybe p = malloc(4);\n  if (!p)\n    return;\n"
+START = "void f(unsigned n)\n{\n  void *?owned p = malloc(4);\n  if (!p)\n    return;\n"
 
 
 def _compile(tmp_path, body, *flags):
@@ -56,10 +56,10 @@ def _diags(tmp_path, body, *flags):
 LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 
 CALLER_CLEAN = {
-    "freed_on_failure": START + "  void * owned maybe q = grow(move(p), n);\n  if (!q)\n  {\n    free(p);\n    return;\n  }\n"
+    "freed_on_failure": START + "  void *?owned q = grow(move(p), n);\n  if (!q)\n  {\n    free(p);\n    return;\n  }\n"
     "  free(q);\n}\n",
-    "tested_the_other_way": START + "  void * owned maybe q = grow(move(p), n);\n  if (q)\n    free(q);\n  else\n    free(p);\n}\n",
-    "no_maybe_always_moves": START + "  void * owned q = wrap(move(p));\n  free(q);\n}\n",
+    "tested_the_other_way": START + "  void *?owned q = grow(move(p), n);\n  if (q)\n    free(q);\n  else\n    free(p);\n}\n",
+    "no_maybe_always_moves": START + "  void *owned q = wrap(move(p));\n  free(q);\n}\n",
 }
 
 
@@ -71,7 +71,7 @@ def test_caller_clean(tmp_path, name, opt):
 
 CALLER_BAD = {
     "used_where_valid": (
-        START + "  void * owned maybe q = grow(move(p), n);\n  if (q)\n    use(p);\n  free(q);\n  free(p);\n}\n",
+        START + "  void *?owned q = grow(move(p), n);\n  if (q)\n    use(p);\n  free(q);\n  free(p);\n}\n",
         8,
         "'p' is used after it was moved",
     ),
@@ -81,7 +81,7 @@ CALLER_BAD = {
         "'p' leaks: it may still own memory when it is assigned again",
     ),
     "failure_path_leaks": (
-        START + "  void * owned maybe q = grow(move(p), n);\n  if (!q)\n    return;\n  free(q);\n}\n",
+        START + "  void *?owned q = grow(move(p), n);\n  if (!q)\n    return;\n  free(q);\n}\n",
         8,
         "'p' leaks: it still owns memory at return",
     ),
@@ -95,7 +95,7 @@ def test_caller_reported(tmp_path, name, opt):
     assert (line, msg) in _diags(tmp_path, body, opt)
 
 
-CALLEE = "void * owned maybe takes(p) g(void * owned p, unsigned n)\n{\n  void * owned maybe q = malloc(n);\n"
+CALLEE = "void *?@(owned, takes(p)) g(void *owned p, unsigned n)\n{\n  void *?owned q = malloc(n);\n"
 
 
 def test_callee_clean(tmp_path):
@@ -114,14 +114,14 @@ def test_callee_keeps_it_on_success(tmp_path):
 
 
 ERRORS = {
-    "not_owned_result": ("void * view maybe takes(p) f(void * owned p, char *s);", "takes(p): the result must be owned"),
-    "unknown": ("void * owned takes(x) f(void * owned p);", "takes(x): no parameter is called 'x'"),
-    "view_parameter": ("void * owned takes(p) f(void *p);", "takes(p): 'p' must be an owned parameter that is not drop"),
+    "not_owned_result": ("void *?@(view, takes(p)) f(void *owned p, char *s);", "takes(p): the result must be owned"),
+    "unknown": ("void *@(owned, takes(x)) f(void *owned p);", "takes(x): no parameter is called 'x'"),
+    "view_parameter": ("void *@(owned, takes(p)) f(void *p);", "takes(p): 'p' must be an owned parameter that is not drop"),
     "drop_parameter": (
-        "void * owned takes(p) f(drop void * owned p);",
+        "void *@(owned, takes(p)) f(drop void *owned p);",
         "takes(p): 'p' must be an owned parameter that is not drop",
     ),
-    "not_a_function": ("void * owned takes(p) v;", "takes(p): only a function's result takes a parameter over"),
+    "not_a_function": ("void *@(owned, takes(p)) v;", "takes(p): only a function's result takes a parameter over"),
 }
 
 

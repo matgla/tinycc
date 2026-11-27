@@ -187,11 +187,11 @@ def test_auto_type_spelling_in_error(tmp_path):
 
 PRELUDE = """\
 #pragma yasc
-void * owned malloc(unsigned n);
-void free(drop void * owned maybe p);
+void *owned malloc(unsigned n);
+void free(drop void *?owned p);
 struct node { int v; };
-struct node * borrows(static) maybe find(int k);
-char * view first(char *s);
+struct node *?borrows(static) find(int k);
+char *view first(char *s);
 int use(char *p);
 """
 PRELUDE_LINES = PRELUDE.count("\n")
@@ -251,8 +251,8 @@ def test_auto_pointer_satisfies_the_plain_pointer_rule(tmp_path):
 )
 def test_auto_copy_of_an_owned_pointer_is_an_error(tmp_path, init):
     body = (
-        "struct box { char * owned buf; };\n"
-        "void f(char * owned p, struct box *s)\n{\n  auto q = " + init + ";\n  free(q);\n  free(p);\n}\n"
+        "struct box { char *owned buf; };\n"
+        "void f(char *owned p, struct box *s)\n{\n  auto q = " + init + ";\n  free(q);\n  free(p);\n}\n"
     )
     proc, diags = _yasc(tmp_path, body)
     assert proc.returncode != 0
@@ -269,14 +269,14 @@ def test_auto_copy_of_an_owned_pointer_is_an_error(tmp_path, init):
 # a copy of an lvalue needs move(...) or borrow(...)
 @pytest.mark.parametrize("opt", LEVELS)
 def test_auto_takes_an_owned_rvalue(tmp_path, opt):
-    body = "void f(void)\n{\n  auto q = (char * owned)malloc(4);\n  use(q);\n  free(q);\n}\n"
+    body = "void f(void)\n{\n  auto q = (char *owned)malloc(4);\n  use(q);\n  free(q);\n}\n"
     proc, diags = _yasc(tmp_path, body, opt)
     assert proc.returncode == 0 and diags == [], proc.stderr
-    proc, explicit = _yasc(tmp_path, body.replace("auto q", "char * owned q"), opt)
+    proc, explicit = _yasc(tmp_path, body.replace("auto q", "char *owned q"), opt)
     assert proc.returncode == 0 and explicit == diags, proc.stderr
 
 
 def test_auto_owned_rvalue_still_owns(tmp_path):
-    proc, diags = _yasc(tmp_path, "void f(void)\n{\n  auto q = (char * owned)malloc(4);\n  use(q);\n}\n")
+    proc, diags = _yasc(tmp_path, "void f(void)\n{\n  auto q = (char *owned)malloc(4);\n  use(q);\n}\n")
     assert proc.returncode == 0, proc.stderr
     assert diags == [(5, "warning", "'q' leaks: it still owns memory at the end of its scope")]

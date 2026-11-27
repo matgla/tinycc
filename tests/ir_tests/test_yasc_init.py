@@ -35,18 +35,35 @@ PRELUDE = (
     "int g(int);\n"
     "void fill(out int *p);\n"
     "void plain(int *p);\n"
-    "void see(const int *p);\n"
+    "void see(int *p);\n"
     "static inline void ifill(out int *p) { *p = 7; }\n"
-    "void pfill(out const char * view maybe *p);\n"
-    "static inline int ipfill(const char *s, out const char * borrows(s) maybe *p)\n"
+    "void pfill(out const char *?view *p);\n"
+    "static inline int ipfill(char *s, out const char *?borrows(s) *p)\n"
     "{\n  *p = nullptr;\n  if (s[0] == '0')\n    *p = s;\n  return 8;\n}\n"
     "struct pt { int x, y; };\n"
     "void sfill(out struct pt *p);\n"
+    "void sread(struct pt *p);\n"
+    "int gr(char *b);\n"
+    "int grw(inout char *b);\n"
+    "int gw(out char *b, unsigned long n);\n"
+    "int gn(char b[n], unsigned long n);\n"
+    "int gwn(out char b[n], unsigned long n);\n"
+    "int vf(int n, ...);\n"
+    "void afill(out int a[1]);\n"
+    "void vfill(int n, out int a[n]);\n"
+    "void bfill(out void buf[n], unsigned long n);\n"
+    "void mfill(out void buf[?n], unsigned long n);\n"
 )
 
 READ_MAY = "may be used uninitialized: yasc wants a value on every path"
 READ_IS = "is used uninitialized"
 ADDR = "is taken where it may have no value: set it first, pass it to an 'out' parameter, or declare it '= undefined'"
+AGG_READ = "is read before anything is written to it (it is declared '= undefined')"
+
+
+def PARAM(name, n, callee, may=False):
+    return (f"'{name}' {'may have' if may else 'has'} no value yet where it goes to parameter {n} of '{callee}', "
+            "which may read it: write it first, or the parameter should say 'out'")
 
 
 def _run(tmp_path, body, *flags):
@@ -69,6 +86,27 @@ def _diags(proc):
 
 
 BAD = {
+    # `= undefined` is followed: a parameter that may read (in, inout) needs a value
+    "undefined_to_reader": ("int f(void)\n{\n  int m = undefined;\n  plain(&m);\n  return m;\n}\n", 4, PARAM("m", 1, "plain")),
+    "undefined_maybe_to_reader": (
+        "int f(int c)\n{\n  int m = undefined;\n  if (c)\n    m = 1;\n  plain(&m);\n  return m;\n}\n",
+        6,
+        PARAM("m", 1, "plain", may=True),
+    ),
+    "undefined_array_to_reader": ("int f(void)\n{\n  char b[4] = undefined;\n  return gr(b);\n}\n", 4, PARAM("b", 1, "gr")),
+    "undefined_array_to_inout": ("int f(void)\n{\n  char b[4] = undefined;\n  return grw(b);\n}\n", 4, PARAM("b", 1, "grw")),
+    "undefined_array_to_sized_reader": (
+        "int f(void)\n{\n  char b[4] = undefined;\n  return gn(b, 4);\n}\n",
+        4,
+        PARAM("b", 1, "gn"),
+    ),
+    "undefined_struct_to_reader": (
+        "int f(void)\n{\n  struct pt p = undefined;\n  sread(&p);\n  return p.x;\n}\n",
+        4,
+        PARAM("p", 1, "sread"),
+    ),
+    "undefined_array_read": ("int f(void)\n{\n  char b[4] = undefined;\n  return b[1];\n}\n", 4, f"'b' {AGG_READ}"),
+    "undefined_struct_member_read": ("int f(void)\n{\n  struct pt p = undefined;\n  return p.y;\n}\n", 4, f"'p' {AGG_READ}"),
     "never_set": ("int f(void)\n{\n  int x;\n  return x;\n}\n", 4, f"'x' {READ_IS}"),
     "one_branch": ("int f(int a)\n{\n  int x;\n  if (a)\n    x = 1;\n  return x;\n}\n", 6, f"'x' {READ_MAY}"),
     "loop_only": (
@@ -76,11 +114,11 @@ BAD = {
         6,
         f"'s' {READ_MAY}",
     ),
-    "pointer": ("int f(void)\n{\n  int * view p;\n  return *p;\n}\n", 4, f"'p' {READ_IS}"),
+    "pointer": ("int f(void)\n{\n  int *view p;\n  return *p;\n}\n", 4, f"'p' {READ_IS}"),
     "address_unset": ("int f(void)\n{\n  int m;\n  plain(&m);\n  return m;\n}\n", 4, f"the address of 'm' {ADDR}"),
     "address_to_const": ("int f(void)\n{\n  int m;\n  see(&m);\n  return m;\n}\n", 4, f"the address of 'm' {ADDR}"),
     "address_in_pointer": (
-        "int f(void)\n{\n  int m;\n  int * view p = &m;\n  *p = 1;\n  return m;\n}\n",
+        "int f(void)\n{\n  int m;\n  int *view p = &m;\n  *p = 1;\n  return m;\n}\n",
         4,
         f"the address of 'm' {ADDR}",
     ),
@@ -138,18 +176,38 @@ GOOD = {
         "int f(int c)\n{\n  int x;\n  switch (c)\n  {\n  case 0:\n    x = 1;\n    break;\n  default:\n    x = 2;\n  }\n  return x;\n}\n"
     ),
     "out_call": "int f(void)\n{\n  int n;\n  fill(&n);\n  return n;\n}\n",
+    # an array parameter's `out` (read(2)'s `out void buf[?n]`): on the pointer it becomes
+    "out_array_param": "int f(void)\n{\n  int n;\n  afill(&n);\n  return n;\n}\n",
+    "out_vla_param": "int f(void)\n{\n  int n;\n  vfill(1, &n);\n  return n;\n}\n",
+    "out_void_sized_param": "int f(void)\n{\n  int n;\n  bfill(&n, sizeof n);\n  return n;\n}\n",
+    "out_void_sized_maybe_param": "int f(void)\n{\n  int n;\n  mfill(&n, sizeof n);\n  return n;\n}\n",
     "out_inlined": "int f(void)\n{\n  int n;\n  ifill(&n);\n  return n;\n}\n",
     # `out` on the pointer p points at (the level below the parameter's own)
-    "out_pointer_call": "int f(void)\n{\n  const char * maybe q;\n  pfill(&q);\n  return q != nullptr;\n}\n",
+    "out_pointer_call": "int f(void)\n{\n  const char *?q;\n  pfill(&q);\n  return q != nullptr;\n}\n",
     "out_pointer_inlined": (
-        "int f(const char *s)\n{\n  const char * maybe q;\n  int b = ipfill(s, &q);\n  return q ? b : 0;\n}\n"
+        "int f(char *s)\n{\n  const char *?q;\n  int b = ipfill(s, &q);\n  return q ? b : 0;\n}\n"
     ),
     "overflow_result": (
         "int f(int a, int b)\n{\n  int r;\n  if (__builtin_add_overflow(a, b, &r) || __builtin_mul_overflow(r, 2, &r))\n"
         "    return -1;\n  return r;\n}\n"
     ),
     "set_then_address": "int f(void)\n{\n  int m;\n  m = 3;\n  plain(&m);\n  return m;\n}\n",
-    "undefined_address": "int f(void)\n{\n  int m = undefined;\n  plain(&m);\n  return m;\n}\n",
+    "undefined_to_out": "int f(void)\n{\n  int m = undefined;\n  fill(&m);\n  plain(&m);\n  return m;\n}\n",
+    # where the check cannot follow (varargs, regular C) `= undefined` still vouches
+    "undefined_to_varargs": "int f(void)\n{\n  int m = undefined;\n  vf(1, &m);\n  return m;\n}\n",
+    "undefined_array_written": "int f(void)\n{\n  char b[4] = undefined;\n  b[0] = 1;\n  return gr(b);\n}\n",
+    "undefined_array_to_out": "int f(void)\n{\n  char b[4] = undefined;\n  gw(b, 4);\n  return grw(b);\n}\n",
+    "undefined_array_to_sized_out": "int f(void)\n{\n  char b[4] = undefined;\n  gwn(b, 4);\n  return gr(b);\n}\n",
+    "undefined_array_loop_filled": (
+        "int f(void)\n{\n  char b[4] = undefined;\n  for (int i = 0; i < 4; i++)\n    b[i] = 0;\n  return gr(b);\n}\n"
+    ),
+    # an aggregate is followed as one object, and only a definite case is said
+    "undefined_array_one_branch": (
+        "int f(int c)\n{\n  char b[4] = undefined;\n  if (c)\n    b[0] = 1;\n  return gr(b);\n}\n"
+    ),
+    "undefined_struct_assigned": (
+        "int f(struct pt q)\n{\n  struct pt p = undefined;\n  p = q;\n  sread(&p);\n  return p.x;\n}\n"
+    ),
     "undefined_array": "int f(void)\n{\n  char b[4] = undefined, c[2] = {1, 2};\n  b[0] = 1;\n  return b[0] + c[1];\n}\n",
     "undefined_struct": "int f(void)\n{\n  struct pt p = undefined;\n  sfill(&p);\n  return p.x;\n}\n",
     "undefined_vla": "int f(int n)\n{\n  int a[n] = undefined;\n  a[0] = 1;\n  return a[0];\n}\n",
@@ -181,7 +239,7 @@ def test_undefined_emits_no_code(tmp_path):
     under -ccompat, where a yasc file still parses it and nothing is enforced)."""
     objs = []
     for init in ("", " = undefined"):
-        body = f"int f(void)\n{{\n  char b[64]{init};\n  fill((int * view)(void * view)b);\n  return b[1];\n}}\n"
+        body = f"int f(void)\n{{\n  char b[64]{init};\n  fill((int *view)(void *view)b);\n  return b[1];\n}}\n"
         src = tmp_path / "t.c"
         src.write_text(PRELUDE + body)
         out = tmp_path / f"t{len(objs)}.o"

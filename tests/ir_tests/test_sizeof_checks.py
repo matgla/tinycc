@@ -38,7 +38,7 @@ CASES = {
         PRE + "void f1(IO struct S * V p, IO struct S * V q, IO char * V c)\n{\n"
         "  memset(p, 0, sizeof p); /* W: argument to 'sizeof' in 'memset' call is the same expression as the "
         "destination; did you mean to dereference it? */\n"
-        "  memcpy(p, q, sizeof(q)); /* W: the same pointer type 'struct S * */\n"  # 'struct S * view' in yasc
+        "  memcpy(p, q, sizeof(q)); /* W: the same pointer type 'struct S * */\n"  # 'struct S *view' in yasc
         "  (void)memcmp(p, q, sizeof p); /* W: the same expression as the first source */\n"
         "  strncpy(c, c, sizeof c); /* W: in 'strncpy' call is the same expression as the destination; did you mean "
         "to provide an explicit length? */\n"

@@ -1088,6 +1088,33 @@ ST_FUNC Sym *sym_unpark(TokenSym *ts)
   return s;
 }
 
+/* The Syms pushed on global_stack since its top was ABOVE go under
+ * everything else on it, as if declared at the start of the unit: a type
+ * the compiler makes in the middle of a parameter list (@src()'s,
+ * builtin/misc.c) must not be popped with the list's parameters. */
+ST_FUNC void sym_sink_to_bottom(Sym *above)
+{
+  Sym *top = global_stack, *low;
+  if (top == above)
+    return;
+  for (low = top; low->prev != above; low = low->prev)
+    ;
+  global_stack = above;
+  low->prev = NULL;
+  if (!global_stack)
+  {
+    global_stack = top;
+    gs_bottom = low;
+    return;
+  }
+  if (!gs_bottom)
+    gs_bottom = global_stack;
+  while (gs_bottom->prev)
+    gs_bottom = gs_bottom->prev;
+  gs_bottom->prev = top;
+  gs_bottom = low;
+}
+
 /* End of TU: drop the records of the prototypes nothing named. */
 ST_FUNC void sym_parked_free_all(void)
 {

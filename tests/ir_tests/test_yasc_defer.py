@@ -97,7 +97,7 @@ def test_body_cannot_see_later_names(tmp_path):
 
 
 def test_warning_once_for_many_exits(tmp_path):
-    body = "void f(int a) { defer { int * view p = 1; note(*p); } if (a) return; if (a > 1) return; note(a); }\n"
+    body = "void f(int a) { defer { int *view p = 1; note(*p); } if (a) return; if (a > 1) return; note(a); }\n"
     proc = _yasc(tmp_path, body, "-Wall")
     assert proc.returncode == 0, proc.stderr
     warnings = [line for line in proc.stderr.splitlines() if "warning: " in line]

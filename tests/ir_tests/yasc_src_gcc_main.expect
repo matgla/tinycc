@@ -1,0 +1,2 @@
+gcc tcc-made yasc_src_gcc_main.c:22 main
+tcc yasc_src_gcc.c:20 gcc_here

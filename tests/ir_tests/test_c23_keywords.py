@@ -27,7 +27,7 @@ constexpr int k = 5;
 int use(void) { int *p = nullptr; bool b = true; return (p == 0) + b + k + a + buf[0]; }
 """
 
-YASC = "#pragma yasc\n" + C23.replace("int *p = nullptr", "int * view maybe p = nullptr")
+YASC = "#pragma yasc\n" + C23.replace("int *p = nullptr", "int *?view p = nullptr")
 
 OLD = """\
 int true = 1, false = 0, nullptr = 2, alignas = 3, alignof = 4, constexpr = 5;

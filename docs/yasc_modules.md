@@ -38,8 +38,8 @@ module net.socket;                 /* first declaration of the file */
 import net.addr;                   /* another module */
 
 export typedef struct sock sock_t; /* opaque to importers */
-export sock_t * owned maybe sock_open(addr_t addr);
-export void sock_close(sock_t * owned drop s);
+export sock_t *?owned sock_open(addr_t addr);
+export void sock_close(sock_t *owned drop s);
 
 struct sock { int fd; };            /* private: importers never see the body */
 int parse_port(const char *s) { ... }   /* private: internal linkage */
@@ -50,7 +50,7 @@ import net.socket;
 
 int main(void)
 {
-    sock_t * owned maybe s = sock_open(addr_any());
+    sock_t *?owned s = sock_open(addr_any());
     ...
 }
 ```
@@ -201,7 +201,7 @@ in geom rebuilds geom.o only, a changed signature rebuilds its importers
   Kotlin platform types): its pointer node carries `YASC_UNCHECKED`, and it
   converts to and from `owned` and `view` pointers without a diagnostic; the
   flow checks (-Wlifetime) take it as neither maybe nor null -- checks start at
-  the yasc variable it lands in. So `char * owned p = c_name();` and handing an
+  the yasc variable it lands in. So `char *owned p = c_name();` and handing an
   owned result to a C function (`c_take(make())`) are silent, while the same
   with a pointer declared in yasc still warns. An owned variable passed to a
   C function's parameter says what happens to it (2026-11-23):
@@ -209,7 +209,7 @@ in geom rebuilds geom.o only, a changed signature rebuilds its importers
   over (p is moved there); a plain `c_use(p)` is -Wimplicit-move's "'p' is
   owned and goes to a regular-C parameter: write borrow(p) or move(p)" (a
   fix-it adds borrow). A call's owned result needs neither. Replaces the
-  earlier "reads as `view maybe`" rule, which would have flagged every C call.
+  earlier "reads as `?view`" rule, which would have flagged every C call.
 - The arguments written inside a regular-C macro are regular C too, and so is
   a yasc macro used inside one (its expansion is inside the markers): with
   tcc's function-like `va_arg`, `va_arg(ap, char *)`. A regular-C macro inside
@@ -238,24 +238,24 @@ in geom rebuilds geom.o only, a changed signature rebuilds its importers
   yasc; it does not matter today, since C code has no owned pointers to check.
 - **GCC attributes refine it** (`attr_apply_pointer_facts`, attribute.c): a C
   header that says what it means is believed over "unchecked".
-  - `malloc` (or `malloc(dealloc, n)`): the result is `owned maybe` -- `owned`
+  - `malloc` (or `malloc(dealloc, n)`): the result is `?owned` -- `owned`
     with `returns_nonnull`. Storing it in a view or discarding it warns, and so
-    does a pointer that is not `maybe` (the flow checks); `char * owned maybe p =
+    does a pointer that is not `?` (the flow checks); `char *?owned p =
     malloc(n);` is the yasc spelling.
   - `malloc(dealloc, n)`: the deallocator's n-th parameter is
-    `owned maybe drop`, so freeing a pointer yasc code does not own warns.
+    `?owned drop`, so freeing a pointer yasc code does not own warns.
   - `nonnull(i, ...)` / `nonnull`: those parameters are marked
     (`SymAttr.nonnull`) and a null constant for one is a `-Wnonnull` warning, in
     every unit (in `-Wall`, so in safe mode). As with GCC, every declaration's
     `nonnull` counts: a redeclaration or the definition adds its marks to the
-    earlier ones (`patch_type`, attr_merge.c). "Not `maybe`" means more once the
+    earlier ones (`patch_type`, attr_merge.c). "Not `?`" means more once the
     flow checks exist.
   - yasos libc (branch feat/yasc-attributes, `sys/_attrs.h`) puts them on its
     allocators (`malloc`..`strdup` with `free`, `fopen` with `fclose`, `opendir`
     with `closedir`, `popen` with `pclose`) and `nonnull` on the functions that
     read a whole string. `__has_attribute` reports the three.
   - `yasc_view` / `yasc_maybe` on a struct member (`attr_apply_member_facts`,
-    tcc only): its pointer is `view`, with `yasc_maybe` `view maybe`, so yasc
+    tcc only): its pointer is `view`, with `yasc_maybe` `?view`, so yasc
     code dereferences it without `unsafe` and the flow checks see what is stored
     in it.  A struct has one definition, so a yasc copy of it in a side header
     (as `sys/yasc/*.h` redeclares functions) is not possible; the attribute
@@ -264,7 +264,7 @@ in geom rebuilds geom.o only, a changed signature rebuilds its importers
     not a pointer, or `yasc_maybe` alone, a warning.  yasos libc spells them
     `__yl_view` / `__yl_view_maybe` (empty where `__has_attribute` says no), on
     the syscall contexts (`sys/syscall.h`): `view` where libc points the member
-    at its own object, `view maybe` where it passes on its caller's pointer.
+    at its own object, `?view` where it passes on its caller's pointer.
     test_yasc_member_view.py.
 - Not yet: `access(write_only, n)` as `out`, `warn_unused_result`, and side
   files of annotations for C libraries we cannot edit.
@@ -278,7 +278,7 @@ in geom rebuilds geom.o only, a changed signature rebuilds its importers
   - an include guard `YASC_MODULE_A_B_H`, the module's `#include`s, and
     `#include <c/d.h>` for each module it imports (so C callers use `-I DIR`, and
     generate the imported modules' headers into the same DIR);
-  - the exported declarations, with the yasc qualifiers (`owned view maybe out
+  - the exported declarations, with the yasc qualifiers (`owned ?view out
     drop`) left out -- C has no use for them, and defining them as empty macros
     would break C code that uses `out` or `view` as names;
   - a plain `export inline` as its prototype (the module defines it), an

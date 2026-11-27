@@ -97,31 +97,31 @@ def test_code_unchanged(tmp_path, opt):
 # yasc: a call's result that borrows from an argument (borrows(...), or the
 # elision) points into that argument, a frame address too
 YASC_PRELUDE = (
-    "char * borrows(p) f(char * maybe p);\n"
-    "char * borrows(static, p) fs(char * maybe p);\n"
-    "char * view v(char *p);\n"
-    "char * borrows(a) two(char *a, char *b);\n"
+    "char *borrows(p) f(char *?p);\n"
+    "char *borrows(static, p) fs(char *?p);\n"
+    "char *view v(char *p);\n"
+    "char *borrows(a) two(char *a, char *b);\n"
 )
 
 YASC_BAD = {
-    "call": ("char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return f(buf);\n}\n", "f"),
-    "static_or_param": ("char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return fs(buf);\n}\n", "fs"),
-    "elision": ("char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return v(buf);\n}\n", "v"),
-    "nested": ("char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return f(f(buf));\n}\n", "f"),
-    "offset": ("char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return f(buf) + 1;\n}\n", "f"),
-    "element": ("char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return f(&buf[1]);\n}\n", "f"),
+    "call": ("char *borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return f(buf);\n}\n", "f"),
+    "static_or_param": ("char *borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return fs(buf);\n}\n", "fs"),
+    "elision": ("char *borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return v(buf);\n}\n", "v"),
+    "nested": ("char *borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return f(f(buf));\n}\n", "f"),
+    "offset": ("char *borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return f(buf) + 1;\n}\n", "f"),
+    "element": ("char *borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  return f(&buf[1]);\n}\n", "f"),
     "borrowed_one": (
-        "char * borrows(p) g(char *p)\n{\n  char buf[4] = \"ab\";\n  return two(buf, p);\n}\n",
+        "char *borrows(p) g(char *p)\n{\n  char buf[4] = \"ab\";\n  return two(buf, p);\n}\n",
         "two",
     ),
 }
 
 YASC_CLEAN = {
-    "static": "char * borrows(static) g(void)\n{\n  static char sb[4];\n  return f(sb);\n}\n",
-    "literal": "char * borrows(static) g(void)\n{\n  return f(\"lit\");\n}\n",
-    "parameter": "char * borrows(p) g(char *p)\n{\n  return f(p);\n}\n",
-    "not_borrowed": "char * borrows(p) g(char *p)\n{\n  char buf[4] = \"ab\";\n  return two(p, buf);\n}\n",
-    "used_inside": "int g(void)\n{\n  char buf[4] = \"ab\";\n  char * view r = f(buf);\n  return *r;\n}\n",
+    "static": "char *borrows(static) g(void)\n{\n  static char sb[4];\n  return f(sb);\n}\n",
+    "literal": "char *borrows(static) g(void)\n{\n  return f(\"lit\");\n}\n",
+    "parameter": "char *borrows(p) g(char *p)\n{\n  return f(p);\n}\n",
+    "not_borrowed": "char *borrows(p) g(char *p)\n{\n  char buf[4] = \"ab\";\n  return two(p, buf);\n}\n",
+    "used_inside": "int g(void)\n{\n  char buf[4] = \"ab\";\n  char *view r = f(buf);\n  return *r;\n}\n",
 }
 
 
@@ -154,7 +154,7 @@ def test_yasc_through_call(tmp_path, name, opt):
 
 @pytest.mark.parametrize("opt", LEVELS)
 def test_yasc_through_call_held(tmp_path, opt):
-    body = "char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  char * view r = f(buf);\n  return r;\n}\n"
+    body = "char *borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  char *view r = f(buf);\n  return r;\n}\n"
     assert _yasc_diags(_run_yasc(tmp_path, body, "-Wall", opt)) == [
         (5, "'g' may return the address of a local variable (held in 'r')")
     ]
@@ -168,6 +168,6 @@ def test_yasc_clean(tmp_path, name, opt):
 
 
 def test_yasc_through_call_unsafe(tmp_path):
-    body = "char * borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  unsafe { return f(buf); }\n}\n"
+    body = "char *borrows(static) g(void)\n{\n  char buf[4] = \"ab\";\n  unsafe { return f(buf); }\n}\n"
     proc = _run_yasc(tmp_path, body, "-Wall")
     assert proc.returncode == 0 and not proc.stderr, proc.stderr

@@ -102,10 +102,11 @@ void indir(void)
   /* Not for the operand of '&', which needs the address this lvalue names:
    * a folded `&arr[2]` in a static initializer became `&arr` (the restore in
    * unary() knows only the symbol).  Not for a word a relocation fills in
-   * (a pointer, a __rodata_relative offset): its bytes are only the addend. */
+   * (a pointer, a __rodata_relative offset): its bytes are only the addend.
+   * Nor a self-relative word (@src()): the distance means nothing alone. */
   if (nocode_wanted && !indir_keep_lvalue && (vtop->r & (VT_VALMASK | VT_SYM | VT_LVAL)) == (VT_CONST | VT_SYM | VT_LVAL) && vtop->sym &&
       sym_is_const_object(vtop->sym) && !(vtop->type.t & VT_VOLATILE) &&
-      !vtop->sym->a.possibly_written && !vtop->sym->a.tentative && !(vtop->type.t & (VT_ARRAY | VT_VLA | VT_RODATA_REL)))
+      !vtop->sym->a.possibly_written && !vtop->sym->a.tentative && !(vtop->type.t & (VT_ARRAY | VT_VLA | VT_RODATA_REL | VT_SELF_REL)))
   {
     int btype = vtop->type.t & VT_BTYPE;
     if (btype == VT_BYTE || btype == VT_SHORT || btype == VT_INT || btype == VT_LLONG || btype == VT_BOOL ||
@@ -159,20 +160,21 @@ void indir(void)
 }
 
 /* pass a parameter to a function and do type checking and casting */
-void gfunc_param_typed(Sym *func, Sym *arg)
+void gfunc_param_typed(Sym *func, Sym *arg, Sym *callee)
 {
-  int func_type;
+  int func_type, argn = 0;
   CType type;
 
-  /* -Wnonnull: a null constant for a parameter __attribute__((nonnull)) names */
-  if (arg && arg->a.nonnull && tcc_state->warn_nonnull && is_null_pointer(vtop))
+  if (arg)
   {
     Sym *p;
-    int n = 1;
+    argn = 1;
     for (p = sym_first(func); p && p != arg; p = p->next)
-      n++;
-    tcc_warning_once(warn_nonnull, "null passed as argument %d, which is declared nonnull", n);
+      argn++;
   }
+  /* -Wnonnull: a null constant for a parameter __attribute__((nonnull)) names */
+  if (arg && arg->a.nonnull && tcc_state->warn_nonnull && is_null_pointer(vtop))
+    tcc_warning_once(warn_nonnull, "null passed as argument %d, which is declared nonnull", argn);
 
   /* If &g is being bound to a non-const pointer param, the callee may write
    * through it — poison g so inline-eval won't fold `*&g` to its initializer. */
@@ -255,8 +257,10 @@ void gfunc_param_typed(Sym *func, Sym *arg)
      * 16 bytes is the AArch64 rule.) */
     yasc_argument = 1;
     yasc_argument_c = arg->yasc & YASC_PARAM_C;
+    fe_arg_index = argn, fe_arg_callee = callee; /* named by conversion warnings */
     gen_assign_cast(&type);
     yasc_argument = yasc_argument_c = 0;
+    fe_arg_index = 0, fe_arg_callee = NULL;
   }
 }
 

@@ -1,7 +1,7 @@
 """yasc `c_api(T)`: the type C callers see in place of a yasc one
 (docs/yasc_c_api.md).
 
-    const char * borrows(static) maybe c_api(char *) dlerror(void);
+    const char *?@(borrows(static), c_api(char *)) dlerror(void);
 
 The body and yasc callers keep the yasc type; a regular-C declaration of the
 same function is compared with the C type (either order), and the function
@@ -24,7 +24,7 @@ TCC = CURRENT_DIR.parent.parent / "armv8m-tcc"
 pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 
 Y = "#pragma yasc\n"
-DL = "const char * borrows(static) maybe c_api(char *) dlerror(void);\n"
+DL = "const char *?@(borrows(static), c_api(char *)) dlerror(void);\n"
 
 
 def _cc(tmp_path, src, *flags, name="t.c"):
@@ -39,21 +39,21 @@ def _cc(tmp_path, src, *flags, name="t.c"):
 
 ACCEPTED = {
     "c_redecl_after": Y + DL + "#pragma tcc c_begin\nchar *dlerror(void);\n#pragma tcc c_end\n"
-    "int u(void) { const char * maybe e = dlerror(); return e ? *e : 0; }\n",
+    "int u(void) { const char *?e = dlerror(); return e ? *e : 0; }\n",
     "c_redecl_before": Y + "#pragma tcc c_begin\nchar *dlerror(void);\n#pragma tcc c_end\n" + DL +
-    "int u(void) { const char * maybe e = dlerror(); return e ? *e : 0; }\n",
+    "int u(void) { const char *?e = dlerror(); return e ? *e : 0; }\n",
     # the definition need not say it again; a C declaration after it still fits
-    "definition": Y + DL + "const char * borrows(static) maybe dlerror(void) { return \"\"; }\n"
+    "definition": Y + DL + "const char *?borrows(static) dlerror(void) { return \"\"; }\n"
     "#pragma tcc c_begin\nchar *dlerror(void);\n#pragma tcc c_end\n",
     "function_pointer": Y + DL + "#pragma tcc c_begin\nstruct ops { char *(*err)(void); };\n"
     "struct ops o = { dlerror };\n#pragma tcc c_end\n",
-    "param_array": Y + "int execv(const char *path, const char * view const c_api(char * const) argv[]);\n"
-    "#pragma tcc c_begin\nint execv(const char *path, char * const argv[]);\n#pragma tcc c_end\n",
-    "out_inner_level": Y + "long sl(const char *s, out const char * borrows(s) c_api(char *) * maybe endptr, int b);\n"
+    "param_array": Y + "int execv(char *path, char *@(view, c_api(char * const)) argv[]);\n"
+    "#pragma tcc c_begin\nint execv(const char *path, char *const argv[]);\n#pragma tcc c_end\n",
+    "out_inner_level": Y + "long sl(char *s, out const char *@(borrows(s), c_api(char *)) *?endptr, int b);\n"
     "#pragma tcc c_begin\nlong sl(const char *s, char **endptr, int b);\n#pragma tcc c_end\n",
-    "member": Y + "struct pw { const char * view c_api(char *) name; int uid; };\n",
+    "member": Y + "struct pw { const char *c_api(char *) name; int uid; };\n",
     # C may say more const of a result than yasc: it only reads it
-    "result_more_const_in_c": Y + "char * borrows(static) c_api(const char *) k(void);\n",
+    "result_more_const_in_c": Y + "char *@(borrows(static), c_api(const char *)) k(void);\n",
     "same_c_api_twice": Y + DL + DL,
 }
 
@@ -65,26 +65,26 @@ def test_accepted(tmp_path, name):
 
 
 REJECTED = {
-    "pointer_to_int": (Y + "void * borrows(static) c_api(int) f(void);\n",
-                       "c_api(int) cannot stand for 'void * borrows(static)': a pointer and something that is not one"),
-    "int_to_long": (Y + "int * borrows(static) c_api(long *) g(void);\n",
+    "pointer_to_int": (Y + "void *@(borrows(static), c_api(int)) f(void);\n",
+                       "c_api(int) cannot stand for 'const void *borrows(static)': a pointer and something that is not one"),
+    "int_to_long": (Y + "int *@(borrows(static), c_api(long *)) g(void);\n",
                     "different types (c_api(...) may differ in const and volatile only)"),
-    "char_to_int": (Y + "const char * borrows(static) c_api(int *) h(void);\n",
-                    "c_api(int *) cannot stand for 'const char * borrows(static)'"),
-    "c_const_yasc_writes": (Y + "int k(inout char * c_api(const char *) p);\n",
+    "char_to_int": (Y + "const char *@(borrows(static), c_api(int *)) h(void);\n",
+                    "c_api(int *) cannot stand for 'const char *borrows(static)'"),
+    "c_const_yasc_writes": (Y + "int k(inout char *c_api(const char *) p);\n",
                             "it is const for C callers, and the yasc declaration may write it"),
-    "member_c_const": (Y + "struct pw { char * view c_api(const char *) name; };\n",
+    "member_c_const": (Y + "struct pw { char *c_api(const char *) name; };\n",
                        "it is const for C callers, and the yasc declaration may write it"),
-    "twice": (Y + "char * view c_api(char *) c_api(char *) m(void);\n", "c_api(...) twice in one declarator"),
-    "redecl_other_c_api": (Y + "const char * borrows(static) c_api(char *) d(void);\n"
-                           "const char * borrows(static) c_api(const char *) d(void);\n",
+    "twice": (Y + "char *@(view, c_api(char *), c_api(char *)) m(void);\n", "c_api(...) twice in one declarator"),
+    "redecl_other_c_api": (Y + "const char *@(borrows(static), c_api(char *)) d(void);\n"
+                           "const char *@(borrows(static), c_api(const char *)) d(void);\n",
                            "'d' is declared again with another c_api(...)"),
     "c_redecl_not_the_c_type": (Y + DL + "#pragma tcc c_begin\nint *dlerror(void);\n#pragma tcc c_end\n",
                                 "incompatible types for redefinition of 'dlerror'"),
     "function_pointer_other_type": (Y + DL + "#pragma tcc c_begin\nstruct ops { int *(*err)(void); };\n"
                                     "struct ops o = { dlerror };\n#pragma tcc c_end\n",
                                     "assignment from incompatible pointer type"),
-    "nested_declarator": (Y + "char * borrows(static) c_api(char *) (*fp)(void);\n",
+    "nested_declarator": (Y + "char *@(borrows(static), c_api(char *)) (*fp)(void);\n",
                           "c_api(...) in a declarator in parentheses is not supported"),
 }
 
@@ -100,12 +100,12 @@ def test_rejected(tmp_path, name):
 YASC_HEADER = """#pragma yasc
 #include <sys/_attrs.h>
 /* null when no error happened since the last call */
-const char * borrows(static) maybe c_api(char *) dlerror(void);
-int execv(const char *path, const char * view const c_api(char * const) argv[]);
-long sl(const char *s, out const char * borrows(s) c_api(char *) * maybe endptr, int base);
-extern const char * view c_api(char *) maybe gname;
+const char *?@(borrows(static), c_api(char *)) dlerror(void);
+int execv(char *path, char *@(view, c_api(char * const)) argv[]);
+long sl(char *s, out const char *@(borrows(s), c_api(char *)) *?endptr, int base);
+extern const char *?@(view, c_api(char *)) gname;
 struct pw {
-  const char * view c_api(char *) pw_name;
+  const char *c_api(char *) pw_name;
   int uid;
 };
 """
@@ -132,7 +132,7 @@ def test_c_header(tmp_path):
 
 def test_c_header_declarator_list(tmp_path):
     (tmp_path / "yasc").mkdir()
-    (tmp_path / "yasc" / "x.h").write_text("#pragma yasc\nextern char * view a, * view c_api(char *) b;\n")
+    (tmp_path / "yasc" / "x.h").write_text("#pragma yasc\nextern char *view a, *@(view, c_api(char *)) b;\n")
     proc = subprocess.run([str(TCC), "-yasc-c-header", str(tmp_path / "yasc" / "x.h")], capture_output=True,
                           text=True)
     assert proc.returncode != 0
@@ -154,7 +154,7 @@ BAD = {
     "local_index": "void f(int i) { char *e = dlerror(); e[i] = 0; }\n",
     "local_deref": "void f(void) { char *e = dlerror(); *e = 0; }\n",
     "arithmetic": "void f(void) { char *e = dlerror(); char *p = e + 2; p[0] = 0; }\n",
-    "out_argument": "void f(const char *s) { char *end; sl(s, &end, 10); *end = 0; }\n",
+    "out_argument": "void f(char *s) { char *end; sl(s, &end, 10); *end = 0; }\n",
     "to_writing_parameter": "void f(void) { wr(dlerror()); }\n",
     "to_builtin_strcpy": "void f(void) { char *e = dlerror(); strcpy(e, \"x\"); }\n",
 }
@@ -210,6 +210,6 @@ def test_written_header_and_c_caller(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "writing through the result of 'dlerror'" in proc.stderr, proc.stderr
     # a yasc unit reads the yasc header itself: const, and no warning
-    ysrc = '#pragma yasc\n#include "x.h"\nint g(void) { const char * maybe e = dlerror(); return e ? *e : 0; }\n'
+    ysrc = '#pragma yasc\n#include "x.h"\nint g(void) { const char *?e = dlerror(); return e ? *e : 0; }\n'
     proc = _cc(tmp_path, ysrc, "-I", str(tmp_path), name="y.c")
     assert proc.returncode == 0, proc.stderr

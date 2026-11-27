@@ -250,6 +250,7 @@ static void recover_restore(TCCRecover *r)
   unary_addr_operand = 0;
   indir_keep_lvalue = 0;
   yasc_returning = yasc_argument = yasc_argument_c = 0;
+  fe_arg_index = 0, fe_arg_callee = NULL;
   if (s1->unsafe_depth)
   {
     BufferedFile *uf;
@@ -1040,6 +1041,10 @@ ST_FUNC void tccgen_decls_recovering(TCCState *s1)
   {
     TCCRecover *rp = s1->recover; /* &r, read back from memory */
     recover_restore(rp);
+    /* the dialect is the file's being read: this point was armed before the
+       file's `#pragma yasc`, and its saved one would make the rest regular C */
+    if (file)
+      s1->yasc = file->yasc;
     sym_pop(&local_stack, NULL, 0);
     /* a file-scope prototype's parameters are pushed on the global stack,
        above every global (which has scope 0) */

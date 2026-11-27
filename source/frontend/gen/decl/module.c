@@ -477,7 +477,7 @@ static int yasc_peek(const int *p, const int *stop, const int **next)
    takes(...) (declarator.c type_decl). */
 static int yasc_ptr_qual(int t)
 {
-  return (t >= TOK_owned && t <= TOK_drop) || (t >= TOK_CONST1 && t <= TOK_CONST3) ||
+  return (t >= TOK_owned && t <= TOK_maybe) || (t >= TOK_CONST1 && t <= TOK_CONST3) ||
          (t >= TOK_VOLATILE1 && t <= TOK_VOLATILE3) || (t >= TOK_RESTRICT1 && t <= TOK_RESTRICT3) ||
          t == TOK__Atomic;
 }
@@ -535,6 +535,9 @@ static void yasc_export_finish(void)
   /* the C header leaves out a yasc qualifier's (...): armed by the
      qualifier, then the depth inside them */
   int prev2 = 0, ptr_quals = 0, c_arm = 0, c_skip = 0, c_const = 0, c_prev = 0;
+  /* the C header leaves out a default argument (`T p = d`, default_arg.c):
+     the level of its parameter list while in one */
+  int c_dflt = 0;
   CValue cv;
 
   yasc_pending = NULL;
@@ -632,6 +635,14 @@ static void yasc_export_finish(void)
     }
     const int at_plist = !in_body && level > 0 && level < 32 && ((plist >> level) & 1);
     const int was_pstart = pstart;
+    /* out / inout / drop: words where a parameter starts, or after its type
+       before a handle's words (`int drop owned(close) fd`); names elsewhere */
+    int pword = 0;
+    if (at_plist && t >= TOK_out && t <= TOK_drop)
+    {
+      const int n = yasc_peek(p, stop, NULL);
+      pword = was_pstart || (n >= TOK_owned && n <= TOK_maybe);
+    }
     if (t == '(' && !in_body && level + 1 < 32)
     {
       plist = (plist & ~(1u << (level + 1))) | ((prev >= TOK_UIDENT || prev == ')') ? 1u << (level + 1) : 0);
@@ -640,8 +651,10 @@ static void yasc_export_finish(void)
     }
     else if (t == ',' && at_plist)
       pstart = 1, paccess = 0;
-    else if (at_plist && (t == TOK_out || t == TOK_inout || t == TOK_drop || (t == TOK_in && was_pstart)))
+    else if (pword || (at_plist && was_pstart && t == TOK_in))
       paccess = 1;
+    else if (at_plist && t == TOK_UNUSED1 && was_pstart)
+      ; /* yasc `unused int x`: a parameter's declaration still starts */
     else
       pstart = 0;
     if (t == '{' || t == '(' || t == '[')
@@ -664,6 +677,15 @@ static void yasc_export_finish(void)
     }
     else if (yasc_cheader && yasc_qual_args(t, prev_c, prev2, ptr_quals, p, stop))
       c_arm = c_drop = 1;
+    if (c_dflt)
+    {
+      if ((t == ',' && level == c_dflt) || (t == ')' && level == c_dflt - 1))
+        c_dflt = 0;
+      else
+        c_drop = 1;
+    }
+    else if (!c_drop && t == '=' && at_plist)
+      c_dflt = level, c_drop = 1;
     if (!c_drop)
       ptr_quals = t == '*' || (ptr_quals && yasc_ptr_qual(t));
     prev2 = prev_c;
@@ -671,9 +693,13 @@ static void yasc_export_finish(void)
       tcc_error("-fmodule-header: c_api(...) in an exported declaration has no C header form here: declare it in "
                 "a yasc header (tcc -yasc-c-header)");
     if (yasc_cheader && !c_drop && !(c_proto && (in_body || yasc_is_inline_kw(t))) &&
-        !(t >= TOK_owned && t <= TOK_drop) && !(t == TOK_in && was_pstart && at_plist))
+        !(t >= TOK_owned && t <= TOK_maybe) &&
+        !pword && !((t == TOK_in || t == TOK_UNUSED1) && was_pstart && at_plist) &&
+        /* `inout` before a function's type: its view result is written through (yasc only) */
+        !(t == TOK_inout && !at_plist))
     {
-      if (in_body && (t == TOK_defer || t == TOK_errdefer))
+      if (in_body && (t == TOK_defer || t == TOK_errdefer ||
+                      (t == TOK_UNUSED1 && (prev_c == ';' || prev_c == '{' || prev_c == '}'))))
         tcc_error("-fmodule-header: an exported static inline function uses '%s', which C does not have",
                   get_tok_str(t, NULL));
       if (in_body && (prev_c == '.' || prev_c == TOK_ARROW) && yasc_method_name_known(t))

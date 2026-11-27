@@ -505,7 +505,7 @@ the stash moved to a *pre-RA* snapshot and a vreg/frame-offset renumbering
 splice. Multi-week, and a much wider miscompilation surface.
 
 **Top hazards for (a):** compile-time and memory blowup (the eval-only path
-expands the whole body at every constant-arg site *before* const-prop and DCE
+expands the whole body at every constant-arg site *before*const-prop and DCE
 run — 32 × ~200-word bodies for `20020506-1` alone; the `inline_count >= 8`
 budget only covers call-heavy callees, so a global expansion budget is needed);
 token-replay rebinding hazards, which every existing lexical guard exists to

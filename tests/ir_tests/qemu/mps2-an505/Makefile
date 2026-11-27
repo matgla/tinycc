@@ -140,7 +140,7 @@ TCC_FLAGS += -fno-pic -mno-sb-relative-got
 # the shared archive: -L first so the explicit -larmv8m-libtcc1.a resolves
 # here, and -B LAST so the linker runtime's unconditional libtcc1 pull
 # (tcc_add_support; the last -B owns the {B} library paths) also lands here.
-LIBTCC1_BM_MEMBERS = libtcc1 alloca armeabi armeabi_divmod va_list builtin arm_string arm_mem arm_copystub armv8m_atomic yasc
+LIBTCC1_BM_MEMBERS = libtcc1 alloca armeabi armeabi_divmod va_list builtin arm_string arm_mem arm_copystub armv8m_atomic yasc fortify_printf
 LIBTCC1_BM_CC_SUM := $(shell sha256sum "$(CC)" 2>/dev/null | cut -c1-12)
 ifeq ($(strip $(LIBTCC1_BM_CC_SUM)),)
 LIBTCC1_BM_CC_SUM := unknowncc

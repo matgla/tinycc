@@ -90,7 +90,7 @@ struct pk { char c; uint32_t u; } __attribute__((packed));
 enum op { OP_A, OP_B };
 static const char g_msg[] = "hi";
 static volatile uint32_t g_reg;
-int use(const volatile void *p);
+int use(volatile void *p);
 """
 
 ERRORS = {
@@ -103,74 +103,74 @@ ERRORS = {
     "as_float_lossy": ("float f(int x) { return cast<as(float)>(x); }", "needs cast<float(float)>"),
     "trunc_float": ("int f(double d) { return cast<trunc(int)>(d); }", "int(T) for a float"),
     "bits_size": ("uint16_t f(float x) { return cast<bits(uint16_t)>(x); }", "is not the same size"),
-    "bits_pointer": ("uintptr_t f(int * view p) { return cast<bits(uintptr_t)>(p); }", "is a pointer conversion"),
+    "bits_pointer": ("uintptr_t f(int *view p) { return cast<bits(uintptr_t)>(p); }", "is a pointer conversion"),
     "int_to_enum": ("enum op f(int x) { return cast<int(enum op)>(x); }", "int makes an integer type"),
     "to_bool": ("_Bool f(int x) { return cast<int(_Bool)>(x); }", "compare it (x != 0)"),
     # syntax
     "no_type": ("int f(long long x) { return cast<int>(x); }", "'int' needs its type: int(T)"),
     "unknown": ("int f(int x) { return cast<wide(int)>(x); }", "'wide' is not a cast permission"),
     "two_types": ("int f(int x) { return cast<int(int), trunc(int)>(x); }", "one permission carries the type"),
-    "mix": ("int f(int * view p) { return cast<int(int), align(4)>(p); }", "do not mix"),
-    "align_two": ("char * view f(char * view p) { return cast<align(3)>(p); }", "not a power of two"),
+    "mix": ("int f(int *view p) { return cast<int(int), align(4)>(p); }", "do not mix"),
+    "align_two": ("char *view f(char *view p) { return cast<align(3)>(p); }", "not a power of two"),
     # pointer permissions
-    "ptr_missing": ("uint32_t f(uint8_t * view p) { return *cast<as(uint32_t *)>(p); }", "pointer conversion"),
-    "align_missing": ("uint32_t f(uint8_t * view p) { return *cast<ptr(uint32_t *)>(p); }",
+    "ptr_missing": ("uint32_t f(uint8_t *view p) { return *cast<as(uint32_t *)>(p); }", "pointer conversion"),
+    "align_missing": ("uint32_t f(uint8_t *view p) { return *cast<ptr(uint32_t *)>(p); }",
                       "the alignment rises from 1 to 4: add align"),
-    "packed_align": ("uint32_t f(struct pk * view s) { return *cast<ptr(uint32_t *)>(&s->u); }",
+    "packed_align": ("uint32_t f(struct pk *view s) { return *cast<ptr(uint32_t *)>(&s->u); }",
                      "the alignment rises from 1 to 4"),
-    "align_unneeded": ("uint32_t f(uint32_t * view p) { return *cast<ptr(uint32_t *), align>(p); }",
+    "align_unneeded": ("uint32_t f(uint32_t *view p) { return *cast<ptr(uint32_t *), align>(p); }",
                        "align is not needed"),
     "align_unneeded_member": ("struct d { int pos; _Alignas(4) char buf[8]; };\n"
-                              "uint32_t f(struct d * view s) { return *cast<ptr(uint32_t *), align>(s->buf); }",
+                              "uint32_t f(struct d *view s) { return *cast<ptr(uint32_t *), align>(s->buf); }",
                               "align is not needed"),
-    "ptr_drops_const": ("char * view f(const char * view s) { return cast<ptr(char *)>(s); }",
+    "ptr_drops_const": ("char *view f(char *view s) { return cast<ptr(char *)>(s); }",
                         "drops 'const': this needs qual"),
-    "qual_safe_cast": ("char * view f(const char * view s) { return cast<qual(char *)>(s); }",
+    "qual_safe_cast": ("char *view f(char *view s) { return cast<qual(char *)>(s); }",
                        "qual is unsafe: write unsafe_cast"),
     "unsafe_needless": ("int f(long x) { return unsafe_cast<int(int)>(x); }", "nothing unsafe here: write cast"),
-    "qual_unneeded": ("char * view f(inout char * view s) { return unsafe_cast<qual(char *)>(s); }",
+    "qual_unneeded": ("char *view f(inout char *view s) { return unsafe_cast<qual(char *)>(s); }",
                       "qual is not needed"),
-    "qual_const_object": ("void f(void) { char * view p = unsafe_cast<qual(char *)>(g_msg); use(p); }",
+    "qual_const_object": ("void f(void) { char *view p = unsafe_cast<qual(char *)>(g_msg); use(p); }",
                           "points at a const object"),
-    "qual_literal": ("void f(void) { char * view p = unsafe_cast<qual(char *)>(\"lit\"); use(p); }",
+    "qual_literal": ("void f(void) { char *view p = unsafe_cast<qual(char *)>(\"lit\"); use(p); }",
                      "points at a const object"),
-    "qual_volatile_object": ("void f(void) { uint32_t * view p = unsafe_cast<qual(uint32_t *)>(&g_reg); use(p); }",
+    "qual_volatile_object": ("void f(void) { uint32_t *view p = unsafe_cast<qual(uint32_t *)>(&g_reg); use(p); }",
                              "points at a volatile object"),
-    "qual_nested": ("void f(inout char * view * view p) { const char * view * view q = cast<ptr(const char * view *)>(p); use(q); }",
+    "qual_nested": ("void f(inout char *view *view p) { const char *view *view q = cast<ptr(const char *view *)>(p); use(q); }",
                     "adds const below a level that is not const"),
-    "const_safe_cast": ("void f(void) { char * view p = cast<ptr(char *), const>(\"\"); use(p); }",
+    "const_safe_cast": ("void f(void) { char *view p = cast<ptr(char *), const>(\"\"); use(p); }",
                         "const is unsafe: write unsafe_cast"),
-    "const_unneeded": ("char * view f(inout char * view s) { return unsafe_cast<const(char *)>(s); }",
+    "const_unneeded": ("char *view f(inout char *view s) { return unsafe_cast<const(char *)>(s); }",
                        "const is not needed"),
-    "const_volatile": ("uint32_t * view f(inout volatile uint32_t * view r) { return unsafe_cast<const(uint32_t *)>(r); }",
+    "const_volatile": ("uint32_t *view f(inout volatile uint32_t *view r) { return unsafe_cast<const(uint32_t *)>(r); }",
                        "const is not needed"),
-    "const_drops_volatile": ("char * view f(const volatile char * view s) { return unsafe_cast<const(char *)>(s); }",
+    "const_drops_volatile": ("char *view f(volatile char *view s) { return unsafe_cast<const(char *)>(s); }",
                              "drops 'const volatile': this needs qual (unsafe_cast); const drops only const"),
-    "const_and_qual": ("void f(void) { char * view p = unsafe_cast<ptr(char *), const, qual>(\"\"); use(p); }",
+    "const_and_qual": ("void f(void) { char *view p = unsafe_cast<ptr(char *), const, qual>(\"\"); use(p); }",
                        "const and qual: write one"),
-    "const_untyped": ("void f(void) { char * view p = unsafe_cast<const>(\"\"); use(p); }",
+    "const_untyped": ("void f(void) { char *view p = unsafe_cast<const>(\"\"); use(p); }",
                       "const alone needs its type"),
-    "qual_literal_hint": ("void f(void) { char * view p = unsafe_cast<qual(char *)>(\"lit\"); use(p); }",
+    "qual_literal_hint": ("void f(void) { char *view p = unsafe_cast<qual(char *)>(\"lit\"); use(p); }",
                           "unsafe_cast<..., const>"),
-    "addr_int_to_ptr_safe": ("void f(void) { uint32_t * view p = cast<addr(uint32_t *)>(0x40000000u); use(p); }",
+    "addr_int_to_ptr_safe": ("void f(void) { uint32_t *view p = cast<addr(uint32_t *)>(0x40000000u); use(p); }",
                              "is unsafe: write unsafe_cast"),
-    "addr_narrow": ("uint16_t f(int * view p) { return cast<addr(uint16_t)>(p); }", "does not fit that integer"),
-    "fn_safe": ("typedef int (*cmp_t)(const void *, const void *);\n"
-                "int c2(const int *a, const int *b);\n"
+    "addr_narrow": ("uint16_t f(int *view p) { return cast<addr(uint16_t)>(p); }", "does not fit that integer"),
+    "fn_safe": ("typedef int (*cmp_t)(void *, void *);\n"
+                "int c2(int *a, int *b);\n"
                 "cmp_t f(void) { return cast<fn(cmp_t)>(c2); }", "write unsafe_cast"),
-    "inner_plain": ("const char * view * f(char * view * view p) { return cast<ptr(const char **)>(p); }",
+    "inner_plain": ("const char *view * f(char *view *view p) { return cast<ptr(const char **)>(p); }",
                     "only the outermost '*'"),
     # the C cast
     "c_int": ("uint16_t f(int x) { return (uint16_t)x; }",
               "C cast: write cast<int(unsigned short)>(...), or cast<trunc(...)>(...) to keep the low bits"),
-    "c_ptr": ("const struct dirent * view f(const char * view b) { return (const struct dirent * view)b; }",
-              "C cast: write cast<ptr(const struct dirent * view), align>(...)"),
-    "c_qual": ("char * view f(const char * view s) { return (char * view)s; }",
-               "C cast: write unsafe_cast<qual(char * view)>(...)"),
-    "c_null": ("void f(void) { int * view maybe p = (int * view maybe)0; use(p); }", "C cast: write nullptr"),
+    "c_ptr": ("const struct dirent *view f(char *view b) { return (const struct dirent *view)b; }",
+              "C cast: write cast<ptr(const struct dirent *view), align>(...)"),
+    "c_qual": ("char *view f(char *view s) { return (char *view)s; }",
+               "C cast: write unsafe_cast<qual(char *view)>(...)"),
+    "c_null": ("void f(void) { int *?view p = (int *?view)0; use(p); }", "C cast: write nullptr"),
     "c_as": ("long long f(int x) { return (long long)x; }", "C cast: write cast<as(long long)>(...)"),
     "c_float": ("float f(int x) { return (float)x; }", "C cast: write cast<float(float)>(...)"),
-    "c_addr": ("uintptr_t f(int * view p) { return (uintptr_t)p; }", "C cast: write cast<addr(unsigned int)>(...)"),
+    "c_addr": ("uintptr_t f(int *view p) { return (uintptr_t)p; }", "C cast: write cast<addr(unsigned int)>(...)"),
 }
 
 
@@ -186,25 +186,25 @@ def test_casts_that_compile(tmp_path):
     proc, _ = _compile(tmp_path, PRELUDE + """
 #include <stddef.h>
 struct d { int pos; _Alignas(struct dirent) char buf[64]; };
-typedef int (*cmp_t)(const void *, const void *);
-int c2(const int *a, const int *b);
+typedef int (*cmp_t)(void *, void *);
+int c2(int *a, int *b);
 static _Alignas(4) uint8_t g_buf[16];
-void f(struct d * view s, const char * view str, char * view * view argv, uint8_t * view raw, double dd)
+void f(struct d *view s, char *view str, char *view *view argv, uint8_t *view raw, double dd)
 {
-  const struct dirent * view a = cast<ptr(const struct dirent *)>(s->buf);       /* aligned member: free */
-  const struct dirent * view b = cast<ptr(const struct dirent *), align>(s->buf + s->pos);
-  const uint32_t * view w = cast<ptr(const uint32_t *)>(g_buf);                  /* _Alignas global */
-  const uint32_t * view w2 = cast<ptr(const uint32_t *), align(4)>(raw);
-  char * view hit = unsafe_cast<qual(char *)>(str);
-  const char * view * view cc = unsafe_cast<qual(const char * view *)>(argv);
-  uint32_t * view dst = unsafe_cast<ptr(uint32_t *), qual, align>(str);
-  char * view lit = unsafe_cast<ptr(char *), const>("");                      /* const object: POSIX char * */
-  char * view msg = unsafe_cast<const(char *)>(g_msg);
-  volatile uint32_t * view reg = unsafe_cast<addr(volatile uint32_t *)>(0x40070000u);
+  const struct dirent *view a = cast<ptr(const struct dirent *)>(s->buf);       /* aligned member: free */
+  const struct dirent *view b = cast<ptr(const struct dirent *), align>(s->buf + s->pos);
+  const uint32_t *view w = cast<ptr(const uint32_t *)>(g_buf);                  /* _Alignas global */
+  const uint32_t *view w2 = cast<ptr(const uint32_t *), align(4)>(raw);
+  char *view hit = unsafe_cast<qual(char *)>(str);
+  const char *view *view cc = unsafe_cast<qual(const char *view *)>(argv);
+  uint32_t *view dst = unsafe_cast<ptr(uint32_t *), qual, align>(str);
+  char *view lit = unsafe_cast<ptr(char *), const>("");                      /* const object: POSIX char * */
+  char *view msg = unsafe_cast<const(char *)>(g_msg);
+  volatile uint32_t *view reg = unsafe_cast<addr(volatile uint32_t *)>(0x40070000u);
   uintptr_t ad = cast<addr(uintptr_t)>(str);
   cmp_t cmp = unsafe_cast<fn(cmp_t)>(c2);
-  const void * view vp = cast<as(const void *)>(raw);
-  const uint8_t * view back = cast<ptr(const uint8_t *)>(vp);
+  const void *view vp = cast<as(const void *)>(raw);
+  const uint8_t *view back = cast<ptr(const uint8_t *)>(vp);
   uint8_t lo = cast<trunc(uint8_t)>(s->pos);
   int8_t n = cast<int(int8_t)>(s->pos);
   uint32_t fb = cast<bits(uint32_t)>(1.5f);
@@ -226,11 +226,11 @@ def test_yasc_qualifiers_come_from_the_operand(tmp_path):
     proc, _ = _compile(tmp_path, """
 #include <stdlib.h>
 struct node { int v; };
-void use(struct node * view n);
+void use(struct node *view n);
 void f(void)
 {
-  void * owned maybe raw = malloc(sizeof(struct node));
-  struct node * owned maybe n = cast<ptr(struct node *)>(move(raw));
+  void *?owned raw = malloc(sizeof(struct node));
+  struct node *?owned n = cast<ptr(struct node *)>(move(raw));
   if (n)
     use(n);
   free(n);
@@ -287,7 +287,7 @@ def test_proven_casts_cost_nothing(tmp_path, opt):
 struct d { int pos; _Alignas(4) char buf[16]; };
 uint16_t widen(uint8_t x) { return cast<int(uint16_t)>(x); }
 int trunc_(int x) { return cast<trunc(uint8_t)>(x); }
-const uint32_t * view member(struct d * view s) { return cast<ptr(const uint32_t *)>(s->buf); }
+const uint32_t *view member(struct d *view s) { return cast<ptr(const uint32_t *)>(s->buf); }
 long long as_(int x) { return cast<as(long long)>(x); }
 uint8_t konst(void) { return cast<int(uint8_t)>(200); }
 """, opt)
@@ -304,7 +304,7 @@ def test_optimizer_drops_checks_it_proves(tmp_path, opt):
 
 def test_unproven_checks_and_no_sanitize(tmp_path):
     body = ("uint8_t f(int x) { return cast<int(uint8_t)>(x); }\n"
-            "const uint32_t * view g(const uint8_t * view p) { return cast<ptr(const uint32_t *), align>(p); }\n"
+            "const uint32_t *view g(uint8_t *view p) { return cast<ptr(const uint32_t *), align>(p); }\n"
             "enum e { A, B, C };\nenum e h(int x) { return cast<enum(enum e)>(x); }\n")
     proc, obj = _compile(tmp_path, body, "-O1")
     assert proc.returncode == 0, proc.stderr

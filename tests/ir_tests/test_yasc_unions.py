@@ -27,10 +27,10 @@ PRELUDE = """\
 typedef unsigned long uintptr_t;
 typedef unsigned uint32_t;
 int use(char *p);
-union val { char * view s; uintptr_t addr; int i; };
-struct holder { char * view p; int n; };
+union val { char *s; uintptr_t addr; int i; };
+struct holder { char *p; int n; };
 union agg { struct holder h; int raw[2]; };
-union arr { char * view a[2]; uintptr_t w[2]; };
+union arr { char *a[2]; uintptr_t w[2]; };
 struct tagged { int k; union val u; };
 typedef union { uint32_t raw; struct { uint32_t en:1, irq:1, _r:6, div:8, _r2:16; } b; } ctrl_t;
 """
@@ -74,7 +74,7 @@ NEEDS_UNSAFE = {
     "nested": ("int f(union agg *a)\n{\n  return use(%s);\n}\n", "a->h.p", FROM_C),
     "element": ("int f(union arr *a)\n{\n  return use(%s);\n}\n", "a->a[1]", FROM_C),
     "whole": ("struct holder f(union agg *a)\n{\n  return %s;\n}\n", "a->h", WHOLE),
-    "address": ("char * view * view f(inout union val *v)\n{\n  return %s;\n}\n", "&v->s", ADDR),
+    "address": ("char *view *view f(inout union val *v)\n{\n  return %s;\n}\n", "&v->s", ADDR),
 }
 
 
@@ -99,7 +99,7 @@ def test_what_needs_no_unsafe(tmp_path):
     pointers at all (U1)."""
     body = (
         "#pragma tcc c_begin\nvoid c_keep(char *p);\n#pragma tcc c_end\n"
-        "void f(inout union val *v, inout union agg *a, char * maybe p)\n{\n"
+        "void f(inout union val *v, inout union agg *a, char *?p)\n{\n"
         "  v->addr = 0x20000000;\n"
         "  a->h.n = 3;\n"
         "  int n = v->i + a->h.n + a->raw[1] + cast<int(int)>(sizeof(v->s)) + cast<int(int)>(sizeof(a->h));\n"
@@ -125,10 +125,10 @@ def test_store_is_checked_as_its_type(tmp_path):
 @pytest.mark.parametrize(
     "decl,what",
     [
-        ("union bad { char * owned p; int x; };", " 'p'"),
-        ("union bad { struct { char * owned maybe q; } s; int x; };", " 's'"),
-        ("union bad { char * owned maybe a[2]; int x; };", " 'a'"),
-        ("union bad { struct { char * owned r; }; int x; };", ""),
+        ("union bad { char *owned p; int x; };", " 'p'"),
+        ("union bad { struct { char *?owned q; } s; int x; };", " 's'"),
+        ("union bad { char *?owned a[2]; int x; };", " 'a'"),
+        ("union bad { struct { char *owned r; }; int x; };", ""),
     ],
     ids=["pointer", "in_struct", "array", "anonymous_struct"],
 )
@@ -158,7 +158,7 @@ def test_volatile_bitfield_store(tmp_path, name):
     assert (4, "error", BITFIELD) in _diags(proc), proc.stderr
     # -ccompat (regular C): nothing; -Wno-volatile-bitfield cannot lower it
     plain = PRELUDE.split("int use")[0] + PRELUDE.split("struct tagged")[1].split("\n", 1)[1] + body
-    ok = _compile(tmp_path, plain.replace(" * view ", " * ").replace("inout ", ""), "-ccompat", prelude="")
+    ok = _compile(tmp_path, plain.replace(" *view ", " * ").replace("inout ", ""), "-ccompat", prelude="")
     assert ok.returncode == 0 and _diags(ok) == [], ok.stderr
     low = _compile(tmp_path, body, "-Wno-volatile-bitfield")
     assert (4, "error", BITFIELD) in _diags(low), low.stderr

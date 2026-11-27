@@ -245,6 +245,10 @@ static int parse_btype_body(CType *type, AttributeDef *ad, int ignore_label)
       type->t = t;
       parse_btype_qualify(type, VT_CONSTANT);
       t = type->t;
+      /* -Wredundant-const: written, not a typedef's; where */
+      yasc_btype_consts++;
+      if (tcc_state->yasc && func_param_decl_depth)
+        yasc_btype_const_line = file ? file->line_num : 0, yasc_btype_const_col = tcc_stack_usage_name_column(tok);
       next();
       break;
     case TOK_VOLATILE1:
@@ -395,7 +399,32 @@ static int parse_btype_body(CType *type, AttributeDef *ad, int ignore_label)
         break;
       }
 
-      if (tcc_state->yasc && tok >= TOK_owned && tok <= TOK_drop)
+      /* yasc out / inout / drop: words only where a parameter's declaration
+         starts, as `in`, or after its type before a handle's words (`int drop
+         owned(close) fd`); names everywhere else (`out char *out`, `int drop;`).
+         After the type, before a declarator, they are misplaced. */
+      int pword = 0;
+      if (tcc_state->yasc && tok >= TOK_out && tok <= TOK_drop && func_param_decl_depth > 0 && !pp_in_c())
+      {
+        pword = !typespec_found;
+        if (typespec_found)
+        {
+          n = tok;
+          next();
+          pword = tok >= TOK_owned && tok <= TOK_drop;
+          if (!pword && (tok == '*' || tok >= TOK_UIDENT))
+            tcc_error("'%s' qualifies the object: write it before the type", get_tok_str(n, NULL));
+          unget_tok(n);
+        }
+      }
+      if (tcc_state->yasc && tok == TOK_maybe_gone && typespec_found && !pp_in_c() && !sym_find(tok))
+      {
+        next();
+        if (tok >= TOK_UIDENT || tok == '*')
+          yasc_maybe_gone("against a pointer's '*' ('*?owned') or before a handle's word ('int ?owned(close) fd')");
+        unget_tok(TOK_maybe_gone);
+      }
+      if (tcc_state->yasc && tok >= TOK_owned && tok <= TOK_drop && (tok <= TOK_maybe || pword))
       {
         n = tok;
         /* `int owned(close) maybe fd`, `int view fd`: an int handle */
@@ -448,8 +477,17 @@ static int parse_btype_body(CType *type, AttributeDef *ad, int ignore_label)
           ad->yasc |= w;
         }
         next();
-        if (typespec_found && YASC_NAME_FOLLOWS(tok))
-          yasc_keyword_as_name(n);
+        break;
+      }
+
+      /* yasc `inout` before a function's type: its view result may be
+         written through (else it is read-only on every level when it
+         points into static memory; a result from parameters is as
+         writable as what the call passed for them) */
+      if (tcc_state->yasc && tok == TOK_inout && !typespec_found && func_param_decl_depth == 0 && !pp_in_c())
+      {
+        ad->yasc |= YASC_INOUT;
+        next();
         break;
       }
 
@@ -462,6 +500,20 @@ static int parse_btype_body(CType *type, AttributeDef *ad, int ignore_label)
         ad->yasc |= YASC_IN;
         next();
         break;
+      }
+
+      /* yasc `unused int x`: a parameter the body may leave alone, as
+         __attribute__((unused)) does; only where a parameter's declaration
+         starts (a name everywhere else), unless `unused` names a type */
+      if (tcc_state->yasc && tok == TOK_UNUSED1 && !typespec_found && func_param_decl_depth > 0 && !pp_in_c())
+      {
+        Sym *u = sym_find(TOK_UNUSED1);
+        if (!u || !(u->type.t & VT_TYPEDEF))
+        {
+          ad->attr_unused = 1;
+          next();
+          break;
+        }
       }
 
       if (typespec_found)

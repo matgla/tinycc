@@ -39,8 +39,8 @@ int included_from_yasc(void);
 
 YASC_HEADER = """\
 #pragma yasc
-char * owned yalloc(void);
-void yfree(drop char * owned p);
+char *owned yalloc(void);
+void yfree(drop char *owned p);
 """
 
 MAIN = """\
@@ -48,8 +48,8 @@ MAIN = """\
 #include "y.h"
 int f(void)
 {
-  char * owned p = yalloc();
-  char * maybe q = MKPTR(0);
+  char *owned p = yalloc();
+  char *?q = MKPTR(0);
   struct maybe m = {TAKE(1)};
   (void)q;
   yfree(p);
@@ -109,7 +109,7 @@ def test_pragma_still_reaches_the_end_of_its_file(tmp_path):
 
 def test_yasc_macro_stays_yasc(tmp_path):
     """A macro defined in yasc code expands as yasc wherever it is used."""
-    main = '#pragma yasc\n#define OWNED_PTR(T) T * owned\nOWNED_PTR(char) make(void);\n'
+    main = '#pragma yasc\n#define OWNED_PTR(T) T *owned\nOWNED_PTR(char) make(void);\n'
     proc = _run(tmp_path, main, "-ccompat")
     assert proc.returncode == 0, proc.stderr
 

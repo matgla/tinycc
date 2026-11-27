@@ -2,14 +2,14 @@
 
     struct value {
       enum vkind k;
-      union(k) { long i when(V_INT); char * view s when(V_STR); } u;
+      union(k) { long i when(V_INT); char *s when(V_STR); } u;
     };
 
 A member of u is used (read, written, its address taken) only where k is
 known to select it on every path: k compared with a constant (if, &&, ?:,
 switch with case ranges, an early return) or a constant stored in it.  A
 store of anything else to k, assigning the base again, or handing the base
-to a call that may write through it (not `const T * view`) forgets what was
+to a call that may write through it (not `const T *view`) forgets what was
 known; any call forgets a global's.  -Wlifetime (strict): unsafe lowers it.
 The same at every -O.  A tagged member is not a U2 union read: a view in it
 is a view, not regular C.
@@ -31,17 +31,17 @@ PRELUDE = """\
 enum vkind { V_INT, V_STR, V_ADDR, V_D, V_E };
 int use(char *p);
 struct value;
-int look(const struct value *v);
+int look(struct value *v);
 void poke(inout struct value *v);
 struct value {
   enum vkind k;
   union(k) {
     long i when(V_INT);
-    char * view s when(V_STR);
+    char *s when(V_STR);
     unsigned long a when(V_ADDR);
     int de when(V_D, V_E);
-    struct { char * view path; } st when(V_ADDR);
-    char * view arr[2] when(V_E);
+    struct { char *path; } st when(V_ADDR);
+    char *arr[2] when(V_E);
   } u;
 };
 struct value g;
@@ -103,7 +103,7 @@ GOOD = {
         "int f(struct value *v)\n{\n  enum vkind k = v->k;\n  switch (k) {\n  case V_INT: return cast<int(int)>(v->u.i);\n"
         "  case V_STR: return use(v->u.s);\n  default: return 0;\n  }\n}\n"
     ),
-    "global_pointer": "struct value * view gp;\nlong f(void)\n{\n  if (gp->k == V_INT)\n    return gp->u.i;\n  return 0;\n}\n",
+    "global_pointer": "struct value *gp;\nlong f(void)\n{\n  if (gp->k == V_INT)\n    return gp->u.i;\n  return 0;\n}\n",
     "jump_to_the_end": "void f(struct value *v)\n{\n  if (v->k == V_STR)\n    use(v->u.s);\n}\n",
     "inline": (
         "static inline long peek(struct value *v)\n{\n  return v->k == V_INT ? v->u.i : -1;\n}\n"
@@ -147,7 +147,7 @@ BAD = {
         _msg("de", "V_D or V_E"),
     ),
     "address": (
-        "char * view * view f(inout struct value *v)\n{\n  return &v->u.arr[0];\n}\n",
+        "char *view *view f(inout struct value *v)\n{\n  return &v->u.arr[0];\n}\n",
         3,
         _msg("arr", "V_E"),
     ),
@@ -181,12 +181,12 @@ BAD = {
         _msg("s", "V_STR"),
     ),
     "global_pointer_call_forgets": (
-        "struct value * view gp;\nlong f(void)\n{\n  if (gp->k != V_INT)\n    return 0;\n  look(0);\n  return gp->u.i;\n}\n",
+        "struct value *gp;\nlong f(void)\n{\n  if (gp->k != V_INT)\n    return 0;\n  look(0);\n  return gp->u.i;\n}\n",
         7,
         _msg("i", "V_INT"),
     ),
     "global_pointer_reassigned": (
-        "struct value * view gp, * view other;\nlong f(void)\n{\n  if (gp->k != V_INT)\n    return 0;\n  gp = other;\n"
+        "struct value *view gp, *view other;\nlong f(void)\n{\n  if (gp->k != V_INT)\n    return 0;\n  gp = other;\n"
         "  return gp->u.i;\n}\n",
         7,
         _msg("i", "V_INT"),
@@ -319,10 +319,10 @@ def test_switch_handles_every_variant(tmp_path):
 # ---- owned members: freed or moved before the variant changes ----
 
 OWNED = """\
-void * owned maybe malloc(unsigned n);
-void free(drop void * owned maybe p);
-void take(char * owned maybe p);
-struct box { enum vkind k; union(k) { long i when(V_INT); char * owned maybe s when(V_STR); } u; };
+void *?owned malloc(unsigned n);
+void free(drop void *?owned p);
+void take(char *?owned p);
+struct box { enum vkind k; union(k) { long i when(V_INT); char *?owned s when(V_STR); } u; };
 """
 
 OWNED_GOOD = {
@@ -413,7 +413,7 @@ def test_owned_member_lost(tmp_path, name, opt):
 
 
 def test_owned_member_in_plain_union_still_refused(tmp_path):
-    proc = _compile(tmp_path, "union bad { char * owned p; int x; };\n")
+    proc = _compile(tmp_path, "union bad { char *owned p; int x; };\n")
     msg = "a union holds an owned member 'p': which member is live is not known, so it is never freed"
     assert (1, "error", msg) in _diags(proc), proc.stderr
 
@@ -421,7 +421,7 @@ def test_owned_member_in_plain_union_still_refused(tmp_path):
 def test_nested_member_path_is_named_in_place(tmp_path):
     """`v->in.p` is the member in place, not element 1 of an array of `in`s."""
     body = (
-        "void free(drop void * owned maybe p);\nstruct o { int a; struct { char * owned maybe p; } in; };\n"
+        "void free(drop void *?owned p);\nstruct o { int a; struct { char *?owned p; } in; };\n"
         "void f(inout struct o *v)\n{\n  free(v->in.p);\n  free(v->in.p);\n}\n"
     )
     proc = _compile(tmp_path, body)

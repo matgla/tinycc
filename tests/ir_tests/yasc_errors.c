@@ -38,7 +38,7 @@ static !int parse_u8(const char *s)
   return parse_u8(s);
 }
 
-static const char * borrows(static) pname(error e)
+static const char *borrows(static) pname(error e)
 {
   if (e == error.BadDigit)
     return "BadDigit";
@@ -66,7 +66,7 @@ static void t_catch(void)
 }
 
 static char buf[4];
-static !char * borrows(static) make(int mode)
+static !char *borrows(static) make(int mode)
 {
   defer printf("make %d: leave\n", mode);
   errdefer printf("make %d: undo\n", mode);
@@ -87,7 +87,7 @@ static void t_errdefer(void)
 {
   for (int m = 0; m < 4; m++)
   {
-    char * view s = make(m) catch |e| {
+    char *view s = make(m) catch |e| {
       printf("make %d failed: %s\n", m, pname(e));
       continue;
     };
@@ -177,7 +177,7 @@ static void t_values(void)
   !int bad = error.Empty;
   printf("local %d %d %d %d\n", r catch 0, ok catch 0, bad catch -1, unwrap_or(parse_u8("x"), 9));
   printf("from %d %d\n", from_errno(EACCES) catch |e| e, from_errno(0) catch -1);
-  !int (*fp)(const char * view) = parse_u8;
+  !int (*fp)(const char *view) = parse_u8;
   printf("fp %d\n", fp("200") catch -1);
 }
 

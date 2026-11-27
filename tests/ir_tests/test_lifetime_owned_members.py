@@ -1,4 +1,4 @@
-"""-Wlifetime: an owned member that is never null (`T * owned buf`) is a
+"""-Wlifetime: an owned member that is never null (`T *owned buf`) is a
 member path followed for ownership only (LT_MEMBER_NOTMAYBE): used or freed
 after it was freed is reported, through a call's result it is said that the
 check does not follow it -- and nothing about null, since it cannot be."""
@@ -16,11 +16,11 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 
 PRELUDE = """\
-void * owned maybe malloc(unsigned n);
-void free(drop void * owned maybe p);
+void *?owned malloc(unsigned n);
+void free(drop void *?owned p);
 int use(char *p);
-struct box { char * owned buf; int n; };
-struct box * borrows(static) holder(void);
+struct box { char *owned buf; int n; };
+struct box *borrows(static) holder(void);
 """
 PRELUDE_LINES = PRELUDE.count("\n")
 
@@ -50,7 +50,7 @@ BAD = {
 
 CLEAN = {
     "read": "int f(struct box *b)\n{\n  return use(b->buf) + b->buf[0];\n}\n",
-    "replaced": "void f(inout struct box *b)\n{\n  char * owned maybe n = malloc(4);\n  if (!n)\n    return;\n"
+    "replaced": "void f(inout struct box *b)\n{\n  char *?owned n = malloc(4);\n  if (!n)\n    return;\n"
     "  free(b->buf);\n  b->buf = move(n);\n  use(b->buf);\n}\n",
 }
 

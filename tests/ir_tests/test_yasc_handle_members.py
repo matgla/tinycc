@@ -1,8 +1,8 @@
-"""yasc int handles as struct members: `int owned(close) maybe fd;`.
+"""yasc int handles as struct members: `int ?owned(close) fd;`.
 
 They parse in a struct body (owned(...) is a qualifier there, never a
 method's name), a union refuses them as it refuses owned pointers, and the
-member paths of -Wlifetime follow them as they follow `* owned maybe`
+member paths of -Wlifetime follow them as they follow `*?owned`
 members: a local struct's handle leaks, a member closed twice or used after
 it was closed is said, an untested one passed to a non-maybe parameter is
 said, and `c->fd >= 0` / `< 0` / `== -1` tests refine it.  The same at every
@@ -22,11 +22,11 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 
 PRELUDE = """\
-int close(drop int owned maybe fd);
-int owned(close) maybe open(const char *p, int fl);
-long write(int view fd, const void *b, unsigned n);
-struct conn { int owned(close) maybe fd; int n; };
-struct m { int owned(close) maybe fd; int get(struct m *self); };
+int close(drop int ?owned fd);
+int ?owned(close) open(char *p, int fl);
+long write(int view fd, void *b, unsigned n);
+struct conn { int ?owned(close) fd; int n; };
+struct m { int ?owned(close) fd; int get(struct m *self); };
 """
 PRELUDE_LINES = PRELUDE.count("\n")
 
@@ -52,7 +52,7 @@ def _diags(proc):
     return out
 
 
-MAYBE_ARG = "a handle that may be invalid is passed as argument 1 of 'write', which is not maybe"
+MAYBE_ARG = "a handle that may be invalid is passed as argument 1 of 'write', which is not '?'"
 
 BAD = {
     "leak": ("void f(void) { struct conn c = undefined; c.fd = open(\"x\", 0); }", "'c.fd' leaks: it still owns a handle at the end of its scope"),

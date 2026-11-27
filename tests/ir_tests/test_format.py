@@ -160,25 +160,25 @@ def test_safe_default(tmp_path):
 def test_yasc_pointer_types_spelled_as_written(tmp_path):
     """A yasc pointer's qualifiers as the source spells them, no trailing space."""
     body = (
-        "void free(drop void * owned maybe p);\n"
-        "void t(const char * maybe s, char * owned p, const char *q, inout int * view maybe *pp,\n"
-        "       char * owned maybe m)\n"
+        "void free(drop void *?owned p);\n"
+        "void t(const char *?s, char *owned p, const char *q, inout int *?view *pp,\n"
+        "       char *?owned m)\n"
         "{\n  pf(\"%d\", s);\n  pf(\"%d\", p);\n  pf(\"%d\", q);\n  pf(\"%d\", pp);\n  pf(\"%d\", m);\n"
         "  free(p);\n  free(m);\n}\n"
     )
     proc = _run(tmp_path, body, prelude=PRELUDE_YASC, ccompat=False)
     got = [m.split("has type ", 1)[1] for _, k, m in _diags(proc, 1) if "has type" in m]
-    assert got == ["'const char * view maybe'", "'char * owned'", "'const char * view'", "'int * view maybe * view'",
-                   "'char * owned maybe'"], proc.stderr
+    assert got == ["'const char *?view'", "'char *owned'", "'const char *view'", "'int *?view *view'",
+                   "'char *?owned'"], proc.stderr
     body = (
-        "struct T { char buf[8]; char * borrows(buf) key; };\ntypedef struct FILE FILE;\n"
-        "int fclose(drop FILE * owned maybe f);\n"
-        "void t(inout struct T *x, FILE * owned(fclose) fp, const char * borrows(static) s)\n"
+        "struct T { char buf[8]; char *borrows(buf) key; };\ntypedef struct FILE FILE;\n"
+        "int fclose(drop FILE *?owned f);\n"
+        "void t(inout struct T *x, FILE *owned(fclose) fp, const char *borrows(static) s)\n"
         "{\n  pf(\"%d\", x->key);\n  pf(\"%d\", fp);\n  pf(\"%d\", s);\n  fclose(fp);\n}\n"
     )
     proc = _run(tmp_path, body, prelude=PRELUDE_YASC, ccompat=False)
     got = [m.split("has type ", 1)[1] for _, k, m in _diags(proc, 1) if "has type" in m]
-    assert got == ["'char * borrows(buf)'", "'struct FILE * owned(fclose)'", "'const char * borrows(static)'"], proc.stderr
+    assert got == ["'char *borrows(buf)'", "'struct FILE *owned(fclose)'", "'const char *borrows(static)'"], proc.stderr
     # regular C keeps its spelling
     proc = _run(tmp_path, "void t(char *p) { pf(\"%d\", p); }\n", "-Wall")
     assert "has type 'char *'" in proc.stderr, proc.stderr
@@ -383,7 +383,7 @@ def test_strftime_strfmon_format_arg(tmp_path, opt):
 
 def test_format_arg_and_format_security(tmp_path):
     """a gettext of a literal is a literal format; of a variable it is not"""
-    body = "void f(const char *s)\n{\n  pf(_(\"x\"));\n  pf(_(s));\n  pf(gettext(\"%d\"));\n}\n"
+    body = "void f(char *s)\n{\n  pf(_(\"x\"));\n  pf(_(s));\n  pf(gettext(\"%d\"));\n}\n"
     pl = TIME_PRELUDE.count("\n")
     proc = _run(tmp_path, body, "-Wformat", "-Wformat-security", prelude=TIME_PRELUDE)
     assert [(l, m) for l, _, m in _diags(proc, pl)] == [

@@ -26,14 +26,14 @@ LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 # tests use find().
 PRELUDE = """\
 #pragma yasc
-void * owned malloc(unsigned n);
-void free(drop void * owned maybe p);
+void *owned malloc(unsigned n);
+void free(drop void *?owned p);
 int use(char *p);
 int sink(int x);
-void take(char * owned p);
-void (*take_fp)(char * owned p);
+void take(char *owned p);
+void (*take_fp)(char *owned p);
 struct big { int a[8]; };
-struct big take_big(char * owned p);
+struct big take_big(char *owned p);
 """
 PRELUDE_LINES = PRELUDE.count("\n")
 
@@ -68,21 +68,21 @@ def _check(tmp_path, body, *flags):
 
 
 def test_use_after_free(tmp_path):
-    assert _check(tmp_path, "void f(char * owned p)\n{\n  free(p);\n  use(p);\n}\n") == [
+    assert _check(tmp_path, "void f(char *owned p)\n{\n  free(p);\n  use(p);\n}\n") == [
         (4, "warning", "'p' is used after it was freed"),
         (3, "note", "'p' was freed here"),
     ]
 
 
 def test_double_free(tmp_path):
-    assert _check(tmp_path, "void f(char * owned p)\n{\n  free(p);\n  free(p);\n}\n") == [
+    assert _check(tmp_path, "void f(char *owned p)\n{\n  free(p);\n  free(p);\n}\n") == [
         (4, "warning", "'p' is freed twice"),
         (3, "note", "'p' was freed here"),
     ]
 
 
 def test_use_after_move_into_owned_variable(tmp_path):
-    body = "void f(char * owned p)\n{\n  char * owned q = move(p);\n  use(p);\n  free(q);\n}\n"
+    body = "void f(char *owned p)\n{\n  char *owned q = move(p);\n  use(p);\n  free(q);\n}\n"
     assert _check(tmp_path, body) == [
         (4, "warning", "'p' is used after it was moved"),
         (3, "note", "'p' was moved here"),
@@ -90,7 +90,7 @@ def test_use_after_move_into_owned_variable(tmp_path):
 
 
 def test_use_after_move_into_parameter(tmp_path):
-    body = "void f(char * owned p)\n{\n  take(move(p));\n  use(p);\n}\n"
+    body = "void f(char *owned p)\n{\n  take(move(p));\n  use(p);\n}\n"
     assert _check(tmp_path, body) == [
         (4, "warning", "'p' is used after it was moved"),
         (3, "note", "'p' was moved here"),
@@ -98,7 +98,7 @@ def test_use_after_move_into_parameter(tmp_path):
 
 
 def test_maybe_moved(tmp_path):
-    body = "void f(char * owned p, int x)\n{\n  if (x)\n    take(move(p));\n  use(p);\n}\n"
+    body = "void f(char *owned p, int x)\n{\n  if (x)\n    take(move(p));\n  use(p);\n}\n"
     assert _check(tmp_path, body) == [
         (5, "warning", "'p' may be used after it was moved"),
         (4, "note", "'p' was moved here"),
@@ -106,47 +106,47 @@ def test_maybe_moved(tmp_path):
 
 
 def test_leak_at_return(tmp_path):
-    body = "void f(int x)\n{\n  char * owned p = malloc(1);\n  if (x)\n    return;\n  free(p);\n}\n"
+    body = "void f(int x)\n{\n  char *owned p = malloc(1);\n  if (x)\n    return;\n  free(p);\n}\n"
     assert _check(tmp_path, body) == [(5, "warning", "'p' leaks: it still owns memory at return")]
 
 
 def test_leak_at_return_value(tmp_path):
-    body = "int f(int x)\n{\n  char * owned p = malloc(1);\n  if (x)\n    return 1;\n  free(p);\n  return 0;\n}\n"
+    body = "int f(int x)\n{\n  char *owned p = malloc(1);\n  if (x)\n    return 1;\n  free(p);\n  return 0;\n}\n"
     assert _check(tmp_path, body) == [(5, "warning", "'p' leaks: it still owns memory at return")]
 
 
 def test_leak_at_scope_end(tmp_path):
-    body = "void f(void)\n{\n  {\n    char * owned p = malloc(1);\n    use(p);\n  }\n  sink(0);\n}\n"
+    body = "void f(void)\n{\n  {\n    char *owned p = malloc(1);\n    use(p);\n  }\n  sink(0);\n}\n"
     assert _check(tmp_path, body) == [(6, "warning", "'p' leaks: it still owns memory at the end of its scope")]
 
 
 def test_leak_on_one_path(tmp_path):
-    body = "void f(int x)\n{\n  char * owned p = malloc(1);\n  if (x)\n    free(p);\n}\n"
+    body = "void f(int x)\n{\n  char *owned p = malloc(1);\n  if (x)\n    free(p);\n}\n"
     assert _check(tmp_path, body) == [(6, "warning", "'p' leaks: it still owns memory at the end of its scope")]
 
 
 def test_leak_may_at_join(tmp_path):
     body = (
-        "void f(int x)\n{\n  {\n    char * owned p = malloc(1);\n    if (x)\n      free(p);\n    else\n"
+        "void f(int x)\n{\n  {\n    char *owned p = malloc(1);\n    if (x)\n      free(p);\n    else\n"
         "      use(p);\n  }\n  sink(0);\n}\n"
     )
     assert _check(tmp_path, body) == [(9, "warning", "'p' leaks: it may still own memory at the end of its scope")]
 
 
 def test_leak_when_assigned_again(tmp_path):
-    body = "void f(void)\n{\n  char * owned p = malloc(1);\n  p = malloc(2);\n  free(p);\n}\n"
+    body = "void f(void)\n{\n  char *owned p = malloc(1);\n  p = malloc(2);\n  free(p);\n}\n"
     assert _check(tmp_path, body) == [(4, "warning", "'p' leaks: it still owns memory when it is assigned again")]
 
 
 def test_owned_parameter_leaks(tmp_path):
-    assert _check(tmp_path, "void f(char * owned p)\n{\n  use(p);\n}\n") == [
+    assert _check(tmp_path, "void f(char *owned p)\n{\n  use(p);\n}\n") == [
         (4, "warning", "'p' leaks: it still owns memory at the end of the function")
     ]
 
 
 def test_leak_in_loop_body(tmp_path):
     body = (
-        "void f(int n)\n{\n  for (int i = 0; i < n; i++)\n  {\n    char * owned t = malloc(2);\n    use(t);\n"
+        "void f(int n)\n{\n  for (int i = 0; i < n; i++)\n  {\n    char *owned t = malloc(2);\n    use(t);\n"
         "  }\n}\n"
     )
     assert _check(tmp_path, body) == [(7, "warning", "'t' leaks: it still owns memory at the end of its scope")]
@@ -154,7 +154,7 @@ def test_leak_in_loop_body(tmp_path):
 
 def test_break_and_continue_end_the_body_scope(tmp_path):
     body = (
-        "void f(int n)\n{\n  for (int i = 0; i < n; i++)\n  {\n    char * owned t = malloc(2);\n"
+        "void f(int n)\n{\n  for (int i = 0; i < n; i++)\n  {\n    char *owned t = malloc(2);\n"
         "    if (i == 3)\n      break;\n    if (i & 1)\n      continue;\n    free(t);\n  }\n}\n"
     )
     assert _check(tmp_path, body) == [
@@ -164,7 +164,7 @@ def test_break_and_continue_end_the_body_scope(tmp_path):
 
 
 def test_use_after_move_into_owned_member(tmp_path):
-    body = "struct box { char * owned p; };\nvoid f(inout struct box *b, char * owned p)\n{\n  b->p = move(p);\n  free(p);\n}\n"
+    body = "struct box { char *owned p; };\nvoid f(inout struct box *b, char *owned p)\n{\n  b->p = move(p);\n  free(p);\n}\n"
     assert _check(tmp_path, body) == [
         (5, "warning", "'p' is used after it was moved"),
         (4, "note", "'p' was moved here"),
@@ -172,50 +172,50 @@ def test_use_after_move_into_owned_member(tmp_path):
 
 
 def test_error_union_error_path_leaks(tmp_path):
-    body = "!char * owned f(int x)\n{\n  char * owned p = malloc(1);\n  if (x)\n    return error.Bad;\n  return p;\n}\n"
+    body = "!char *owned f(int x)\n{\n  char *owned p = malloc(1);\n  if (x)\n    return error.Bad;\n  return p;\n}\n"
     assert _check(tmp_path, body) == [(5, "warning", "'p' leaks: it still owns memory at return")]
 
 
 def test_owned_returned_through_plain_pointer_leaks(tmp_path):
-    body = "char * borrows(static) f(void)\n{\n  char * owned p = malloc(1);\n  return p;\n}\n"
+    body = "char *borrows(static) f(void)\n{\n  char *owned p = malloc(1);\n  return p;\n}\n"
     assert _check(tmp_path, body) == [(4, "warning", "'p' leaks: it still owns memory at return")]
 
 
 # --- what is clean ---------------------------------------------------------
 
 CLEAN = {
-    "null_test": "void f(char * owned p)\n{\n  if (p)\n    free(p);\n}\n",
-    "early_return_on_null": "void f(char * owned p)\n{\n  if (!p)\n    return;\n  free(p);\n}\n",
-    "compare_null": "void f(char * owned p)\n{\n  if (p != 0)\n    take(move(p));\n}\n",
-    "returned": "char * owned f(void)\n{\n  char * owned p = malloc(1);\n  use(p);\n  return p;\n}\n",
-    "moved_then_freed": "void f(char * owned p)\n{\n  char * owned q;\n  q = move(p);\n  use(q);\n  free(q);\n}\n",
-    "loop": "void f(int n)\n{\n  for (int i = 0; i < n; i++)\n  {\n    char * owned t = malloc(2);\n"
+    "null_test": "void f(char *owned p)\n{\n  if (p)\n    free(p);\n}\n",
+    "early_return_on_null": "void f(char *owned p)\n{\n  if (!p)\n    return;\n  free(p);\n}\n",
+    "compare_null": "void f(char *owned p)\n{\n  if (p != 0)\n    take(move(p));\n}\n",
+    "returned": "char *owned f(void)\n{\n  char *owned p = malloc(1);\n  use(p);\n  return p;\n}\n",
+    "moved_then_freed": "void f(char *owned p)\n{\n  char *owned q;\n  q = move(p);\n  use(q);\n  free(q);\n}\n",
+    "loop": "void f(int n)\n{\n  for (int i = 0; i < n; i++)\n  {\n    char *owned t = malloc(2);\n"
     "    free(t);\n  }\n}\n",
-    "function_pointer": "void f(char * owned p)\n{\n  take_fp(move(p));\n}\n",
-    "struct_return_call": "void f(char * owned p)\n{\n  struct big b = take_big(move(p));\n  (void)b;\n}\n",
-    "null_then_maybe": "void f(int n)\n{\n  char * owned maybe p = 0;\n  if (n)\n    p = malloc(3);\n  free(p);\n}\n",
-    "reassigned_after_free": "void f(void)\n{\n  char * owned p = malloc(1);\n  free(p);\n  p = malloc(2);\n"
+    "function_pointer": "void f(char *owned p)\n{\n  take_fp(move(p));\n}\n",
+    "struct_return_call": "void f(char *owned p)\n{\n  struct big b = take_big(move(p));\n  (void)b;\n}\n",
+    "null_then_maybe": "void f(int n)\n{\n  char *?owned p = 0;\n  if (n)\n    p = malloc(3);\n  free(p);\n}\n",
+    "reassigned_after_free": "void f(void)\n{\n  char *owned p = malloc(1);\n  free(p);\n  p = malloc(2);\n"
     "  free(p);\n}\n",
-    "defer": "void f(int x)\n{\n  char * owned p = malloc(1);\n  defer free(p);\n  if (x)\n    return;\n"
+    "defer": "void f(int x)\n{\n  char *owned p = malloc(1);\n  defer free(p);\n  if (x)\n    return;\n"
     "  use(p);\n}\n",
-    "switch_break": "void f(int x)\n{\n  char * owned p = malloc(1);\n  switch (x)\n  {\n  case 1:\n"
+    "switch_break": "void f(int x)\n{\n  char *owned p = malloc(1);\n  switch (x)\n  {\n  case 1:\n"
     "    break;\n  default:\n    use(p);\n  }\n  free(p);\n}\n",
-    "borrowed_copy": "void f(char * owned p)\n{\n  char * view q = p;\n  use(q);\n  free(p);\n}\n",
+    "borrowed_copy": "void f(char *owned p)\n{\n  char *view q = p;\n  use(q);\n  free(p);\n}\n",
     # an owned out-parameter: p owns what get left there (test_yasc_outparams.py)
-    "address_taken": "void get(char * owned *pp);\nvoid f(void)\n{\n  char * owned p = undefined;\n  get(&p);\n"
+    "address_taken": "void get(out char *owned *pp);\nvoid f(void)\n{\n  char *owned p = undefined;\n  get(&p);\n"
     "  use(p);\n  free(p);\n}\n",
-    "noreturn": "_Noreturn void die(void);\nvoid f(char * owned p)\n{\n  if (!use(p))\n    die();\n"
+    "noreturn": "_Noreturn void die(void);\nvoid f(char *owned p)\n{\n  if (!use(p))\n    die();\n"
     "  free(p);\n}\n",
     # a store into an owned member moves (vstore notes it: lifetime.c)
-    "into_owned_member": "struct box { char * owned p; };\nvoid f(inout struct box *b, char * owned p)\n{\n"
+    "into_owned_member": "struct box { char *owned p; };\nvoid f(inout struct box *b, char *owned p)\n{\n"
     "  b->p = move(p);\n}\n",
     # a store into a view member only borrows
     # a view of p kept in *b while p moves on (freeing p there is
     # test_yasc_view.py's: the view outlives it)
-    "into_view_member": "struct pin { char * view p; };\nvoid f(inout struct pin *b, char * owned p)\n{\n"
+    "into_view_member": "struct pin { char *p; };\nvoid f(inout struct pin *b, char *owned p)\n{\n"
     "  b->p = p;\n  take(move(p));\n}\n",
     # returned through an error union: the payload is owned
-    "returned_in_error_union": "!char * owned make_errunion(int x)\n{\n  char * owned p = malloc(1);\n"
+    "returned_in_error_union": "!char *owned make_errunion(int x)\n{\n  char *owned p = malloc(1);\n"
     "  errdefer free(p);\n"
     "  if (x)\n    return error.Bad;\n  return p;\n}\n",
 }
@@ -230,14 +230,14 @@ def test_clean(tmp_path, name, opt):
 # --- inlining does not change the answer -----------------------------------
 
 INLINED = """\
-static void consume(char * owned p)
+static void consume(char *owned p)
 {
   free(p);
 }
 
-static char * owned make(int n)
+static char *owned make(int n)
 {
-  char * owned p = malloc(n);
+  char *owned p = malloc(n);
   return p;
 }
 
@@ -248,21 +248,21 @@ static int borrow(char *p)
 
 void inl_ok(void)
 {
-  char * owned p = make(4);
+  char *owned p = make(4);
   borrow(p);
   consume(move(p));
 }
 
 void inl_bad(int x)
 {
-  char * owned p = make(4);
+  char *owned p = make(4);
   consume(move(p));
   borrow(p);
 }
 
 void maybe_moved(int x)
 {
-  char * owned p = malloc(1);
+  char *owned p = malloc(1);
   if (x)
     consume(move(p));
   use(p);
@@ -291,8 +291,8 @@ def test_inline_only_static_is_checked(tmp_path, opt):
     a check-only parse at the end of the unit checks it (once: the expansion
     stays silent).  An uncalled static of the main file is checked too."""
     body = (
-        "static void leaky(char * owned p)\n{\n  use(p);\n}\nvoid g(char * owned q)\n{\n  leaky(move(q));\n}\n"
-        "static void unused(char * owned p)\n{\n  free(p);\n  free(p);\n}\n"
+        "static void leaky(char *owned p)\n{\n  use(p);\n}\nvoid g(char *owned q)\n{\n  leaky(move(q));\n}\n"
+        "static void unused(char *owned p)\n{\n  free(p);\n  free(p);\n}\n"
     )
     assert sorted(_check(tmp_path, body, opt)) == sorted(_check(tmp_path, body, "-O0"))
     assert len(_check(tmp_path, body, opt)) == 3
@@ -300,7 +300,7 @@ def test_inline_only_static_is_checked(tmp_path, opt):
 
 # --- switches --------------------------------------------------------------
 
-BAD = "void f(char * owned p)\n{\n  free(p);\n  free(p);\n}\n"
+BAD = "void f(char *owned p)\n{\n  free(p);\n  free(p);\n}\n"
 
 
 def test_wno_lifetime(tmp_path):
@@ -363,15 +363,15 @@ def test_code_unchanged(tmp_path, opt):
 #
 # A `maybe` variable is followed for null: dereferencing it needs a test on
 # every path (`if (p)`, `if (!p) return`, `p != 0 &&`, a noreturn call on the
-# null path).  A pointer that is not maybe may never get null: storing a value
+# null path).  A pointer that is not '?' may never get null: storing a value
 # that may be null in one, or returning it from a function whose result is not
 # maybe, is reported.  Sources that may be null: maybe variables by their
 # state, calls returning maybe, the constant 0.
 
 MAYBE_PRELUDE = """\
-struct node { int v; struct node * view maybe next; };
-struct node * borrows(static) maybe find(int k);
-struct node * borrows(static) must(int k);
+struct node { int v; struct node *?next; };
+inout struct node *?borrows(static) find(int k);
+inout struct node *borrows(static) must(int k);
 _Noreturn void die(void);
 """
 
@@ -381,59 +381,70 @@ def _maybe(tmp_path, body, *flags):
 
 
 MAYBE_BAD = {
-    "member": ("int f(struct node * maybe p)\n{\n  return p->v;\n}\n", 3, "'p' may be null where it is dereferenced"),
-    "index": ("int f(char * maybe s, int i)\n{\n  return s[i];\n}\n", 3, "'s' may be null where it is dereferenced"),
+    "member": ("int f(struct node *?p)\n{\n  return p->v;\n}\n", 3, "'p' may be null where it is dereferenced"),
+    "index": ("int f(char *?s, int i)\n{\n  return s[i];\n}\n", 3, "'s' may be null where it is dereferenced"),
     "store": (
-        "void f(int k)\n{\n  struct node * view maybe q = find(k);\n  q->v = 1;\n}\n",
+        "void f(int k)\n{\n  struct node *?view q = find(k);\n  q->v = 1;\n}\n",
         4,
         "'q' may be null where it is dereferenced",
     ),
-    "null": ("int f(void)\n{\n  struct node * view maybe q = 0;\n  return q->v;\n}\n", 4, "'q' is null where it is dereferenced"),
+    "null": ("int f(void)\n{\n  struct node *?view q = 0;\n  return q->v;\n}\n", 4, "'q' is null where it is dereferenced"),
     "tested_on_one_path": (
-        "int f(struct node * maybe p, int x)\n{\n  if (x && p)\n    x = 1;\n  return p->v;\n}\n",
+        "int f(struct node *?p, int x)\n{\n  if (x && p)\n    x = 1;\n  return p->v;\n}\n",
         5,
         "'p' may be null where it is dereferenced",
     ),
     "return_maybe": (
-        "struct node * borrows(static) f(int k)\n{\n  return find(k);\n}\n",
+        "struct node *borrows(static) f(int k)\n{\n  return find(k);\n}\n",
         3,
-        "a pointer that may be null is returned from 'f', whose result is not maybe",
+        "a pointer that may be null is returned from 'f', whose result is not '?'",
     ),
     "return_null": (
-        "struct node * borrows(static) f(void)\n{\n  return 0;\n}\n",
+        "struct node *borrows(static) f(void)\n{\n  return 0;\n}\n",
         3,
-        "a null pointer is returned from 'f', whose result is not maybe",
+        "a null pointer is returned from 'f', whose result is not '?'",
     ),
     "store_maybe": (
-        "void f(int k)\n{\n  struct node * view q = find(k);\n  (void)q;\n}\n",
+        "void f(int k)\n{\n  struct node *view q = find(k);\n  (void)q;\n}\n",
         3,
-        "a pointer that may be null is stored in 'q', which is not maybe",
+        "a pointer that may be null is stored in 'q', which is not '?'",
     ),
     "store_null": (
-        "void f(void)\n{\n  char * view s = 0;\n  (void)s;\n}\n",
+        "void f(void)\n{\n  char *view s = 0;\n  (void)s;\n}\n",
         3,
-        "a null pointer is stored in 's', which is not maybe",
+        "a null pointer is stored in 's', which is not '?'",
     ),
     # values followed across blocks: the pointer is read before the branch
     # of `?:` and dereferenced after it, or the arms meet in a temp
-    "ternary_untested": ("int f(struct node * maybe p, int c)\n{\n  return c ? p->v : 0;\n}\n", 3, "'p' may be null where it is dereferenced"),
+    "ternary_untested": ("int f(struct node *?p, int c)\n{\n  return c ? p->v : 0;\n}\n", 3, "'p' may be null where it is dereferenced"),
     "store_before_ternary": (
-        "void f(inout struct node * maybe p, int c)\n{\n  p->v = c ? 1 : 2;\n}\n",
+        "void f(inout struct node *?p, int c)\n{\n  p->v = c ? 1 : 2;\n}\n",
         3,
         "'p' may be null where it is dereferenced",
     ),
     "ternary_join_stored": (
-        "int f(inout struct node * maybe p, int c)\n{\n  struct node * view x = c ? p : must(1);\n  return x->v;\n}\n",
+        "int f(inout struct node *?p, int c)\n{\n  struct node *view x = c ? p : must(1);\n  return x->v;\n}\n",
         3,
-        "a pointer that may be null is stored in 'x', which is not maybe",
+        "a pointer that may be null is stored in 'x', which is not '?'",
     ),
     "ternary_join_returned": (
-        "struct node * borrows(static) f(int c)\n{\n  return c ? find(c) : must(c);\n}\n",
+        "struct node *borrows(static) f(int c)\n{\n  return c ? find(c) : must(c);\n}\n",
         3,
-        "a pointer that may be null is returned from 'f', whose result is not maybe",
+        "a pointer that may be null is returned from 'f', whose result is not '?'",
+    ),
+    # assigned in the test: the edge where it is null is still null
+    "assigned_in_test_wrong_edge": (
+        "int f(int k)\n{\n  struct node *?view q;\n  if ((q = find(k)))\n    k = 1;\n  return q->v;\n}\n",
+        6,
+        "'q' may be null where it is dereferenced",
+    ),
+    "assigned_parameter_in_test_wrong_edge": (
+        "int f(inout struct node *?p, int k)\n{\n  if ((p = find(k)))\n    k = 1;\n  return p->v;\n}\n",
+        5,
+        "'p' may be null where it is dereferenced",
     ),
     "switch_value": (
-        "int f(struct node * maybe p)\n{\n  switch (p->v)\n  {\n  case 1:\n    return 2;\n  }\n  return 0;\n}\n",
+        "int f(struct node *?p)\n{\n  switch (p->v)\n  {\n  case 1:\n    return 2;\n  }\n  return 0;\n}\n",
         3,
         "'p' may be null where it is dereferenced",
     ),
@@ -447,25 +458,52 @@ def test_maybe_reported(tmp_path, name):
 
 
 MAYBE_CLEAN = {
-    "if_set": "int f(struct node * maybe p)\n{\n  if (p)\n    return p->v;\n  return 0;\n}\n",
-    "early_return": "int f(struct node * maybe p)\n{\n  if (!p)\n    return 0;\n  return p->v;\n}\n",
-    "and_chain": "int f(struct node * maybe p)\n{\n  return p != 0 && p->v;\n}\n",
-    "noreturn": "int f(struct node * maybe p)\n{\n  if (!p)\n    die();\n  return p->v;\n}\n",
-    "refilled": "int f(int k)\n{\n  struct node * view maybe q = find(k);\n  if (!q)\n    q = must(k);\n"
+    "if_set": "int f(struct node *?p)\n{\n  if (p)\n    return p->v;\n  return 0;\n}\n",
+    "early_return": "int f(struct node *?p)\n{\n  if (!p)\n    return 0;\n  return p->v;\n}\n",
+    "and_chain": "int f(struct node *?p)\n{\n  return p != 0 && p->v;\n}\n",
+    "noreturn": "int f(struct node *?p)\n{\n  if (!p)\n    die();\n  return p->v;\n}\n",
+    "refilled": "int f(int k)\n{\n  struct node *?view q = find(k);\n  if (!q)\n    q = must(k);\n"
     "  return q->v;\n}\n",
     "plain_parameter": "int f(struct node *p)\n{\n  return p->v;\n}\n",
-    "maybe_result": "struct node * borrows(static) maybe f(int k)\n{\n  return find(k);\n}\n",
-    "list_walk": "int f(struct node * maybe p)\n{\n  int n = 0;\n  while (p)\n  {\n    n += p->v;\n"
+    "maybe_result": "struct node *?borrows(static) f(int k)\n{\n  return find(k);\n}\n",
+    "list_walk": "int f(struct node *?p)\n{\n  int n = 0;\n  while (p)\n  {\n    n += p->v;\n"
     "    p = p->next;\n  }\n  return n;\n}\n",
-    "tested_return": "struct node * borrows(static) f(int k)\n{\n  struct node * view maybe q = find(k);\n  if (q)\n    return q;\n"
+    "tested_return": "struct node *borrows(static) f(int k)\n{\n  struct node *?view q = find(k);\n  if (q)\n    return q;\n"
     "  return must(k);\n}\n",
-    "ternary": "int f(struct node * maybe p)\n{\n  return p ? p->v : 0;\n}\n",
-    "tested_before_ternary": "int f(struct node * maybe p, int c)\n{\n  if (!p)\n    return 0;\n"
+    "ternary": "int f(struct node *?p)\n{\n  return p ? p->v : 0;\n}\n",
+    "tested_before_ternary": "int f(struct node *?p, int c)\n{\n  if (!p)\n    return 0;\n"
     "  return c ? p->v : 0;\n}\n",
-    "ternary_join_tested": "int f(inout struct node * maybe p, int c)\n{\n  struct node * view maybe x = c ? p : 0;\n"
+    "ternary_join_tested": "int f(inout struct node *?p, int c)\n{\n  struct node *?view x = c ? p : 0;\n"
     "  return x ? x->v : 0;\n}\n",
-    "ternary_join_set": "int f(inout struct node * maybe p, int c)\n{\n  if (!p)\n    return 0;\n"
-    "  struct node * view x = c ? p : must(1);\n  return x->v;\n}\n",
+    "ternary_join_set": "int f(inout struct node *?p, int c)\n{\n  if (!p)\n    return 0;\n"
+    "  struct node *view x = c ? p : must(1);\n  return x->v;\n}\n",
+    # the test reads the value just stored (`CMP T` after `q <-- T`): a test of q
+    "assigned_in_test": "int f(int k)\n{\n  struct node *?view q;\n  if (!(q = find(k)))\n    return 0;\n"
+    "  return q->v;\n}\n",
+    "assigned_in_test_eq": "int f(int k)\n{\n  struct node *?view q;\n  if ((q = find(k)) == 0)\n    return 0;\n"
+    "  return q->v;\n}\n",
+    "assigned_in_test_set": "int f(int k)\n{\n  struct node *?view q;\n  if ((q = find(k)))\n    return q->v;\n"
+    "  return 0;\n}\n",
+    "assigned_parameter_in_test": "int f(inout struct node *?p)\n{\n  if (!p)\n    return 0;\n"
+    "  if (!(p = find(p->v)))\n    return 0;\n  return p->v;\n}\n",
+    "assigned_parameter_in_test_eq": "int f(inout struct node *?p)\n{\n  if ((p = find(1)) == 0)\n    return 0;\n"
+    "  return p->v;\n}\n",
+    "assigned_parameter_in_test_set": "int f(inout struct node *?p)\n{\n  if ((p = find(1)))\n    return p->v;\n"
+    "  return 0;\n}\n",
+    # -O1+ inlines step: the test reads step's result variable, which p (q)
+    # was just given too -- a test of p (localtime.c parse_time at -O2)
+    "assigned_parameter_in_test_inlined": "static struct node *?view step(struct node *p)\n{\n"
+    "  if (p->v)\n    return nullptr;\n  return p->next;\n}\n"
+    "int f(inout struct node *?p)\n{\n  if (!p)\n    return 0;\n"
+    "  if (!(p = step(p)))\n    return 0;\n  return p->v;\n}\n",
+    "assigned_in_test_inlined": "static struct node *?view step(struct node *p)\n{\n"
+    "  if (p->v)\n    return nullptr;\n  return p->next;\n}\n"
+    "int f(struct node *p)\n{\n  struct node *?view q;\n  if (!(q = step(p)))\n    return 0;\n"
+    "  return q->v;\n}\n",
+    "assigned_parameter_in_while": "int f(inout struct node *?p, int k)\n{\n  int n = 0;\n"
+    "  while ((p = find(k++)) != 0)\n    n += p->v;\n  return n;\n}\n",
+    "assigned_in_while": "int f(int k)\n{\n  int n = 0;\n  struct node *?view q;\n"
+    "  while ((q = find(k++)) != 0)\n    n += q->v;\n  return n;\n}\n",
 }
 
 
@@ -485,10 +523,10 @@ def test_maybe_same_at_every_level(tmp_path, opt):
 
 # --- out: the function writes the target -------------------------------------
 #
-# `out T * view p`: *p must be written on every path before the function returns,
+# `out T *view p`: *p must be written on every path before the function returns,
 # and never read before it is written.  Any write through p counts (a member
 # too), and so does handing p on (a call, a store): whoever gets it may write
-# the target.  A null `out T * view maybe p` has nothing to write.
+# the target.  A null `out T *?view p` has nothing to write.
 
 OUT_PRELUDE = """\
 struct S { int a, b; };
@@ -534,7 +572,7 @@ OUT_CLEAN = {
     "whole": "int f(out struct S *s)\n{\n  *s = (struct S){1, 2};\n  return 0;\n}\n",
     "out_callee": "int f(out struct S *s)\n{\n  return fill(s);\n}\n",
     "handed_on": "void f(out struct S *s)\n{\n  zero(s);\n}\n",
-    "maybe_null": "void f(out int * maybe n)\n{\n  if (n)\n    *n = 0;\n}\n",
+    "maybe_null": "void f(out int *?n)\n{\n  if (n)\n    *n = 0;\n}\n",
     "every_path": "int f(out int *n, int x)\n{\n  if (x)\n  {\n    *n = 1;\n    return 1;\n  }\n  *n = 0;\n"
     "  return 0;\n}\n",
 }
@@ -553,7 +591,7 @@ def test_out_same_at_every_level(tmp_path, opt):
 
 
 def test_empty_body_owned_parameter(tmp_path):
-    assert _check(tmp_path, "void f(char * owned p)\n{\n}\n") == [
+    assert _check(tmp_path, "void f(char *owned p)\n{\n}\n") == [
         (3, "warning", "'p' leaks: it still owns memory at the end of the function")
     ]
 
@@ -564,30 +602,30 @@ def test_empty_body_owned_parameter(tmp_path):
 # argument that may be null is reported, for a direct call, a call through a
 # pointer, and a call the inliner expands (where the argument is stored into
 # the callee's parameter rather than passed).  A parameter declared in regular
-# C is `view maybe` and takes anything.
+# C is `?view` and takes anything.
 
 ARG_PRELUDE = """\
 struct node { int v; };
-struct node * borrows(static) maybe find(int k);
+inout struct node *?borrows(static) find(int k);
 int takes(struct node *n);
-int takes_maybe(struct node * maybe n);
+int takes_maybe(struct node *?n);
 static int peek(struct node *n) { return n->v; }
 int (*takes_fp)(struct node *n);
-static int wrap(struct node * maybe q) { return takes(q); }
+static int wrap(struct node *?q) { return takes(q); }
 """
 
 ARG_BAD = {
-    "call_result": ("int f(int k)\n{\n  return takes(find(k));\n}\n", 3, "a pointer that may be null is passed as argument 1 of 'takes', which is not maybe"),
-    "null": ("int f(void)\n{\n  return takes(0);\n}\n", 3, "a null pointer is passed as argument 1 of 'takes', which is not maybe"),
+    "call_result": ("int f(int k)\n{\n  return takes(find(k));\n}\n", 3, "a pointer that may be null is passed as argument 1 of 'takes', which is not '?'"),
+    "null": ("int f(void)\n{\n  return takes(0);\n}\n", 3, "a null pointer is passed as argument 1 of 'takes', which is not '?'"),
     "inlined_callee": (
-        "int f(int k)\n{\n  struct node * view maybe q = find(k);\n  return peek(q);\n}\n",
+        "int f(int k)\n{\n  struct node *?view q = find(k);\n  return peek(q);\n}\n",
         4,
-        "a pointer that may be null is passed as argument 1 of 'peek', which is not maybe",
+        "a pointer that may be null is passed as argument 1 of 'peek', which is not '?'",
     ),
     "through_a_pointer": (
-        "int f(int k)\n{\n  struct node * view maybe q = find(k);\n  return takes_fp(q);\n}\n",
+        "int f(int k)\n{\n  struct node *?view q = find(k);\n  return takes_fp(q);\n}\n",
         4,
-        "a pointer that may be null is passed as argument 1, which is not maybe",
+        "a pointer that may be null is passed as argument 1, which is not '?'",
     ),
 }
 
@@ -608,9 +646,9 @@ def test_maybe_argument_reported(tmp_path, name, opt):
 
 
 ARG_CLEAN = {
-    "tested": "int f(int k)\n{\n  struct node * view maybe q = find(k);\n  if (q)\n    return takes(q);\n  return 0;\n}\n",
+    "tested": "int f(int k)\n{\n  struct node *?view q = find(k);\n  if (q)\n    return takes(q);\n  return 0;\n}\n",
     "maybe_parameter": "int f(int k)\n{\n  return takes_maybe(find(k));\n}\n",
-    "tested_inline": "int f(int k)\n{\n  struct node * view maybe q = find(k);\n  return q ? peek(q) : 0;\n}\n",
+    "tested_inline": "int f(int k)\n{\n  struct node *?view q = find(k);\n  return q ? peek(q) : 0;\n}\n",
     "regular_c_parameter": "int legacy(struct node *n);\nint f(int k)\n{\n  return legacy(find(k));\n}\n",
 }
 
@@ -643,7 +681,7 @@ NONNULL_BAD = {
         [(3, "warning", "a pointer that may be null is passed as argument 2 of 'cpy', which is declared nonnull")],
     ),
     "all_parameters": (
-        "int f(inout struct node *d, int k)\n{\n  struct node * view maybe q = find(k);\n  return all(d, q);\n}\n",
+        "int f(inout struct node *d, int k)\n{\n  struct node *?view q = find(k);\n  return all(d, q);\n}\n",
         [(4, "warning", "a pointer that may be null is passed as argument 2 of 'all', which is declared nonnull")],
     ),
     "null_constant_once": (
@@ -653,7 +691,7 @@ NONNULL_BAD = {
 }
 
 NONNULL_CLEAN = {
-    "tested": "int f(inout struct node *d, int k)\n{\n  struct node * view maybe q = find(k);\n  return q ? cpy(d, q) : 0;\n}\n",
+    "tested": "int f(inout struct node *d, int k)\n{\n  struct node *?view q = find(k);\n  return q ? cpy(d, q) : 0;\n}\n",
     "not_nonnull": "int f(int k)\n{\n  return some(find(k), 0);\n}\n",
 }
 
@@ -681,7 +719,7 @@ def test_wrap_reports_once(tmp_path):
     its line, at every level (at -O1+ from the end-of-unit check)."""
     for opt in LEVELS:
         got = _arg(tmp_path, "int f(int k)\n{\n  return wrap(find(k));\n}\n", opt)
-        assert got == [(0, "warning", "a pointer that may be null is passed as argument 1 of 'takes', which is not maybe")], (opt, got)
+        assert got == [(0, "warning", "a pointer that may be null is passed as argument 1 of 'takes', which is not '?'")], (opt, got)
 
 
 # --- borrows: a pointer that owns nothing outliving its owner -----------------
@@ -693,72 +731,72 @@ def test_wrap_reports_once(tmp_path):
 # followed per owner (test_lifetime_paths.py owners_*).
 
 BORROW_PRELUDE = (
-    "char * owned make(void);\nchar * borrows(s) maybe find(char *s, int c);\nchar * borrows(s) first(char *s);\n"
+    "char *owned make(void);\nchar *?borrows(s) find(char *s, int c);\nchar *borrows(s) first(char *s);\n"
 )
 
 BORROW_BAD = {
     "freed": (
-        "int f(void)\n{\n  char * owned p = make();\n  char * view v = p;\n  free(p);\n  return use(v);\n}\n",
+        "int f(void)\n{\n  char *owned p = make();\n  char *view v = p;\n  free(p);\n  return use(v);\n}\n",
         [(6, "warning", "'v' is used after 'p', which it borrows from, was freed"), (5, "note", "'p' was freed here")],
     ),
     "moved_into_parameter": (
-        "int f(void)\n{\n  char * owned p = make();\n  char * view v = p + 2;\n  take(move(p));\n  return *v;\n}\n",
+        "int f(void)\n{\n  char *owned p = make();\n  char *view v = p + 2;\n  take(move(p));\n  return *v;\n}\n",
         [(6, "warning", "'v' is used after 'p', which it borrows from, was moved"), (5, "note", "'p' was moved here")],
     ),
     "moved_into_variable": (
-        "int f(void)\n{\n  char * owned p = make();\n  char * view v = p;\n  char * owned q = move(p);\n  int r = use(v);\n"
+        "int f(void)\n{\n  char *owned p = make();\n  char *view v = p;\n  char *owned q = move(p);\n  int r = use(v);\n"
         "  free(q);\n  return r;\n}\n",
         [(6, "warning", "'v' is used after 'p', which it borrows from, was moved"), (5, "note", "'p' was moved here")],
     ),
     "freed_on_one_path": (
-        "int f(int c)\n{\n  char * owned p = make();\n  char * view v = p;\n  if (c)\n  {\n    free(p);\n"
+        "int f(int c)\n{\n  char *owned p = make();\n  char *view v = p;\n  if (c)\n  {\n    free(p);\n"
         "    p = make();\n  }\n  int r = use(v);\n  free(p);\n  return r;\n}\n",
         [(10, "warning", "'v' may be used after 'p', which it borrows from, was freed"), (7, "note", "'p' was freed here")],
     ),
     # a call whose result borrows(s) from an owned argument
     "through_call": (
-        "int f(void)\n{\n  char * owned p = make();\n  char * view maybe v = find(p, 'x');\n  free(p);\n"
+        "int f(void)\n{\n  char *owned p = make();\n  char *?view v = find(p, 'x');\n  free(p);\n"
         "  return v ? *v : 0;\n}\n",
         [(6, "warning", "'v' is used after 'p', which it borrows from, was freed"), (5, "note", "'p' was freed here")],
     ),
     "through_call_plus_offset": (
-        "int f(void)\n{\n  char * owned p = make();\n  char * view v = first(p) + 1;\n  take(move(p));\n  return *v;\n}\n",
+        "int f(void)\n{\n  char *owned p = make();\n  char *view v = first(p) + 1;\n  take(move(p));\n  return *v;\n}\n",
         [(6, "warning", "'v' is used after 'p', which it borrows from, was moved"), (5, "note", "'p' was moved here")],
     ),
     # an inlined call (-O1+) borrows what the callee's declared result says
     "through_inline": (
-        "static inline char * view next(inout char *s)\n{\n  return s + 1;\n}\n"
-        "int f(void)\n{\n  char * owned p = make();\n  char * view v = next(p);\n  free(p);\n  return use(v);\n}\n",
+        "static inline char *view next(inout char *s)\n{\n  return s + 1;\n}\n"
+        "int f(void)\n{\n  char *owned p = make();\n  char *view v = next(p);\n  free(p);\n  return use(v);\n}\n",
         [(10, "warning", "'v' is used after 'p', which it borrows from, was freed"), (9, "note", "'p' was freed here")],
     ),
     "through_inline_borrows": (
-        "static inline char * borrows(s) maybe at(inout char *s, int k)\n{\n  return k ? s + k : 0;\n}\n"
-        "int f(int k)\n{\n  char * owned p = make();\n  char * view maybe v = at(p, k);\n  take(move(p));\n"
+        "static inline char *?borrows(s) at(inout char *s, int k)\n{\n  return k ? s + k : 0;\n}\n"
+        "int f(int k)\n{\n  char *owned p = make();\n  char *?view v = at(p, k);\n  take(move(p));\n"
         "  return v ? *v : 0;\n}\n",
         [(10, "warning", "'v' is used after 'p', which it borrows from, was moved"), (9, "note", "'p' was moved here")],
     ),
     "through_nested_inline": (
-        "static inline char * view next(inout char *s)\n{\n  return s + 1;\n}\n"
-        "int f(void)\n{\n  char * owned p = make();\n  char * view v = next(next(p));\n  free(p);\n  return *v;\n}\n",
+        "static inline char *view next(inout char *s)\n{\n  return s + 1;\n}\n"
+        "int f(void)\n{\n  char *owned p = make();\n  char *view v = next(next(p));\n  free(p);\n  return *v;\n}\n",
         [(10, "warning", "'v' is used after 'p', which it borrows from, was freed"), (9, "note", "'p' was freed here")],
     ),
 }
 
 BORROW_CLEAN = {
-    "used_before": "int f(void)\n{\n  char * owned p = make();\n  char * view v = p;\n  int r = use(v);\n  free(p);\n"
+    "used_before": "int f(void)\n{\n  char *owned p = make();\n  char *view v = p;\n  int r = use(v);\n  free(p);\n"
     "  return r;\n}\n",
-    "borrowed_again": "int f(void)\n{\n  char * owned p = make();\n  char * view v = p;\n  free(p);\n  p = make();\n"
+    "borrowed_again": "int f(void)\n{\n  char *owned p = make();\n  char *view v = p;\n  free(p);\n  p = make();\n"
     "  v = p;\n  int r = use(v);\n  free(p);\n  return r;\n}\n",
-    "assigned_elsewhere": "int f(inout char *s)\n{\n  char * owned p = make();\n  char * view v = p;\n  free(p);\n"
+    "assigned_elsewhere": "int f(inout char *s)\n{\n  char *owned p = make();\n  char *view v = p;\n  free(p);\n"
     "  v = s;\n  return use(v);\n}\n",
-    "through_call_used_before": "int f(void)\n{\n  char * owned p = make();\n  char * view v = first(p);\n"
+    "through_call_used_before": "int f(void)\n{\n  char *owned p = make();\n  char *view v = first(p);\n"
     "  int r = *v;\n  free(p);\n  return r;\n}\n",
-    "through_inline_used_before": "static inline char * view next(inout char *s)\n{\n  return s + 1;\n}\n"
-    "int f(void)\n{\n  char * owned p = make();\n  char * view v = next(p);\n  int r = *v;\n  free(p);\n"
+    "through_inline_used_before": "static inline char *view next(inout char *s)\n{\n  return s + 1;\n}\n"
+    "int f(void)\n{\n  char *owned p = make();\n  char *view v = next(p);\n  int r = *v;\n  free(p);\n"
     "  return r;\n}\n",
-    "through_inline_of_a_view": "static inline char * view next(inout char *s)\n{\n  return s + 1;\n}\n"
-    "int f(inout char *s)\n{\n  char * owned p = make();\n  char * view v = next(s);\n  free(p);\n  return *v;\n}\n",
-    "through_call_of_a_view": "int f(char *s)\n{\n  char * owned p = make();\n  char * view v = first(s);\n"
+    "through_inline_of_a_view": "static inline char *view next(inout char *s)\n{\n  return s + 1;\n}\n"
+    "int f(inout char *s)\n{\n  char *owned p = make();\n  char *view v = next(s);\n  free(p);\n  return *v;\n}\n",
+    "through_call_of_a_view": "int f(char *s)\n{\n  char *owned p = make();\n  char *view v = first(s);\n"
     "  free(p);\n  return *v;\n}\n",
 }
 
@@ -783,23 +821,23 @@ def test_borrow_clean(tmp_path, name, opt):
 
 # --- maybe members: `q->next` followed like a maybe variable ------------------
 #
-# A `T * maybe` member reached through a pointer variable (`q->next`,
+# A `T *?` member reached through a pointer variable (`q->next`,
 # `(*q).next`, and through another such member: `q->next->next`) is followed
 # for null per path.  Untested it may be null; `if (q->next)`, `!q->next`,
 # `q->next != 0`, `&&`, `?:` and `while (n->next)` refine it; a store sets it
 # from the value stored.  Assigning the base again forgets its members, and so
 # does a call that gets the base (or `&q->next`) as a pointer to memory that is
-# not const; a `const T * view` parameter keeps them.  Stores through other
+# not const; a `const T *view` parameter keeps them.  Stores through other
 # pointers are assumed not to alias.
 
 MEMBER_PRELUDE = """\
-struct node { int v; struct node * view maybe next; };
-struct list { struct list * view maybe next; int v; };
-struct node * borrows(static) must(int k);
+struct node { int v; struct node *?next; };
+struct list { struct list *?next; int v; };
+inout struct node *borrows(static) must(int k);
 void update(inout struct node *n);
 void show(const struct node *n);
 int both(inout struct node *n, int x);
-void set_next(inout struct node * view maybe *pp);
+void set_next(inout struct node *?view *pp);
 int vsum(int n, ...);
 static inline void clear_next(inout struct node *n)
 {
@@ -828,19 +866,19 @@ MEMBER_BAD = {
     "untested": ("int f(struct node *q)\n{\n  return q->next->v;\n}\n", 3, "'q->next' may be null where it is dereferenced"),
     "ternary_untested": ("int f(struct node *q, int c)\n{\n  return c ? q->next->v : 0;\n}\n", 3, "'q->next' may be null where it is dereferenced"),
     "copy_then_member_changed": (
-        "int f(inout struct node *q)\n{\n  struct node * view maybe n = q->next;\n  q->next = 0;\n  if (n)\n"
+        "int f(inout struct node *q)\n{\n  struct node *?view n = q->next;\n  q->next = 0;\n  if (n)\n"
         "    return q->next->v;\n  return 0;\n}\n",
         6,
         "'q->next' is null where it is dereferenced",
     ),
     "copy_reassigned": (
-        "int f(struct node *q, int c)\n{\n  struct node * view maybe n = q->next;\n  if (c)\n    n = must(1);\n"
+        "int f(struct node *q, int c)\n{\n  struct node *?view n = q->next;\n  if (c)\n    n = must(1);\n"
         "  if (n)\n    return q->next->v;\n  return 0;\n}\n",
         7,
         "'q->next' may be null where it is dereferenced",
     ),
     "copy_then_call": (
-        "int f(inout struct node *q)\n{\n  struct node * view maybe n = q->next;\n  update(q);\n  if (!n)\n"
+        "int f(inout struct node *q)\n{\n  struct node *?view n = q->next;\n  update(q);\n  if (!n)\n"
         "    return 0;\n  return q->next->v;\n}\n",
         7,
         "'q->next' may be null where it is dereferenced",
@@ -899,14 +937,14 @@ MEMBER_BAD = {
         "'q->next->next' may be null where it is dereferenced",
     ),
     "returned": (
-        "struct node * view f(struct node *q)\n{\n  return q->next;\n}\n",
+        "struct node *view f(struct node *q)\n{\n  return q->next;\n}\n",
         3,
-        "a pointer that may be null is returned from 'f', whose result is not maybe",
+        "a pointer that may be null is returned from 'f', whose result is not '?'",
     ),
     "stored_in_plain": (
-        "int f(struct node *q)\n{\n  struct node * view n = q->next;\n  return n->v;\n}\n",
+        "int f(struct node *q)\n{\n  struct node *view n = q->next;\n  return n->v;\n}\n",
         3,
-        "a pointer that may be null is stored in 'n', which is not maybe",
+        "a pointer that may be null is stored in 'n', which is not '?'",
     ),
     "reported_once": (
         "int f(struct node *q)\n{\n  return q->next->v + q->next->v;\n}\n",
@@ -931,7 +969,7 @@ MEMBER_CLEAN = {
     "and_chain": "int f(struct node *q)\n{\n  return q->next && q->next->v;\n}\n",
     "ternary": "int f(struct node *q)\n{\n  return q->next ? q->next->v : 0;\n}\n",
     "walk_to_last": "int f(struct node *n)\n{\n  while (n->next)\n    n = n->next;\n  return n->v;\n}\n",
-    "for_walk": "int f(inout struct node *h)\n{\n  int s = 0;\n  for (struct node * view n = h; n->next; n = n->next)\n"
+    "for_walk": "int f(inout struct node *h)\n{\n  int s = 0;\n  for (struct node *view n = h; n->next; n = n->next)\n"
     "    s += n->next->v;\n  return s;\n}\n",
     "const_view_call": "int f(struct node *q)\n{\n  if (!q->next)\n    return 0;\n  show(q);\n  return q->next->v;\n}\n",
     "inlined_const_view": "int f(struct node *q)\n{\n  if (!q->next)\n    return 0;\n  peek(q);\n"
@@ -939,18 +977,18 @@ MEMBER_CLEAN = {
     "argument_read_before_call": "int f(inout struct node *q)\n{\n  if (!q->next)\n    return 0;\n"
     "  return both(q, q->next->v);\n}\n",
     # a local holding a copy of the member: testing one tells about the other
-    "copy_tested": "int f(struct node *q)\n{\n  struct node * view maybe n = q->next;\n  if (n)\n"
+    "copy_tested": "int f(struct node *q)\n{\n  struct node *?view n = q->next;\n  if (n)\n"
     "    return q->next->v;\n  return 0;\n}\n",
-    "member_tested_copy_used": "int f(struct node *q)\n{\n  struct node * view maybe n = q->next;\n"
+    "member_tested_copy_used": "int f(struct node *q)\n{\n  struct node *?view n = q->next;\n"
     "  if (q->next)\n    return n->v;\n  return 0;\n}\n",
-    "copy_early_return": "int f(struct node *q)\n{\n  struct node * view maybe n = q->next;\n  if (!n)\n"
+    "copy_early_return": "int f(struct node *q)\n{\n  struct node *?view n = q->next;\n  if (!n)\n"
     "    return 0;\n  return q->next->v + n->v;\n}\n",
     "ternary_tested": "int f(struct node *q, int c)\n{\n  if (!q->next)\n    return 0;\n  return c ? q->next->v : 0;\n}\n",
     "stored_set": "int f(inout struct node *q)\n{\n  q->next = must(1);\n  return q->next->v;\n}\n",
     "refilled": "int f(inout struct node *q, int k)\n{\n  if (!q->next)\n    q->next = must(k);\n  return q->next->v;\n}\n",
     "two_levels_tested": "int f(struct node *q)\n{\n  if (q->next && q->next->next)\n    return q->next->next->v;\n"
     "  return 0;\n}\n",
-    "maybe_local": "int f(struct node *q)\n{\n  struct node * view maybe n = q->next;\n  if (n)\n    return n->v;\n"
+    "maybe_local": "int f(struct node *q)\n{\n  struct node *?view n = q->next;\n  if (n)\n    return n->v;\n"
     "  return 0;\n}\n",
     "unlink_next": "void f(inout struct node *q)\n{\n  if (q->next)\n    q->next = q->next->next;\n}\n",
 }
@@ -981,11 +1019,11 @@ def test_member_code_unchanged(tmp_path, opt):
     assert (tmp_path / "plain.o").read_bytes() == (tmp_path / "checked.o").read_bytes()
 
 
-# An `owned maybe` member is followed for ownership too: freed (or moved out)
+# An `?owned` member is followed for ownership too: freed (or moved out)
 # and then read or freed again is reported, with a note where; a store gives
 # it a new value.  It never leaks on its own: its struct owns it.
 
-OWNED_MEMBER_PRELUDE = "struct onode { int v; struct onode * owned maybe next; };\n"
+OWNED_MEMBER_PRELUDE = "struct onode { int v; struct onode *?owned next; };\n"
 
 OWNED_MEMBER_BAD = {
     "used_after_free": (
@@ -1001,7 +1039,7 @@ OWNED_MEMBER_BAD = {
         [(5, "warning", "'q->next' may be freed twice"), (4, "note", "'q->next' was freed here")],
     ),
     "moved_out": (
-        "int f(inout struct onode *q)\n{\n  struct onode * owned maybe n = move(q->next);\n  free(n);\n"
+        "int f(inout struct onode *q)\n{\n  struct onode *?owned n = move(q->next);\n  free(n);\n"
         "  return q->next ? q->next->v : 0;\n}\n",
         [(5, "warning", "'q->next' is used after it was moved"), (3, "note", "'q->next' was moved here")],
     ),
@@ -1009,9 +1047,9 @@ OWNED_MEMBER_BAD = {
 
 OWNED_MEMBER_CLEAN = {
     "freed_then_cleared": "void f(inout struct onode *q)\n{\n  free(q->next);\n  q->next = 0;\n}\n",
-    "freed_then_refilled": "int f(inout struct onode *q, struct onode * owned n)\n{\n  free(q->next);\n  q->next = move(n);\n"
+    "freed_then_refilled": "int f(inout struct onode *q, struct onode *owned n)\n{\n  free(q->next);\n  q->next = move(n);\n"
     "  return q->next->v;\n}\n",
-    "pop_front": "void f(inout struct onode *q)\n{\n  struct onode * owned maybe n = move(q->next);\n  if (n)\n  {\n"
+    "pop_front": "void f(inout struct onode *q)\n{\n  struct onode *?owned n = move(q->next);\n  if (n)\n  {\n"
     "    q->next = move(n->next);\n    free(n);\n  }\n}\n",
     "tested_free": "void f(inout struct onode *q)\n{\n  if (q->next)\n    free(q->next);\n  q->next = 0;\n}\n",
 }
@@ -1044,9 +1082,9 @@ def test_owned_member_clean(tmp_path, name, opt):
 # callee's test or store counts as little as the call's, at every -O.
 
 OBJ_PRELUDE = MEMBER_PRELUDE + """\
-struct node * borrows(static) maybe find(int k);
+inout struct node *?borrows(static) find(int k);
 struct node g;
-struct node * borrows(static) gp;
+struct node *borrows(static) gp;
 static inline int has_next(void)
 {
   return g.next != 0;

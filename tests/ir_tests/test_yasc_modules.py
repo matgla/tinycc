@@ -59,7 +59,7 @@ export typedef struct point { int x, y; } point_t;
 export enum color { RED, GREEN };
 struct sock { int fd; };
 
-export sock_t * owned maybe sock_open(int port);
+export sock_t *?owned sock_open(int port);
 export int counter = 3;
 int helper(int x) { return x + counter; }
 static int helper2(void) { return 1; }
@@ -67,7 +67,7 @@ int priv_global;
 int priv_init = 7;
 extern int outside;
 export point_t origin(void) { point_t p = {helper(1), helper2() + outside + priv_global + priv_init}; return p; }
-sock_t * owned maybe sock_open(int port) { (void)port; return 0; }
+sock_t *?owned sock_open(int port) { (void)port; return 0; }
 export int use_color(enum color c) { return c; }
 """
 
@@ -113,7 +113,7 @@ def test_typedef_named_module(tmp_path):
 
 
 def test_opaque_handle(tmp_path):
-    proc = _yasc(tmp_path, "module a;\nstruct p { int x; };\nexport typedef struct p p_t;\nexport struct p * borrows(static) get(void);\n")
+    proc = _yasc(tmp_path, "module a;\nstruct p { int x; };\nexport typedef struct p p_t;\nexport struct p *borrows(static) get(void);\n")
     assert proc.returncode == 0 and not proc.stderr, proc.stderr
 
 
@@ -233,11 +233,11 @@ export typedef struct point { int x, y; } point_t;
 export enum color { RED, GREEN = 5 };
 struct sock { int fd; };
 
-export sock_t * owned maybe sock_open(int port);
+export sock_t *?owned sock_open(int port);
 export int counter = 3, other, arr[2] = {1, 2};
 int helper(int x) { return x + counter; }
 export point_t origin(void) { point_t p = {helper(1), 2}; return p; }
-sock_t * owned maybe sock_open(int port) { (void)port; return 0; }
+sock_t *?owned sock_open(int port) { (void)port; return 0; }
 export inline int twice(int v) { return v * 2 + RED; }
 export static inline int thrice(int v) { return v * 3; }
 export struct __attribute__((packed)) packed_s { char c; int i; };
@@ -248,7 +248,7 @@ IFACE_TEXT = (
     "typedef struct sock sock_t ; "
     "typedef struct point { int x , y ; } point_t ; "
     "enum color { RED , GREEN = 5 } ; "
-    "sock_t * owned maybe sock_open ( int port ) ; "
+    "sock_t * ? owned sock_open ( int port ) ; "
     "extern int counter , other , arr [ 2 ] ; "
     "point_t origin ( void ) ; "
     "static inline int twice ( int v ) { return v * 2 + RED ; } "
@@ -586,8 +586,8 @@ import geom;
 export typedef struct sock sock_t;
 export enum color { RED, GREEN = 5 };
 struct sock { int fd; };
-export sock_t * owned maybe sock_open(int port);
-export void sock_close(drop sock_t * owned s);
+export sock_t *?owned sock_open(int port);
+export void sock_close(drop sock_t *owned s);
 export size_t name_len(const char *s);
 export int counter = 3, arr[2] = {1, 2};
 export const double scale = 2.5;
@@ -637,7 +637,7 @@ def test_header_contents(tmp_path):
     assert (tmp_path / "inc" / "net" / "socket.h").read_text() == HEADER_TEXT
     # the interface still carries the yasc qualifiers and the inline body
     text = _load_ymi(tmp_path / "net" / "socket.ymi")["text"]
-    assert "sock_t * owned maybe sock_open" in text
+    assert "sock_t * ? owned sock_open" in text
     assert "static inline int twice ( int v ) { return v * 2 ; }" in text
 
 
@@ -673,14 +673,14 @@ def test_header_is_c99_for_gcc(tmp_path):
 
 QUAL_ARGS_MODULE = """\
 module q;
-int close(int drop owned(close) maybe fd);
+int close(int drop ?owned(close) fd);
 struct grid { int n; };
-export struct tok borrows(text) { const char * borrows(text) pos; };
+export struct tok borrows(text) { const char *borrows(text) pos; };
 static struct grid the_grid;
-export struct grid * borrows(static) grid_get(void) { return &the_grid; }
-export const char * borrows(s) skip(const char *s) { return s + 1; }
-export char * owned takes(p) keep(char * owned p) { return p; }
-export int owned(close) maybe open_fd(int f);
+export struct grid *borrows(static) grid_get(void) { return &the_grid; }
+export const char *borrows(s) skip(const char *s) { return s + 1; }
+export char *@(owned, takes(p)) keep(char *owned p) { return p; }
+export int ?owned(close) open_fd(int f);
 export struct tok borrows(src) tok_init(const char *src);
 export int takes(int v);
 """
@@ -708,10 +708,10 @@ def test_header_leaves_out_qualifier_arguments(tmp_path):
 
 IN_MODULE = """\
 module ro;
-export int first(int n, const char * view *argv);
-export int count(const char * view a[], char * view b[], int c[4], inout char * view e[], int g[owned]);
-export int bytes(const int * maybe p, const char *s, char * view const *v);
-export int rows(const char (* view m)[4], const char (* view c)[4]);
+export int first(int n, const char *view *argv);
+export int count(const char *view a[], char *view b[], int c[4], inout char *view e[], int g[owned]);
+export int bytes(const int *?p, const char *s, char *@(view, const) *v);
+export int rows(const char (*view m)[4], const char (*view c)[4]);
 """
 
 IN_TEXT = """\
@@ -725,7 +725,7 @@ int rows(const char(* m) [4], const char(* c) [4]);
 def test_header_spells_in_as_const(tmp_path):
     """an `in` parameter's target is const in the C header: before the '*'
     of its outermost pointer, and for an array parameter before its name --
-    the elements (`char * view b[]` is `char * const b[]`, not `char const *
+    the elements (`char *view b[]` is `char *const b[]`, not `char const *
     b[]`); inout and an owned array say nothing"""
     proc = _module(tmp_path, IN_MODULE, f"-fmodule-header={tmp_path / 'inc'}")
     assert proc.returncode == 0 and not proc.stderr, proc.stderr
@@ -793,10 +793,10 @@ def test_example_makefile(tmp_path):
 
 def test_import_brings_unchecked_c(tmp_path):
     (tmp_path / "legacy.h").write_text("void *c_alloc(unsigned n);\nchar *c_name(void);\n")
-    _ok(_cc(tmp_path, "a", 'module a;\n#include "legacy.h"\nexport char * borrows(static) a_view(void);\n'
-            "export void a_release(void * owned maybe p);\n"))
-    proc = _cc(tmp_path, "m", "import a;\nvoid f(void) {\n  char * owned p = c_alloc(1);\n"
-               "  char * owned q = a_view();\n  a_release(move(p)); a_release(move(q)); }\n")
+    _ok(_cc(tmp_path, "a", 'module a;\n#include "legacy.h"\nexport inout char *borrows(static) a_view(void);\n'
+            "export void a_release(void *?owned p);\n"))
+    proc = _cc(tmp_path, "m", "import a;\nvoid f(void) {\n  char *owned p = c_alloc(1);\n"
+               "  char *owned q = a_view();\n  a_release(move(p)); a_release(move(q)); }\n")
     assert proc.returncode == 0, proc.stderr
     # c_alloc comes from the module's C header: unchecked; a_view is the
     # module's own (yasc) view: checked

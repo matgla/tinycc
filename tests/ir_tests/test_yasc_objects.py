@@ -2,10 +2,10 @@
 (docs/static_analysis_todo.md).
 
 The object (a struct, not a pointer) holds what a function gave it and a
-deallocator takes back: `int regcomp(out regex_t owned(regfree) * view
+deallocator takes back: `int regcomp(out regex_t owned(regfree) *view
 preg, ...)` writes it (a status result's test deciding), `void
 regfree(drop regex_t owned(regfree) *preg)` releases it, and a read
-through a pointer that cannot write (`const regex_t * view`) uses it.  The
+through a pointer that cannot write (`const regex_t *view`) uses it.  The
 slot check follows it like an owned item: leaks, use after release,
 release twice, the wrong deallocator.  Its address written into by such a
 function while the local is not declared owned(...) is reported too.
@@ -23,7 +23,7 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 
 PRELUDE = """\
 #pragma yasc
-typedef struct { int re_nsub; void * view maybe impl; } regex_t;
+typedef struct { int re_nsub; void *?impl; } regex_t;
 int regcomp(out regex_t owned(regfree) *preg, const char *pat, int fl);
 int regexec(const regex_t *preg, const char *s);
 void regfree(drop regex_t owned(regfree) *preg);

@@ -276,11 +276,15 @@ static __attribute__((noinline)) int unary_paren_type(int t, CType *type)
   if (!parse_btype(type, &ad, 0))
     return PAREN_NOT_TYPE;
   btype_no_auto(&ad);
+  /* yasc: its plain pointers are views in a compound literal only */
+  const int plain_mark = yasc_paren_type_begin();
   type_decl(type, &ad, &n, TYPE_ABSTRACT);
   skip(')');
+  yasc_paren_type_end(plain_mark, tok == '{');
   /* check ISOC99 compound literal */
   if (tok == '{')
   {
+    yasc_src_object_check(type, "a compound literal");
     /* data is allocated locally by default */
     if (global_expr)
       r = VT_CONST;
@@ -746,6 +750,8 @@ static void yasc_note_tagged(int tu, int m)
     tcc_ir_note_tagged(tcc_state->ir, 0, -1, 0, NULL, tu, m, line); /* not followed: said */
 }
 
+static int unary_member_tok; /* the member unary_member named last */
+
 static __attribute__((noinline)) int unary_member(int addr_operand)
 {
   Sym *s;
@@ -792,7 +798,11 @@ static __attribute__((noinline)) int unary_member(int addr_operand)
   /* expect pointer on structure */
   if (!name_read)
     next();
+  /* a yasc_src's file / func / module are its header's (builtin/misc.c) */
+  if (yasc_src_header_member(tok))
+    qualifiers = vtop->type.t & (VT_CONSTANT | VT_VOLATILE);
   CType struct_type = vtop->type; /* save before find_field/type changes */
+  unary_member_tok = tok;          /* `p->arr[i] = v` names arr (unary) */
   s = find_field(&vtop->type, tok, &cumofs);
   if (s && s->a.attr_facts)
     attr_deprecated_use(s); /* a deprecated member */
@@ -966,11 +976,13 @@ static __attribute__((noinline)) int unary_member(int addr_operand)
   /* ... and so is an `int owned(close) maybe fd` handle member: maybe
      there is "may be < 0", refined by the handle tests (LT_MEMBER_HANDLE) */
   /* ... and an owned member that is never null, for ownership only
-     (LT_MEMBER_NOTMAYBE: no null checks) */
+     (LT_MEMBER_NOTMAYBE: no null checks), and a view pointer member that is
+     never null (a plain one: `struct s { char *p; }`), so that null stored
+     in either is said */
   const int lt_q = type_yasc(&s->type);
-  const int lt_followed = !yasc_union &&
-                          ((s->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR || type_is_handle(&s->type)) &&
-                          !(lt_q & YASC_UNCHECKED) && (lt_q & (YASC_MAYBE | YASC_OWNED));
+  const int lt_ptr = (s->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR;
+  const int lt_followed = !yasc_union && (lt_ptr || type_is_handle(&s->type)) && !(lt_q & YASC_UNCHECKED) &&
+                          ((lt_q & (YASC_MAYBE | YASC_OWNED)) || (lt_ptr && (lt_q & YASC_VIEW)));
   const int lt_kind = ((lt_q & YASC_OWNED) ? LT_MEMBER_OWNED : 0) | (type_is_handle(&s->type) ? LT_MEMBER_HANDLE : 0) |
                       (!(lt_q & YASC_MAYBE) ? LT_MEMBER_NOTMAYBE : 0);
   if (tcc_state->ir && tcc_state->ir->lt_on && (struct_type.t & (VT_BTYPE | VT_ARRAY)) == VT_STRUCT)
@@ -991,6 +1003,11 @@ static __attribute__((noinline)) int unary_member(int addr_operand)
   if (tcc_state->ir && tcc_state->ir->lt_on && !nocode_wanted && !yasc_union && type_borrows_field(&s->type) >= 0 &&
       (vtop->r & VT_VALMASK) < VT_CONST && TCCIR_DECODE_VREG_TYPE(vtop->vr) == TCCIR_VREG_TYPE_TEMP)
     tcc_ir_lt_note_field_load(tcc_state->ir, vtop->vr, type_borrows_field(&s->type));
+  /* ... and a member others borrow from: their entries are this function's */
+  if (tcc_state->ir && tcc_state->ir->lt_on && !nocode_wanted && tcc_state->yasc && yasc_field_borrows(0) &&
+      (struct_type.t & (VT_BTYPE | VT_ARRAY)) == VT_STRUCT && struct_type.ref &&
+      (vtop->r & VT_VALMASK) < VT_CONST && TCCIR_DECODE_VREG_TYPE(vtop->vr) == TCCIR_VREG_TYPE_TEMP)
+    yasc_note_field_sources(struct_type.ref, s->v & ~SYM_FIELD, vtop->vr);
   uv_last = UV_VALUE;
   /* an array (or VLA) is never an lvalue */
   if (!(vtop->type.t & (VT_ARRAY | VT_VLA)))
@@ -1060,6 +1077,8 @@ typedef struct SubscriptState
   int pm_align;      /* struct and what its place guarantees, when pm_set */
   unsigned char flex, addr_operand, uu_nr, pm_set;
   unsigned char via_union; /* yasc: an array member reached through a union */
+  unsigned lval_tok : 24;  /* fe_lval_tok of the base, which the index's parse moves (in
+                              the padding: unary_subscript is on the parser's recursion) */
 } SubscriptState;
 
 /* The index of base[index] while __builtin_object_size follows a pointer:
@@ -1184,6 +1203,7 @@ static __attribute__((noinline)) void unary_subscript(int flex, int addr_operand
     ss.pm_st = packed_member_last.st, ss.pm_align = packed_member_last.align;
   ss.uu_nr = 0;
   ss.uu_base = tcc_state->unused_on ? unused_part_begin(&ss.uu_nr, 1) : NULL; /* `a[i] = 0` */
+  ss.lval_tok = fe_lval_tok;
   next();
   /* yasc: s[i] of a slice, and slicing x[a:b]; the index is not the
      pointer __builtin_object_size follows (subscript_index_objsize) */
@@ -1197,6 +1217,7 @@ static __attribute__((noinline)) void unary_subscript(int flex, int addr_operand
     objsize_rec = os_saved;
     if (done)
     {
+      fe_lval_tok = ss.lval_tok;
       if (ss.uu_base)
         unused_part_end(ss.uu_base, ss.uu_nr, 1);
       return;
@@ -1206,6 +1227,7 @@ static __attribute__((noinline)) void unary_subscript(int flex, int addr_operand
     subscript_index_objsize();
   else
     gexpr();
+  fe_lval_tok = ss.lval_tok;
   unary_subscript_end(&ss);
   /* `v->u.arr[i].p`: the chain goes on through the element */
   if (tcc_state->yasc)
@@ -1217,8 +1239,16 @@ static __attribute__((noinline)) void unary_subscript(int flex, int addr_operand
   }
 }
 
+/* yasc: how the lvalue the last unary() left was reached -- FE_LVAL_ELEM
+   (`a[i]`), FE_LVAL_DEREF (`*p`), else 0 -- and the name it starts from:
+   `= ...` asks the lifetime check about a null stored there (infix.c).
+   Set as each part of it is parsed, after what nests in it: no local of
+   unary()'s on the parser's recursion (tests/selfhost/test_parser_stack_frames.py) */
+int fe_lval_kind, fe_lval_tok;
+
 ST_FUNC HOT void unary(void)
 {
+  fe_lval_kind = 0, fe_lval_tok = tok >= TOK_UIDENT ? tok : 0;
   /* This is the operand of '&': it stays the lvalue it names -- indir()
      folds no load into a constant, a __rodata_relative pointer stays a word.
      The flag is the caller's: the expressions nested in this one get 0. */
@@ -1267,6 +1297,7 @@ ST_FUNC HOT void unary(void)
       fe_check_deref_bounds(addr_operand); /* `*(a + 4)` */
     indir();
     uv_last = UV_VALUE;
+    fe_lval_kind = FE_LVAL_DEREF; /* the operand's name stays */
     goto postfix;
   case '!':
     next();
@@ -1338,6 +1369,8 @@ ST_FUNC HOT void unary(void)
     next();
     unary_addr_operand = 1;
     unary();
+    if ((vtop->type.t & VT_SELF_REL) && (vtop->r & VT_LVAL))
+      self_rel_addr_error();
     packed = packed_member_last.set && tcc_warn_wanted(warn_address_of_packed_member) && packed_member_is_vtop();
     unary_take_address();
     vtop->packed_addr = packed;
@@ -1350,7 +1383,7 @@ ST_FUNC HOT void unary(void)
   case '(':
     if (unary_paren())
       goto done;
-    goto postfix;
+    goto postfix; /* `(*p)`: what the expression inside left */
   default:
     break;
   }
@@ -1387,6 +1420,9 @@ postfix:
       if (tok == TOK_ARROW || tok == '[' || tok == '(')
         rodata_rel_rvalue();
     }
+    /* a yasc_src name (@src(), builtin/misc.c): const, only ever read */
+    if ((vtop->type.t & VT_SELF_REL) && (vtop->r & VT_LVAL) && (tok == TOK_ARROW || tok == '[' || tok == '('))
+      self_rel_rvalue();
     if (tok == TOK_INC || tok == TOK_DEC)
     {
       Sym *lhs = unused_lhs();
@@ -1399,10 +1435,12 @@ postfix:
     {
       next();
       yasc_slice_member(); /* s.ptr, s.len */
+      fe_lval_kind = 0;
     }
     else if (tok == '.' || tok == TOK_ARROW)
     {
       const int mf = unary_member(addr_operand);
+      fe_lval_kind = 0, fe_lval_tok = unary_member_tok;
       if (mf < 0)
         continue;
       member_flex = mf;
@@ -1410,10 +1448,12 @@ postfix:
     else if (tok == '[')
     {
       unary_subscript(flex, addr_operand);
+      fe_lval_kind = FE_LVAL_ELEM;
     }
     else if (tok == '(')
     {
       unary_funcall();
+      fe_lval_kind = 0;
       uv_effects++, uv_last = UV_EFFECT;
     }
     else
@@ -1430,4 +1470,6 @@ done:
       rodata_rel_store_error();
     rodata_rel_rvalue();
   }
+  if (!addr_operand && (vtop->type.t & VT_SELF_REL) && (vtop->r & VT_LVAL))
+    self_rel_rvalue();
 }

@@ -1031,11 +1031,16 @@ typedef struct YascFieldBorrows
   int nsrc;
   int src_tok[YASC_FIELD_SRC_MAX], src_off[YASC_FIELD_SRC_MAX], src_size[YASC_FIELD_SRC_MAX];
   int is_static;
+  Sym *st; /* the struct's type Sym (its CType.ref) */
 } YascFieldBorrows;
 #define type_borrows_field(type)                                                                                       \
   ((((type)->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && (type)->ref && (type)->ref->vreg <= -2) ? -2 - (type)->ref->vreg \
                                                                                               : -1)
 ST_FUNC YascFieldBorrows *yasc_field_borrows(int i);
+/* member MTOK of struct ST is accessed, its address in temp VREG: the
+   entries borrowing from it are the function's too (the flow check kills
+   them where it changes) */
+ST_FUNC void yasc_note_field_sources(Sym *st, int mtok, int vreg);
 /* yasc `struct T borrows(text) { ... }`: a struct whose values borrow (struct.c) */
 ST_FUNC int yasc_struct_params(Sym *s);              /* how many borrows(...) names it takes, 0: none */
 ST_FUNC int yasc_struct_param(Sym *s, int tok);      /* the name's position, -1 */
@@ -1045,6 +1050,24 @@ ST_FUNC int yasc_struct_result_code(int name);         /* -1: none recorded */
 ST_DATA int yasc_sbind_pending, yasc_sbind_static, yasc_sbind_nb, yasc_sbind_names[4];
 ST_DATA Sym yasc_static_bound; /* SValue.sym of a call result bound to static storage */
 ST_DATA int yasc_borrows_field_ok, yasc_field_bnb, yasc_field_bstatic, yasc_field_bnames[28];
+/* yasc `static T *?borrows(owner) g;`: a file-scope global whose pointer
+ * points into what the global OWNER (an owned pointer) owns.  By the
+ * global's Sym, for the unit (declarator.c); ir/lifetime.c gb_check keeps
+ * the rule at every function's boundary. */
+#define YASC_GBORROW_MAX 4
+typedef struct YascGlobalBorrows
+{
+  Sym *self;
+  int nowner;
+  Sym *owner[YASC_GBORROW_MAX];
+} YascGlobalBorrows;
+ST_DATA YascGlobalBorrows *yasc_gborrows;
+ST_DATA int yasc_ngborrows;
+ST_FUNC const YascGlobalBorrows *yasc_gborrow_of(Sym *s); /* S borrows: its entry, else NULL */
+ST_FUNC int yasc_gborrow_is_owner(Sym *s);               /* some global borrows from S */
+ST_FUNC void yasc_gborrow_bind(Sym *self);               /* decl.c: the declarator's borrows(...) for SELF */
+ST_FUNC void yasc_gborrow_clear_pending(void);
+ST_FUNC void yasc_gborrows_free(void);                   /* the unit ends: its Syms die */
 
 /* Internal spill: the parameter list of a file-scope prototype goes to the spill
  * file between declarations and comes back when something reads it
@@ -1119,6 +1142,8 @@ typedef struct SymLocalFacts
   int deprecated_line;
   int nodiscard_msg;           /* a token, or 0 */
   unsigned char deprecated;    /* -Wdeprecated-declarations at each use */
+  unsigned char yasc_unsafe;   /* -Wyasc-unsafe-call: yasc code calls it only inside unsafe */
+  int yasc_unsafe_msg;         /* what to use instead: a token, or 0 */
   unsigned char unused_result; /* ATTR_WUR / ATTR_NODISCARD: -Wunused-result */
   unsigned char fmt_kind, fmt_idx, fmt_first; /* format(): -Wformat */
   unsigned char fmt_arg;                      /* format_arg(n): the result is argument n's format */
@@ -1584,6 +1609,8 @@ typedef struct AttributeDef
   unsigned char attr_access_n;
   unsigned char attr_access[FORTIFY_MAX_ACCESS][3];
   int attr_deprecated_msg;
+  unsigned char attr_yasc_unsafe;     /* yasc_unsafe; attr_yasc_unsafe_msg its text (a token), or 0 */
+  int attr_yasc_unsafe_msg;
   int attr_nodiscard_msg;             /* [[nodiscard("why")]]: a token, or 0 */
   /* C23 `auto` (C23 or yasc) or `__auto_type` with no type specifier: the
      keyword; the declaration takes its type from the initializer (decl.c) */
@@ -2028,6 +2055,8 @@ struct TCCState
   unsigned char warn_implicit_move;             /* yasc: ownership leaves a variable without move() */
   unsigned char warn_unchecked;                 /* yasc: a regular-C pointer becomes owned / view outside unsafe */
   unsigned char warn_redundant_view;            /* yasc: `view` on a parameter's own pointer, which is one anyway */
+  unsigned char warn_redundant_const;           /* yasc: `const` on what an in parameter points to, which is const anyway */
+  unsigned char warn_param_access;              /* yasc: an inout parameter that only writes (out) or never writes (in) */
   unsigned char warn_zero_as_null_pointer_constant; /* yasc: a null pointer written NULL or 0, not nullptr */
   unsigned char warn_volatile_bitfield;         /* yasc: a bit-field store to volatile memory (hidden read-modify-write) */
   unsigned char warn_register_access;           /* yasc: a register field marked ro written, wo read, w1c written back */
@@ -2071,6 +2100,7 @@ struct TCCState
   unsigned char warn_cross_tu;                  /* a global's types differ between units (at the link) */
   unsigned char warn_tainted_format;            /* a printf format from untrusted input (ir/taint.c) */
   unsigned char warn_yasc_c_api;                /* writes through what a yasc function's c_api(...) handed C (ir/capi_check.c) */
+  unsigned char warn_yasc_unsafe_call;          /* yasc code calls a yasc_unsafe function outside unsafe (attr_checks.c) */
   /* -Wunused-* (frontend/gen/core/unused.c) */
   unsigned char warn_unused;                    /* -Wunused: the name of the group below */
   unsigned char warn_unused_variable;           /* a local, or a file-scope static, never used */
@@ -3036,7 +3066,7 @@ static inline SValue tcc_ir_svalue_call_id_argc(int call_id, int argc)
 #define VT_COMPLEX 0x00010000 /* Complex type flag (bit 16) */
 #define VT_VECTOR 0x00020000  /* GCC vector type flag (bit 17): element type in sym->type, total bytes in sym->c */
 #define VT_RODATA_REL 0x00040000 /* __rodata_relative pointer: stored as an offset into .rodata (rodata_rel.c) */
-/* currently unused: 0x00080000  */
+#define VT_SELF_REL 0x00080000 /* self-relative pointer: the word holds target - &word (@src(), builtin/misc.c) */
 
 #define VT_STRUCT_SHIFT 20 /* shift for bitfield shift values (32 - 2*6) */
 #define VT_STRUCT_MASK (((1U << (6 + 6)) - 1) << VT_STRUCT_SHIFT | VT_BITFIELD)
@@ -3381,6 +3411,13 @@ PUB_FUNC void _tcc_note(const char *fmt, ...) PRINTF_LIKE(1, 2);
    (`const * view b` cannot follow `char *a = s,`) */
 #define FIXIT_REPLACE_FIRST 3
 PUB_FUNC int tcc_fixit(int line, const char *word, int where, const char *text);
+/* the same, for WORD known to start at column COL (from 1) of LINE: it and
+   the blanks after it are replaced by TEXT; nothing when it is not there */
+PUB_FUNC int tcc_fixit_col(int line, int col, const char *word, const char *text);
+/* WORD, found once on LINE (0: the diagnostic's), goes: it and the blanks
+   after it, or, a yasc pointer's word in `*@( )`, the group written again
+   without it (`*@(const, view)` -> `*const`) */
+PUB_FUNC int tcc_fixit_drop(int line, const char *word);
 /* A call's fix-its, for the diagnostic just shown.  tcc_fixit_call() finds
    the call `NAME(` once on LINE (0: the diagnostic's) of its file, with its
    arguments up to ARG (from 0) on that line, and copies the first
@@ -3484,6 +3521,7 @@ ST_FUNC int normalized_PATHCMP(const char *f1, const char *f2);
 #define OPT_AR 5
 #define OPT_IMPDEF 6
 #define OPT_YASC_C_HEADER 7
+#define OPT_FORMAT 8
 #define OPT_M32 32
 #define OPT_M64 64
 
@@ -3519,6 +3557,7 @@ ST_DATA CString tokcstr; /* current parsed string, if any */
 ST_DATA TokenString *pp_pragma_capture;
 /* yasc: is the token just read regular C, in a unit that has yasc in it?
    (TCCState.yasc follows the file and macro being read; tccpp.c) */
+ST_FUNC void yasc_maybe_gone(const char *where);
 ST_FUNC int pp_in_c(void);
 /* does the unit have yasc in it -- its main file, or any file from a #pragma
    yasc, or an imported interface?  (TCCState.yasc is the file being read) */
@@ -3945,6 +3984,7 @@ ST_INLN void sym_free(Sym *sym);
 ST_FUNC Sym *sym_push(int v, CType *type, int r, int c);
 ST_FUNC void sym_pop(Sym **ptop, Sym *b, int keep);
 ST_FUNC Sym *sym_push2(Sym **ps, int v, int t, int c);
+ST_FUNC void sym_sink_to_bottom(Sym *above);
 ST_FUNC Sym *sym_find2(Sym *s, int v);
 ST_INLN Sym *sym_find(int v);
 ST_FUNC Sym *label_find(int v);
@@ -4455,6 +4495,7 @@ ST_FUNC void tcc_run_free(TCCState *s1);
 #if 0 /* included in tcc.c */
 ST_FUNC int tcc_tool_ar(TCCState *s, int argc, char **argv);
 ST_FUNC int tcc_tool_yasc_c_header(TCCState *s, int argc, char **argv);
+ST_FUNC int tcc_tool_format(TCCState *s, int argc, char **argv);
 #ifdef TCC_TARGET_PE
 ST_FUNC int tcc_tool_impdef(TCCState *s, int argc, char **argv);
 #endif

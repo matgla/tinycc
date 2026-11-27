@@ -234,8 +234,8 @@ def test_once_per_place(tmp_path):
 
 
 def test_safe_default(tmp_path):
-    prelude = "typedef unsigned int size_t;\nvoid free(drop void * owned maybe p);\n"
+    prelude = "typedef unsigned int size_t;\nvoid free(drop void *?owned p);\n"
     # the cast needs unsafe in safe mode (strict lifetimes); -Wfree-nonheap-object still speaks
-    body = "int g;\nvoid f(void)\n{\n  free(unsafe(cast<as(void * owned)>(&g)));\n}\n"
+    body = "int g;\nvoid f(void)\n{\n  free(unsafe(cast<as(void *owned)>(&g)));\n}\n"
     proc = _run(tmp_path, body, prelude=prelude, ccompat=False)
     assert proc.returncode == 0 and "warning: 'free' called on unallocated object 'g'" in proc.stderr, proc.stderr

@@ -390,6 +390,83 @@ int __attribute__((noinline)) try_inline_multi3(const char *func_name, Sym *call
   return 1;
 }
 
+/* yasc: a view result whose sources are parameters only (borrows(s), or the
+   elision) is as writable as the arguments passed for them, level by level
+   -- C23's strchr: `strchr(buf, c)` of a char buf is a char *, of a const
+   one a const char *.  The parameters it borrows (a mask), 0 when the
+   declared result stands (static memory among its sources, not a view). */
+static uint32_t yasc_result_arg_mask(CType *rt)
+{
+  int q = type_yasc(rt), code;
+  if ((rt->t & (VT_BTYPE | VT_ARRAY)) != VT_PTR || !rt->ref || !(q & YASC_VIEW) || (q & (YASC_OWNED | YASC_UNCHECKED)))
+    return 0;
+  code = rt->ref->vreg;
+  if (code & YASC_BORROWS_STATIC)
+    return 0;
+  return (uint32_t)(code & YASC_BORROWS_ARGS);
+}
+
+/* level T of the result and the same level of each source argument
+   (SRC[i], NULL: the argument's chain ended there): const if any says so */
+static void yasc_result_level(CType *t, CType **src, int nsrc)
+{
+  CType *next[YASC_BORROWS_MAX_PARAMS];
+  int cst = 0;
+  for (int i = 0; i < nsrc; i++)
+  {
+    next[i] = NULL;
+    if (!src[i])
+    {
+      cst = 1;
+      continue;
+    }
+    cst |= (src[i]->t & VT_CONSTANT) != 0;
+    if (((src[i]->t & VT_BTYPE) == VT_PTR) && src[i]->ref)
+      next[i] = &src[i]->ref->type;
+  }
+  if ((t->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && t->ref && (t->ref->type.t & VT_BTYPE) != VT_FUNC)
+  {
+    CType target = t->ref->type;
+    yasc_result_level(&target, next, nsrc);
+    if (target.t != t->ref->type.t || target.ref != t->ref->type.ref)
+      t->ref = sym_pointer_node_b(&target, t->ref->yasc | ((t->ref->ymod & YASC_PMOD_RESTRICT) ? YASC_RESTRICT : 0),
+                                  t->ref->vreg);
+  }
+  if (cst)
+    t->t |= VT_CONSTANT;
+  else
+    t->t &= ~VT_CONSTANT;
+}
+
+/* the call's result type RT from the arguments ARGS[k] of the parameters in
+   MASK (SEEN: those the call passed; one missing, or not a pointer: the
+   declared result stands) */
+static void yasc_call_result_access(CType *rt, const CType *args, uint32_t mask, uint32_t seen)
+{
+  CType *src[YASC_BORROWS_MAX_PARAMS];
+  int n = 0;
+  if ((seen & mask) != mask)
+    return;
+  for (int k = 0; k < YASC_BORROWS_MAX_PARAMS; k++)
+    if ((mask >> k) & 1)
+    {
+      /* a pointer or an array: its level 1; anything else (a slice, a
+         nullptr constant's int) leaves the declared result */
+      if (!(args[k].t & VT_ARRAY) && (args[k].t & VT_BTYPE) != VT_PTR)
+        return;
+      if (!args[k].ref || type_is_slice((CType *)&args[k]))
+        return;
+      src[n++] = &args[k].ref->type;
+    }
+  if (!n)
+    return;
+  CType target = rt->ref->type;
+  yasc_result_level(&target, src, n);
+  if (target.t != rt->ref->type.t || target.ref != rt->ref->type.ref)
+    rt->ref = sym_pointer_node_b(&target, rt->ref->yasc | ((rt->ref->ymod & YASC_PMOD_RESTRICT) ? YASC_RESTRICT : 0),
+                                 rt->ref->vreg);
+}
+
 /* Redirect a call to a __tcc_* helper: NOP old params, emit new call via
  * gen_ir_call_args.  RESULT_TYPE is the declared one, yasc qualifiers and all,
  * and -Wlifetime reads the helper call as the declared function's. */
@@ -1378,6 +1455,12 @@ static void unary_funcall_body(void)
               (call_func_sym->type.t & VT_BTYPE) == VT_FUNC && call_func_sym->type.ref == s
           ? call_func_sym
           : NULL;
+  /* yasc default arguments: a direct call only (decl/default_arg.c) */
+  Sym *dflt_fn = (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM) && vtop->c.i == 0 &&
+                         call_func_sym && (call_func_sym->type.t & VT_BTYPE) == VT_FUNC
+                     ? call_func_sym
+                     : NULL;
+  const int call_line = file->line_num; /* &@src() in a default: this call */
   next();
 
   /* A call of a nested function passes its static chain, the frame of the
@@ -1624,6 +1707,10 @@ static void unary_funcall_body(void)
     ret.c.i = 0;
     PUT_R_RET(&ret, ret.type.t);
   }
+  /* yasc: a view result borrowing parameters only is as writable as the
+     arguments passed for them (yasc_call_result_access) */
+  uint32_t ra_mask = yasc_result_arg_mask(&s->type), ra_seen = 0;
+  CType *ra_args = ra_mask ? tcc_mallocz(YASC_BORROWS_MAX_PARAMS * sizeof(CType)) : NULL;
 
   /* Storage for arguments in case we need to constant-fold.
    * Heap-allocated to reduce unary()'s stack frame.
@@ -1784,7 +1871,10 @@ static void unary_funcall_body(void)
   CallArgChecks *ck = call_arg_checks_begin(
       call_func_sym,
       call_func_sym && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM) ? call_func_sym : NULL);
-  if (tok != ')' || self_pending)
+  /* the arguments written are all there: the rest are defaults */
+#define DFLT_NEXT() (sa && !tcc_state->reverse_funcargs && yasc_default_have(dflt_fn, nb_args - nb_implicit_args))
+  int dflt_fill = tok == ')' && !self_pending && DFLT_NEXT();
+  if (tok != ')' || self_pending || dflt_fill)
   {
     r = tcc_state->reverse_funcargs;
     SValue num;
@@ -1809,10 +1899,14 @@ static void unary_funcall_body(void)
           fortify_arg_before(fc, nb_args);
         if (self_pending)
           vpushv(&funcall_self_arg);
+        else if (dflt_fill)
+          yasc_default_push(dflt_fn, nb_args - nb_implicit_args, call_line);
         else if (ck && ck->ma.fn)
           call_arg_memaccess(ck, nb_args);
         else
           expr_eq();
+        if (ra_mask && nb_args < YASC_BORROWS_MAX_PARAMS && ((ra_mask >> nb_args) & 1))
+          ra_args[nb_args] = vtop->type, ra_seen |= 1u << nb_args;
         if (yasc_pp_live)
           yasc_pp_arg(vtop, call_func_sym, sa, nb_args); /* plain_param.c */
         if (fc)
@@ -1824,7 +1918,7 @@ static void unary_funcall_body(void)
         /* Materialize comparisons before applying the parameter conversion. */
         if (!NOEVAL_WANTED)
           tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
-        gfunc_param_typed(s, sa);
+        gfunc_param_typed(s, sa, call_func_sym);
         /* Conversion to _Bool can leave a new VT_CMP on the value stack. */
         if (!NOEVAL_WANTED)
           tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
@@ -1926,22 +2020,39 @@ static void unary_funcall_body(void)
       nb_args++;
       if (sa)
         sa = sa->next;
+      if (dflt_fill)
+      {
+        if (DFLT_NEXT())
+          continue;
+        break;
+      }
       if (self_pending)
       {
         self_pending = 0;
         if (tok == ')')
+        {
+          if ((dflt_fill = DFLT_NEXT()))
+            continue;
           break;
+        }
         continue;
       }
       if (tok == ')')
+      {
+        if ((dflt_fill = DFLT_NEXT()))
+          continue;
         break;
+      }
       skip(',');
     }
   }
+#undef DFLT_NEXT
   if (sa && s->f.func_type != FUNC_OLD)
     tcc_error("too few arguments to function");
   if (ck)
     call_arg_checks_end(ck, nb_args);
+  if (oc && fc && fortify_call_warned(fc))
+    objsize_call_overflow_said(oc); /* one warning, the one that says it traps */
   if (oc)
     objsize_call_args_end(oc);
 
@@ -1957,7 +2068,9 @@ static void unary_funcall_body(void)
       p2 = p->prev;
       begin_macro(p, 1), next();
       expr_eq();
-      gfunc_param_typed(s, sa);
+      if (ra_mask && nb_args - 1 - n < YASC_BORROWS_MAX_PARAMS && ((ra_mask >> (nb_args - 1 - n)) & 1))
+        ra_args[nb_args - 1 - n] = vtop->type, ra_seen |= 1u << (nb_args - 1 - n);
+      gfunc_param_typed(s, sa, call_func_sym);
       if (!NOEVAL_WANTED)
         tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
 
@@ -2000,6 +2113,11 @@ static void unary_funcall_body(void)
 
   next();
   // gfunc_call(nb_args);
+  if (ra_mask)
+  {
+    yasc_call_result_access(&ret.type, ra_args, ra_mask, ra_seen);
+    tcc_free(ra_args);
+  }
 
   /* Try constant folding for math functions */
   int folded = 0;
@@ -2994,8 +3112,10 @@ static void unary_funcall_body(void)
          * Clear sym: the original entry had sym=call_func_sym (the inlined
          * function).  If left non-NULL it would be visible to downstream
          * call processing (e.g. (*foo())->bar(0) would see sym=foo when
-         * processing the bar call), triggering a spurious second inline. */
-        vtop->type = s->type;
+         * processing the bar call), triggering a spurious second inline.
+         * A view result borrowing parameters: as writable as the arguments
+         * (yasc_call_result_access), as a real call's. */
+        vtop->type = ra_mask ? ret.type : s->type;
         vtop->r = VT_LOCAL | VT_LVAL;
         vtop->vr = inline_ret_vr;
         vtop->c.i = inline_ret_loc;
@@ -3234,6 +3354,14 @@ void unary_funcall(void)
   Sym *fsym = vtop->sym; /* the function, or the pointer variable called through */
   const int direct = (vtop->type.t & VT_BTYPE) == VT_FUNC &&
                      (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM);
+  /* -ffortify: sprintf / vsprintf, checked against the destination's size
+     (builtin/chk.c) */
+  if (direct && chk_implicit_call(fsym))
+  {
+    pending_call_temp_slots = saved_pending;
+    attr_call_result(fsym);
+    return;
+  }
   /* object sizes: allocations, and the checks at memcpy, free, ... */
   ObjCall *oc = direct ? objsize_call_begin(fsym) : NULL;
   /* -ffortify: the checks its declaration's attributes ask for */

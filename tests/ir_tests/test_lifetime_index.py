@@ -8,7 +8,7 @@
   a[i].next->v` is clean, untested it may be null.  `a[i]` and `a[j]` are
   not assumed to be the same element, nor `a[i]` and `a[1]`: a store
   through one does not change what is known of the other.
-- Owned elements at a variable index (`char * owned a[N]`, `b[i].buf`,
+- Owned elements at a variable index (`char *owned a[N]`, `b[i].buf`,
   `int owned(close) fds[N]`): per array and index variable an item 'a[i]'
   stands for the element at i while i is not written; writing i joins it
   into every element (vague: only definite states are reported there).
@@ -35,15 +35,15 @@ LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 
 PRELUDE = """\
 #pragma yasc
-void * owned maybe malloc(unsigned n);
-void free(drop void * owned maybe p);
+void *?owned malloc(unsigned n);
+void free(drop void *?owned p);
 int use(char *p);
-int close(int drop owned(close) maybe fd);
-int owned(close) maybe open(const char *p, int f);
-int pipe(out int owned(close) maybe *fds);
-struct box { char * owned maybe buf; int n; };
-struct node { int v; struct node * view maybe next; };
-void fill(inout struct node *a, int n);
+int close(int drop ?owned(close) fd);
+int ?owned(close) open(const char *p, int f);
+int pipe(out int ?owned(close) *fds);
+struct box { char *?owned buf; int n; };
+struct node { int v; struct node *?next; };
+void fill(out struct node *a, int n);
 struct node g[4];
 """
 PRELUDE_LINES = PRELUDE.count("\n")
@@ -146,7 +146,7 @@ int f(int i)
 {
   struct node a[4] = undefined;
   fill(a, 4);
-  struct node * view maybe n = a[i].next;
+  struct node *?view n = a[i].next;
   if (n)
     return a[i].next->v;
   return 0;
@@ -269,7 +269,7 @@ OWNED_CLEAN = {
     "alloc_then_free_loops": """\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 0; i < 4; i++)
     a[i] = malloc(4);
@@ -280,7 +280,7 @@ void f(void)
     "declared_in_for": """\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   for (int i = 0; i < 4; i++)
     a[i] = malloc(4);
   for (unsigned i = 0; i <= 3; ++i)
@@ -290,7 +290,7 @@ void f(void)
     "counting_down": """\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   for (int i = 3; i >= 0; i--)
     a[i] = malloc(4);
   for (int i = 0; i < 4; i++)
@@ -311,7 +311,7 @@ void f(void)
     "handles": """\
 void f(void)
 {
-  int owned(close) maybe fds[2] = undefined;
+  int ?owned(close) fds[2] = undefined;
   int i;
   for (i = 0; i < 2; i++)
     fds[i] = open("x", 0);
@@ -322,7 +322,7 @@ void f(void)
     "pipe_then_loop": """\
 void f(void)
 {
-  int owned(close) maybe fds[2] = undefined;
+  int ?owned(close) fds[2] = undefined;
   if (pipe(fds) < 0)
     return;
   for (int i = 0; i < 2; i++)
@@ -332,7 +332,7 @@ void f(void)
     "variable_bound": """\
 void f(int n)
 {
-  char * owned maybe a[8] = undefined;
+  char *?owned a[8] = undefined;
   int i;
   for (i = 0; i < n; i++)
     a[i] = malloc(4);
@@ -343,7 +343,7 @@ void f(int n)
     "two_index_variables": """\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i, j;
   for (i = 0; i < 4; i++)
     a[i] = malloc(4);
@@ -354,7 +354,7 @@ void f(void)
     "constant_store_then_loops": """\
 void f(void)
 {
-  char * owned maybe a[5] = undefined;
+  char *?owned a[5] = undefined;
   int i;
   a[4] = 0;
   for (i = 0; i < 4; i++)
@@ -366,7 +366,7 @@ void f(void)
     "constant_alloc_then_loops": """\
 void f(void)
 {
-  char * owned maybe a[5] = undefined;
+  char *?owned a[5] = undefined;
   int i;
   a[4] = malloc(3);
   for (i = 0; i < 4; i++)
@@ -379,7 +379,7 @@ void f(void)
     "second_for_i_full_free": """\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   for (int i = 0; i < 4; i++)
     a[i] = malloc(8);
   for (int i = 0; i < 4; i++)
@@ -389,7 +389,7 @@ void f(void)
     "tested_in_loop": """\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 0; i < 4; i++)
     a[i] = malloc(4);
@@ -403,7 +403,7 @@ void f(void)
     "break_on_failure": """\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 0; i < 4; i++)
   {
@@ -418,7 +418,7 @@ void f(void)
     "goto_cleanup": """\
 int f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 0; i < 4; i++)
   {
@@ -441,7 +441,7 @@ fail:
     "cleanup_on_failure": """\
 int f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i, j;
   for (i = 0; i < 4; i++)
   {
@@ -461,13 +461,13 @@ int f(void)
     "moved_out": """\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 0; i < 4; i++)
     a[i] = malloc(4);
   for (i = 0; i < 4; i++)
   {
-    char * owned maybe p = move(a[i]);
+    char *?owned p = move(a[i]);
     free(p);
   }
 }
@@ -475,7 +475,7 @@ void f(void)
     "freed_once_each": """\
 void f(int i)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   a[i] = malloc(4);
   free(a[i]);
 }
@@ -483,7 +483,7 @@ void f(int i)
     "constant_then_loop": """\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 0; i < 4; i++)
     a[i] = 0;
@@ -493,7 +493,7 @@ void f(void)
 }
 """,
     "member_array": """\
-struct s { char * owned maybe p[4]; int n; };
+struct s { char *?owned p[4]; int n; };
 void f(void)
 {
   struct s x = undefined;
@@ -507,7 +507,7 @@ void f(void)
     "two_dimensions": """\
 void f(void)
 {
-  char * owned maybe a[2][3] = undefined;
+  char *?owned a[2][3] = undefined;
   int i;
   for (i = 0; i < 3; i++)
     a[1][i] = malloc(4);
@@ -518,7 +518,7 @@ void f(void)
     "loop_with_continue": """\
 void f(int n)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i = 0;
   while (i < n)
   {
@@ -538,7 +538,7 @@ void f(int n)
     "shifted_free_loop": """\
 void f(void)
 {
-  char * owned maybe a[5] = undefined;
+  char *?owned a[5] = undefined;
   int i;
   for (i = 0; i < 5; i++)
     a[i] = malloc(4);
@@ -550,7 +550,7 @@ void f(void)
     "shifted_alloc_loop": """\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 1; i < 5; i++)
     a[i - 1] = malloc(4);
@@ -561,7 +561,7 @@ void f(void)
     "neighbours": """\
 void f(int i)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   a[i] = malloc(4);
   a[i + 1] = malloc(4);
   free(a[i + 1]);
@@ -583,7 +583,7 @@ void f(void)
     "shifted_past_the_end": """\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 0; i < 4; i++)
     a[i] = malloc(4);
@@ -595,7 +595,7 @@ void f(void)
     "two_offsets_in_a_loop": """\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 0; i < 4; i++)
     a[i] = malloc(4);
@@ -611,7 +611,7 @@ void f(void)
     "swap_remove": """\
 void f(int i, int j)
 {
-  char * owned maybe a[4] = {0};
+  char *?owned a[4] = {0};
   for (int k = 0; k < 4; k++)
     a[k] = malloc(4);
   if (i < 0 || i >= 4 || j < 0 || j >= 4 || i == j)
@@ -630,7 +630,7 @@ void f(int i, int j)
     "under_i_ne_j": """\
 void f(int i, int j)
 {
-  char * owned maybe a[2] = undefined;
+  char *?owned a[2] = undefined;
   a[0] = malloc(4);
   a[1] = malloc(4);
   if (i != j && i >= 0 && i < 2 && j >= 0 && j < 2)
@@ -652,7 +652,7 @@ OWNED_BAD = {
     "computed_index": ("""\
 void f(int i)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   a[i * 2] = malloc(4);
 }
 """, 4, "'a' is reached in a way the lifetime check does not follow: what it owns is not checked"),
@@ -660,7 +660,7 @@ void f(int i)
     "two_index_variables": ("""\
 void f(int i, int j)
 {
-  char * owned maybe a[2] = undefined;
+  char *?owned a[2] = undefined;
   a[0] = malloc(4);
   a[1] = malloc(4);
   free(a[i]);
@@ -671,7 +671,7 @@ void f(int i, int j)
     "index_written_after_the_guard": ("""\
 void f(int i, int j, int k)
 {
-  char * owned maybe a[2] = undefined;
+  char *?owned a[2] = undefined;
   a[0] = malloc(4);
   a[1] = malloc(4);
   if (i == j)
@@ -689,7 +689,7 @@ void f(int i, int j, int k)
     "guard_on_one_path": ("""\
 void f(int i, int j, int c)
 {
-  char * owned maybe a[2] = undefined;
+  char *?owned a[2] = undefined;
   a[0] = malloc(4);
   a[1] = malloc(4);
   if (c && i == j)
@@ -705,7 +705,7 @@ void f(int i, int j, int c)
     "no_free_loop": ("""\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 0; i < 4; i++)
     a[i] = malloc(4);
@@ -714,7 +714,7 @@ void f(void)
     "freed_on_one_path": ("""\
 void f(int c)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 0; i < 4; i++)
     a[i] = malloc(4);
@@ -726,7 +726,7 @@ void f(int c)
     "used_after_free": ("""\
 void f(int i)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   a[i] = malloc(4);
   free(a[i]);
   use(a[i]);
@@ -735,7 +735,7 @@ void f(int i)
     "freed_twice_by_loops": ("""\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 0; i < 4; i++)
     a[i] = malloc(4);
@@ -748,7 +748,7 @@ void f(void)
     "element_after_free_loop": ("""\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 0; i < 4; i++)
     a[i] = malloc(4);
@@ -760,7 +760,7 @@ void f(void)
     "maybe_untested": ("""\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 0; i < 4; i++)
     a[i] = malloc(4);
@@ -769,18 +769,18 @@ void f(void)
   for (i = 0; i < 4; i++)
     free(a[i]);
 }
-""", 8, "'a[i]' may be null, and is passed as argument 1 of 'use', which is not maybe"),
+""", 8, "'a[i]' may be null, and is passed as argument 1 of 'use', which is not '?'"),
     "stored_unfreed": ("""\
 void f(int i)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   a[i] = malloc(4);
 }
 """, 5, "'a[i]' leaks: it may still own memory at the end of its scope"),
     "assigned_again_by_loop": ("""\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 0; i < 4; i++)
     a[i] = malloc(4);
@@ -793,7 +793,7 @@ void f(void)
     "handles_not_closed": ("""\
 void f(void)
 {
-  int owned(close) maybe fds[2] = undefined;
+  int ?owned(close) fds[2] = undefined;
   for (int i = 0; i < 2; i++)
     fds[i] = open("x", 0);
 }
@@ -810,7 +810,7 @@ void f(void)
     "shifted_used_after_free": ("""\
 void f(int i)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   a[i + 1] = malloc(4);
   free(a[i + 1]);
   use(a[i + 1]);
@@ -819,7 +819,7 @@ void f(int i)
     "shifted_alloc_loop_leaks": ("""\
 void f(void)
 {
-  char * owned maybe a[5] = undefined;
+  char *?owned a[5] = undefined;
   int i;
   for (i = 0; i < 4; i++)
     a[i + 1] = malloc(4);
@@ -828,7 +828,7 @@ void f(void)
     "shifted_freed_twice": ("""\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 0; i < 4; i++)
     a[i] = malloc(4);
@@ -841,7 +841,7 @@ void f(void)
     "shifted_used_after_free_loop": ("""\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 0; i < 4; i++)
     a[i] = malloc(4);
@@ -863,7 +863,7 @@ void f(void)
     "constant_store_then_alloc_loop": ("""\
 void f(void)
 {
-  char * owned maybe a[5] = undefined;
+  char *?owned a[5] = undefined;
   int i;
   a[4] = 0;
   for (i = 0; i < 4; i++)
@@ -873,7 +873,7 @@ void f(void)
     "constant_alloc_not_freed_after_loops": ("""\
 void f(void)
 {
-  char * owned maybe a[5] = undefined;
+  char *?owned a[5] = undefined;
   int i;
   a[4] = malloc(3);
   for (i = 0; i < 4; i++)
@@ -886,7 +886,7 @@ void f(void)
     "second_index_partial_free": ("""\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i, j;
   for (i = 0; i < 4; i++)
     a[i] = malloc(8);
@@ -897,7 +897,7 @@ void f(void)
     "second_for_i_partial_free": ("""\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   for (int i = 0; i < 4; i++)
     a[i] = malloc(8);
   for (int i = 1; i < 4; i++)
@@ -907,7 +907,7 @@ void f(void)
     "second_index_no_free": ("""\
 void f(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i, j;
   for (i = 0; i < 4; i++)
     a[i] = malloc(8);
@@ -935,7 +935,7 @@ def test_owned_reported(tmp_path, name, opt):
 INLINE = """\
 static inline void fill4(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   for (int i = 0; i < 4; i++)
     a[i] = malloc(4);
 }

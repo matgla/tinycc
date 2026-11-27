@@ -31,8 +31,9 @@
  * the declarator itself) waits the same way, for the end of the body it is
  * declared in: owned when it is given an owned value (`char *p =
  * malloc(n)`), freed, passed to an owned parameter, stored into an owned
- * pointer or returned as owned; else view; maybe as well when it is tested
- * for null, passed to a maybe parameter, or given null or a maybe value.
+ * pointer or returned as owned; else a view, never null unless it says
+ * `maybe` (null or a maybe value stored into it is the flow checks' error,
+ * with the `* maybe` fix-it).
  * Inner levels (`char **pp`'s first '*'), statics, typedefs, function
  * pointers' parameters and the pointers of nested declarators are reported at
  * once, as before.
@@ -114,6 +115,7 @@ static Sym *pp_last_def; /* yasc_pp_declarator's, for yasc_pp_rekey */
 static int pp_bodies;    /* bodies being parsed */
 int yasc_pp_live;        /* PPS_BODY / PPS_ALIAS entries: the hooks look */
 int yasc_pp_local_decl;  /* a local declarator is being read (decl()) */
+int yasc_global_decl;    /* a global's / static's declarator is (gen_priv.h) */
 int yasc_pp_binding;     /* PPS_LHELD entries named: yasc_pp_local_bind looks */
 int yasc_pp_view_line;   /* the local declarator's own pointer says view, at this line */
 
@@ -147,7 +149,7 @@ static void pp_unnamed_error(int i)
 
 /* the note's text: literals for the immediate path, this for the decided */
 static char pp_note[256];
-/* the second place for the fix-it: `*name` replaced by `* kw name` */
+/* the second place for the fix-it: `*name` replaced by `*kw name` */
 static char pp_alt_word[80], pp_alt_text[96];
 
 /* the fix-its of the pointer of entry I: after its '*', else `*name`
@@ -156,29 +158,25 @@ static char pp_alt_word[80], pp_alt_text[96];
    const stand right before the '*') */
 static void pp_fixits(int i, const char *name, const char *kw, const char *note, int cnst)
 {
-  static char fix[32], before[32];
-  snprintf(fix, sizeof fix, cnst ? "const * %s " : " %s ", kw);
-  snprintf(before, sizeof before, "%s ", kw);
+  static char fix[32];
+  snprintf(fix, sizeof fix, cnst ? "const *%s " : "%s ", kw);
   tcc_fixit_next(pp[i].line, "*", cnst ? FIXIT_REPLACE_FIRST : FIXIT_AFTER, fix, note);
   if (!name)
     return;
   snprintf(pp_alt_word, sizeof pp_alt_word, "*%s", name);
-  snprintf(pp_alt_text, sizeof pp_alt_text, cnst ? "const * %s %s" : "* %s %s", kw, name);
+  snprintf(pp_alt_text, sizeof pp_alt_text, cnst ? "const *%s %s" : "*%s %s", kw, name);
   tcc_fixit_next_alt(pp_alt_word, cnst ? FIXIT_REPLACE_FIRST : FIXIT_REPLACE, pp_alt_text);
-  if (!cnst)
-    tcc_fixit_next_alt(name, FIXIT_BEFORE, before);
 }
 
 static void pp_report(int i)
 {
   const char *name = pp[i].tok ? get_tok_str(pp[i].tok, NULL) : NULL;
   int f = pp[i].flags, n;
-  const char *kw;
   if (pp[i].state == PPS_ALIAS)
     return;
-  /* a local pointer the body does not own is the `view maybe` it was while
-     the body was parsed (declarator.c): no error.  What it holds is what
-     flows into it; the checks followed it as a written one. */
+  /* a local pointer the body does not own is the `view` it was while the
+     body was parsed (declarator.c): no error.  The checks followed it as a
+     written one (null stored into it: lifetime.c says `* maybe`). */
   if (pp[i].state == PPS_BODY && pp[i].is_local && pp[i].ptr_local && name && !(f & PP_OWN))
     return;
   /* an error: the flow checks say nothing more of it */
@@ -189,17 +187,17 @@ static void pp_report(int i)
   else if (pp[i].state == PPS_HELD || !name)
   {
     pp_fixits(i, name, "view",
-              "a parameter the function does not free only borrows: write '* view' ('* owned' when it frees it)", 0);
+              "a parameter the function does not free only borrows: write '*view' ('*owned' when it frees it)", 0);
   }
   else
   {
     static const char *const own_what[] = {"frees '%s'", "passes '%s' on to an owned parameter",
                                            "keeps '%s' where it outlives the call", "returns '%s' as owned",
                                            "gives '%s' an owned value"};
-    static const char *const kws[] = {"view", "view maybe", "owned", "owned maybe"};
+    static const char *const kws[] = {"view", "?view", "owned", "?owned"};
     int k = ((f & PP_OWN) ? 2 : 0) | ((f & PP_MAYBE) ? 1 : 0);
     const int cnst = !(k & 2) && (f & PP_CONSTSRC);
-    kw = k & 2 ? "owned" : "view";
+
     if (f & PP_OWN)
     {
       int w = pp[i].own_why == PP_FREED      ? 0
@@ -226,8 +224,8 @@ static void pp_report(int i)
     else if (f & PP_MAYBE && n < (int)sizeof pp_note)
     {
       const char *what = pp[i].maybe_why == PP_NULLTEST    ? "tests it for null"
-                         : pp[i].maybe_why == PP_MAYBEARG  ? "passes it to a maybe parameter"
-                                                           : "gives it null or a maybe value";
+                         : pp[i].maybe_why == PP_MAYBEARG  ? "passes it to a '?' parameter"
+                                                           : "gives it null or a '?' value";
       n += snprintf(pp_note + n, sizeof pp_note - n, " and %s", what);
       if (pp[i].maybe_via && n < (int)sizeof pp_note)
         n += snprintf(pp_note + n, sizeof pp_note - n, " through '%s'", get_tok_str(pp[i].maybe_via, NULL));
@@ -235,7 +233,7 @@ static void pp_report(int i)
         n += snprintf(pp_note + n, sizeof pp_note - n, " (line %d)", pp[i].maybe_line);
     }
     if (n < (int)sizeof pp_note)
-      snprintf(pp_note + n, sizeof pp_note - n, ": write '%s* %s%s'", cnst ? "const " : "", kw, k & 1 ? " maybe" : "");
+      snprintf(pp_note + n, sizeof pp_note - n, ": write '%s*%s'", cnst ? "const " : "", kws[k]);
     pp_fixits(i, name, kws[k], pp_note, cnst);
   }
   if (name && pp[i].state == PPS_BODY && pp[i].is_local && pp[i].ptr_local)
@@ -329,19 +327,18 @@ void yasc_pp_local_end(int mark, int tok, int keep)
 }
 
 /* the local declarator just read declares TYPE, an automatic variable when
-   KEEP: `view maybe` on its own pointer says what a plain one is
-   (-Wredundant-view; `* maybe` stays).  A `view` without maybe says more:
-   never null. */
+   KEEP: `view` on its own pointer says what a plain one is
+   (-Wredundant-view).  `view maybe` says more (`* maybe` is enough), and so
+   does `restrict view`. */
 void yasc_pp_redundant_view(CType *type, int keep)
 {
   const int line = yasc_pp_view_line;
   yasc_pp_view_line = 0;
   if (!line || !keep || (type->t & (VT_BTYPE | VT_ARRAY)) != VT_PTR || !tcc_warn_wanted(warn_redundant_view) ||
-      (type_yasc(type) & (YASC_VIEW | YASC_OWNED | YASC_UNCHECKED | YASC_MAYBE)) != (YASC_VIEW | YASC_MAYBE))
+      (type_yasc(type) & (YASC_VIEW | YASC_OWNED | YASC_UNCHECKED | YASC_MAYBE | YASC_RESTRICT)) != YASC_VIEW)
     return;
-  tcc_warning_once_at(warn_redundant_view, line,
-                      "a local's pointer is a view that may be null unless the function owns it: drop 'view'");
-  tcc_fixit(line, "view ", FIXIT_REPLACE, "");
+  tcc_warning_once_at(warn_redundant_view, line, "a local's pointer is a view unless the function owns it: drop 'view'");
+  tcc_fixit_drop(line, "view");
 }
 
 /* the local SYM is made: the pointer that waits for it is followed */
@@ -355,9 +352,23 @@ void yasc_pp_local_bind(Sym *sym)
       pp[i].local_vr = sym->vreg;
       pp[i].local_c = sym->c;
       pp[i].ptr_local = (sym->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR;
+      /* its view is implicit: null stored into it says `* maybe` */
+      if (pp[i].ptr_local)
+        tcc_ir_lt_implicit_view(tcc_state->ir, sym->vreg);
       break;
     }
   pp_count();
+}
+
+/* the local just made is an array of plain pointers, said at the end of the
+   body: its initializer's null elements are not said too (yasc_init_null) */
+int yasc_pp_held_array(void)
+{
+  /* (bound to its variable, or not yet: -fsyntax-only makes none; an
+     aggregate's held pointer is an array's element either way) */
+  return pp_nb && pp[pp_nb - 1].is_local &&
+         ((pp[pp_nb - 1].state == PPS_BODY && !pp[pp_nb - 1].ptr_local) ||
+          (pp[pp_nb - 1].state == PPS_LHELD && pp[pp_nb - 1].tok));
 }
 
 /* the parameter IDX (from 0) whose declarator began at entry MARK is TOK */
@@ -475,6 +486,7 @@ void yasc_pp_recover(int body)
 {
   int i, j = 0;
   yasc_pp_local_decl = 0;
+  yasc_global_decl = 0;
   if (body)
   {
     /* a local declarator the error left: said now */
@@ -507,6 +519,7 @@ void yasc_pp_finish(void)
   pp_cap = 0;
   pp_bodies = 0;
   yasc_pp_local_decl = 0;
+  yasc_global_decl = 0;
 }
 
 /* entry I is the local of vreg VR, frame offset C (a register candidate's

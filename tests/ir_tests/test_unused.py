@@ -222,8 +222,8 @@ def test_nested_function_asm_goto_computed_goto(tmp_path):
 def test_yasc_defer_and_move_are_uses(tmp_path):
     body = (
         "#include <stdlib.h>\n"
-        "void take(char * owned p);\n"
-        "int f(int n)\n{\n  char * owned p = malloc(4);\n  char * owned q = malloc(4);\n"
+        "void take(char *owned p);\n"
+        "int f(int n)\n{\n  char *owned p = malloc(4);\n  char *owned q = malloc(4);\n"
         "  int seen = n;\n  defer { (void)seen; }\n  take(move(q));\n  free(move(p));\n  return 0;\n}\n"
     )
     proc = _run(tmp_path, body, "-Wunused", ccompat=False)

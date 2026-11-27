@@ -413,6 +413,17 @@ static int parse_checked_attribute(AttributeDef *ad, int t)
       ad->attr_deprecated_msg = m;
     return 1;
   }
+  /* yasc_unsafe("what to use"): yasc code calls it inside unsafe only
+     (-Wyasc-unsafe-call, expr/attr_checks.c) -- strcpy, sprintf: their
+     destination has no size */
+  if (attr_named(t, "yasc_unsafe"))
+  {
+    int m = attr_message();
+    ad->attr_yasc_unsafe = 1;
+    if (m)
+      ad->attr_yasc_unsafe_msg = m;
+    return 1;
+  }
   /* -fstack-protector*'s choice for this function (op/ubsan.c
      ssp_begin_function).  Under -fstack-protector* not inlined, as gcc does
      not inline across a mismatch: an inlined body is protected or not with
@@ -584,7 +595,7 @@ ST_FUNC int tcc_attribute_supported(int t)
              attr_named(t, "deprecated") || attr_named(t, "tainted_result") || attr_named(t, "tainted_arg") ||
              attr_named(t, "warn_unused_result") || attr_named(t, "fallthrough") ||
              attr_named(t, "stack_protect") || attr_named(t, "no_stack_protector") || attr_named(t, "yasc_view") ||
-             attr_named(t, "yasc_maybe") || attr_named(t, "yasc_c_api");
+             attr_named(t, "yasc_maybe") || attr_named(t, "yasc_c_api") || attr_named(t, "yasc_unsafe");
     return 0;
   }
 }
@@ -994,7 +1005,7 @@ void attr_apply_decl_facts_at(Sym *s, AttributeDef *ad, int line)
   SymLocalFacts *f;
   if (s)
     yasc_capi_attr_apply(&s->type, ad);
-  if (!s || !(ad->attr_deprecated | ad->attr_unused_result | ad->attr_fmt_kind | ad->attr_fmt_arg | ad->attr_alloc_a |
+  if (!s || !(ad->attr_deprecated | ad->attr_yasc_unsafe | ad->attr_unused_result | ad->attr_fmt_kind | ad->attr_fmt_arg | ad->attr_alloc_a |
                ad->attr_malloc | ad->attr_tainted_result | ad->attr_tainted_args | ad->attr_ssp | ad->attr_cstr_args |
                ad->attr_access_n))
     return;
@@ -1020,6 +1031,14 @@ void attr_apply_decl_facts_at(Sym *s, AttributeDef *ad, int line)
     f->deprecated = 1;
     if (ad->attr_deprecated_msg)
       f->deprecated_msg = ad->attr_deprecated_msg;
+  }
+  if (ad->attr_yasc_unsafe)
+  {
+    if (!f->deprecated && !f->yasc_unsafe)
+      attr_decl_place(f, line);
+    f->yasc_unsafe = 1;
+    if (ad->attr_yasc_unsafe_msg)
+      f->yasc_unsafe_msg = ad->attr_yasc_unsafe_msg;
   }
   if (ad->attr_unused_result > f->unused_result)
     f->unused_result = ad->attr_unused_result;

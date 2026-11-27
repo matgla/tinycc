@@ -12,16 +12,16 @@
 
 struct stack
 {
-  int * owned items;
+  int *owned items;
   int len, cap;
 
   /* no self: stack.create(...) */
-  struct stack * owned maybe create(int cap)
+  struct stack *?owned create(int cap)
   {
-    struct stack * owned maybe s = mem_new(sizeof *s);
+    struct stack *?owned s = mem_new(sizeof *s);
     if (!s)
       return s;
-    int * owned maybe items = mem_new(cap * sizeof(int));
+    int *?owned items = mem_new(cap * sizeof(int));
     if (!items)
     {
       mem_free(s);
@@ -44,12 +44,12 @@ struct stack
 
   int pop(inout struct stack *self) { return self->items[--self->len]; }
 
-  int full(const struct stack *self) { return self->len == self->cap; }
+  int full(struct stack *self) { return self->len == self->cap; }
 
-  int empty(const struct stack *self) { return self->len == 0; }
+  int empty(struct stack *self) { return self->len == 0; }
 
   /* a drop self: the call consumes the object, as mem_free would */
-  void destroy(drop struct stack * owned self)
+  void destroy(drop struct stack *owned self)
   {
     mem_free(self->items);
     mem_free(self);
@@ -61,12 +61,12 @@ struct range
 {
   int from, to;
   int length(struct range self) { return self.to - self.from; }
-  int contains(const struct range *self, int v) { return v >= self->from && v < self->to; }
+  int contains(struct range *self, int v) { return v >= self->from && v < self->to; }
 };
 
 int main(void)
 {
-  struct stack * owned maybe s = stack.create(3);
+  struct stack *?owned s = stack.create(3);
   if (!s)
     return 1;
   for (int i = 1; i <= 4; i++)

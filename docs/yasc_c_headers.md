@@ -41,11 +41,14 @@ for nothing.
 | `#pragma tcc c_begin` ... `#pragma tcc c_end`: a regular-C section, for declarations nobody annotated yet (a plain pointer is an error in yasc) | the section as written, without the two lines |
 | `#ifdef __YASC__` ... `#else` ... `#endif` (also `#if defined(__YASC__)`, `#ifndef __YASC__`): what only yasc can say (slices, yasc inline functions) | the `#else` part only |
 | other preprocessor lines | as written; in a `#define` body the yasc words are left out and `nullptr` becomes `((void *)0)` |
-| `owned`, `owned(D)`, `view`, `maybe`, `drop`, `borrows(...)`, `takes(...)`, `in`/`out`/`inout`, `[maybe]` / `[owned]` in a parameter's brackets | left out (`T * view s` reads `T *s`) |
-| a parameter `T p[maybe :0]` (NUL inside the buffer) | `T p[]` and `__yl_cstr(N)` |
-| a result `T * owned(D) ...` (`owned` alone: `free`) | `__yl_dealloc(D, N)`, N: D's `drop` parameter when D is declared above in the same header, else 1 |
+| `owned`, `owned(D)`, `view`, `?`, `drop`, `borrows(...)`, `takes(...)`, `in`/`out`/`inout` (also `inout` before a function's type), `[?]` / `[owned]` in a parameter's brackets | left out (`T *view s` reads `T *s`) |
+| a view result | as written: C's standard prototypes differ (`char *strerror`, `const char *gai_strerror`), so its `const` is the C header's; with `c_api(T)`, `__yl_c_api(0, ...)` says the yasc type, read-only on every level unless `inout` is before the type |
+| a parameter `T p[?:0]` (NUL inside the buffer) | `T p[]` and `__yl_cstr(N)` |
+| a parameter `T p[n]` / `T p[?n]`, n another parameter (before or after p) | `T *p` (C has no `void p[n]`, nor a bound declared later) and `__yl_access(mode, N, n's N)`: `read_only` for const elements, `write_only` for `out`, else `read_write` -- the checks a yasc caller gets |
+| a result `T *owned(D) ...` (`owned` alone: `free`) | `__yl_dealloc(D, N)`, N: D's `drop` parameter when D is declared above in the same header, else 1 |
 | `c_api(T)` after a `*` (docs/yasc_c_api.md) | T in place of what is left of it; on a prototype also `__yl_c_api(n, yasc type)`, n 0 the result, else parameter n |
-| a struct member `T * view m` / `T * view maybe m` | `T *m __yl_view` / `__yl_view_maybe` |
+| a struct member `T *view m` / `T *?view m` | `T *m __yl_view` / `__yl_view_maybe` |
+| an `in` parameter (no `inout` / `out` / `drop`, a pointer not `owned`, no `c_api(...)`), also a function pointer's | the `const` it lacks on the first level it points to: `char *s` reads `const char *s`, `char **pp` `char *const *pp`, `char *argv[]` `char *const argv[]`. yasc makes every level const, but C converts `char **` to `char *const *` and no further, so the C header says the first level only (and `__yl_c_api` the whole type). A yasc header therefore leaves out the `const` an `in` parameter implies (`-Wredundant-const`), and its C header stays the same |
 | attributes written on a declaration (`__yl_nonnull(1)`, `__yl_alloc_size(2)`, `__yl_malloc`, ...) | as written, before the derived ones |
 
 The derived attributes are `<sys/_attrs.h>` macros, so gcc, clang and older tcc
@@ -54,7 +57,7 @@ the tool adds `#include <sys/_attrs.h>`.
 
 ## What is not derived: `nonnull`, `returns_nonnull`
 
-A `view` parameter without `maybe` tells a yasc caller "do not pass null". A C
+A `view` parameter without `?` tells a yasc caller "do not pass null". A C
 `nonnull` tells the compiler that a null argument is undefined, and gcc deletes
 the callee's null checks because of it. The two differ where the function handles
 null on purpose. `getline(NULL, &n, f)` and `posix_memalign(NULL, ...)` are defined

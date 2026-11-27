@@ -39,19 +39,19 @@ Rules for every item:
   as errors, the yasc dialect, `-Wlifetime`.  `-ccompat` (or `-std=c*`/`gnu*`)
   turns all of it off; the keywords are identifiers there.
 - [x] Plain pointers are forbidden in yasc: every `*` says `owned`, `view` or
-  `borrows(...)`; `maybe`, `out`, `drop` combine.  Function pointers exempt.
+  `borrows(...)`; `?`, `out`, `drop` combine.  Function pointers exempt.
 - [x] A parameter declared as an array: the pointer it becomes is a `view`
-  (`char * view a[]` is `char * view * view a`; unchecked in regular C).  As
+  (`char *view a[]` is `char *view *view a`; unchecked in regular C).  As
   C99's `a[const]`, the outermost brackets qualify it: `a[owned]`,
-  `a[maybe]`, `a[view]`, `a[restrict]`.  Test:
+  `a[?]`, `a[view]`, `a[restrict]`.  Test:
   test_yasc_array_param.py.
-- [x] `T * readonly p` (and `a[readonly]`) was `const T * view p`; removed
+- [x] `T * readonly p` (and `a[readonly]`) was `const T *view p`; removed
   2026-11-25 once a view parameter's target became read-only by default
   (in / inout / out): in a parameter it said nothing, elsewhere it spelled
-  `const T * view` twice.  After a `*` (or in a parameter's brackets) it is
+  `const T *view` twice.  After a `*` (or in a parameter's brackets) it is
   an error naming the long form; everywhere else a name.  The plain-pointer
-  fix-it gives a local copying an `in` parameter `char const * view p` (only
-  the first declarator of a list: `, const * view b` is no C).  The C header
+  fix-it gives a local copying an `in` parameter `char const *view p` (only
+  the first declarator of a list: `, const *view b` is no C).  The C header
   writes an `in` parameter's `const` (test_yasc_modules.py
   test_header_spells_in_as_const).  Test: test_yasc_readonly.py.
 - [x] The dialect is per file: the main file under `-std=yasc`, a file from
@@ -77,20 +77,21 @@ Rules for every item:
   with the inferred type; `auto q = p` with p owned is an error.
 - [x] `-fdiagnostics-color`, `-fdiagnostics-format=json|sarif`
   (`driver/diag_out.c`, no columns), fix-it hints
-  (`-fdiagnostics-parseable-fixits`; test_fixits.py): `move(p)`, `* view` /
-  `* owned` decided from the body, `sprintf` -> `snprintf(buf, sizeof buf, ...)`.
+  (`-fdiagnostics-parseable-fixits`; test_fixits.py): `move(p)`, `*view` /
+  `*owned` decided from the body, `sprintf` -> `snprintf(buf, sizeof buf, ...)`.
 
 ### yasc: what the annotations mean
 
 ```c
-char * owned maybe p = malloc(n);                    /* owns; may be null */
-char * borrows(s) find(char *s, int c);        /* result points into s */
-const char * borrows(static) err_name(int e);
-struct cache { char * owned buf; char * borrows(buf) key; };
-struct tokenizer borrows(text) { const char * borrows(text) pos; };
-FILE * owned(fclose) maybe fopen(const char *path, const char *mode);
-int owned(close) maybe fd = open(path, O_RDONLY);    /* int handle; invalid is < 0 */
-void * owned maybe takes(p) realloc(void * owned maybe p, size_t n);
+char *?owned p = malloc(n);                    /* owns; may be null */
+char *borrows(s) find(char *s, int c);        /* result points into s */
+const char *borrows(static) err_name(int e);
+struct cache { char *owned buf; char *borrows(buf) key; };
+static const unsigned char *?borrows(zfile) ztrans; /* a global into a global's */
+struct tokenizer borrows(text) { const char *borrows(text) pos; };
+FILE *?owned(fclose) fopen(const char *path, const char *mode);
+int ?owned(close) fd = open(path, O_RDONLY);    /* int handle; invalid is < 0 */
+void *?@(owned, takes(p)) realloc(void *?owned p, size_t n);
 regex_t owned(regfree) re;                           /* an object owned as a whole */
 ```
 
@@ -102,7 +103,7 @@ regex_t owned(regfree) re;                           /* an object owned as a who
   as long as `x`, dead when `x` is freed, moved or assigned again.  Elision: a
   result written `view` borrows from all its `view` parameters; with none it
   is an error.
-- `maybe`: may be null (an int handle: may be < 0).  `out`: the callee writes
+- `?`: may be null (an int handle: may be < 0).  `out`: the callee writes
   it on every path.  `drop`: the callee destroys it.  `takes(p)`: a valid
   result took over what `p` owned; a null result left `p` alone.
 
@@ -127,7 +128,7 @@ bodies are silent; a static every call inlined gets a check-only parse.
 - [x] Ownership (`-Wlifetime`): use after move or free, double free, leaks at
   return / scope end / break / continue / reassignment; `-Wimplicit-move`.
   Tests: test_lifetime.py, test_yasc_move.py.
-- [x] `maybe`: dereferenced, stored in or passed to a non-maybe, returned;
+- [x] `?`: dereferenced, stored in or passed to a non-maybe, returned;
   struct members by path (`q->next->v`, `s.next`, `a[1].next`, `a[i].next`),
   values across blocks, values with no name (`find(k)->v`).
   Tests: test_lifetime.py, test_lifetime_paths.py, test_lifetime_index.py.
@@ -139,12 +140,66 @@ bodies are silent; a static every call inlined gets a check-only parse.
   `view` does not escape (`tcc_ir_view_escape_check`), `borrows(member)`,
   borrowing structs, a borrow through a call's result.
   Tests: test_yasc_view.py, test_yasc_struct_borrows.py.
-- [x] An owned member that is never null (`T * owned buf`) is a member path
+- [x] Globals that borrow from globals (2026-11-27, declarator.c
+  yasc_gborrows, lifetime.c gb_check, test_yasc_global_borrows.py):
+  `static T *?borrows(zfile) ztrans;` names owned file-scope globals (Sym
+  table per unit).  The invariant holds at function boundaries, so each
+  function is checked alone: an owner stored into, handed to an owned / drop
+  parameter (dead after the call), moved into an owned local or store, or
+  returned owned kills its borrowers; a dead one read, alive at a way out, or
+  alive at a call that may read globals (tcc_ir_call_writes_global) is said;
+  a store into one must point into its owners (origins followed
+  flow-insensitively through pointer temps and locals, a borrowing call's
+  result included).  Items are a global and an offset, so a global struct's
+  borrows(member) members (`g.trans` borrows `g.file`; nested structs; arrays
+  of up to 16 structs at a constant index) follow the same rule, named
+  `go.z.trans` / `arr[1].trans`.  Through a view parameter (VeCtx, the same
+  day): a drop argument kills after the call; a dead member of the caller's
+  object at a way out, or at a call that gets the object or is not a system
+  header's, is said.  The frontend records the temps holding a source
+  member's address (lt_fsrcs, unary.c yasc_note_field_sources), so a function
+  that never names `trans` still has its entry, and only a kill through such
+  an address counts (VE_SURE) -- the offset-only kill also hits a store into
+  any member at that offset.
+  Round 3 (2026-11-27): gb items are &g + off + idx * scale (gb_forms reads
+  the raw-IR address arithmetic: `idx SHL n`, `(idx + k)`, `MUL`); elements
+  are walked on demand (no 16-element cap); a kill through one index kills
+  what another may name (kmask), only the same index revives, an index
+  variable changed while dead leaves the item lost.  Detached: a borrower
+  set to null / static storage survives its owner's change (gb and VeCtx:
+  VE_DET, joined by AND).  An owner's address (taddr/vaddr, through copies
+  and -O0 frame slots): a store through it kills, to a call it needs the
+  borrowers detached, stored or returned it is an error.  VeCtx: indexes the
+  same way (tix/tco, txv/txa/txs; an index not one variable is lost at
+  once), pointer locals outlive unless every value is `&local`
+  (ve_frame_locals), owned locals/parameters are said where they leave
+  (returned, stored, handed to a call; ve_dealloc_arg exempts a
+  deallocator's `drop void *`), a base pointer changed while dead -> lost.
+  Round 4: a pointer loaded from a known place is a base of its own (a
+  path, VE_PATH0 - k: `o->in`), the same at every load, named from the
+  member records; a store into that place leaves its dead members lost.  A
+  call gets an object when an argument's base (resolved) is the item's base,
+  its root or a path it is reached through -- any call, a system header's
+  too.  Local statics borrow (from globals or other statics: their Syms
+  have static storage and outlive the scope).
+  Round 5: a path carries an index (`o->in[i]`, ve_resolve_addr reads the
+  load with the index folded in, `T <- p***DEREF*** ADD x`); paths at
+  indexes that may be equal alias (ve_base_alias); an index that is not one
+  variable makes a path of its own, lost at its kill (a note says to put the
+  index in a variable; gb the same for `arr[i * k]`).  Items killed only as
+  an alias (VE_ALIAS / gb alias, joined by AND) come back with the item
+  that killed them.  The VeCtx fixpoint runs again while items or paths
+  appear (an AND join needs them all from the start).  A store into an
+  owner kills that owner (its kmask holds the aliases), not every owner an
+  index may make it.  Tables full (64 members/paths in VeCtx; 64 borrowers,
+  60 owners, 64 elements in gb): an error says the function names more than
+  the check follows, rather than passing what lies past them.
+- [x] An owned member that is never null (`T *owned buf`) is a member path
   followed for ownership only (LT_MEMBER_NOTMAYBE, 2026-11-23,
   test_lifetime_owned_members.py): used or freed after a free, through a
   call's result; never a null report.
 - [x] The method self rules (2026-11-23, test_yasc_self.py): a checked
-  `struct T * view` parameter keeps the owned members of the struct valid.
+  `struct T *view` parameter keeps the owned members of the struct valid.
   The callee may not return with one freed or moved out (null for a maybe
   one is fine).  The caller hands the struct over with them set and not
   freed: a local struct passed by `&s` stays followed (it was "not
@@ -154,7 +209,7 @@ bodies are silent; a static every call inlined gets a check-only parse.
   start), and the caller's count as freed (`defer s.clear()`).  An inlined
   method's self binding is the same handing over, so -O changes nothing.
   Not covered: members of members (`b->in.buf`, `b->next->buf`), owned
-  variants of tagged unions (the tag check's), `struct T * owned self`.
+  variants of tagged unions (the tag check's), `struct T *owned self`.
 - [x] `owned(dealloc)` (test_yasc_dealloc.py; elements of local structs and
   arrays too, test_lifetime_loop_bounds.py), int handles
   (test_yasc_handles.py), `takes(p)` (test_yasc_takes.py), owned items of
@@ -192,7 +247,7 @@ bodies are silent; a static every call inlined gets a check-only parse.
   (`a[i * 2]`, `a[f()]`) and `&a[i]` handed on (said: "'a' is reached in a way
   the lifetime check does not follow"); maybe members at `a[i + 1].next`;
 - borrowing structs over 256 bytes, in arrays, or from `?:` of two calls;
-- status codes instead of `takes` (`int push(..., void * owned item)`);
+- status codes instead of `takes` (`int push(..., void *owned item)`);
 - caps: 32 predicates, 8 contexts per block, 16384 contexts and 1 MB of states
   per function, 64 array items, 16 index items, 16 loop summaries -- past
   them the result is less precise (and may differ at -O1+ in a big function);
@@ -244,7 +299,7 @@ Same result at every -O, once per place.
 
 - [x] `__builtin_object_size` / `__builtin_dynamic_object_size`
   (`builtin/objsize.c`), decided by the parser: the same at every -O.
-- [x] `_FORTIFY_SOURCE` with yasos libc (`sys/_fortify.h`, test_fortify.py).
+- [x] `_FORTIFY_SOURCE`: the `__builtin___*_chk` builtins (test_fortify.py); yasos libc needs no wrappers -- tcc checks the calls itself (`-ffortify`, test_compiler_fortify.py).
 - [x] `-Wstringop-overflow`, `-Wformat-overflow`, `-Wformat-truncation`,
   `-Walloc-size-larger-than=N`, `-Wfree-nonheap-object`,
   `-Wmismatched-dealloc` (-Wall); `-Walloc-mul-overflow` (when asked).
@@ -288,7 +343,7 @@ Same result at every -O, once per place.
 - [ ] `-Wtainted-format`: memory through pointers of unknown origin, a large
   struct copy made by a helper call, a summary's write through a parameter
   past the seventh.
-- [ ] `mmap` ownership: a `maybe` with another sentinel than null.
+- [ ] `mmap` ownership: a `?` with another sentinel than null.
 
 ## Next: strict lifetimes, `unsafe`, checked `restrict`, and what the optimizer may then assume (planned 2026-11-23)
 
@@ -387,7 +442,7 @@ no error reported.  `unchecked` pointers carry no fact at all.
     - [x] U3 tagged unions (2026-11-23, decl/struct.c, lifetime.c
       tcc_ir_tag_check, test_yasc_tagged_unions.py), like Zig's
       `union(enum)` but with the tag an explicit member, checked at compile
-      time: `union(k) { long i when(V_INT); char * view s when(V_STR); } u;`
+      time: `union(k) { long i when(V_INT); char *s when(V_STR); } u;`
       as a named member of the struct whose earlier member k (integer or
       enum, not a bit-field) is the tag.  Every member says when(K, ...);
       at most 31 values.  A use of a member (read, write, address) must
@@ -397,7 +452,7 @@ no error reported.  `unchecked` pointers carry no fact at all.
       with its range compares), set by a constant stored in the tag,
       forgotten by any other store to it (or to the same member through
       another base), by assigning the base, by a call that may write
-      through the base (not `const T * view`) and, for a global, by any
+      through the base (not `const T *view`) and, for a global, by any
       call.  Bases: a pointer variable or parameter, a local struct, a
       global struct.  A tagged member is not a U2 read (a view in it stays
       a view); the chain below it (`v->u.st.path`, `v->u.arr[i]`) neither
@@ -441,12 +496,12 @@ no error reported.  `unchecked` pointers carry no fact at all.
       pointer, qsort / atexit and the like (callbacks) forget every global,
       as does the start of an inlined body.  So `free(g.p); free(g.p);`
       is said.  The tag check follows the same rule.
-    - Handle members (`int owned(close) maybe fd;`) parse since 2026-11-23
+    - Handle members (`int ?owned(close) fd;`) parse since 2026-11-23
       and a union refuses them like owned pointers; a handle read through a
       union drops to a plain int.
 - [x] int handles as struct members (2026-11-23, decl/method.c: `owned(`
   is a qualifier in a struct body, never a method name;
-  test_yasc_handle_members.py).  `int owned(close) maybe fd` members are
+  test_yasc_handle_members.py).  `int ?owned(close) fd` members are
   member paths of kind LT_MEMBER_HANDLE (IRLtMember.owned is LT_MEMBER_*
   flags): a local struct's handle leaks, closed twice / used after close
   through a pointer is said, an untested one to a non-maybe parameter is
@@ -502,7 +557,7 @@ no error reported.  `unchecked` pointers carry no fact at all.
 ### S3: `restrict` is the exclusive borrow
 
 Done 2026-11-23 (test_yasc_restrict.py), first version:
-- [x] Kept in the type: `T * restrict view p`, `T * restrict borrows(x) p`
+- [x] Kept in the type: `T *@(restrict, view) p`, `T *@(restrict, borrows(x)) p`
   (`YASC_RESTRICT` 0x100 in the int qualifiers; the pointer node keeps it in
   its `ymod`, part of the interned key).  Regular C drops it as before.
 - [x] What becomes a restrict pointer (argument, initializer, assignment,
@@ -580,7 +635,7 @@ lands with a counter (`-dump-ir-passes` statistics) of how often it fired on
     gated on there being no indexed instruction at all, and narrowing the
     gate miscompiled plain C (bug_orphan_jump_hop, bug_bitfield_packed10).
   - [x] entry_store_prop (2026-11-23): an object whose address goes only
-    to read-only no-escape parameters (`const T * view`, directly or
+    to read-only no-escape parameters (`const T *view`, directly or
     through a single-def temp) keeps its entry-block stores: a constant
     field read in a loop after the call is the constant.  Phase 3c also
     forwards into a read folded into arithmetic (`T2 ADD StackLoc[-20]`,
@@ -597,7 +652,7 @@ lands with a counter (`-dump-ir-passes` statistics) of how often it fired on
     `owned` (not unchecked, not takes(p)) is a root like an O4 parameter
     (IRYfCall.fresh); handing it to a `drop` parameter (free) keeps it in
     (IRYfCall.drop), as does a no-escape parameter.  Run test: case_fresh.
-- [ ] **O3 valid for the pointee.**  A non-`maybe` yasc parameter can be
+- [ ] **O3 valid for the pointee.**  A non-`?` yasc parameter can be
   loaded from for `sizeof(*p)` bytes at any point of the function where it is
   still live (not moved, not dropped): invariant load hoisting out of
   zero-trip loops, if-conversion over a load.  Only the pointee at offset 0;
@@ -606,8 +661,8 @@ lands with a counter (`-dump-ir-passes` statistics) of how often it fired on
   parameter is not touched through any pointer not derived from it --
   loads survive other stores, loop bounds stay in registers, memmove becomes
   memcpy.
-  - [x] load_cse (2026-11-23; a no-escape or drop argument keeps it in): the function's `T * restrict view` and
-    `T * owned` parameters (ir->yf_excl, recorded with the variables); per
+  - [x] load_cse (2026-11-23; a no-escape or drop argument keeps it in): the function's `T *@(restrict, view)` and
+    `T *owned` parameters (ir->yf_excl, recorded with the variables); per
     parameter P, flow-insensitive over the flat IR, m = may derive from P,
     d = derives from P (every def); the fact holds only if every use of a
     value in m is a memory access, a comparison, a no-escape parameter or
@@ -640,9 +695,9 @@ lands with a counter (`-dump-ir-passes` statistics) of how often it fired on
   storage it lives in" in the checker first.
 - [ ] **O6 stores before a drop are dead.**  `memset_explicit` and volatile
   exempt.
-- [ ] **O7 non-null.**  Fold `p == 0` on a non-`maybe` pointer.  Last, and
+- [ ] **O7 non-null.**  Fold `p == 0` on a non-`?` pointer.  Last, and
   not default: a guard written on purpose (a bootloader checking corrupted
-  input) needs a spelling that keeps it -- a test of `(T * maybe)p` is kept.
+  input) needs a spelling that keeps it -- a test of `(T *?)p` is kept.
 - Not planned: heap to stack for a non-escaping `owned` local (4-8 KB process
   stacks); call-level purity (does not follow from pointer annotations).
 - `volatile` pointees and everything `unchecked` get none of the above.

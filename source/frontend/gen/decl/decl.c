@@ -183,6 +183,25 @@ static void save_function_body(TokenString **str, int **pack, int compiled_now, 
  * auto-inline candidate, or generate the code.  Called at the definition
  * itself, or at the end of the TU for a body gen_deferred_function_bodies
  * replays. */
+/* SYM's own parameters have a size to evaluate at its entry (`int p[n]`,
+   func_vla_arg).  vla_param_exprs also holds the prototypes' since the last
+   definition -- `void *memcpy(out void dst[n], ...)` in <string.h> -- which
+   say nothing of SYM. */
+static int func_has_vla_param_exprs(Sym *sym)
+{
+  for (Sym *arg = sym->type.ref ? sym_first(sym->type.ref) : NULL; arg; arg = arg->next)
+  {
+    if ((arg->type.t & VT_BTYPE) != VT_PTR || !arg->type.ref)
+      continue;
+    if (arg->type.ref->type.t & VT_VLA)
+      return 1;
+    for (int i = 0; i < tcc_state->nb_vla_param_exprs; i++)
+      if (tcc_state->vla_param_exprs[i].param == arg->type.ref)
+        return 1;
+  }
+  return 0;
+}
+
 static void define_global_function(Sym *sym, Section *ad_section)
 {
   /* static inline functions are just recorded as a kind
@@ -235,7 +254,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
         sym->type.ref->f.func_type != FUNC_ELLIPSIS &&
         !sym->type.ref->f.func_alwinl && !sym->type.ref->f.func_noinline &&
         (TCC_OPT(tcc_state, opt_inline_functions) || TCC_OPT(tcc_state, opt_inline_small)) &&
-        tcc_state->nb_vla_param_exprs == 0 && fn->func_str)
+        !func_has_vla_param_exprs(sym) && fn->func_str)
     {
       int sig = auto_inline_sig_ok(sym);
       int thr = TCC_OPT(tcc_state, opt_inline_limit) > 0 ? TCC_OPT(tcc_state, opt_inline_limit)
@@ -341,7 +360,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
             * expressions (which may have side effects like i++) are evaluated
             * during function prolog, outside the saved body token stream.
             * Inlining would replay only the body, losing those side effects. */
-           tcc_state->nb_vla_param_exprs == 0)
+           !func_has_vla_param_exprs(sym))
   {
     /* Auto-inline candidate: save the body as a token stream so call
      * sites within this TU can replay it.
@@ -425,6 +444,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
       TokenString *compile_ts = tok_str_borrow(fn->func_str, body_len);
       compile_ts->owner = fn->func_str; /* for tok_str_release_parsed */
       int saved_outer_tok = tok;
+      const int saved_outer_yasc = tcc_state->yasc; /* the replay sets its own dialect */
       CValue saved_outer_tokc = tokc;
       if (TCC_LOG_INLINE_STRUCT)
         fprintf(stderr, "[auto-inline] SMALL: compiling standalone for %s\n",
@@ -438,6 +458,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
       end_macro();
       tcc_state->compile_replay = saved_replay;
       tok = saved_outer_tok;
+      tcc_state->yasc = saved_outer_yasc;
       tokc = saved_outer_tokc;
       /* Revoke auto-inline for functions that contain nested function
        * definitions — their closure/trampoline semantics cannot be
@@ -538,6 +559,8 @@ static void define_global_function(Sym *sym, Section *ad_section)
         compile_ts->owner = fn->func_str; /* for tok_str_release_parsed */
 
         int saved_outer_tok = tok;
+
+        const int saved_outer_yasc = tcc_state->yasc; /* the replay sets its own dialect */
         CValue saved_outer_tokc = tokc;
         TokenString *saved_replay = tcc_state->compile_replay;
         tcc_state->compile_replay = compile_ts;
@@ -547,6 +570,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
         end_macro();
         tcc_state->compile_replay = saved_replay;
         tok = saved_outer_tok;
+        tcc_state->yasc = saved_outer_yasc;
         tokc = saved_outer_tokc;
         /* Promoted as a small straight-line leaf: inline it at every call
          * site, not only the all-constant ones. */
@@ -556,6 +580,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
       else if (fn->func_str)
       {
         int saved_outer_tok = tok;
+        const int saved_outer_yasc = tcc_state->yasc; /* the replay sets its own dialect */
         CValue saved_outer_tokc = tokc;
         const int post_opt_inline_cap = 512;
         if (body_len <= post_opt_inline_cap)
@@ -638,6 +663,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
           }
         }
         tok = saved_outer_tok;
+        tcc_state->yasc = saved_outer_yasc;
         tokc = saved_outer_tokc;
       }
       else
@@ -682,6 +708,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
         TokenString *compile_ts = tok_str_borrow(fn->func_str, body_len);
         compile_ts->owner = fn->func_str; /* for tok_str_release_parsed */
         int saved_outer_tok = tok;
+        const int saved_outer_yasc = tcc_state->yasc; /* the replay sets its own dialect */
         CValue saved_outer_tokc = tokc;
         tcc_state->had_nested_funcs = 0;
         TokenString *saved_replay = tcc_state->compile_replay;
@@ -692,6 +719,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
         end_macro();
         tcc_state->compile_replay = saved_replay;
         tok = saved_outer_tok;
+        tcc_state->yasc = saved_outer_yasc;
         tokc = saved_outer_tokc;
         /* Token-replay cannot reproduce nested function closure
          * semantics during re-compile; drop tokens in that case.
@@ -715,6 +743,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
         if (fn->func_str)
         {
           int saved_outer_tok2 = tok;
+          const int saved_outer_yasc2 = tcc_state->yasc; /* the replay sets its own dialect */
           CValue saved_outer_tokc2 = tokc;
           TokenString *ts = fn->func_str;
           fn->func_str = NULL;
@@ -723,6 +752,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
           gen_function(sym);
           end_macro();
           tok = saved_outer_tok2;
+          tcc_state->yasc = saved_outer_yasc2;
           tokc = saved_outer_tokc2;
         }
         else
@@ -792,6 +822,26 @@ static int body_calls_unprototyped(Sym *sym, TokenString *body)
     tok_get(&t, &p, &cv);
     for (next_tok = p; next_tok < end && *next_tok == TOK_LINENUM;)
       next_tok += 2;
+    /* yasc's cast<PERM(T), ...>: `as(`, `ptr(`, `trunc(` name permissions,
+       not functions -- skip to the '>' that closes the list */
+    if ((t == TOK_cast || t == TOK_unsafe_cast) && !sym_find(t) && next_tok < end && *next_tok == TOK_LT)
+    {
+      int depth = 0;
+      p = next_tok;
+      tok_get(&t, &p, &cv); /* the '<' */
+      while (p < end)
+      {
+        tok_get(&t, &p, &cv);
+        if (t == '(')
+          depth++;
+        else if (t == ')')
+          depth--;
+        else if (t == TOK_GT && depth <= 0)
+          break;
+      }
+      prev = TOK_GT;
+      continue;
+    }
     /* A tag after struct/union/enum names a type: `struct T (*fp)(void)`. */
     if (t >= TOK_UIDENT && prev != '.' && prev != TOK_ARROW && prev != TOK_STRUCT && prev != TOK_UNION &&
         prev != TOK_ENUM && next_tok < end && *next_tok == '(')
@@ -848,7 +898,7 @@ static void definition_prototype_checks(int v, CType *type, int line, int in_mod
 
 static int defer_function_body(Sym *sym, Section *section)
 {
-  if (!(TCC_OPT(tcc_state, opt_inline_called_once) || TCC_OPT(tcc_state, opt_drop_unused_statics)) || tcc_state->nb_vla_param_exprs ||
+  if (!(TCC_OPT(tcc_state, opt_inline_called_once) || TCC_OPT(tcc_state, opt_drop_unused_statics)) || func_has_vla_param_exprs(sym) ||
       (sym->type.t & VT_INLINE) || !sym->type.ref || sym->type.ref->f.func_type != FUNC_NEW || sym->a.nested_func)
     return 0;
   DeferredFunc *d = tcc_mallocz(sizeof *d);
@@ -865,10 +915,12 @@ static int defer_function_body(Sym *sym, Section *section)
   {
     /* Generate it now, from the saved tokens, as if never deferred. */
     int saved_tok = tok, saved_line = file->line_num;
+    const int saved_yasc = tcc_state->yasc; /* the replay sets its own dialect */
     CValue saved_tokc = tokc;
     define_deferred_function(d);
     tok = saved_tok;
     tokc = saved_tokc;
+    tcc_state->yasc = saved_yasc;
     file->line_num = saved_line;
     tcc_free(d->pack);
     tcc_free(d);
@@ -1186,7 +1238,7 @@ static void decl_auto_infer(CType *type, CType *btype, AttributeDef *ad, int v, 
     it.t &= ~VT_STRUCT_MASK;
   if ((it.t & VT_BTYPE) == VT_VOID)
     tcc_error("'%s' cannot take the type void", kw);
-  it.t &= ~(VT_STORAGE | VT_CONSTANT | VT_VOLATILE | VT_RODATA_REL);
+  it.t &= ~(VT_STORAGE | VT_CONSTANT | VT_VOLATILE | VT_RODATA_REL | VT_SELF_REL);
 
   q = type_yasc(&it);
   if ((q & YASC_OWNED) && !(q & (YASC_FRESH | YASC_UNCHECKED)) && lval)
@@ -1434,7 +1486,18 @@ int decl(int l)
       recover_decl.l = l == VT_CONST || l == VT_LOCAL ? l : 0;
       recover_decl.v = 0;
       recover_decl.storage = type.t & VT_STORAGE;
+      /* yasc: a global's or static's pointers are views (declarator.c) */
+      yasc_global_decl = !tcc_state->yasc || (type.t & VT_TYPEDEF) ? 0
+                         : l == VT_CONST                           ? 1
+                         : (l == VT_LOCAL || l == VT_JMP) && (type.t & VT_EXTERN) ? 1
+                         : (l == VT_LOCAL || l == VT_JMP) && (type.t & VT_STATIC) ? 2
+                                                                                   : 0;
+      /* borrows(owner) on a global or a static: bound to its Sym below (a
+         block-scope extern is a copy of the global's: refused) */
+      const int gb_decl = (yasc_global_decl == 1 && l == VT_CONST) || yasc_global_decl == 2;
+      yasc_gborrow_clear_pending();
       type_decl(&type, &ad, &v, TYPE_DIRECT);
+      yasc_global_decl = 0;
       recover_decl.l = 0;
       if (pp_local >= 0)
       {
@@ -1450,6 +1513,10 @@ int decl(int l)
         decl_auto_infer(&type, &btype, &ad, v, ndecl == 0);
       /* this declarator built the function type itself, not a typedef or typeof */
       const int own_functype = (type.t & VT_BTYPE) == VT_FUNC && type.ref && type.ref == declarator_last_functype;
+      /* yasc default arguments go to the function's name (default_arg.c) */
+      yasc_default_bind(v, &type, own_functype);
+      if (!(type.t & VT_TYPEDEF) && (type.t & VT_BTYPE) != VT_FUNC)
+        yasc_src_object_check(&type, "an object");
       /* #pragma GCC visibility covers every declaration it encloses, extern
        * ones too; an attribute on the declaration wins.  Not typedefs: their
        * attributes merge into every later declaration that uses them. */
@@ -2078,6 +2145,9 @@ int decl(int l)
           if (in_module)
             yasc_module_sym(sym_find(v), this_exported);
         }
+        if (tcc_state->yasc)
+          yasc_gborrow_bind(gb_decl && v && !(type.t & VT_TYPEDEF) && (type.t & VT_BTYPE) != VT_FUNC ? sym_find(v)
+                                                                                                    : NULL);
         if (tok != ',')
         {
           if (l == VT_JMP)

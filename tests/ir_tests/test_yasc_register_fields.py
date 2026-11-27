@@ -36,8 +36,8 @@ typedef union { uint32_t raw; struct { uint32_t en:1, irq:1 w1c, _r:6, div:8, _r
 typedef struct { uint32_t ctrl; uint32_t status w1c; } pair_t;
 typedef struct { uint32_t a, b, c; uint32_t st w1c; uint32_t e; } big_t;
 ctrl_t read_ctrl(volatile ctrl_t *r);
-void read_into(volatile ctrl_t *r, inout ctrl_t *dst);
-void build(inout ctrl_t *dst);
+void read_into(volatile ctrl_t *r, out ctrl_t *dst);
+void build(out ctrl_t *dst);
 struct regs {
   volatile uint32_t ctrl;
   volatile uint32_t status w1c;
@@ -158,7 +158,7 @@ GOOD = {
     "shifted_left": "void f(inout struct regs *g)\n{\n  uint32_t p = g->ctrl;\n  g->status = p << 2;\n}\n",
     "arithmetic": "void f(inout struct regs *g)\n{\n  uint32_t p = g->ctrl;\n  g->status = p + 1;\n}\n",
     "unsafe": "void f(inout struct regs *g)\n{\n  unsafe {\n    g->status |= 4;\n  }\n}\n",
-    "address_of_wo": "volatile uint32_t * view f(inout struct regs *g)\n{\n  return &g->txdata;\n}\n",
+    "address_of_wo": "volatile uint32_t *view f(inout struct regs *g)\n{\n  return &g->txdata;\n}\n",
 }
 
 
@@ -188,7 +188,7 @@ def test_notes_freed_when_the_body_has_an_error(tmp_path, opt):
     ASan build reports a leak otherwise)."""
     body = (
         "enum vk { V_INT, V_STR };\n"
-        "struct value { enum vk k; union(k) { long i when(V_INT); char * view s when(V_STR); } u; };\n"
+        "struct value { enum vk k; union(k) { long i when(V_INT); char *s when(V_STR); } u; };\n"
         "long f(inout struct regs *g, volatile ctrl_t *r, struct value *v)\n{\n"
         "  g->status = 4;\n  ctrl_t c = read_ctrl(r);\n  long x = v->u.i;\n  return nope + c.raw + x;\n}\n"
     )

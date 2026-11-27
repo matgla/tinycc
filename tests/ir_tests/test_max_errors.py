@@ -462,9 +462,9 @@ int proto(char *s);
 struct node { int *next; int v; };
 int use(int *p, int *q)
 {
-  char *loc[1] = {nullptr};
+  typedef char *loc_t;
   int x;
-  (void)loc;
+  (void)sizeof(loc_t);
   (void)q;
   return x + *p;
 }
@@ -477,11 +477,10 @@ def test_yasc_plain_pointer_goes_on(tmp_path):
     p = _run(tmp_path, YASC, ccompat=False)
     d = [(l, k, m) for l, k, m in _diags(p)]
     plain = [l for l, k, m in d if "plain pointer in yasc" in m]
-    # a parameter's own pointer is a view (lines 1, 3), and so is a local
-    # pointer its function does not own; a member (line 2) and an array of
-    # pointers (loc, line 5, said at the end of its body: decl/plain_param.c)
-    # are plain
-    assert plain == [2, 5], p.stderr
+    # a parameter's own pointer is a view (lines 1, 3), and so are a member's
+    # (line 2), a local pointer its function does not own and an array's
+    # elements; a typedef's pointer (loc_t, line 5) is plain
+    assert plain == [5], p.stderr
     assert (9, "error", "'x' is used uninitialized") in d
     assert (11, "warning", "'unused_fn' defined but not used") in d
     assert (12, "error", "'undecl' undeclared") in d
@@ -518,17 +517,20 @@ def test_no_hang_at_eof(tmp_path, body):
 
 
 def test_local_label_after_error(tmp_path):
-    # `out:` is no label in yasc (`out` is a keyword): the __label__ the
-    # nested function jumps to is then never defined -- one error, and the
-    # compile ends (it went round closing the label's block)
+    # `errdefer:` is no label in yasc (`errdefer` starts a statement): the
+    # __label__ the nested function jumps to is then never defined -- one
+    # error, and the compile ends (it went round closing the label's block)
     body = (
-        "int g[4];\nint f(void)\n{\n  __label__ out;\n  g[0] = 1;\n  void jump(void) { goto out; }\n"
-        "  jump();\n  return 0;\nout:\n  return 1;\n}\nint h(void) { return 2; }\n"
+        "int g[4];\nint f(void)\n{\n  __label__ L;\n  g[0] = 1;\n  void jump(void) { goto L; }\n"
+        "  jump();\n  return 0;\nL:\n  return 1;\n}\nint h(void) { return 2; }\n"
     )
     for opt in ("-O0", "-O2"):
-        p = _run(tmp_path, body, opt, ccompat=False, timeout=20)
+        p = _run(tmp_path, body.replace("L", "errdefer"), opt, ccompat=False, timeout=20)
         assert p.returncode == 1
         assert _error_lines(p) == [9], (opt, p.stderr)
+        # `out` is a name outside a parameter list: `out:` is a label
+        p = _run(tmp_path, body.replace("L", "out"), opt, ccompat=False, timeout=20)
+        assert p.returncode == 0 and _error_lines(p) == [], (opt, p.stderr)
 
 
 SWEEP = """\

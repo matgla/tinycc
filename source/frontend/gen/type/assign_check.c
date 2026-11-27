@@ -461,7 +461,7 @@ static void yasc_verify_assign(CType *dt)
     if (v && (v->yasc & YASC_BODY_PARAM) && (sq & YASC_VIEW) && !type_borrows(&vtop->type))
     {
       const char *n = get_tok_str(v->v, NULL);
-      tcc_yasc_rule("the parameter '%s' owns nothing (a view unless it says owned): write '* owned %s' when the "
+      tcc_yasc_rule("the parameter '%s' owns nothing (a view unless it says owned): write '*owned %s' when the "
                     "function takes it over, 'drop' before the type too when it frees it", n, n);
     }
     else
@@ -684,6 +684,71 @@ void yasc_union_member_end(int addr_operand)
                    addr_operand ? "addressed" : "used whole");
 }
 
+/* yasc: an initializer's null (nullptr, 0) for a pointer that is not '?':
+   a member (`struct s y = {.p = nullptr}`; `struct s { char *p; }`'s p is a
+   view, never null) or a static pointer.  What flows in later is the
+   lifetime check's (a store through `->` / `.`); a member left out of the
+   braces is not said. */
+__attribute__((noinline)) void yasc_init_null(CType *type, int is_static, int in_aggregate)
+{
+  const int q = type_yasc(type);
+  /* (file scope runs with nocode_wanted set: a static object is data) */
+  /* (an inlined body: the function's own said it) */
+  if (!(q & (YASC_OWNED | YASC_VIEW)) || (q & (YASC_MAYBE | YASC_UNCHECKED)) || type_is_handle(type) ||
+      (nocode_wanted && !is_static) || tcc_state->in_inline_expansion)
+    return;
+  if (!is_null_pointer(vtop) && !((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && vtop->c.i == 0 &&
+                                  is_integer_btype(vtop->type.t & VT_BTYPE)))
+    return;
+  /* `char *a[2] = {nullptr}`: the plain array is the error */
+  if (!is_static && in_aggregate && !yasc_init_field && yasc_pp_held_array())
+    return;
+  if (yasc_init_field && (yasc_init_field->v & ~SYM_FIELD) < SYM_FIRST_ANOM)
+  {
+    tcc_warning_c(warn_lifetime)("a null pointer initializes '%s', which is not '?'",
+                                 get_tok_str(yasc_init_field->v & ~SYM_FIELD, NULL));
+    tcc_note("a member's pointer is never null unless it says '?': write '*?' in its declaration");
+  }
+  else if (in_aggregate)
+  {
+    tcc_warning_c(warn_lifetime)("a null pointer initializes an element that is not '?'");
+    tcc_note("an element's pointer is never null unless it says '?': write '*?' in the element type");
+  }
+  else
+    tcc_warning_c(warn_lifetime)("a null pointer initializes a pointer that is not '?'");
+}
+
+/* yasc: an automatic object's initializer value for a member (or array
+   element) pointer that is not '?', other than a null constant
+   (yasc_init_null's): the lifetime check says whether it may be null
+   (tcc_ir_lt_note_init_store).  The member's name, 0 for an element; -1:
+   nothing to check. */
+__attribute__((noinline)) int yasc_init_flow_tok(CType *type)
+{
+  const int q = type_yasc(type);
+  if (!tcc_state->ir || !tcc_state->ir->lt_on || nocode_wanted || tcc_state->in_inline_expansion ||
+      !(q & (YASC_OWNED | YASC_VIEW)) || (q & (YASC_MAYBE | YASC_UNCHECKED)) || type_is_handle(type) ||
+      is_null_pointer(vtop) || ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && vtop->c.i == 0))
+    return -1;
+  if (yasc_init_field && (yasc_init_field->v & ~SYM_FIELD) < SYM_FIRST_ANOM)
+    return yasc_init_field->v & ~SYM_FIELD;
+  return yasc_init_field || yasc_pp_held_array() ? -1 : 0;
+}
+
+/* yasc: `a[i] = v` / `*p = v` into an element or a target pointer that is
+   not '?' (a view or owned one): the lifetime check says whether V may be
+   null (tcc_ir_lt_note_assign_store, infix.c).  A variable and a member
+   are followed by the check itself, a global's own pointer too. */
+__attribute__((noinline)) int yasc_store_flow_wanted(CType *type)
+{
+  int q;
+  if (!tcc_state->yasc || !tcc_state->ir || !tcc_state->ir->lt_on || nocode_wanted ||
+      tcc_state->in_inline_expansion || (type->t & (VT_BTYPE | VT_ARRAY)) != VT_PTR || !type->ref)
+    return 0;
+  q = type_yasc(type);
+  return (q & (YASC_OWNED | YASC_VIEW)) && !(q & (YASC_MAYBE | YASC_UNCHECKED)) && !type_is_handle(type);
+}
+
 /* yasc: an explicit cast to an owned / view / borrows pointer says what
    the types cannot check, so outside unsafe it is -Wunchecked's (strict):
    from regular C, from an integer (MMIO, flash offsets), dropping maybe,
@@ -707,7 +772,7 @@ static __attribute__((noinline)) void yasc_cast_check(CType *dt)
   if (sq & YASC_UNCHECKED)
     tcc_warning_once(warn_unchecked, "a pointer from regular C becomes %s here: write unsafe(...)", what);
   else if ((sq & YASC_MAYBE) && !(dq & YASC_MAYBE))
-    tcc_warning_once(warn_unchecked, "a cast drops maybe: test the pointer, or write unsafe(...)");
+    tcc_warning_once(warn_unchecked, "a cast drops '?': test the pointer, or write unsafe(...)");
   else if ((dq & YASC_OWNED) && !(sq & YASC_OWNED))
     tcc_warning_once(warn_unchecked, "a cast makes a pointer that owns nothing owned: write unsafe(...)");
   else if (!(dq & YASC_OWNED) && (sq & YASC_OWNED))
@@ -784,16 +849,35 @@ static int fe_mantissa_bits(int bt)
   return bt == VT_FLOAT ? 24 : 53;
 }
 
+/* a conversion of a call argument (gfunc_param_typed): which one, of what */
+int fe_arg_index;    /* 1-based; 0 = not an argument */
+Sym *fe_arg_callee; /* the called function's symbol, or NULL (a call through a pointer) */
+
+static void fe_arg_where(char *buf, int size)
+{
+  buf[0] = 0;
+  if (!fe_arg_index)
+    return;
+  if (fe_arg_callee && (fe_arg_callee->type.t & VT_BTYPE) == VT_FUNC)
+    snprintf(buf, size, " (argument %d of '%s')", fe_arg_index, get_tok_str(fe_arg_callee->v & ~SYM_FIELD, NULL));
+  else
+    snprintf(buf, size, " (argument %d)", fe_arg_index);
+}
+
+/* every conversion warning names the argument it is about */
+#define FE_CONV_WARN(sw, fmt, ...) tcc_fe_warning_c(sw, fmt "%s", __VA_ARGS__, where)
+
 static void fe_check_conversion(CType *dt, const SValue *sv)
 {
   TCCState *s1 = tcc_state;
   int dtt = dt->t, stt = sv->type.t, dbt = dtt & VT_BTYPE, sbt = stt & VT_BTYPE;
   int dint = is_integer_btype(dbt) && dbt != VT_BOOL, sint = is_integer_btype(sbt);
-  char ds[64], ss[64];
+  char ds[64], ss[64], where[128];
   if (((dtt | stt) & (VT_COMPLEX | VT_VECTOR)) || (!dint && !is_float(dbt)) || (!sint && !is_float(sbt)))
     return;
   fe_conv_type_str(ds, sizeof ds, dtt);
   fe_conv_type_str(ss, sizeof ss, stt);
+  fe_arg_where(where, sizeof where);
   if (dint && fe_int_const(sv))
   {
     int big, n = fe_int_bits(dtt), du = fe_int_unsigned(dtt);
@@ -807,13 +891,13 @@ static void fe_check_conversion(CType *dt, const SValue *sv)
     if (n < 64 && (big || v < -((int64_t)1 << (n - 1)) || v > (int64_t)mask))
     {
       if (s1->warn_overflow)
-        tcc_fe_warning_c(warn_overflow, "%s conversion from '%s' to '%s' changes value from '%s' to '%s'",
+        FE_CONV_WARN(warn_overflow, "%s conversion from '%s' to '%s' changes value from '%s' to '%s'",
                          du ? "unsigned" : "overflow in", ss, ds, from, to);
     }
     else if (du && v < 0 && !big)
     {
       if (s1->warn_sign_conversion)
-        tcc_fe_warning_c(warn_sign_conversion, "unsigned conversion from '%s' to '%s' changes value from '%s' to '%s'",
+        FE_CONV_WARN(warn_sign_conversion, "unsigned conversion from '%s' to '%s' changes value from '%s' to '%s'",
                          ss, ds, from, to);
     }
     else if (!du && (big || (n < 64 && v > (int64_t)(mask >> 1))))
@@ -821,11 +905,11 @@ static void fe_check_conversion(CType *dt, const SValue *sv)
       if (fe_int_unsigned(stt) && fe_int_bits(stt) == n)
       {
         if (s1->warn_sign_conversion)
-          tcc_fe_warning_c(warn_sign_conversion, "signed conversion from '%s' to '%s' changes value from '%s' to '%s'",
+          FE_CONV_WARN(warn_sign_conversion, "signed conversion from '%s' to '%s' changes value from '%s' to '%s'",
                            ss, ds, from, to);
       }
       else if (s1->warn_conversion)
-        tcc_fe_warning_c(warn_conversion, "conversion from '%s' to '%s' changes value from '%s' to '%s'", ss, ds, from,
+        FE_CONV_WARN(warn_conversion, "conversion from '%s' to '%s' changes value from '%s' to '%s'", ss, ds, from,
                          to);
     }
     return;
@@ -844,11 +928,11 @@ static void fe_check_conversion(CType *dt, const SValue *sv)
       int n = fe_int_bits(dtt), du = fe_int_unsigned(dtt);
       double lo = du ? 0.0 : -ldexp(1.0, n - 1), hi = ldexp(1.0, n - du);
       if (v != (double)(int64_t)v || v < lo || v >= hi)
-        tcc_fe_warning_c(warn_conversion, "conversion from '%s' to '%s' changes value from '%.17g' to '%lld'", ss, ds,
+        FE_CONV_WARN(warn_conversion, "conversion from '%s' to '%s' changes value from '%.17g' to '%lld'", ss, ds,
                          v, (long long)(v < lo || v >= hi ? 0 : (int64_t)v));
     }
     else if (dbt == VT_FLOAT && (float)v != v)
-      tcc_fe_warning_c(warn_conversion, "conversion from '%s' to '%s' changes value from '%.17g' to '%.9g'", ss, ds, v,
+      FE_CONV_WARN(warn_conversion, "conversion from '%s' to '%s' changes value from '%.17g' to '%.9g'", ss, ds, v,
                        (double)(float)v);
     return;
   }
@@ -873,23 +957,29 @@ static void fe_check_conversion(CType *dt, const SValue *sv)
     if (narrows)
     {
       if (s1->warn_conversion)
-        tcc_fe_warning_c(warn_conversion, "conversion from '%s' to '%s' may change value", ss, ds);
+        FE_CONV_WARN(warn_conversion, "conversion from '%s' to '%s' may change value", ss, ds);
     }
     else if (s1->warn_sign_conversion)
-      tcc_fe_warning_c(warn_sign_conversion, "conversion to '%s' from '%s' may change the sign of the result", ds, ss);
+      FE_CONV_WARN(warn_sign_conversion, "conversion to '%s' from '%s' may change the sign of the result", ds, ss);
     return;
   }
   if (!s1->warn_conversion)
     return;
   if (is_float(sbt) && dint)
-    tcc_fe_warning_c(warn_conversion, "conversion from '%s' to '%s' may change value", ss, ds);
+    FE_CONV_WARN(warn_conversion, "conversion from '%s' to '%s' may change value", ss, ds);
   else if (sint && is_float(dbt) && fe_value_bits(stt) > fe_mantissa_bits(dbt))
-    tcc_fe_warning_c(warn_conversion, "conversion from '%s' to '%s' may change value", ss, ds);
+    FE_CONV_WARN(warn_conversion, "conversion from '%s' to '%s' may change value", ss, ds);
   else if (is_float(sbt) && sbt != VT_FLOAT && dbt == VT_FLOAT) /* double (and long double, also 8 bytes here) to float */
-    tcc_fe_warning_c(warn_conversion, "conversion from '%s' to '%s' may change value", ss, ds);
+    FE_CONV_WARN(warn_conversion, "conversion from '%s' to '%s' may change value", ss, ds);
 }
 
+#undef FE_CONV_WARN
+
 /* verify type compatibility to store vtop in 'dt' type */
+/* vstore: the destination is a plain yasc local (yasc_ro_local_ok), and the
+   value stored was read-only (yasc_ro_dropped) */
+int yasc_ro_local_ok, yasc_ro_dropped;
+
 void verify_assign_cast(CType *dt)
 {
   CType *st, *type1, *type2;
@@ -1000,6 +1090,14 @@ void verify_assign_cast(CType *dt)
         tcc_warning_once(warn_incompatible_pointer_types, "assignment from incompatible pointer type");
         break;
       }
+    }
+    /* yasc: a plain local takes a read-only value -- what flows into it is
+       followed (lifetime.c: written through, handed where it may be written,
+       it is an error), as for a value that may be null */
+    if (qualwarn == VT_CONSTANT && yasc_ro_local_ok)
+    {
+      yasc_ro_dropped = 1;
+      break;
     }
     if (qualwarn)
     {

@@ -2586,6 +2586,7 @@ LIBTCCAPI TCCState *tcc_new(void)
   s->warn_unused_result = 1;
   s->warn_deprecated_declarations = 1;
   s->warn_yasc_c_api = 1; /* only a yasc_c_api attribute (a header written from yasc) brings it */
+  s->warn_yasc_unsafe_call = 1; /* yasc code only, and only a yasc_unsafe declaration brings it */
   s->ms_extensions = 1;
   s->max_errors = 8; /* -fmax-errors=8: the first errors, then stop */
   s->unwind_tables = 1;
@@ -3480,6 +3481,7 @@ enum
   TCC_OPTION_ar,
   TCC_OPTION_impdef,
   TCC_OPTION_yasc_c_header,
+  TCC_OPTION_format,
   TCC_OPTION_dynamiclib,
   TCC_OPTION_flat_namespace,
   TCC_OPTION_two_levelnamespace,
@@ -3552,6 +3554,7 @@ static const TCCOption tcc_options[] = {
     {"Wp,", TCC_OPTION_Wp, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"W", TCC_OPTION_W, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"O", TCC_OPTION_O, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
+    {"format", TCC_OPTION_format, 0}, /* before "f" */
     {"fpie", TCC_OPTION_fpie, 0},
     {"fpic", TCC_OPTION_fpic, 0},
     {"fno-pic", TCC_OPTION_fno_pic, 0},
@@ -3657,6 +3660,7 @@ static const FlagDef options_W[] = {
        printf-style call and an untrusted source (ir/taint.c) */
     {offsetof(TCCState, warn_tainted_format), WD_SAFE, "tainted-format"},
     {offsetof(TCCState, warn_yasc_c_api), WD_ALL | WD_SAFE, "yasc-c-api"},
+    {offsetof(TCCState, warn_yasc_unsafe_call), WD_ALL | WD_SAFE, "yasc-unsafe-call"},
     {offsetof(TCCState, warn_implicit_function_declaration), WD_ALL | WD_SAFE_ERR, "implicit-function-declaration"},
     {offsetof(TCCState, warn_discarded_qualifiers), WD_ALL | WD_SAFE_ERR, "discarded-qualifiers"},
     /* Not in -Wall: a CFG walk per function, yasc only; the safe default has it. */
@@ -3681,6 +3685,11 @@ static const FlagDef options_W[] = {
     {offsetof(TCCState, warn_implicit_move), WD_STRICT, "implicit-move"},
     {offsetof(TCCState, warn_unchecked), WD_STRICT, "unchecked"},
     {offsetof(TCCState, warn_redundant_view), WD_SAFE, "redundant-view"},
+    /* yasc: `const` on any level an in parameter points to (const anyway) */
+    {offsetof(TCCState, warn_redundant_const), WD_SAFE, "redundant-const"},
+    /* yasc: `inout` wider than the body needs -- written before it is read
+       on every path (out), or never written (in, the default) */
+    {offsetof(TCCState, warn_param_access), WD_SAFE, "param-access"},
     /* yasc spells the null pointer one way: nullptr (NULL and 0 are
        regular C).  On in the safe default; -ccompat code says nothing. */
     {offsetof(TCCState, warn_zero_as_null_pointer_constant), WD_SAFE, "zero-as-null-pointer-constant"},
@@ -5157,6 +5166,9 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
       goto extra_action;
     case TCC_OPTION_yasc_c_header:
       x = OPT_YASC_C_HEADER;
+      goto extra_action;
+    case TCC_OPTION_format:
+      x = OPT_FORMAT;
       goto extra_action;
     case TCC_OPTION_ar:
       x = OPT_AR;

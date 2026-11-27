@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include "mem.h"
 
-static void note(const char *what)
+static void note(char *what)
 {
   printf("  %s\n", what);
 }
@@ -26,13 +26,13 @@ static int work(int fail_at)
 }
 
 /* The buffer is freed on every way out, without repeating mem_free. */
-static int shout(const char *s)
+static int shout(char *s)
 {
-  char * owned maybe buf = mem_strdup(s);
+  char *?owned buf = mem_strdup(s);
   if (!buf)
     return -1;
   defer mem_free(buf);
-  for (char * view p = buf; *p; p++)
+  for (char *view p = buf; *p; p++)
     if (*p >= 'a' && *p <= 'z')
       *p = cast<int(char)>(*p - 'a' + 'A');
   if (buf[0] == 'Q')

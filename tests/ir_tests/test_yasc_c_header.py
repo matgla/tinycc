@@ -24,6 +24,7 @@ ATTRS = """\
 #define __yl_cstr(n)
 #define __yl_view
 #define __yl_view_maybe
+#define __yl_access(mode, ref, size) __attribute__((__access__(mode, ref, size)))
 """
 
 SOURCE = """\
@@ -43,24 +44,29 @@ int legacy_use(char *p) __yl_nonnull(1);
 
 typedef struct rec rec;
 struct rec {
-  char * view name;
-  int * view maybe next;
+  char *name;
+  int *?next;
   char buf[8];
 };
 
 typedef struct ctx {
-  const char * view maybe path;
-  long * view result;
+  const char *?path;
+  long *result;
 } ctx;
 typedef char ctx_fits[(sizeof(ctx) <= 16) ? 1 : -1];
 
-void rec_free(int flags, drop rec * owned maybe r);
-rec * owned(rec_free) maybe rec_new(const char *name) __yl_nonnull(1);
-char * borrows(s) maybe rec_find(const char *s, int c);
-long rec_read(inout rec *r, out char * maybe dst, in const char *src);
-int rec_open(int owned(close) fd, char * owned(free) maybe *out_name);
-char * borrows(path) rec_base(inout char path[maybe :0]);
-int rec_sort(rec *base, int (* view cmp)(const rec *, const rec *));
+void rec_free(int flags, drop rec *?owned r);
+rec *?owned(rec_free) rec_new(char *name) __yl_nonnull(1);
+char *?borrows(s) rec_find(char *s, int c);
+long rec_read(inout rec *r, out char *?dst, in char *src);
+int rec_open(int owned(close) fd, char *?owned(free) *out_name);
+char *borrows(path) rec_base(inout char path[maybe :0]);
+int rec_sort(inout rec *base, int (*view cmp)(rec *, rec *));
+long rec_fill(int fd, out void buf[?n], unsigned long n);
+void rec_copy(out char dst[n], char src[n], unsigned long n);
+int rec_sum(unsigned long n, int v[n]);
+void rec_bump(inout int v[k], int k);
+int rec_pair(out int ?owned(close) fds[2]);
 #ifdef __YASC__
 int rec_count([]const char names);
 #else
@@ -105,6 +111,11 @@ long rec_read(rec *r, char *dst, const char *src);
 int rec_open(int fd, char **out_name);
 char *rec_base(char path[]) __yl_cstr(1);
 int rec_sort(rec *base, int (*cmp)(const rec *, const rec *));
+long rec_fill(int fd, void *buf, unsigned long n) __yl_access(write_only, 2, 3);
+void rec_copy(char *dst, const char *src, unsigned long n) __yl_access(write_only, 1, 3) __yl_access(read_only, 2, 3);
+int rec_sum(unsigned long n, const int *v) __yl_access(read_only, 2, 1);
+void rec_bump(int *v, int k) __yl_access(read_write, 1, 2);
+int rec_pair(int fds[2]);
 int rec_count(const char *names, int n);
 #endif /* __YASC__ */
 """
@@ -141,13 +152,25 @@ def test_c_header_is_c99(tmp_path):
     assert proc.returncode == 0, proc.stderr
 
 
+def test_sized_parameter_checked_from_c(tmp_path):
+    """`T p[n]` is `T *p` in C with __yl_access: a C caller's call is checked as a yasc one's."""
+    inc = _tree(tmp_path)
+    assert _gen(inc, "-o", "rec.h").returncode == 0
+    use = tmp_path / "use.c"
+    use.write_text("#include <rec.h>\nvoid f(const char *s) { char d[4]; rec_copy(d, s, 8); }\n")
+    proc = subprocess.run([str(TCC), "-ccompat", "-ffortify", "-Wstringop-overflow", "-c", f"-I{inc}", str(use), "-o", str(tmp_path / "use.o")], capture_output=True,
+                          text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "'rec_copy' accesses 8 bytes of an object of 4" in proc.stderr, proc.stderr
+
+
 def test_yasc_unit_reads_the_source(tmp_path):
     inc = _tree(tmp_path)
     assert _gen(inc, "-o", "rec.h").returncode == 0
     use = tmp_path / "use.c"
     use.write_text("#include <rec.h>\n"
                    "int f(void) { return *rec_find(\"x\", 'x'); }\n"
-                   "void g(void) { rec * owned maybe r = rec_new(\"a\"); rec_free(0, r); }\n")
+                   "void g(void) { rec *?owned r = rec_new(\"a\"); rec_free(0, r); }\n")
     proc = subprocess.run([str(TCC), "-std=yasc", "-fsyntax-only", "-Wno-missing-prototypes", f"-I{inc}", str(use)],
                           capture_output=True, text=True)
     assert "use.c:2: error: a pointer that may be null is dereferenced" in proc.stderr, proc.stderr
@@ -197,7 +220,7 @@ def test_c_section_survives_an_include(tmp_path, before):
     (tmp_path / "inline.h").write_text("static inline int up(int c) { return c + 1; }\n")
     (tmp_path / "h.h").write_text("#pragma yasc\n#pragma tcc c_begin\n#include \"other.h\"\n"
                                   "struct s { char *p; };\nint c_fn(char *p);\n#pragma tcc c_end\n"
-                                  "char *y_p;\n")  # (a parameter's own pointer would be a view)
+                                  "char *y_p(void);\n")  # (a function's result says it; a global's is a view)
     (tmp_path / "u.c").write_text(before + "#include \"h.h\"\n")
     proc = subprocess.run([str(TCC), "-std=yasc", "-fsyntax-only", str(tmp_path / "u.c")], capture_output=True,
                           text=True)
@@ -215,3 +238,19 @@ def test_c_header_after_a_yasc_one(tmp_path):
     proc = subprocess.run([str(TCC), "-std=yasc", "-fsyntax-only", str(tmp_path / "u.c")], capture_output=True,
                           text=True)
     assert "error" not in proc.stderr, proc.stderr
+
+
+def test_parameter_words_used_as_names(tmp_path):
+    """out / inout / drop are words where a parameter starts (or before an int
+    handle's words) and names everywhere else: the names stay in the C header"""
+    inc = _tree(tmp_path, "#pragma yasc\n#pragma once\n"
+                "struct w { int out; int drop; char *inout; };\n"
+                "void name(out char *out, int drop, inout int *inout);\n"
+                "int close(int drop ?owned(close) fd);\n"
+                "static inline int sum(int out, int in) { int drop = out + in; return drop; }\n")
+    proc = _gen(inc)
+    assert proc.returncode == 0, proc.stderr
+    assert "struct w { int out; int drop; char *inout __yl_view; };" in proc.stdout, proc.stdout
+    assert "void name(char *out, int drop, int *inout);" in proc.stdout, proc.stdout
+    assert "int close(int fd);" in proc.stdout, proc.stdout
+    assert "static inline int sum(int out, int in) { int drop = out + in; return drop; }" in proc.stdout, proc.stdout

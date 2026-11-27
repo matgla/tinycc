@@ -117,6 +117,22 @@ void str_lit_pool_merge(addr_t pre_off)
   }
 }
 
+/* The .rodata offset of LEN bytes at BYTES (a string with its NUL), shared
+ * with every identical string literal of the unit: @src()'s file and function
+ * names (builtin/misc.c), whose words hold distances within .rodata and so
+ * need the offset, not a symbol. */
+addr_t str_lit_pool_intern(const char *bytes, addr_t len)
+{
+  unsigned int h = str_lit_hash((const unsigned char *)bytes, len);
+  addr_t off;
+  if (str_lit_pool_find(h, (const unsigned char *)bytes, len, &off))
+    return off;
+  off = section_add(rodata_section, len, 4);
+  memcpy(rodata_section->data + off, bytes, len);
+  str_lit_pool_add(h, off, len);
+  return off;
+}
+
 /* define a new external reference to a symbol 'v' of type 'u' */
 ST_FUNC Sym *external_global_sym(int v, CType *type)
 {

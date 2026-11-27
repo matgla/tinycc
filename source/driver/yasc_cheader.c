@@ -28,6 +28,7 @@ typedef struct YhTok
   int kind;
   int start, end;
   int del;
+  int pword; /* a parameter word: in, unused, out, inout or drop where a parameter's declaration starts */
   const char *repl;
   char ins[256];
 } YhTok;
@@ -221,10 +222,49 @@ static int yh_word_with_group(YhState *st, YhTok *t)
   return yh_is(st, t, "owned") || yh_is(st, t, "borrows") || yh_is(st, t, "takes");
 }
 
+/* The parameter words (in, unused, out, inout, drop) are words only where a parameter's declaration
+   starts -- after '(' or ',' or another of them, a name after them -- or, out / inout / drop, before a
+   handle's owned / view / maybe; names everywhere else (`char *out`, `int drop;`), as the compiler
+   reads them. */
+static int yh_storage_word(YhState *st, YhTok *t);
+
+static void yh_mark_pwords(YhState *st, YhToks *v)
+{
+  static const char *const words[] = {"in", "unused", "out", "inout", "drop", NULL};
+  int i, k, p, n;
+  for (i = 0; i < (int)v->size; i++) {
+    YhTok *t = &v->data[i];
+    if (t->kind != YH_ID)
+      continue;
+    for (k = 0; words[k] && !yh_is(st, t, words[k]); k++)
+      ;
+    if (!words[k])
+      continue;
+    p = yh_prev(v, i, 0);
+    n = yh_next(v, i + 1, (int)v->size);
+    t->pword = p >= 0 && (yh_is(st, &v->data[p], "(") || yh_is(st, &v->data[p], ",") || v->data[p].pword) &&
+               n < (int)v->size && v->data[n].kind == YH_ID;
+    /* `inout` before a function's type (its view result is written
+       through): where a declaration starts, a type after it */
+    if (k == 3 && n < (int)v->size && v->data[n].kind == YH_ID &&
+        (p < 0 || yh_is(st, &v->data[p], ";") || yh_is(st, &v->data[p], "}") || yh_is(st, &v->data[p], "{") ||
+         yh_storage_word(st, &v->data[p]) || v->data[p].kind == YH_PP))
+      t->pword = 1;
+    /* after a handle's type: `int drop owned(close) maybe fd` */
+    if (k >= 2 && n < (int)v->size &&
+        (yh_is(st, &v->data[n], "owned") || yh_is(st, &v->data[n], "view") || yh_is(st, &v->data[n], "maybe")))
+      t->pword = 1;
+  }
+}
+
+static int yh_pword(YhState *st, YhTok *t, const char *word)
+{
+  return t->pword && yh_is(st, t, word);
+}
+
 static int yh_word_alone(YhState *st, YhTok *t)
 {
-  return yh_is(st, t, "view") || yh_is(st, t, "maybe") || yh_is(st, t, "drop") || yh_is(st, t, "out") ||
-         yh_is(st, t, "inout");
+  return yh_is(st, t, "view") || yh_is(st, t, "maybe") || t->pword;
 }
 
 /* Leaves out the yasc words of tokens [a, b); body: a function's, where yasc statements have no C form. */
@@ -249,11 +289,11 @@ static void yh_strip(YhState *st, YhToks *v, int a, int b, int body)
       }
     } else if (yh_word_alone(st, t)) {
       t->del = 1;
-    } else if (yh_is(st, t, "in")) {
-      p = yh_prev(v, i, a);
-      n = yh_next(v, i + 1, b);
-      if (p >= 0 && (yh_is(st, &v->data[p], "(") || yh_is(st, &v->data[p], ",")) && n < b && v->data[n].kind == YH_ID)
-        t->del = 1;
+    } else if (body && yh_is(st, t, "unused") && (p = yh_prev(v, i, a)) >= 0 &&
+               (yh_is(st, &v->data[p], ";") || yh_is(st, &v->data[p], "{") || yh_is(st, &v->data[p], "}")) &&
+               (n = yh_next(v, i + 1, b)) < b && yh_is(st, &v->data[n], "(")) {
+      yh_error(st, t->start, "a yasc statement in an inline function has no C form: define it under #ifdef __YASC__",
+               "unused");
     } else if (yh_is(st, t, "nullptr")) {
       t->repl = "((void *)0)";
     } else if (yh_is(st, t, "[")) {
@@ -339,7 +379,7 @@ static void yh_level(YhState *st, YhToks *v, int a, int b, int param, YhLevel *l
       lv->view = 1;
     else if (yh_is(st, t, "maybe"))
       lv->maybe = 1;
-    else if (yh_is(st, t, "drop"))
+    else if (yh_pword(st, t, "drop"))
       lv->drop = 1;
     else if (yh_is(st, t, "borrows"))
       lv->borrows = 1;
@@ -438,12 +478,53 @@ static void yh_capi_text(YhState *st, YhToks *v, int a, int b, int param, char *
                !yh_word_with_group(st, t) && !yh_attr_word(st, t) && !yh_is(st, t, "c_api"))
         name = i;
     }
+  /* an in parameter (no inout / out / drop, a pointer not owned): every level it points to is const in
+     yasc, written or not -- the last top-level '*' is its own unless it is an array */
+  /* ... and a view result (`view` / `borrows(...)`, no inout before the type): read-only too */
+  int in = param || yh_has_word(st, v, a, b, "view") || yh_has_word(st, v, a, b, "borrows"), own_star = -1,
+      base_const = 0, any_ptr = 0;
+  if (in) {
+    int first_star = -1, array = 0;
+    /* (the yasc type, not a C one: `in` only says what yasc makes const) */
+    for (i = a, depth = 0; i < b; i++) {
+      YhTok *t = &v->data[i];
+      if (yh_pword(st, t, "out") || yh_pword(st, t, "inout") || yh_pword(st, t, "drop") || yh_is(st, t, "owned"))
+        in = 0;
+      if (yh_word_with_group(st, t) || yh_attr_word(st, t) || yh_is(st, t, "c_api")) {
+        i = yh_past_group(st, v, i, b) - 1;
+        continue;
+      }
+      if (yh_is(st, t, "(") && depth == 0)
+        in = 0; /* a function pointer: its parameters are its own */
+      if (yh_is(st, t, "(") || yh_is(st, t, "[")) {
+        if (depth == 0 && yh_is(st, t, "["))
+          array = 1;
+        depth++;
+      } else if (yh_is(st, t, ")") || yh_is(st, t, "]"))
+        depth--;
+      else if (depth == 0 && yh_is(st, t, "*")) {
+        if (first_star < 0)
+          first_star = i;
+        last_star = i;
+      } else if (first_star < 0 && yh_is(st, t, "const"))
+        base_const = 1;
+    }
+    /* the parameter words stand before the slot (yh_capi starts past them) */
+    for (i = yh_prev(v, a, 0); i >= 0 && v->data[i].pword; i = yh_prev(v, i, 0))
+      if (yh_is(st, &v->data[i], "out") || yh_is(st, &v->data[i], "inout") || yh_is(st, &v->data[i], "drop"))
+        in = 0;
+    any_ptr = array || last_star >= 0;
+    own_star = array ? -1 : last_star;
+    in = in && any_ptr;
+  }
   buf[0] = 0;
+  if (in && !base_const)
+    yh_append(buf, size, "const");
   for (i = a; i < b; i++) {
     YhTok *t = &v->data[i];
     char word[96];
     int n;
-    if (!yh_sig(t) || i == name || yh_word_alone(st, t) || (param && yh_is(st, t, "in")))
+    if (!yh_sig(t) || i == name || yh_word_alone(st, t))
       continue;
     if (yh_word_with_group(st, t) || yh_attr_word(st, t) || yh_is(st, t, "c_api")) {
       i = yh_past_group(st, v, i, b) - 1;
@@ -457,6 +538,23 @@ static void yh_capi_text(YhState *st, YhToks *v, int a, int b, int param, char *
     if (buf[0] && strcmp(word, "]") && strcmp(word, ")") && buf[strlen(buf) - 1] != '[' && buf[strlen(buf) - 1] != '(')
       yh_append(buf, size, " ");
     yh_append(buf, size, word);
+    if (in && yh_is(st, t, "*") && i != own_star) {
+      /* a level it points to: const, unless written so */
+      int k = i + 1, c = 0;
+      for (; k < b; k++) {
+        YhTok *u = &v->data[k];
+        if (!yh_sig(u) || yh_word_alone(st, u))
+          continue;
+        if (yh_word_with_group(st, u) || yh_is(st, u, "c_api")) {
+          k = yh_past_group(st, v, k, b) - 1;
+          continue;
+        }
+        c = yh_is(st, u, "const");
+        break;
+      }
+      if (!c)
+        yh_append(buf, size, " const");
+    }
   }
 }
 
@@ -501,7 +599,7 @@ static void yh_capi(YhState *st, YhToks *v, int a, int b, int name, int lp, int 
     /* storage classes, attributes and the parameter words stay where they are */
     for (start = yh_next(v, start, i); start < i;) {
       YhTok *u = &v->data[start];
-      if (yh_storage_word(st, u) || yh_word_alone(st, u) || yh_is(st, u, "in"))
+      if (yh_storage_word(st, u) || yh_word_alone(st, u))
         start = yh_next(v, start + 1, i);
       else if (yh_attr_word(st, u))
         start = yh_next(v, yh_past_group(st, v, start, i), i);
@@ -549,13 +647,71 @@ static void yh_capi(YhState *st, YhToks *v, int a, int b, int name, int lp, int 
   }
 }
 
+/* A parameter slot [a, b): its name (the identifier before its outermost '[', else its last identifier that
+   is no C or yasc word), and that '[' (-1: none). */
+static int yh_param_name(YhState *st, YhToks *v, int a, int b, int *bracket)
+{
+  int i, depth = 0, name = -1;
+  *bracket = -1;
+  for (i = a; i < b; i++) {
+    YhTok *t = &v->data[i];
+    if (!yh_sig(t))
+      continue;
+    if (yh_is(st, t, "(") || yh_is(st, t, "[")) {
+      if (depth == 0 && yh_is(st, t, "[") && *bracket < 0) {
+        *bracket = i;
+        return name;
+      }
+      depth++;
+    } else if (yh_is(st, t, ")") || yh_is(st, t, "]"))
+      depth--;
+    else if (depth == 0 && t->kind == YH_ID && !yh_type_word(st, t) && !yh_attr_word(st, t) &&
+             !yh_word_with_group(st, t) && !yh_word_alone(st, t) && !yh_is(st, t, "in") && !yh_is(st, t, "c_api")) {
+      int n = yh_next(v, i + 1, b);
+      if (!(n < b && yh_is(st, &v->data[n], "(")))
+        name = i;
+    }
+  }
+  return name;
+}
+
+/* yasc `T p[n]`, n another parameter (index j, from 1): C has no such form (n may come later, `void p[n]` is no
+   array), so p is `T *p` and the call check is __yl_access(mode, p, n) -- const elements read, `out` written,
+   else both, as the yasc frontend says (decl/declarator.c param_bounds_apply). */
+static void yh_sized_param(YhState *st, YhToks *v, int a, int b, int pname, int bracket, int index, int j,
+                           char *attrs, size_t asize)
+{
+  int k, star = -1, cnst = 0, c = yh_close(st, v, bracket, b);
+  char num[96];
+  for (k = a; k < pname; k++)
+    if (yh_is(st, &v->data[k], "*"))
+      star = k;
+  for (k = star >= 0 ? star + 1 : a; k < pname; k++)
+    if (yh_is(st, &v->data[k], "const"))
+      cnst = 1;
+  /* an in parameter (no out / inout / drop) is read-only on every level */
+  snprintf(num, sizeof num, " __yl_access(%s, %d, %d)",
+           cnst                                     ? "read_only"
+           : yh_has_word(st, v, a, pname, "out")    ? "write_only"
+           : yh_has_word(st, v, a, pname, "inout") ||
+                   yh_has_word(st, v, a, pname, "drop") ? "read_write"
+                                                        : "read_only",
+           index, j);
+  yh_append(attrs, asize, num);
+  for (k = bracket; k <= c; k++)
+    v->data[k].del = 1;
+  yh_append(v->data[pname].ins, sizeof v->data[pname].ins, "*");
+}
+
 /* A prototype: its name at name, its parameters in (lp, rp); the attributes go before the ';' at semi. */
 static void yh_prototype(YhState *st, YhToks *v, int a, int name, int lp, int rp, int semi)
 {
   YhLevel res;
   char attrs[240] = "", num[96], cstr[64] = "";
-  int i, start = lp + 1, depth = 0, index = 0, drop_arg = 0;
+  int i, start = lp + 1, depth = 0, index = 0, drop_arg = 0, w, eq = -1;
+  int np = 0, ps[32], pe[32], pn[32], pb[32];
   yh_level(st, v, a, name, 0, &res);
+  /* the parameters' slots and names first: a bound may name a later one */
   for (i = lp + 1; i <= rp; i++) {
     YhTok *t = &v->data[i];
     if (yh_is(st, t, "(") || yh_is(st, t, "["))
@@ -564,14 +720,67 @@ static void yh_prototype(YhState *st, YhToks *v, int a, int name, int lp, int rp
       depth--;
     if (i == rp || (depth == 0 && yh_is(st, t, ","))) {
       int f = yh_next(v, start, i);
+      if (f < i && !(yh_is(st, &v->data[f], "void") && yh_next(v, f + 1, i) == i) && !yh_is(st, &v->data[f], ".") &&
+          np < 32) {
+        ps[np] = start, pe[np] = i;
+        pn[np] = yh_param_name(st, v, start, i, &pb[np]);
+        np++;
+      }
+      start = i + 1;
+    }
+  }
+  for (i = 0; i < np; i++) {
+    int k, c, bound = -1, j;
+    if (pb[i] < 0 || pn[i] < 0)
+      continue;
+    c = yh_close(st, v, pb[i], pe[i]);
+    for (k = yh_next(v, pb[i] + 1, c); k < c; k = yh_next(v, k + 1, c)) {
+      YhTok *t = &v->data[k];
+      if (yh_is(st, t, "?") || yh_is(st, t, "maybe") || yh_is(st, t, "view") || yh_is(st, t, "owned"))
+        continue;
+      if (bound >= 0 || t->kind != YH_ID) {
+        bound = -2;
+        break;
+      }
+      bound = k;
+    }
+    if (bound < 0)
+      continue;
+    for (j = 0; j < np; j++)
+      if (j != i && pn[j] >= 0 && v->data[pn[j]].end - v->data[pn[j]].start == v->data[bound].end - v->data[bound].start &&
+          !memcmp(st->src + v->data[pn[j]].start, st->src + v->data[bound].start,
+                  v->data[bound].end - v->data[bound].start))
+        break;
+    if (j < np && !yh_has_word(st, v, rp, semi, "__yl_access"))
+      yh_sized_param(st, v, ps[i], pe[i], pn[i], pb[i], i + 1, j + 1, attrs, sizeof attrs);
+  }
+  start = lp + 1, depth = 0;
+  for (i = lp + 1; i <= rp; i++) {
+    YhTok *t = &v->data[i];
+    if (yh_is(st, t, "(") || yh_is(st, t, "["))
+      depth++;
+    else if ((yh_is(st, t, ")") || yh_is(st, t, "]")) && i != rp)
+      depth--;
+    else if (depth == 0 && eq < 0 && yh_is(st, t, "="))
+      eq = i;
+    if (i == rp || (depth == 0 && yh_is(st, t, ","))) {
+      int f = yh_next(v, start, i);
+      /* `T p = default` (a yasc default argument): C callers pass every argument */
+      if (eq >= 0) {
+        int k = yh_prev(v, eq, start);
+        for (k = k < 0 ? eq : k + 1; k < i; k++)
+          v->data[k].del = 1;
+        eq = -1;
+      }
       if (f < i && !(yh_is(st, &v->data[f], "void") && yh_next(v, f + 1, i) == i) && !yh_is(st, &v->data[f], ".")) {
         index++;
         if (yh_has_word(st, v, start, i, ":") && !yh_has_word(st, v, rp, semi, "__yl_cstr")) {
           snprintf(num, sizeof num, " __yl_cstr(%d)", index);
           yh_append(cstr, sizeof cstr, num);
         }
-        if (yh_has_word(st, v, start, i, "drop") && !drop_arg)
-          drop_arg = index;
+        for (w = start; w < i && !drop_arg; w++)
+          if (yh_pword(st, &v->data[w], "drop"))
+            drop_arg = index;
       }
       start = i + 1;
     }
@@ -601,7 +810,28 @@ static void yh_prototype(YhState *st, YhToks *v, int a, int name, int lp, int rp
   }
 }
 
-/* A struct's members [a, b): a `view` member pointer becomes __yl_view (or __yl_view_maybe). */
+/* a function pointer among [a, b): a '(' followed by '*' at depth 0 */
+static int yh_fnptr(YhState *st, YhToks *v, int a, int b)
+{
+  int i, depth = 0;
+  for (i = a; i < b; i++) {
+    YhTok *t = &v->data[i];
+    if (!yh_sig(t))
+      continue;
+    if (yh_is(st, t, "(")) {
+      int n = yh_next(v, i + 1, b);
+      if (depth == 0 && n < b && yh_is(st, &v->data[n], "*"))
+        return 1;
+      depth++;
+    } else if (yh_is(st, t, ")"))
+      depth--;
+  }
+  return 0;
+}
+
+/* A struct's members [a, b): a member pointer that is a view -- written, or
+   plain (a member's pointer is a view unless it says owned or borrows) --
+   becomes __yl_view (or __yl_view_maybe).  A function pointer is neither. */
 static void yh_members(YhState *st, YhToks *v, int a, int b)
 {
   int i, start = a, depth = 0;
@@ -617,12 +847,136 @@ static void yh_members(YhState *st, YhToks *v, int a, int b)
       if (first < i && !yh_has_word(st, v, first, i, "{")) {
         yh_capi(st, v, start, i, -1, -1, -1, NULL, 0);
         yh_level(st, v, start, i, 0, &lv);
-        if (lv.pointer && lv.view) {
+        if (lv.pointer && (lv.view || (!lv.owned && !lv.borrows && !yh_fnptr(st, v, start, i)))) {
           yh_append(t->ins, sizeof t->ins, lv.maybe ? " __yl_view_maybe" : " __yl_view");
           st->need_attrs = 1;
         }
       }
       start = i + 1;
+    }
+  }
+}
+
+/* A parameter [s, e) whose target is read-only in yasc (`in`, the default: no inout / out / drop, a pointer
+   not owned) says so in C: the level it points to gets the `const` it lacks.  The first level only -- C
+   converts `char **` to `char * const *` but not to `const char * const *` -- so `char *s` is
+   `const char *s`, `char **pp` `char *const *pp`, `char *argv[]` `char *const argv[]`.  c_api(...) says the
+   C type itself; a function pointer's parameters are their own list (yh_in_scan). */
+static void yh_in_param(YhState *st, YhToks *v, int s, int e)
+{
+  int i, depth = 0, nstar = 0, star[16], array = -1, first = yh_next(v, s, e), target, k;
+  if (first >= e || yh_is(st, &v->data[first], "[") || yh_is(st, &v->data[first], "."))
+    return;
+  for (i = s; i < e; i++) {
+    YhTok *t = &v->data[i];
+    if (!yh_sig(t))
+      continue;
+    if (depth == 0 && (yh_pword(st, t, "out") || yh_pword(st, t, "inout") || yh_pword(st, t, "drop") ||
+                       yh_is(st, t, "owned") || yh_is(st, t, "c_api")))
+      return;
+    if (yh_is(st, t, "(") && depth == 0 && !yh_attr_word(st, &v->data[yh_prev(v, i, s) < 0 ? i : yh_prev(v, i, s)]) &&
+        !yh_word_with_group(st, &v->data[yh_prev(v, i, s) < 0 ? i : yh_prev(v, i, s)]))
+      return; /* a function pointer or a function: its parameters are their own */
+    if (yh_is(st, t, "(") || yh_is(st, t, "[")) {
+      if (depth == 0 && yh_is(st, t, "[") && array < 0)
+        array = i; /* `T a[n]`: an array parameter, `[` after its name */
+      depth++;
+    } else if (yh_is(st, t, ")") || yh_is(st, t, "]"))
+      depth--;
+    else if (depth == 0 && yh_is(st, t, "*") && array < 0) {
+      if (nstar == 16)
+        return;
+      star[nstar++] = i;
+    }
+  }
+  if (array < 0 && nstar == 0)
+    return;
+  /* the level the parameter points to: the base type (-1) or a '*' */
+  target = array >= 0 ? nstar - 1 : nstar - 2;
+  if (target < 0) {
+    int end = nstar ? star[0] : array;
+    for (i = s; i < end; i++)
+      if (yh_is(st, &v->data[i], "const"))
+        return;
+    /* before the type, after the parameter words and attributes */
+    for (i = first; i < end;) {
+      YhTok *t = &v->data[i];
+      if (t->pword)
+        i = yh_next(v, i + 1, end);
+      else if (yh_attr_word(st, t))
+        i = yh_next(v, yh_past_group(st, v, i, end), end);
+      else
+        break;
+    }
+    if (i < end)
+      yh_append(v->data[i].ins, sizeof v->data[i].ins, "const ");
+    return;
+  }
+  {
+    int end = target + 1 < nstar ? star[target + 1] : (array >= 0 ? array : e);
+    for (i = star[target] + 1; i < end; i++)
+      if (yh_is(st, &v->data[i], "const"))
+        return;
+    /* right after the '*', past the yasc words the C header drops */
+    for (k = yh_next(v, star[target] + 1, e); k < end;) {
+      YhTok *t = &v->data[k];
+      if (yh_word_alone(st, t))
+        k = yh_next(v, k + 1, end);
+      else if (yh_word_with_group(st, t))
+        k = yh_next(v, yh_past_group(st, v, k, end), end);
+      else
+        break;
+    }
+    if (k < e)
+      yh_append(v->data[k].ins, sizeof v->data[k].ins, "const ");
+  }
+}
+
+/* The parameter list (lp, rp) */
+static void yh_in_params(YhState *st, YhToks *v, int lp, int rp)
+{
+  int i, start = lp + 1, depth = 0;
+  for (i = lp + 1; i <= rp; i++) {
+    YhTok *t = &v->data[i];
+    if (i < rp && (yh_is(st, t, "(") || yh_is(st, t, "[")))
+      depth++;
+    else if (i < rp && (yh_is(st, t, ")") || yh_is(st, t, "]")))
+      depth--;
+    else if (i == rp || (depth == 0 && yh_is(st, t, ","))) {
+      yh_in_param(st, v, start, i);
+      start = i + 1;
+    }
+  }
+}
+
+/* Declaration [a, b) with the parameter list of its name at lp (-1: none): every parameter list in it -- that
+   one, and a function pointer's `(*f)(...)` at any depth -- says the const of its in parameters
+   (yh_in_param).  A function's body is left alone. */
+static void yh_in_scan(YhState *st, YhToks *v, int a, int b, int lp)
+{
+  int i, sp = 0, stack[64], closed_start = -1, closed_end = -1;
+  for (i = a; i < b; i++) {
+    YhTok *t = &v->data[i];
+    int p;
+    if (!yh_sig(t))
+      continue;
+    p = yh_prev(v, i, a);
+    if (yh_is(st, t, "{") && p >= 0 && yh_is(st, &v->data[p], ")")) {
+      i = yh_close(st, v, i, b);
+      continue;
+    }
+    if (yh_is(st, t, "(")) {
+      int n;
+      if (i == lp || (p >= 0 && p == closed_end && (n = yh_next(v, closed_start + 1, b)) < b &&
+                      (yh_is(st, &v->data[n], "*") || yh_is(st, &v->data[n], "^"))))
+        yh_in_params(st, v, i, yh_close(st, v, i, b));
+      if (sp < 64)
+        stack[sp] = i;
+      sp++;
+    } else if (yh_is(st, t, ")") && sp > 0) {
+      sp--;
+      closed_start = sp < 64 ? stack[sp] : -1;
+      closed_end = i;
     }
   }
 }
@@ -660,6 +1014,7 @@ static void yh_declaration(YhState *st, int a, int b)
     else if (yh_is(st, t, ")") || yh_is(st, t, "]") || yh_is(st, t, "}"))
       depth--;
   }
+  yh_in_scan(st, v, first, b, lp);
   if (yh_is(st, &v->data[first], "typedef")) {
     /* typedef struct s { ... } s; -- the members still carry their view */
     if (brace >= 0)
@@ -773,6 +1128,7 @@ static void yh_define(YhState *st, YhTok *t)
   YhToks sub;
   YhToks_init(&sub);
   yh_tokenize(st, t->start, t->end, 0, &sub);
+  yh_mark_pwords(st, &sub);
   yh_strip(st, &sub, 0, (int)sub.size, 0);
   yh_emit_range(st, &sub, 0, (int)sub.size);
   YhToks_cleanup(&sub);
@@ -786,6 +1142,7 @@ static int yh_run(YhState *st, const char *include_as)
   char line[256];
   YhText body;
   yh_tokenize(st, 0, st->len, 1, v);
+  yh_mark_pwords(st, v);
   for (i = 0; i < (int)v->size;) {
     YhTok *t = &v->data[i];
     if (t->kind == YH_PP) {
@@ -922,6 +1279,84 @@ static char *yh_read_file(const char *path, int *len)
   return buf;
 }
 
+/* The pointer words as the compiler reads them (tccpp.c yasc_glue) back in the
+   spelling the rest of this file knows: `*?owned` is `* maybe owned`,
+   `*@(const, owned)` is `* const  owned `, `a[?4]` is `a[maybe 4]`,
+   `int ?owned(close) fd` is `int maybe owned(close) fd`.  Lines stay where
+   they are; strings, character constants and comments are copied. */
+static char *yh_normalize(const char *s, int n, int *out_len)
+{
+  YhText o;
+  int i = 0, depth;
+  YhText_init(&o);
+  while (i < n) {
+    char c = s[i];
+    if (c == '"' || c == '\'') {
+      int e = yh_skip_quoted(s, i, n);
+      yh_cat(&o, s + i, e - i);
+      i = e;
+      continue;
+    }
+    if (c == '/' && i + 1 < n && (s[i + 1] == '*' || s[i + 1] == '/')) {
+      int e = i + 2;
+      if (s[i + 1] == '*') {
+        while (e + 1 < n && !(s[e] == '*' && s[e + 1] == '/'))
+          e++;
+        e = e + 2 > n ? n : e + 2;
+      } else
+        while (e < n && s[e] != '\n')
+          e++;
+      yh_cat(&o, s + i, e - i);
+      i = e;
+      continue;
+    }
+    if (c == '?' && i > 0 && (s[i - 1] == '*' || s[i - 1] == '[')) {
+      /* glued: `*?`, `[?` */
+      yh_cat(&o, s[i - 1] == '[' ? "maybe " : " maybe ", -1);
+      i++;
+      if (i + 1 < n && s[i] == '@' && s[i + 1] == '(')
+        goto group;
+      continue;
+    }
+    if (c == '?' && i + 1 < n &&
+        ((!strncmp(s + i + 1, "owned", 5) && !yh_is_idchar((unsigned char)s[i + 6])) ||
+         (!strncmp(s + i + 1, "view", 4) && !yh_is_idchar((unsigned char)s[i + 5])))) {
+      yh_cat(&o, "maybe ", -1);
+      i++;
+      continue;
+    }
+    if (c == '@' && i + 1 < n && s[i + 1] == '(' && i > 0 && s[i - 1] == '*') {
+    group:
+      depth = 0;
+      yh_cat(&o, " ", 1);
+      i++; /* the '@' */
+      for (; i < n; i++) {
+        if (s[i] == '(' && depth++ == 0) {
+          yh_cat(&o, " ", 1);
+          continue;
+        }
+        if (s[i] == ')' && --depth == 0) {
+          yh_cat(&o, " ", 1);
+          i++;
+          break;
+        }
+        if (s[i] == ',' && depth == 1) {
+          yh_cat(&o, " ", 1);
+          continue;
+        }
+        yh_cat(&o, s + i, 1);
+      }
+      continue;
+    }
+    yh_cat(&o, s + i, 1);
+    i++;
+  }
+  yh_cat(&o, "", 0);
+  *out_len = (int)o.size;
+  YhText_push_back(&o, 0);
+  return o.data;
+}
+
 ST_FUNC int tcc_tool_yasc_c_header(TCCState *s1, int argc, char **argv)
 {
   const char *in = NULL, *outname = NULL, *include_as = NULL, *p;
@@ -954,6 +1389,11 @@ ST_FUNC int tcc_tool_yasc_c_header(TCCState *s1, int argc, char **argv)
   if (!st.src) {
     fprintf(stderr, "%s: error: cannot read it\n", in);
     return 1;
+  }
+  {
+    char *norm = yh_normalize(st.src, st.len, &st.len);
+    tcc_free((char *)st.src);
+    st.src = norm;
   }
   YhToks_init(&st.toks);
   YhDroppers_init(&st.droppers);

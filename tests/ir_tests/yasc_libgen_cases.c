@@ -72,12 +72,12 @@ int main(int argc, char **argv)
   }
   for (size_t i = 0; i < sizeof D / sizeof D[0]; i++)
   {
-    strcpy(buf, D[i][0]);
+    strlcpy(buf, D[i][0], sizeof buf);
     check("dirname", D[i][0], dirname(buf), D[i][1]);
   }
   for (size_t i = 0; i < sizeof B / sizeof B[0]; i++)
   {
-    strcpy(buf, B[i][0]);
+    strlcpy(buf, B[i][0], sizeof buf);
     check("basename", B[i][0], basename(buf), B[i][1]);
   }
   check("dirname", "NULL", dirname(NULL), ".");
@@ -114,12 +114,12 @@ int main(int argc, char **argv)
   };
   for (size_t i = 0; i < sizeof PD / sizeof PD[0]; i++)
   {
-    strcpy(buf, PD[i][0]);
+    strlcpy(buf, PD[i][0], sizeof buf);
     check2("dirname", PD[i][0], dirname(buf), PD[i][1], PD[i][2]);
   }
   for (size_t i = 0; i < sizeof PB / sizeof PB[0]; i++)
   {
-    strcpy(buf, PB[i][0]);
+    strlcpy(buf, PB[i][0], sizeof buf);
     check2("basename", PB[i][0], basename(buf), PB[i][1], PB[i][2]);
   }
 

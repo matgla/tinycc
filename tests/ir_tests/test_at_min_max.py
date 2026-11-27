@@ -67,7 +67,7 @@ SIGNED_UNSIGNED = "@{op} of signed '{s}' and unsigned '{u}': a negative value wo
         ),
         ("int f(int *p) { return @min(p, 1); }", "@min wants numbers, not 'int *'"),
         ("struct S { int x; }; int f(struct S s) { return @max(s, 1); }", "@max wants numbers, not 'struct S'"),
-        ("int f(int a) { return @foo(a); }", "unknown builtin '@foo' (there are @min and @max)"),
+        ("int f(int a) { return @foo(a); }", "unknown builtin '@foo' (there are @min, @max and @src)"),
         # a static initializer parses with no code wanted: not constant, not the constant operand
         ("int g; static int x = @min(g, 3);", "initializer element is not constant"),
     ],

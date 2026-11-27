@@ -48,18 +48,18 @@ static __attribute__((noinline)) int to_wide(int x) { return cast<int(int)>(cast
 static __attribute__((noinline)) int trunc8(int x) { return cast<trunc(uint8_t)>(x); }
 static __attribute__((noinline)) int dirent_at(int pos)
 {
-  const struct dirent * view d = cast<ptr(const struct dirent *), align>(g_dir.buf + pos);
+  const struct dirent *view d = cast<ptr(const struct dirent *), align>(g_dir.buf + pos);
   return d->d_reclen;
 }
 static __attribute__((noinline)) int aligned_at(int pos)
 {
-  const char * view p = cast<align(4)>(g_dir.buf + pos);
+  const char *view p = cast<align(4)>(g_dir.buf + pos);
   return p[0];
 }
 
-int main(int argc, const char * view *argv)
+int main(int argc, const char *view *argv)
 {
-  const char * view c = argc > 1 ? argv[1] : "";
+  const char *view c = argc > 1 ? argv[1] : "";
   long long r = 0;
   printf("go %s\n", c);
   memset(&g_dir, 0, sizeof g_dir);

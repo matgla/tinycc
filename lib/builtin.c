@@ -783,8 +783,23 @@ unsigned long __tcc_strlen(const char *s)
 /* How many __tcc_*_chk calls ran (gcc's builtins chk tests read it).  Weak, so
    a program's own definition -- gcc's builtins/lib/chk.c has one -- wins. */
 volatile int chk_calls __attribute__((weak)) = 0;
-extern void __chk_fail(void) __attribute__((weak));
 extern void abort(void);
+extern long write(int fd, const void *buf, unsigned long n);
+
+/* What a failed check runs: -ffortify's string check, the __tcc_*_chk
+   functions below, and a C library's __memcpy_chk ... (glibc's name, so
+   objects from gcc or clang call it too).  The message goes out through
+   write(2), not stdio: the overflow may have been into stdio's own state.
+   Weak: a program's or a C library's own definition wins (gcc's
+   builtins/lib/chk.c has one). */
+__attribute__((weak, noreturn)) void __chk_fail(void)
+{
+  static const char msg[] = "*** buffer overflow detected ***: terminated\n";
+  write(2, msg, sizeof msg - 1);
+  abort();
+  for (;;)
+    ;
+}
 
 static void __tcc_chk_record_call(void)
 {
@@ -793,9 +808,7 @@ static void __tcc_chk_record_call(void)
 
 static void __tcc_chk_fail_or_abort(void)
 {
-  if (__chk_fail)
-    __chk_fail();
-  abort();
+  __chk_fail();
 }
 
 unsigned long __tcc_strnlen(const char *s, unsigned long n)
@@ -814,6 +827,23 @@ unsigned long __tcc_strnlen(const char *s, unsigned long n)
 void __tcc_fortify_str(const char *s, unsigned long n)
 {
   if (s && __tcc_strnlen(s, n) == n)
+    __tcc_chk_fail_or_abort();
+}
+
+/* -ffortify's strcpy / stpcpy (builtin/fortify.c): the source's string and
+   its NUL fit the destination's N bytes */
+void __tcc_fortify_strcpy(const char *s, unsigned long n)
+{
+  if (__tcc_strnlen(s, n) == n)
+    __tcc_chk_fail_or_abort();
+}
+
+/* ... strcat: the destination's string, the source's and the NUL fit its N
+   bytes (a destination with no NUL in them fails too) */
+void __tcc_fortify_strcat(const char *d, const char *s, unsigned long n)
+{
+  unsigned long dl = __tcc_strnlen(d, n);
+  if (dl == n || __tcc_strnlen(s, n - dl) == n - dl)
     __tcc_chk_fail_or_abort();
 }
 

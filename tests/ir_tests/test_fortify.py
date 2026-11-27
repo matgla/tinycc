@@ -1,24 +1,25 @@
 """_FORTIFY_SOURCE on top of __builtin_object_size and the __builtin___*_chk
 builtins (frontend/gen/builtin/chk.c, objsize.c).
 
-yasos libc's <string.h> / <stdio.h> turn memcpy(d, s, n) into
+glibc-style headers turn memcpy(d, s, n) into
 __builtin___memcpy_chk(d, s, n, __builtin_object_size(d, 0)) and kin when
-_FORTIFY_SOURCE > 0 (sys/_fortify.h; level 2 the closest member for the string
-and printf functions, level 3 __builtin_dynamic_object_size).  tcc calls the
-plain function when the call provably fits (or nothing is known of the
-destination), and the checking function otherwise: libc's __memcpy_chk,
-__sprintf_chk, ..., libtcc1's __tcc_strcpy_chk and kin, all ending in
-__chk_fail ("*** buffer overflow detected ***: terminated", abort).  sprintf
+_FORTIFY_SOURCE > 0 (level 2 the closest member for the string and printf
+functions, level 3 __builtin_dynamic_object_size).  tcc calls the plain
+function when the call provably fits (or nothing is known of the
+destination), and the checking function otherwise: the C library's
+__memcpy_chk, __sprintf_chk, ..., libtcc1's __tcc_strcpy_chk and kin, all
+ending in __chk_fail ("*** buffer overflow detected ***: terminated", abort).  sprintf
 folds as gcc's does: a format without conversions, or "%s" of a known
 string.  The object sizes are decided by the parser, so the same at every
 -O.  A fortified call
 gets the plain function's -Wstringop-overflow / -Wformat-overflow /
 -Wformat-truncation warnings, and __has_builtin knows the builtins.
 
-The QEMU runs link newlib: fortify_libc.h is a copy of libc's wrappers and
-fortify_rt.c of its runtime (keep them in step with libs/libc).  With a yasos
-tree around (libs/libc next to libs/tinycc, or YASOS_LIBC_DIR), the real libc
-headers are compiled too.
+The QEMU runs link newlib: fortify_libc.h has the wrappers and fortify_rt.c
+the runtime (as yasos libc had them, before tcc checked the calls itself --
+test_compiler_fortify.py).  With a yasos tree around (libs/libc next to
+libs/tinycc, or YASOS_LIBC_DIR), its headers are checked too: no macros,
+_FORTIFY_SOURCE under -ccompat turns on tcc's own checks.
 """
 
 import os
@@ -272,7 +273,7 @@ def test_run(tmp_path, opt, level):
 def _libc_dir():
     env = os.environ.get("YASOS_LIBC_DIR")
     d = Path(env) if env else ROOT.parent / "libc"
-    return d if (d / "include" / "sys" / "_fortify.h").exists() else None
+    return d if (d / "include" / "sys" / "_attrs.h").exists() else None
 
 
 LIBC_SRC = """\
@@ -292,6 +293,9 @@ void *(*fp)(void *, const void *, size_t) = memcpy;
 @pytest.mark.skipif(_libc_dir() is None, reason="no yasos libc (libs/libc or YASOS_LIBC_DIR)")
 @pytest.mark.parametrize("opt", ["-O0", "-O2"])
 def test_yasos_libc_headers(tmp_path, opt):
+    """no fortify macros: _FORTIFY_SOURCE > 0 under -ccompat is tcc's -ffortify, the same at every level --
+    strcpy / strcat checked by name (libtcc1's __tcc_fortify_*), nothing where the call fits or the
+    destination is unknown"""
     libc = _libc_dir()
     sysinc = libc.parent.parent / "source" / "sys" / "include"
     inc = ["-nostdinc", f"-I{libc / 'include'}", f"-I{sysinc}", f"-I{ROOT / 'include'}"]
@@ -303,8 +307,11 @@ def test_yasos_libc_headers(tmp_path, opt):
         outs[level] = obj.read_bytes()
         calls = _calls(obj)
         for f, names in calls.items():
-            assert _checked(names) == (bool(level) and f.startswith("chk")), (level, f, names)
+            assert not _checked(names), (level, f, names)  # no __*_chk: the C library has none
+            fortified = any(n.startswith("__tcc_fortify_") for n in names)
+            assert fortified == (bool(level) and f == "chk"), (level, f, names)
     assert outs[None] == outs[0]
+    assert outs[1] == outs[2] == outs[3]
 
 
 # --------------------------------------------------------------------------

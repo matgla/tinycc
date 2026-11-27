@@ -187,42 +187,62 @@ void type_to_str(char *buf, int buf_size, CType *type, const char *varstr)
         pstrcat(buf1, buf_size, "volatile ");
       if (t & VT_RODATA_REL)
         pstrcat(buf1, buf_size, "__rodata_relative ");
-      /* yasc: as written, `char * owned(fclose) maybe`, `T * view` */
+      /* yasc: as written, `char *?owned(fclose)`, `T *view`, `T *@(const, view)` */
       if ((s->yasc & (YASC_OWNED | YASC_VIEW | YASC_MAYBE)) && !(s->yasc & YASC_UNCHECKED))
       {
-        if (!buf1[1])
-          pstrcat(buf1, sizeof(buf1), " ");
+        char words[200];
+        int nw = 0;
+        words[0] = 0;
+#define YW_ADD(w)                                                                                                      \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    if (nw++)                                                                                                          \
+      pstrcat(words, sizeof(words), ", ");                                                                             \
+    pstrcat(words, sizeof(words), (w));                                                                                \
+  } while (0)
+        if (t & VT_CONSTANT)
+          YW_ADD("const");
+        if (t & VT_VOLATILE)
+          YW_ADD("volatile");
+        if (t & VT_RODATA_REL)
+          YW_ADD("__rodata_relative");
         if (s->yasc & YASC_OWNED)
         {
-          pstrcat(buf1, sizeof(buf1), "owned");
+          char w[80];
           if (s->vreg > 0 && s->vreg < YASC_OBJ_MARK)
-          {
-            pstrcat(buf1, sizeof(buf1), "(");
-            pstrcat(buf1, sizeof(buf1), get_tok_str(s->vreg, NULL));
-            pstrcat(buf1, sizeof(buf1), ")");
-          }
+            snprintf(w, sizeof w, "owned(%s)", get_tok_str(s->vreg, NULL));
+          else
+            pstrcpy(w, sizeof w, "owned");
+          YW_ADD(w);
         }
         else if ((s->yasc & YASC_VIEW) && s->vreg == YASC_BORROWS_STATIC)
-          pstrcat(buf1, sizeof(buf1), "borrows(static)");
+          YW_ADD("borrows(static)");
         else if ((s->yasc & YASC_VIEW) && s->vreg <= -2 && yasc_field_borrows(-2 - s->vreg))
         {
           /* a member's `borrows(buf)` */
           YascFieldBorrows *e = yasc_field_borrows(-2 - s->vreg);
-          pstrcat(buf1, sizeof(buf1), "borrows(");
+          char w[160];
+          pstrcpy(w, sizeof w, "borrows(");
           for (int k = 0; k < e->nsrc; k++)
           {
             if (k)
-              pstrcat(buf1, sizeof(buf1), ", ");
-            pstrcat(buf1, sizeof(buf1), get_tok_str(e->src_tok[k], NULL));
+              pstrcat(w, sizeof w, ", ");
+            pstrcat(w, sizeof w, get_tok_str(e->src_tok[k], NULL));
           }
           if (e->is_static)
-            pstrcat(buf1, sizeof(buf1), e->nsrc ? ", static" : "static");
-          pstrcat(buf1, sizeof(buf1), ")");
+            pstrcat(w, sizeof w, e->nsrc ? ", static" : "static");
+          pstrcat(w, sizeof w, ")");
+          YW_ADD(w);
         }
         else if (s->yasc & YASC_VIEW)
-          pstrcat(buf1, sizeof(buf1), "view"); /* or borrows(params): their names are not here */
-        if (s->yasc & YASC_MAYBE)
-          pstrcat(buf1, sizeof(buf1), (s->yasc & (YASC_OWNED | YASC_VIEW)) ? " maybe" : "maybe");
+          YW_ADD("view"); /* or borrows(params): their names are not here */
+#undef YW_ADD
+        pstrcpy(buf1, sizeof(buf1), (s->yasc & YASC_MAYBE) ? "*?" : "*");
+        if (nw > 1)
+          pstrcat(buf1, sizeof(buf1), "@(");
+        pstrcat(buf1, sizeof(buf1), words);
+        if (nw > 1)
+          pstrcat(buf1, sizeof(buf1), ")");
         if (varstr)
           pstrcat(buf1, sizeof(buf1), " ");
       }

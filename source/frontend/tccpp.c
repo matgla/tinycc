@@ -114,6 +114,7 @@ static int pp_debug_tok, pp_debug_symv;
 static int pp_counter;
 static void tok_print(const int *str, const char *msg, ...);
 static void next_nomacro(void);
+static void next_nomacro_raw(void);
 static void parse_number(const char *p);
 static void tcc_predef_try_materialize(TokenSym *ts, const char *str, int len);
 static void parse_string(const char *p, int len);
@@ -5982,8 +5983,11 @@ static void parse_number(const char *p)
     }                                                                                                                  \
     break;
 
+/* where the token next_nomacro_raw read last starts (yasc_glue) */
+static uint8_t *lex_tok_start;
+
 /* return next token without macro substitution */
-static void next_nomacro(void)
+static void next_nomacro_raw(void)
 {
   int t, c, is_long, len;
   TokenSym *ts;
@@ -5992,6 +5996,7 @@ static void next_nomacro(void)
 
   p = file->buf_ptr;
 redo_no_start:
+  lex_tok_start = p;
   c = *p;
   switch (c)
   {
@@ -6567,6 +6572,225 @@ keep_tok_flags:
 #if defined(PARSE_DEBUG)
   printf("token = %d %s\n", tok, get_tok_str(tok, &tokc));
 #endif
+}
+
+/* yasc: a pointer's words go against their '*', one per '*' -- `*owned`,
+   `*?borrows(s)`, `*@(const, owned)` -- and `?` is what `maybe` was
+   (docs/yasc_cheatsheet.md).  Read here, as the file is lexed, so the parser
+   and everything that keeps tokens (saved bodies, macros, interfaces) sees
+   the words as before: `?` after a '*' or a '[', or against an int handle's
+   owned / view (`int ?owned(close) fd`), is TOK_maybe (spelled "?");
+   `*@(a, b)` is `* a b`.  Whitespace between a '*' and its first word, or a
+   second word outside @( ), is an error.  Not for tcc -E: it writes what it
+   reads. */
+enum
+{
+  YG_IDLE,
+  YG_STAR,  /* after a '*' */
+  YG_MAYBE, /* after a '*?' (or a handle's '?') */
+  YG_CQUAL, /* after a '*' and C qualifiers written as C writes them: `* const` */
+  YG_WORD,  /* after a '*''s word (or its group) */
+  YG_ARGS,  /* in that word's ( ) */
+  YG_GROUP  /* in *@( ) */
+};
+static int yg_state, yg_depth, yg_word, yg_space, yg_prev;
+static BufferedFile *yg_file;
+
+static int yg_is_cqual(int t)
+{
+  return (t >= TOK_CONST1 && t <= TOK_CONST3) || (t >= TOK_VOLATILE1 && t <= TOK_VOLATILE3) ||
+         (t >= TOK_RESTRICT1 && t <= TOK_RESTRICT3) || t == TOK__Atomic;
+}
+
+static int yg_is_word(int t)
+{
+  return t == TOK_owned || t == TOK_view || t == TOK_borrows || t == TOK_takes || t == TOK_c_api || yg_is_cqual(t);
+}
+
+/* the source at P starts with WORD, a whole identifier */
+static int yg_at_word(const uint8_t *p, const char *word)
+{
+  size_t n = strlen(word);
+  return !memcmp(p, word, n) && !(isidnum_table[p[n] - CH_EOF] & (IS_ID | IS_NUM));
+}
+
+/* 1: the token just read is left out (a group's '@(', ',' or ')') */
+/* a macro's body (read with its spaces) is not held to the spacing: its
+   expansion is not, either */
+#define YG_ERROR(...) ((parse_flags & PARSE_FLAG_SPACES) ? 0 : tcc_lex_error_deferred(__VA_ARGS__))
+
+static int yasc_glue(int glued)
+{
+  const int t = tok;
+  int prev;
+  if (t == ' ' || t == TOK_LINEFEED)
+  {
+    yg_space = 1; /* -E's spaces, a directive's end: what follows is not against it */
+    if (t == TOK_LINEFEED)
+      yg_state = YG_IDLE;
+    return 0;
+  }
+  glued = glued && !yg_space;
+  yg_space = 0;
+  prev = yg_prev;
+  yg_prev = t;
+  switch (yg_state)
+  {
+  case YG_GROUP:
+    if (t == '(')
+      yg_depth++;
+    else if (t == ')' && --yg_depth == 0)
+    {
+      yg_state = YG_WORD, yg_word = 0;
+      return 1;
+    }
+    else if (t == ',' && yg_depth == 1)
+      return 1;
+    else if (t == '?')
+      YG_ERROR("'?' in *@( ): write it against the '*', before the '@': '*?@(...)'");
+    return 0;
+  case YG_ARGS:
+    if (t == '(')
+      yg_depth++;
+    else if (t == ')' && --yg_depth == 0)
+      yg_state = YG_WORD;
+    return 0;
+  }
+  if (yg_is_word(t))
+  {
+    /* C's own qualifiers may stand as C writes them (`char * const p`, a C
+       file read in the default dialect); a yasc word after them goes in the
+       group with them */
+    if (yg_is_cqual(t) && !glued && (yg_state == YG_STAR || yg_state == YG_CQUAL))
+    {
+      yg_state = YG_CQUAL, yg_word = t;
+      return 0;
+    }
+    if (yg_state == YG_CQUAL)
+    {
+      if (!yg_is_cqual(t))
+        YG_ERROR("a pointer's words go in @( ) with its C qualifiers: write '*@(%s, %s)'", get_tok_str(yg_word, NULL),
+                 get_tok_str(t, NULL));
+      yg_state = YG_WORD, yg_word = t;
+      return 0;
+    }
+    if (yg_state == YG_STAR || yg_state == YG_MAYBE)
+    {
+      if (!glued)
+        YG_ERROR("a pointer's word goes against its '%s': write '%s%s'", yg_state == YG_STAR ? "*" : "*?",
+                               yg_state == YG_STAR ? "*" : "*?", get_tok_str(t, NULL));
+      yg_state = YG_WORD, yg_word = t;
+      return 0;
+    }
+    if (yg_state == YG_WORD)
+    {
+      if (yg_is_cqual(t) && yg_is_cqual(yg_word))
+        return 0; /* `char *const volatile p`: C's qualifier list */
+      if (yg_word)
+        YG_ERROR("one word against a '*': write '*@(%s, %s)'", get_tok_str(yg_word, NULL),
+                               get_tok_str(t, NULL));
+      else
+        YG_ERROR("one word against a '*': write '%s' in its @( )", get_tok_str(t, NULL));
+      yg_word = t;
+      return 0;
+    }
+    yg_state = YG_IDLE;
+    return 0;
+  }
+  switch (t)
+  {
+  case '*':
+    yg_state = YG_STAR;
+    return 0;
+  case '?':
+    if (yg_state == YG_STAR)
+    {
+      if (!glued)
+        YG_ERROR("'?' goes against its '*': write '*?'");
+      tok = TOK_maybe;
+      yg_prev = TOK_maybe;
+      yg_state = YG_MAYBE;
+      return 0;
+    }
+    if (prev == '[' && glued)
+    {
+      tok = yg_prev = TOK_maybe; /* `int a[?4]`: the pointer the array becomes */
+      yg_state = YG_IDLE;
+      return 0;
+    }
+    if (yg_at_word(file->buf_ptr, "owned") || yg_at_word(file->buf_ptr, "view"))
+    {
+      tok = yg_prev = TOK_maybe; /* `int ?owned(close) fd`: never a ?: in yasc */
+      yg_state = YG_MAYBE;
+      return 0;
+    }
+    break;
+  case '@':
+    if ((yg_state == YG_STAR || yg_state == YG_MAYBE) && *file->buf_ptr == '(')
+    {
+      if (!glued)
+        YG_ERROR("a pointer's words go against its '*': write '%s@('", yg_state == YG_STAR ? "*" : "*?");
+      file->buf_ptr++;
+      yg_state = YG_GROUP, yg_depth = 1;
+      return 1;
+    }
+    if (yg_state == YG_STAR || yg_state == YG_MAYBE)
+    {
+      /* `a * @min(x, y)` is a builtin's call */
+      const uint8_t *q = file->buf_ptr;
+      while (*q == ' ' || *q == '\t')
+        q++;
+      if (*q == '(')
+        YG_ERROR("a pointer's words: '%s@(a, b)', the '(' against the '@'",
+                               yg_state == YG_STAR ? "*" : "*?");
+    }
+    break;
+  case '(':
+    if (yg_state == YG_WORD && glued &&
+        (yg_word == TOK_owned || yg_word == TOK_borrows || yg_word == TOK_takes || yg_word == TOK_c_api))
+    {
+      yg_state = YG_ARGS, yg_depth = 1;
+      return 0;
+    }
+    break;
+  }
+  yg_state = YG_IDLE;
+  return 0;
+}
+
+/* noinline: next() sits on the parser's recursive paths and the compiler
+   would take this into it (tests/selfhost/test_parser_stack_frames.py) */
+__attribute__((noinline)) static void next_nomacro_yasc(void)
+{
+  TCCState *s1 = tcc_state;
+  do
+  {
+    BufferedFile *f = file;
+    uint8_t *p0 = file->buf_ptr;
+    next_nomacro_raw();
+    if (pp_in_c() || !s1->yasc)
+    {
+      yg_state = YG_IDLE;
+      return;
+    }
+    if (file != yg_file)
+      yg_file = file, yg_state = YG_IDLE;
+    if (yasc_glue(f == file && lex_tok_start == p0))
+      continue;
+    return;
+  } while (1);
+}
+
+static void next_nomacro(void)
+{
+  TCCState *s1 = tcc_state;
+  if (s1->yasc && s1->output_type != TCC_OUTPUT_PREPROCESS && !(parse_flags & PARSE_FLAG_ASM_FILE))
+  {
+    next_nomacro_yasc();
+    return;
+  }
+  yg_state = YG_IDLE;
+  next_nomacro_raw();
 }
 
 #ifdef PP_DEBUG

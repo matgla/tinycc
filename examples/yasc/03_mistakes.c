@@ -10,28 +10,28 @@
 
 void leak(void)
 {
-  char * owned maybe s = mem_strdup("lost");
+  char *?owned s = mem_strdup("lost");
   if (!s)
     return;
 } /* forgot mem_free(s) */
 
 void double_free(void)
 {
-  char * owned maybe s = mem_strdup("x");
+  char *?owned s = mem_strdup("x");
   mem_free(s);
   mem_free(s);
 }
 
 int use_after_free(void)
 {
-  char * owned maybe s = mem_strdup("x");
+  char *?owned s = mem_strdup("x");
   mem_free(s);
   return s != nullptr && s[0] == 'x';
 }
 
 int null_deref(void)
 {
-  char * owned maybe s = mem_strdup("x");
+  char *?owned s = mem_strdup("x");
   int c = s[0]; /* no null test */
   mem_free(s);
   return c;
@@ -60,7 +60,7 @@ int uninitialized(int c)
   return x;
 }
 
-int * borrows(static) local_address(void)
+int *borrows(static) local_address(void)
 {
   int x = 1;
   return &x;
@@ -68,7 +68,7 @@ int * borrows(static) local_address(void)
 
 void null_argument(void)
 {
-  char * owned maybe s = mem_strdup(nullptr); /* nonnull(1) */
+  char *?owned s = mem_strdup(nullptr); /* nonnull(1) */
   mem_free(s);
 }
 
@@ -77,16 +77,16 @@ void null_argument(void)
 
 struct node
 {
-  struct node * owned maybe next; /* the rest of the list, or null */
+  struct node *?owned next; /* the rest of the list, or null */
   int v;
 };
 
-int maybe_member(const struct node *q)
+int maybe_member(struct node *q)
 {
   return q->next->v; /* q->next may be null */
 }
 
-static int length(const char *s) /* s may not be null */
+static int length(char *s) /* s may not be null */
 {
   int n = 0;
   while (s[n])
@@ -94,14 +94,14 @@ static int length(const char *s) /* s may not be null */
   return n;
 }
 
-int maybe_argument(const char * maybe s)
+int maybe_argument(char *?s)
 {
   return length(s); /* test s first */
 }
 
 int borrow_outlives_owner(void)
 {
-  char * owned maybe s = mem_strdup("abc");
+  char *?owned s = mem_strdup("abc");
   if (!s)
     return 0;
   char *tail = s + 1; /* borrows from s */
@@ -109,13 +109,13 @@ int borrow_outlives_owner(void)
   return tail[0]; /* s is gone, and tail with it */
 }
 
-void dangling(inout int * view *slot)
+void dangling(out int *view *slot)
 {
   int x = 1;
   *slot = &x; /* x dies when dangling returns; *slot lives on */
 }
 
-static int * borrows(static) maybe nothing(void)
+static int *?borrows(static) nothing(void)
 {
   return nullptr;
 }
@@ -131,7 +131,7 @@ int null_dereference(void)
 
 int array_leak(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i, n = 0;
   for (i = 0; i < 4; i++)
     a[i] = mem_strdup("x");
@@ -142,7 +142,7 @@ int array_leak(void)
 
 void array_freed_twice(void)
 {
-  char * owned maybe a[4] = undefined;
+  char *?owned a[4] = undefined;
   int i;
   for (i = 0; i < 4; i++)
     a[i] = mem_strdup("x");
@@ -154,7 +154,7 @@ void array_freed_twice(void)
 
 int handle_leak(void)
 {
-  int owned(slot_close) maybe h = slot_open(1);
+  int ?owned(slot_close) h = slot_open(1);
   if (h < 0)
     return -1;
   return slot_read(h); /* forgot slot_close(h) */
@@ -162,7 +162,7 @@ int handle_leak(void)
 
 int handle_untested(void)
 {
-  int owned(slot_close) maybe h = slot_open(1);
+  int ?owned(slot_close) h = slot_open(1);
   int v = slot_read(h); /* h may be -1 */
   slot_close(h);
   return v;

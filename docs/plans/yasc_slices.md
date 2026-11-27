@@ -10,7 +10,7 @@ checked, with the C ABI unchanged at the boundary.
 |---|---|
 | `[]T s` | a slice of T (the prefix goes before the type, as `!T`) |
 | `[:0]T s` | a slice whose element at `len` is a zero (C strings) |
-| `[]char * view argv` | a slice of `char * view` (pointer derivations bind to T, as for `!T`) |
+| `[]char *view argv` | a slice of `char *view` (pointer derivations bind to T, as for `!T`) |
 | `[][]int rows` | a slice of slices |
 | `s[i]` | the element, an lvalue; `i < s.len` checked |
 | `x[a:b]`, `x[a:]`, `x[:b]`, `x[:]` | slicing an array, a slice or (with `b`) a pointer |

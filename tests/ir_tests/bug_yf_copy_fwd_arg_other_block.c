@@ -52,7 +52,7 @@ __attribute__((noinline)) static int g2(void)
 
 __attribute__((noinline)) static int written(int c, int k)
 {
-  struct S y = undefined;
+  struct S y = {}; /* init only writes it, but `out` wants a write on every path */
   init(&y, k);
   struct S x = undefined;
   x = y;
@@ -65,7 +65,7 @@ __attribute__((noinline)) static int written(int c, int k)
 /* a read-only parameter: x still equals y after it */
 __attribute__((noinline)) static int read_only(int c, int k)
 {
-  struct S y = undefined;
+  struct S y = {}; /* init only writes it, but `out` wants a write on every path */
   init(&y, k);
   struct S x = undefined;
   x = y;

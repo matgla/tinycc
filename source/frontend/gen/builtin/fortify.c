@@ -50,6 +50,10 @@ struct FortifyCall
   ObjInfo obj[32];        /* the wanted arguments' objects */
   unsigned is_const;      /* constant arguments, bit i, their values: */
   unsigned long long cval[32];
+  unsigned char warned;   /* a constant size over its buffer was reported */
+  unsigned char str_kind; /* strcpy / stpcpy (FORT_STRCPY), strcat (FORT_STRCAT) */
+  unsigned char kept_dst; /* strcat: its destination, in a register: */
+  SValue kdst;
   unsigned kept;          /* sizes before their pointer, in a register: */
   SValue kval[32];
   struct FortifyCall *live_outer;
@@ -91,6 +95,12 @@ static int fortify_macro_on(void)
   if (!p)
     return 1;
   tok_get(&t, &p, &cv);
+  /* `#define _FORTIFY_SOURCE LEVEL`: what LEVEL says (a few levels deep) */
+  for (int depth = 0; depth < 8 && t >= TOK_IDENT && (d = define_find(t)) && d->d; depth++)
+  {
+    p = d->d;
+    tok_get(&t, &p, &cv);
+  }
   if (t == TOK_PPNUM)
     return strcmp(cv.str.data, "0") != 0;
   if (t == TOK_CINT || t == TOK_CUINT)
@@ -103,6 +113,12 @@ static int fortify_on(void)
   if (tcc_state->fortify != 2)
     return tcc_state->fortify;
   return !tcc_state->ccompat || fortify_macro_on();
+}
+
+/* -ffortify is on for this compile (chk.c's implicit sprintf calls too) */
+int fortify_wanted(void)
+{
+  return fortify_on();
 }
 
 /* the merged attributes of every declaration (decl/attribute.c) */
@@ -139,19 +155,54 @@ static int ptr_param(Sym *fsym, int i)
   return t && (t->t & VT_BTYPE) == VT_PTR;
 }
 
+enum
+{
+  FORT_STRCPY = 1,
+  FORT_STRCAT
+};
+
+/* FSYM is the C library's strcpy / stpcpy (FORT_STRCPY) or strcat
+   (FORT_STRCAT), checked by name as gcc knows them: the destination has to
+   hold the source's string (and, for strcat, what it holds already) -- no
+   size argument says so.  0 for anything else. */
+static int fortify_str_kind(Sym *fsym)
+{
+  const char *name;
+  ElfSym *es;
+  int k;
+  if ((fsym->type.t & (VT_BTYPE | VT_STATIC)) != VT_FUNC || !fsym->type.ref ||
+      fsym->type.ref->f.func_type != FUNC_NEW || (tcc_state->no_builtin_funcs & NO_BUILTIN_ALL) || !ptr_param(fsym, 0) ||
+      !ptr_param(fsym, 1))
+    return 0;
+  name = get_tok_str(fsym->v, NULL);
+  k = !strcmp(name, "strcpy") || !strcmp(name, "stpcpy") ? FORT_STRCPY : !strcmp(name, "strcat") ? FORT_STRCAT : 0;
+  /* the program's own, defined here: not the library's */
+  if (k && (fsym->r & VT_SYM) && (es = elfsym(fsym)) && es->st_shndx != SHN_UNDEF)
+    return 0;
+  return k;
+}
+
 FortifyCall *fortify_call_begin(Sym *fsym)
 {
-  const SymLocalFacts *f;
+  static const SymLocalFacts no_facts;
+  const SymLocalFacts *f = NULL;
   FortifyCall *fc;
   unsigned want = 0;
-  int nargs = 0;
+  int nargs = 0, str_kind;
 
-  if (!fsym || !fsym->a.attr_facts || (fsym->type.t & VT_BTYPE) != VT_FUNC || tcc_state->reverse_funcargs ||
-      !tcc_state->ir || nocode_wanted)
+  if (!fsym || (fsym->type.t & VT_BTYPE) != VT_FUNC || tcc_state->reverse_funcargs || !tcc_state->ir || nocode_wanted)
     return NULL;
-  f = sym_facts_peek(fsym);
-  if (!f || !(f->fort_cstr || f->fort_n) || !fortify_on())
+  if (fsym->a.attr_facts)
+    f = sym_facts_peek(fsym);
+  if (f && !(f->fort_cstr || f->fort_n))
+    f = NULL;
+  str_kind = fortify_str_kind(fsym);
+  if ((!f && !str_kind) || !fortify_on())
     return NULL;
+  if (!f)
+    f = &no_facts;
+  if (str_kind)
+    want |= 1u, nargs = 2; /* the destination's object */
   for (int i = 0; i < 32; i++)
     if ((f->fort_cstr & (1u << i)) && ptr_param(fsym, i))
       want |= 1u << i, nargs = i + 1;
@@ -175,6 +226,7 @@ FortifyCall *fortify_call_begin(Sym *fsym)
   fc->fsym = fsym;
   fc->nargs = nargs;
   fc->want = want;
+  fc->str_kind = str_kind;
   return fc;
 }
 
@@ -259,6 +311,40 @@ static void check_cstr(FortifyCall *fc, int i)
   vpop();
 }
 
+/* strcpy / stpcpy / strcat: vtop is the source, converted; the destination's
+   object was taken at argument 0.  libtcc1 ends the program when the string
+   (strcat: and the one already there) does not fit; a source whose length
+   is known to fit, or an empty one appended, costs nothing. */
+static void check_str(FortifyCall *fc)
+{
+  SValue args[3];
+  unsigned long long sz = objsize_result(&fc->obj[0], 1), sl;
+  int n = 0;
+  const int known = svalue_get_conservative_string_bytes_u64(vtop, &sl);
+  if (fc->str_kind == FORT_STRCPY && known && sz != (unsigned long long)(addr_t)-1 && sl <= sz)
+    return;
+  if (fc->str_kind == FORT_STRCAT && ((known && sl == 1) || !fc->kept_dst))
+    return;
+  if (!push_objsize(fc, 0, 1))
+    return;
+  if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) != VT_CONST)
+    gv(RC_INT);
+  /* the source goes to the check and to the call: once in a register */
+  if (vtop[-1].r & VT_LVAL)
+  {
+    vswap();
+    gv(RC_INT);
+    vswap();
+  }
+  if (fc->str_kind == FORT_STRCAT)
+    args[n++] = fc->kdst;
+  args[n++] = vtop[-1];
+  args[n++] = *vtop;
+  gen_ir_void_call_args(args, n,
+                        tok_alloc_const(fc->str_kind == FORT_STRCPY ? "__tcc_fortify_strcpy" : "__tcc_fortify_strcat"));
+  vpop();
+}
+
 /* access entry A: both arguments are in.  vtop is argument CUR (A's pointer
    or its size), converted. */
 static void check_access(FortifyCall *fc, const unsigned char *a, int cur)
@@ -290,10 +376,13 @@ static void check_access(FortifyCall *fc, const unsigned char *a, int cur)
   if ((vtop[-1].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST &&
       (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST &&
       (unsigned long long)vtop[-1].c.i > (unsigned long long)vtop->c.i / (unsigned)el)
+  {
+    fc->warned = 1;
     tcc_warning_c(warn_stringop_overflow)("'%s' accesses %llu bytes of an object of %llu: the call ends the program",
                                           get_tok_str(fc->fsym->v, NULL),
                                           (unsigned long long)vtop[-1].c.i * (unsigned)el,
                                           (unsigned long long)vtop->c.i);
+  }
   if (el > 1)
   {
     vpushs(el);
@@ -330,6 +419,15 @@ void fortify_arg_emit(FortifyCall *fc, int i)
       }
     }
   }
+  if (fc->str_kind == FORT_STRCAT && i == 0)
+  {
+    /* strcat's destination goes to its check too (check_str) */
+    gv(RC_INT);
+    fc->kdst = *vtop;
+    fc->kept_dst = 1;
+  }
+  if (fc->str_kind && i == 1)
+    check_str(fc);
   if (fc->f->fort_cstr & (1u << i) & fc->want)
     check_cstr(fc, i);
   for (int j = 0; j < fc->f->fort_n; j++)
@@ -341,6 +439,13 @@ void fortify_arg_emit(FortifyCall *fc, int i)
     if ((i == pi || i == si) && (fc->seen & (1u << pi)) && (fc->seen & (1u << si)))
       check_access(fc, a, i);
   }
+}
+
+/* FC reported a sure overflow: the plain function's check (objsize.c) need
+   not say it again */
+int fortify_call_warned(const FortifyCall *fc)
+{
+  return fc->warned;
 }
 
 void fortify_call_end(FortifyCall *fc)

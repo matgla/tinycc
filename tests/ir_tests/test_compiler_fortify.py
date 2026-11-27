@@ -207,31 +207,144 @@ def test_run(tmp_path, opt):
         assert _run(res.elf_file, c) == "ok", c
 
 
+@pytest.mark.parametrize("case", ["str", "strcpy", "plain_strcpy", "plain_strcat", "plain_sprintf", "plain_vsprintf"])
+def test_default_chk_fail(tmp_path, case):
+    """A program with no __chk_fail of its own gets libtcc1's: the message, then abort."""
+    cfg = CompileConfig(extra_cflags="-O1 -ffortify", output_dir=tmp_path)
+    res = compile_testcase([CURRENT_DIR / "chk_fail_default.c"], MACHINE, config=cfg)
+    assert res.success, res.error
+    proc = subprocess.run(build_qemu_command(MACHINE, res.elf_file, [case]), shell=True, capture_output=True,
+                          text=True, timeout=60)
+    out = proc.stdout + proc.stderr
+    assert f"go {case}" in out, out
+    assert "*** buffer overflow detected ***: terminated" in out, out
+    assert f"ok {case}" not in out, out
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_plain_calls_that_fit(tmp_path, opt):
+    """strcpy / strcat / sprintf checked by name (-ffortify): what fits runs as written."""
+    cfg = CompileConfig(extra_cflags=f"{opt} -ffortify", output_dir=tmp_path, output_suffix=opt[1:])
+    res = compile_testcase([CURRENT_DIR / "chk_fail_default.c"], MACHINE, config=cfg)
+    assert res.success, res.error
+    proc = subprocess.run(build_qemu_command(MACHINE, res.elf_file, ["fits"]), shell=True, capture_output=True,
+                          text=True, timeout=60)
+    out = proc.stdout + proc.stderr
+    assert "ok fits abcd ababcd 4-abcd" in out, out
+
+
+NAMED = """\
+#include <stdarg.h>
+char *strcpy(char *d, const char *s);
+char *strcat(char *d, const char *s);
+int sprintf(char *d, const char *fmt, ...);
+int vsprintf(char *d, const char *fmt, va_list ap);
+void use(char *);
+void cpy(const char *s) { char b[8]; strcpy(b, s); use(b); }
+void cat(const char *s) { char b[8] = "ab"; strcat(b, s); use(b); }
+void fmt(const char *s) { char b[8]; sprintf(b, "%s", s); use(b); }
+void vfmt(const char *f, va_list ap) { char b[8]; vsprintf(b, f, ap); use(b); }
+void lit(void) { char b[8]; strcpy(b, "1234567"); use(b); }
+void param(char *d, const char *s) { strcpy(d, s); sprintf(d, "%s", s); }
+"""
+
+
+def _undefined(tmp_path, src, *flags):
+    c = tmp_path / "t.c"
+    c.write_text(src)
+    o = tmp_path / "t.o"
+    proc = subprocess.run([str(TCC), "-ccompat", "-O1", "-w", *flags, "-c", str(c), "-o", str(o)],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    nm = subprocess.run(["arm-none-eabi-nm", str(o)], capture_output=True, text=True).stdout
+    return {line.split()[-1] for line in nm.splitlines() if " U " in line}
+
+
+@pytest.mark.parametrize("name, want", [
+    ("cpy", "__tcc_fortify_strcpy"), ("cat", "__tcc_fortify_strcat"), ("fmt", "__tcc_sprintf_chk"),
+    ("vfmt", "__tcc_vsprintf_chk")])
+def test_checked_by_name(tmp_path, name, want):
+    """-ffortify knows strcpy / strcat / sprintf / vsprintf by name: no macro, no size argument"""
+    head, body = NAMED.split("void use(char *);\n")
+    fn = next(l for l in body.splitlines() if l.startswith(f"void {name}("))
+    assert want in _undefined(tmp_path, head + "void use(char *);\n" + fn + "\n", "-ffortify")
+    assert want not in _undefined(tmp_path, head + "void use(char *);\n" + fn + "\n", "-fno-fortify")
+
+
+def test_not_checked_when_nothing_is_known(tmp_path):
+    """a literal that fits, a destination through a parameter, the program's own strcpy"""
+    head, body = NAMED.split("void use(char *);\n")
+    keep = [l for l in body.splitlines() if l.startswith(("void lit(", "void param("))]
+    syms = _undefined(tmp_path, head + "void use(char *);\n" + "\n".join(keep) + "\n", "-ffortify")
+    assert not syms & {"__tcc_fortify_strcpy", "__tcc_sprintf_chk"}, syms
+    own = ("static char *strcpy(char *d, const char *s) { char *r = d; while ((*d++ = *s++)) ; return r; }\n"
+           "void use(char *);\nvoid cpy(const char *s) { char b[8]; strcpy(b, s); use(b); }\n")
+    assert "__tcc_fortify_strcpy" not in _undefined(tmp_path, own, "-ffortify")
+
+
+def test_one_warning_for_a_constant_overflow(tmp_path):
+    """the -ffortify check's warning (it says the call traps), not the plain one's as well"""
+    c = tmp_path / "t.c"
+    c.write_text("void *memcpy(void *d, const void *s, unsigned long n) __attribute__((access(write_only, 1, 3)));\n"
+                 "void f(const char *s) { char d[4]; memcpy(d, s, 8); }\n")
+    proc = subprocess.run([str(TCC), "-ccompat", "-ffortify", "-Wstringop-overflow", "-c", str(c), "-o",
+                           str(tmp_path / "t.o")], capture_output=True, text=True)
+    warnings = [l for l in proc.stderr.splitlines() if "warning:" in l]
+    assert warnings == [f"{c}:2: warning: 'memcpy' accesses 8 bytes of an object of 4: the call ends the program"], \
+        proc.stderr
+    proc = subprocess.run([str(TCC), "-ccompat", "-fno-fortify", "-Wstringop-overflow", "-c", str(c), "-o",
+                           str(tmp_path / "t.o")], capture_output=True, text=True)
+    assert "writing 8 bytes into a region of size 4" in proc.stderr, proc.stderr
+
+
+def test_chk_fail_is_libtcc1s(tmp_path):
+    """libtcc1 defines __chk_fail (newlib, linked in the QEMU runs, has one too): a program with only
+    libtcc1 and the write / abort it calls links; its own definition still wins (weak)."""
+    src = tmp_path / "t.c"
+    src.write_text("long write(int fd, const void *b, unsigned long n) { (void)fd; (void)b; return (long)n; }\n"
+                   "void abort(void) { for (;;) ; }\n"
+                   "void __chk_fail(void);\n"
+                   "void _start(void) { __chk_fail(); }\n")
+    lib = TCC.parent / "armv8m-libtcc1.a"
+    top = TCC.parent
+    # -nostdlib keeps libtcc1 and the FP runtime: found in the build tree, not a sysroot (CI's cross has none)
+    flags = [f"-B{top}", f"-L{top}/lib", f"-L{top}/lib/fp", f"-L{top}", "-nostdlib", "-fno-pic", "-mno-sb-relative-got",
+             "-Wl,-oformat=elf32-littlearm", "-Wl,-Ttext=0x0"]
+    proc = subprocess.run([str(TCC), "-ccompat", *flags, str(src), str(lib), "-o", str(tmp_path / "t.elf")],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    own = tmp_path / "own.c"
+    own.write_text(src.read_text().replace("void __chk_fail(void);", "void __chk_fail(void) { for (;;) ; }"))
+    proc = subprocess.run([str(TCC), "-ccompat", *flags, str(own), str(lib), "-o", str(tmp_path / "own.elf")],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+
+
 # --------------------------------------------------------------------------
 # yasc's syntax for the same: `char s[:0]`, `T p[n]` with n a parameter
 # (also one after p), `const void buf[n]` for bytes
 
 SYNTAX = """\
 #include <stddef.h>
-char * borrows(path) pdir(char path[maybe :0]);
+char *borrows(path) pdir(char path[maybe :0]);
 void fill(char d[n], size_t n);
 void wr(const void buf[n], size_t n);
 void rd(out void buf[n], size_t n);
 void fill_first(size_t n, char d[n]);
 void use(char *p);
-char * borrows(static) chk_str(void) { static char g[16]; return pdir(g); }
-void chk_rt(size_t n) { char b[8] = undefined; fill(b, n); use(b); }
-void chk_wr(size_t n) { int b[4] = undefined; wr(b, n); }
+char *borrows(static) chk_str(void) { static char g[16]; return pdir(g); }
+void chk_rt(size_t n) { char b[8] = {}; fill(b, n); use(b); }
+void chk_wr(size_t n) { int b[4] = {}; wr(b, n); }
 void chk_rd(size_t n) { int b[4] = undefined; rd(b, n); }
-void chk_first(size_t n) { char b[8] = undefined; fill_first(n, b); use(b); }
-void ok_const(void) { char b[8] = undefined; fill(b, 8); use(b); }
-void ok_bytes(void) { int b[4] = undefined; wr(b, sizeof b); }
-void ok_first(void) { char b[8] = undefined; fill_first(8, b); use(b); }
+void chk_first(size_t n) { char b[8] = {}; fill_first(n, b); use(b); }
+void ok_const(void) { char b[8] = {}; fill(b, 8); use(b); }
+void ok_bytes(void) { int b[4] = {}; wr(b, sizeof b); }
+void ok_first(void) { char b[8] = {}; fill_first(8, b); use(b); }
 """
 
 ATTRS = """\
 #include <stddef.h>
-char * borrows(path) pdir(char * maybe path) __attribute__((null_terminated_string_arg(1)));
+char *borrows(path) pdir(char *?path) __attribute__((null_terminated_string_arg(1)));
 void fill(char *d, size_t n) __attribute__((access(read_write, 1, 2)));
 void wr(const void *buf, size_t n) __attribute__((access(read_only, 1, 2)));
 void rd(out void *buf, size_t n) __attribute__((access(write_only, 1, 2)));

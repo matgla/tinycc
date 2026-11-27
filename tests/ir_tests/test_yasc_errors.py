@@ -65,7 +65,7 @@ def test_keywords_are_identifiers_outside_yasc(tmp_path):
 @pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2", "-Os"])
 def test_correct_code_is_silent(tmp_path, opt):
     body = """\
-!char * borrows(static) name(int i);
+!char *borrows(static) name(int i);
 !int (*hook)(void) = f;
 static int error_count;
 !int h(int a)
@@ -73,7 +73,7 @@ static int error_count;
   errdefer error_count++;
   defer note(a);
   int v = try f();
-  char * view p = name(v) catch 0;
+  char *view p = name(v) catch 0;
   try g();
   if (!p)
     return error.Empty;
@@ -123,8 +123,8 @@ def test_used_without_try_or_catch(tmp_path, body):
 
 
 def test_union_payloads_must_match(tmp_path):
-    proc = _yasc(tmp_path, "!char * borrows(static) p(void);\n!int k(void) { return p(); }\n")
-    assert _error(proc) == "cannot convert '!char * view' to '!int'"
+    proc = _yasc(tmp_path, "!char *borrows(static) p(void);\n!int k(void) { return p(); }\n")
+    assert _error(proc) == "cannot convert '!char *view' to '!int'"
 
 
 def test_try_outside_an_error_union_function(tmp_path):

@@ -414,6 +414,7 @@ UT_COVERAGE_ONLY_SRCS := \
 	$(TOP)/source/frontend/gen/decl/c_api.c \
 	$(TOP)/source/frontend/gen/decl/decl.c \
 	$(TOP)/source/frontend/gen/decl/declarator.c \
+	$(TOP)/source/frontend/gen/decl/default_arg.c \
 	$(TOP)/source/frontend/gen/decl/method.c \
 	$(TOP)/source/frontend/gen/decl/module.c \
 	$(TOP)/source/frontend/gen/decl/plain_param.c \

@@ -56,7 +56,7 @@ union num
 struct counter
 {
   int n;
-  struct counter * view bump(inout struct counter *self)
+  struct counter *view bump(inout struct counter *self)
   {
     self->n++;
     return self;
@@ -75,7 +75,7 @@ struct vec g = {2, 5};
 int main(void)
 {
   struct vec v = vec.make(3, 4);
-  struct vec * view p = &v;
+  struct vec *view p = &v;
   printf("len2 %d\n", v.len2());
   p->scale(2);
   printf("scaled %d %d %d\n", v.x, v.y, p->len2());

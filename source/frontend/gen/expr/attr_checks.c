@@ -86,6 +86,8 @@ static const struct
     {"vsprintf", "vsnprintf(buf, size, fmt, ap), which bounds the output", NULL},
     {"strcpy", "strlcpy(dst, src, size), which bounds the copy", NULL},
     {"strcat", "strlcat(dst, src, size), which bounds the copy", NULL},
+    {"stpcpy", "strlcpy(dst, src, size), which bounds the copy (it returns the length it tried to make)", NULL},
+    {"strncat", "strlcat(dst, src, size): its size is the whole destination's", NULL},
     {"gets", "fgets(buf, size, stdin), which bounds the line", NULL},
     {"tmpnam", "mkstemp(template), which creates the file safely", NULL},
     {"tempnam", "mkstemp(template), which creates the file safely", NULL},
@@ -179,11 +181,37 @@ static void attr_note_at(const char *name, int line, const char *msg)
   s1->diag_replay_file = saved;
 }
 
+/* -Wdeprecated-declarations for F here */
+static int dep_wanted(const SymLocalFacts *f)
+{
+  return f->deprecated && !attr_deprecated_suppress && (tcc_state->warn_deprecated_declarations & WARN_ON);
+}
+
+/* -Wyasc-unsafe-call for F here: yasc code, outside unsafe { } / unsafe(...)
+   and a C section */
+static int unsafe_wanted(const SymLocalFacts *f)
+{
+  return f->yasc_unsafe && tcc_state->yasc && !tcc_state->unsafe_depth && !pp_in_c() &&
+         (tcc_state->warn_yasc_unsafe_call & WARN_ON);
+}
+
 static void dep_report(Sym *s, int line, ObjCall *oc)
 {
   const SymLocalFacts *f = sym_facts_peek(s);
   const char *name = get_tok_str(s->v & ~(SYM_STRUCT | SYM_FIELD), NULL);
   int shown;
+  if (!dep_wanted(f))
+  {
+    /* yasc_unsafe: what it is, the bounded call it should be (dep_fixit) */
+    if (!unsafe_wanted(f))
+      return;
+    shown = attr_warn(ATTR_OPT(warn_yasc_unsafe_call), line, "'%s' is unsafe: %s (inside unsafe { } it is allowed)",
+                      name, f->yasc_unsafe_msg ? get_tok_str(f->yasc_unsafe_msg, NULL) : "nothing bounds what it writes");
+    if (shown)
+      dep_fixit(s, name, line, oc);
+    attr_note_at(f->deprecated_file, f->deprecated_line, "declared here");
+    return;
+  }
   if (f->deprecated_msg)
     shown = attr_warn(ATTR_OPT(warn_deprecated_declarations), line, "'%s' is deprecated: %s", name,
                       get_tok_str(f->deprecated_msg, NULL));
@@ -245,7 +273,7 @@ void attr_dep_call_report(Sym *fsym, int line, ObjCall *oc)
 void attr_deprecated_use(Sym *s)
 {
   const SymLocalFacts *f = sym_facts_peek(s);
-  if (!f || !f->deprecated || attr_deprecated_suppress || !(tcc_state->warn_deprecated_declarations & WARN_ON))
+  if (!f || !(dep_wanted(f) || unsafe_wanted(f)))
     return;
   if (dep_btype_depth && dep_pending_nb < DEP_PENDING_MAX)
   {

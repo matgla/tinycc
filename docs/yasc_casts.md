@@ -46,7 +46,7 @@ unsafe_cast<PERMISSION(TYPE), MODIFIER, ...>(EXPR)
 ```c
 uint16_t port = cast<int(uint16_t)>(n);
 auto de = cast<ptr(struct dirent *), align>(dir->buf + dir->buf_pos);
-char * view hit = unsafe_cast<qual(char *)>(s);
+char *view hit = unsafe_cast<qual(char *)>(s);
 ```
 
 - **The type.** At most one permission carries the target type in
@@ -98,11 +98,11 @@ that needs both is two casts.
   says it, so `grep unsafe_cast` finds every one.
 
 **yasc qualifiers are not cast.**
-- No cast changes `owned`, `view`, `borrows` or `maybe`. `move`, `borrow`, a
+- No cast changes `owned`, `view`, `borrows` or `?`. `move`, `borrow`, a
   null test and `unsafe(...)` do that, as today.
 - When the target type spells none of these words, it takes them from the
   source: `cast<ptr(struct dirent *)>(v)` with `v` a view gives a
-  `struct dirent * view`.
+  `struct dirent *view`.
 - If the target spells different ones, the cast is an error that names the
   right tool.
 
@@ -153,7 +153,7 @@ flash. `qual` refuses that by check 1, which is right for every other cast.
 loses the `const` for the interface.
 
 ```c
-char * borrows(static) maybe dlerror(void) {
+char *?borrows(static) dlerror(void) {
   return unsafe_cast<ptr(char *), const>("");     /* or unsafe_cast<const(char *)>("") */
 }
 ```
@@ -206,7 +206,7 @@ const uint32_t *w = (const uint32_t *)src;  /* src: const uint8_t *, known 4-ali
                                      ->  const uint32_t *w = cast<ptr(const uint32_t *), align>(src);
 p = (uint8_t *)cast_to_aligned;      ->  p = cast<align(8)>(p);                   /* type kept, alignment proven or checked */
 struct node *n = (struct node *)malloc(sizeof *n);
-                                     ->  struct node * owned maybe n = malloc(sizeof *n);  /* void *: no cast */
+                                     ->  struct node *?owned n = malloc(sizeof *n);  /* void *: no cast */
 const char *t = (const char *)s;     ->  const char *t = s;                       /* adding const: implicit */
 if ((uintptr_t)p & 3)                ->  if (cast<addr(uintptr_t)>(p) & 3)
 

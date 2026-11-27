@@ -58,10 +58,10 @@ def test_every_file(tmp_path):
 def test_flow_checks(tmp_path, opt):
     body = """\
 #pragma yasc
-void free(drop void * owned maybe p);
-static void twice(char * owned p) { free(p); free(p); }
-void caller(char * owned p) { twice(p); }
-int * borrows(static) local(void) { int x = 1; return &x; }
+void free(drop void *?owned p);
+static void twice(char *owned p) { free(p); free(p); }
+void caller(char *owned p) { twice(p); }
+int *borrows(static) local(void) { int x = 1; return &x; }
 """
     proc = _run(tmp_path, {"a.c": body}, "-ccompat", "-Wlifetime", "-Wall", opt)
     assert proc.returncode == 0, proc.stderr

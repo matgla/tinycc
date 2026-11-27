@@ -1,7 +1,7 @@
 """The yasc dialect: ownership keywords and the rules the types alone decide.
 
 `-std=yasc` (C23 plus the dialect, for the main file) or `#pragma yasc` (from
-there to the end of its file) make `owned view maybe out drop` keywords;
+there to the end of its file) make `owned ?view out drop` keywords;
 elsewhere they are identifiers.  `owned`, `view` and `maybe` qualify a pointer
 (after the `*`), `out` and `drop` the object (before the type).  The qualifiers never change the
 generated code.  The flow checks (moves, leaks at scope exit, double free)
@@ -14,6 +14,8 @@ are -Wlifetime's, in test_lifetime.py; these are the type-level rules:
 import subprocess
 from pathlib import Path
 
+import re
+
 import pytest
 
 CURRENT_DIR = Path(__file__).parent
@@ -23,16 +25,16 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 
 NOT_OWNING = "a pointer that owns nothing is stored in an owned pointer"
 # ... when it is a parameter (a view unless it says owned)
-NOT_OWNING_Q = ("the parameter 'q' owns nothing (a view unless it says owned): write '* owned q' when the function "
+NOT_OWNING_Q = ("the parameter 'q' owns nothing (a view unless it says owned): write '*owned q' when the function "
                 "takes it over, 'drop' before the type too when it frees it")
 LEAK = "an owned result is stored in a pointer that owns nothing: it is never freed"
 DISCARD = "an owned result is discarded: it is never freed"
 
 PRELUDE = """\
-void * owned maybe alloc(unsigned n);
-void release(drop void * owned maybe p);
-char * owned make(void);
-char * borrows(static) plain(void);
+void *?owned alloc(unsigned n);
+void release(drop void *?owned p);
+char *owned make(void);
+inout char *borrows(static) plain(void);
 """
 
 
@@ -70,7 +72,7 @@ def test_yasc_macro(tmp_path):
 
 
 def test_pragma_starts_the_dialect(tmp_path):
-    body = "int out;\n#pragma yasc\n" + PRELUDE + "void f(void) { char * view v = make(); (void)v; }\n"
+    body = "int out;\n#pragma yasc\n" + PRELUDE + "void f(void) { char *view v = make(); (void)v; }\n"
     proc = _compile(tmp_path, body, "-std=c23")
     assert proc.returncode == 0, proc.stderr
     assert _warnings(proc) == [LEAK]
@@ -78,18 +80,18 @@ def test_pragma_starts_the_dialect(tmp_path):
 
 def test_correct_ownership_is_silent(tmp_path):
     proc = _yasc(tmp_path, """\
-struct S { char * owned text; char * view peek; };
-typedef char * owned ostr;
-char * owned pass(char * owned p) { return p; }
+struct S { char *owned text; char *peek; };
+typedef char *owned ostr;
+char *owned pass(char *owned p) { return p; }
 void take(drop struct S *s);
 int fill(out struct S *s);
 void f(struct S *s);
 void ok(inout struct S *s)
 {
-  char * owned p = alloc(4);
-  char * owned q = 0;
-  char * view borrow = p;
-  char * view inside = p + 1;
+  char *owned p = alloc(4);
+  char *owned q = 0;
+  char *view borrow = p;
+  char *view inside = p + 1;
   ostr t = make();
   s->text = make();
   s->peek = s->text;
@@ -107,16 +109,16 @@ void ok(inout struct S *s)
 @pytest.mark.parametrize(
     "body, expected",
     [
-        ("void f(inout char *q) { char * owned p = q; release(p); }", [NOT_OWNING_Q]),
+        ("void f(inout char *q) { char *owned p = q; release(p); }", [NOT_OWNING_Q]),
         ("void f(inout char *q) { release(q); }", [NOT_OWNING_Q]),
-        ("char * owned f(inout char *q) { return q; }", [NOT_OWNING_Q]),
-        ("void f(void) { char * owned p = plain(); release(p); }", [NOT_OWNING]),
-        ("typedef char * owned ostr;\nvoid f(inout char *q) { ostr s = q; release(s); }", [NOT_OWNING_Q]),
-        ("struct S { char * owned t; };\nvoid f(inout struct S *s, inout char *q) { s->t = q; }", [NOT_OWNING_Q]),
-        ("void f(inout char * owned *pp, inout char *q) { *pp = q; }", [NOT_OWNING_Q]),
-        ("void f(void) { char * view v = make(); (void)v; }", [LEAK]),
+        ("char *owned f(inout char *q) { return q; }", [NOT_OWNING_Q]),
+        ("void f(void) { char *owned p = plain(); release(p); }", [NOT_OWNING]),
+        ("typedef char *owned ostr;\nvoid f(inout char *q) { ostr s = q; release(s); }", [NOT_OWNING_Q]),
+        ("struct S { char *owned t; };\nvoid f(inout struct S *s, inout char *q) { s->t = q; }", [NOT_OWNING_Q]),
+        ("void f(inout char *owned *pp, inout char *q) { *pp = q; }", [NOT_OWNING_Q]),
+        ("void f(void) { char *view v = make(); (void)v; }", [LEAK]),
         ("void use(char *s);\nvoid f(void) { use(make()); }", [LEAK]),
-        ("char * borrows(static) f(void) { return make(); }", [LEAK]),
+        ("char *borrows(static) f(void) { return make(); }", [LEAK]),
         ("void f(void) { make(); }", [DISCARD]),
         ("void f(void) { alloc(8), make(); }", [DISCARD, DISCARD]),
         ("void f(void) { for (make();; make()) break; }", [DISCARD, DISCARD]),
@@ -131,10 +133,11 @@ def test_ownership_warnings(tmp_path, body, expected):
 @pytest.mark.parametrize(
     "body, message",
     [
-        ("owned char * view p;", "'owned' qualifies a pointer: write it after the '*'"),
-        ("maybe int * view p;", "'maybe' qualifies a pointer: write it after the '*'"),
-        ("view int * view p;", "'view' qualifies a pointer: write it after the '*'"),
-        ("char * owned view p;", "a pointer is owned, a view or borrows(...): one of them"),
+        ("owned char *view p;", "'owned' qualifies a pointer: write it after the '*'"),
+        ("?view int *p;", "'?' qualifies a pointer: write it after the '*'"),
+        ("char * maybe p;", "'maybe' is gone: write '?' against the '*'"),
+        ("view int *view p;", "'view' qualifies a pointer: write it after the '*'"),
+        ("char *@(owned, view) p;", "a pointer is owned, a view or borrows(...): one of them"),
         ("char * out p;", "'out' qualifies the object: write it before the type"),
         ("char * drop p;", "'drop' qualifies the object: write it before the type"),
     ],
@@ -147,16 +150,16 @@ def test_misplaced_qualifiers(tmp_path, body, message):
 def test_type_names_show_pointer_qualifiers(tmp_path):
     proc = _yasc(tmp_path, "struct S { int a; };\nvoid f(void) { struct S s; s = make(); }\n")
     assert proc.returncode != 0
-    assert "'char * owned'" in proc.stderr, proc.stderr
+    assert "'char *owned'" in proc.stderr, proc.stderr
 
 
 YASC_FILE = PRELUDE + """\
-struct node { struct node * owned maybe next; char * owned name; };
+struct node { struct node *?owned next; char *owned name; };
 int fill(out struct node *n) { n->next = 0; n->name = make(); return 0; }
 void drain(drop struct node *n)
 {
   while (n->next) {
-    struct node * owned maybe next = move(n->next->next);
+    struct node *?owned next = move(n->next->next);
     release(n->next->name);
     release(n->next);
     n->next = move(next);
@@ -168,10 +171,13 @@ void drain(drop struct node *n)
 
 @pytest.mark.parametrize("level", ["-O0", "-O1", "-O2", "-Os"])
 def test_qualifiers_do_not_change_code(tmp_path, level):
-    gone = ["-Downed=", "-Dview=", "-Dmaybe=", "-Dout=", "-Ddrop=", "-Dborrows(...)=", "-Dmove(x)=(x)"]
+    gone = ["-Downed=", "-Dview=", "-Dmaybe=", "-Dout=", "-Ddrop=", "-Dinout=", "-Dborrows(...)=", "-Dmove(x)=(x)"]
     yasc = _compile(tmp_path, YASC_FILE, "-std=yasc", level, name="y.c", obj="y.o")
     # -std=yasc is safe mode, so -Wlifetime (the SSA path at -O0) is on there
-    plain = _compile(tmp_path, YASC_FILE, "-std=c23", "-Wlifetime", level, *gone, name="p.c", obj="p.o")
+    # what -D cannot take away: `*?`, `[?`, `?owned` and `*@(a, b)`
+    src = re.sub(r"\*@\(((?:[^()]|\([^()]*\))*)\)", lambda m: "* " + m.group(1).replace(",", " ") + " ", YASC_FILE)
+    src = re.sub(r"(?<=[*\[])\?|\?(?=owned|view)", "", src)
+    plain = _compile(tmp_path, src, "-std=c23", "-Wlifetime", level, *gone, name="p.c", obj="p.o")
     assert yasc.returncode == 0 and plain.returncode == 0, yasc.stderr + plain.stderr
     y, p = (tmp_path / "y.o").read_bytes(), (tmp_path / "p.o").read_bytes()
     # The objects name their source file; compare everything else.
@@ -199,28 +205,28 @@ char **c_list(void);
 
 YASC_H = """\
 #pragma yasc
-char * borrows(static) y_hdr_view(void);
+inout char *borrows(static) y_hdr_view(void);
 """
 
 LEGACY_USER = """\
 #include "legacy.h"
 #include "yasc.h"
-char * owned make(void);
-char * borrows(static) y_view(void);
+char *owned make(void);
+inout char *borrows(static) y_view(void);
 void y_take(char *p);
-void release(drop void * owned maybe p);
-#define Y_MK(n) ((char * view)c_alloc(n))
+void release(drop void *?owned p);
+#define Y_MK(n) ((char *view)c_alloc(n))
 void f(void)
 {
-  char * owned a = c_alloc(4);
-  char * owned b = c_name();
-  C_FILE * owned fp = c_open("x");
-  char * owned c = C_MK(3);
-  char * owned * owned l = c_list();
+  char *owned a = c_alloc(4);
+  char *owned b = c_name();
+  C_FILE *owned fp = c_open("x");
+  char *owned c = C_MK(3);
+  char *owned *owned l = c_list();
   c_take(make());
-  char * owned d = Y_MK(3);
-  char * owned e = y_view();
-  char * owned g = y_hdr_view();
+  char *owned d = Y_MK(3);
+  char *owned e = y_view();
+  char *owned g = y_hdr_view();
   y_take(make());
   release(a); release(b); release(fp); release(c); release(l);
   release(d); release(e); release(g);
@@ -247,8 +253,8 @@ def test_legacy_c_pointers_are_unchecked(tmp_path):
 def test_legacy_c_in_safe_mode(tmp_path):
     # safe by default (no -ccompat) is yasc too
     (tmp_path / "legacy.h").write_text(LEGACY_H)
-    body = ('#include "legacy.h"\nvoid release(drop void * owned maybe p);\n'
-            "void f(void)\n{\n  char * owned a = unsafe(c_alloc(4));\n  release(a);\n}\n")
+    body = ('#include "legacy.h"\nvoid release(drop void *?owned p);\n'
+            "void f(void)\n{\n  char *owned a = unsafe(c_alloc(4));\n  release(a);\n}\n")
     proc = _compile(tmp_path, body)
     assert proc.returncode == 0 and not proc.stderr, proc.stderr
 
@@ -256,7 +262,7 @@ def test_legacy_c_in_safe_mode(tmp_path):
 def test_string_literals_do_not_end_checks(tmp_path):
     # a token string replayed for a string literal must not leave the parser
     # reading the rest of the unit as regular C
-    body = 'const char * view s = "x";\nvoid f(void) { char * owned e = plain(); release(e); (void)s; }\n'
+    body = 'const char *view s = "x";\nvoid f(void) { char *owned e = plain(); release(e); (void)s; }\n'
     assert _warnings(_yasc(tmp_path, body)) == [NOT_OWNING]
 
 
@@ -267,7 +273,7 @@ def test_plain_c_unit_unaffected(tmp_path):
     assert proc.returncode == 0 and not proc.stderr, proc.stderr
 
 
-# GCC attributes refine regular C: malloc is an owned result (owned maybe;
+# GCC attributes refine regular C: malloc is an owned result (?owned;
 # owned with returns_nonnull), malloc(dealloc, i) makes the deallocator's
 # argument owned (and drop), nonnull is checked at calls (-Wnonnull, in -Wall).
 
@@ -283,23 +289,23 @@ char *getname(void);
 
 ATTR_USER = """\
 #include "attr.h"
-char * borrows(static) y_view(void);
+inout char *borrows(static) y_view(void);
 void f(void)
 {
-  char * owned maybe a = my_alloc(4);
-  char * owned maybe c = my_dup("x");
-  char * owned d = getname();
-  char * owned e = xalloc(1);
+  char *?owned a = my_alloc(4);
+  char *?owned c = my_dup("x");
+  char *owned d = getname();
+  char *owned e = xalloc(1);
   my_free(a);
   my_free(getname());
   my_free(0);
-  char * view b = my_alloc(4);
+  char *view b = my_alloc(4);
   my_alloc(8);
   my_free(y_view());
   my_dup(0);
   if (c)
     my_cpy(c, 0);
-  char * owned z = my_alloc(1);
+  char *owned z = my_alloc(1);
   my_free(c); my_free(d); my_free(e); my_free(z);
   (void)b;
 }
@@ -307,7 +313,7 @@ void f(void)
 
 NONNULL1 = "null passed as argument 1, which is declared nonnull"
 NONNULL2 = "null passed as argument 2, which is declared nonnull"
-MAYBE_INTO_Z = "a pointer that may be null is stored in 'z', which is not maybe"
+MAYBE_INTO_Z = "a pointer that may be null is stored in 'z', which is not '?'"
 
 
 def test_attributes_refine_regular_c(tmp_path):
@@ -317,8 +323,8 @@ def test_attributes_refine_regular_c(tmp_path):
     proc = _compile(tmp_path, ATTR_USER, "-ccompat", "-std=yasc", "-Wall", "-Wlifetime")
     assert proc.returncode == 0, proc.stderr
     warnings = _located(proc)
-    # silent: owned results into owned maybe pointers, an unchecked one, a
-    # returns_nonnull result into a pointer that is not maybe, owned and
+    # silent: owned results into ?owned pointers, an unchecked one, a
+    # returns_nonnull result into a pointer that is not '?', owned and
     # unchecked pointers and null into the deallocator
     for expected in [
         (12, LEAK),  # an owned result into a view
@@ -390,5 +396,5 @@ def test_has_attribute_reports_them(tmp_path):
 
 
 def test_unknown_deallocator(tmp_path):
-    proc = _compile(tmp_path, "__attribute__((malloc(nosuch, 1))) void * owned maybe a(unsigned);\n", "-std=yasc")
+    proc = _compile(tmp_path, "__attribute__((malloc(nosuch, 1))) void *?owned a(unsigned);\n", "-std=yasc")
     assert _warnings(proc) == ["malloc: deallocator 'nosuch' is not a function declared before"], proc.stderr

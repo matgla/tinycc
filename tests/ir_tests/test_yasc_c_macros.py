@@ -36,7 +36,7 @@ C_H = """\
 Y_H = """\
 #pragma yasc
 #define YID(x) x
-#define YPTR(T) T * view
+#define YPTR(T) T *view
 #define YCALL(m, a) m(a)
 """
 
@@ -77,7 +77,7 @@ def test_arguments_and_nesting(tmp_path, opt):
 
 
 def test_yasc_macro_inside_c_macro_is_c(tmp_path):
-    """YPTR's `view` inside ID(...) is a name: so `char * view u` is a syntax error."""
+    """YPTR's `view` inside ID(...) is a name: so `char *view u` is a syntax error."""
     proc = _run(tmp_path, "void g(char *s) { ID(YPTR(char) u = s;) }\n")
     assert proc.returncode != 0
     assert "m.c:3: error: ';' expected" in proc.stderr, proc.stderr
@@ -97,7 +97,7 @@ void g(inout char *s)
   PTR(char) a = s;       /* the '*' is regular C */
   CHARP b = s;
   PTR(char) view c = s;  /* qualified by yasc code after it */
-  CHARP * view d = &b;   /* the second '*' is yasc's and says view */
+  CHARP *view d = &b;   /* the second '*' is yasc's and says view */
   use(a); use(b); use(c); (void)d;
 }
 """
@@ -121,7 +121,7 @@ int f(int n, ...)
 {
   va_list ap;
   va_start(ap, n);
-  char * view s = va_arg(ap, char *);
+  char *view s = va_arg(ap, char *);
   va_end(ap);
   return s[0];
 }
@@ -162,7 +162,7 @@ void g(char *s)
   PTR(char) a = s;
   CHARP b = s;
   PTR(char) view c = s;
-  CHARP * view d = &b;
+  CHARP *view d = &b;
   use(a); use(b); use(c); (void)d;
 }
 """,
@@ -173,7 +173,7 @@ int f(int n, ...)
 {
   va_list ap;
   va_start(ap, n);
-  char * view s = va_arg(ap, char *);
+  char *view s = va_arg(ap, char *);
   va_end(ap);
   return s[0];
 }

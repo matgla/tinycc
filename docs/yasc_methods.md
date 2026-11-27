@@ -12,7 +12,7 @@ Implementation: `source/frontend/gen/decl/method.c`. Tutorial: chapter 7 of
 | Question | Decision |
 |---|---|
 | Where methods are written | In the struct body, with their bodies (Zig). With modules there is no header to keep declarations in. A prototype in the body, defined outside under the full name, also works. |
-| How a method gets the object | An explicit first parameter (Zig), so the yasc qualifiers say what the method does with it: `view`, `owned`, `drop`, `maybe`, `const`. No hidden `this`. |
+| How a method gets the object | An explicit first parameter (Zig), so the yasc qualifiers say what the method does with it: `view`, `owned`, `drop`, `?`, `const`. No hidden `this`. |
 | Symbol | `TAG__NAME`: a plain C function. C calls and links it by that name; no mangling (as for modules). |
 | Call syntax | `obj.m(...)` passes `&obj`, `p->m(...)` passes `p`; a by-value self gets a copy. `TAG.m(...)` (tag or typedef name) calls any method by name, and is the only way to call a method without a self. |
 
@@ -89,9 +89,9 @@ called-once.
 ## Ownership checks
 
 The object is argument 0 of a normal call, so `-Wlifetime` treats it like any
-argument: `p->destroy()` with `drop struct buf * owned self` moves `p`
+argument: `p->destroy()` with `drop struct buf *owned self` moves `p`
 (a second call is "freed twice", a later use "used after it was freed"), a
-`maybe` pointer is reported when passed to a non-maybe self, and
+`?` pointer is reported when passed to a non-maybe self, and
 `obj.destroy()` on a stack object is "a pointer that owns nothing is stored in
 an owned pointer". For `p->m()` the pointer itself is passed, not `&*p`, so
 its qualifiers are kept.

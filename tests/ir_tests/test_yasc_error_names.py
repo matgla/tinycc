@@ -104,7 +104,7 @@ def test_error_name_reads_only_errno_macros(tmp_path):
     src = tmp_path / "t.c"
     src.write_text(
         "#pragma yasc\n#define TOO_BIG 0x1ffffffffffffffff\n#define SMALL 7\n#define EZORK 77\n"
-        "const char * borrows(static) maybe g(int e)\n{\n  return error_name(e);\n}\n"
+        "const char *?borrows(static) g(int e)\n{\n  return error_name(e);\n}\n"
     )
     obj = tmp_path / "t.o"
     proc = subprocess.run([str(TCC), "-ccompat", "-Wall", "-c", str(src), "-o", str(obj)], capture_output=True, text=True)

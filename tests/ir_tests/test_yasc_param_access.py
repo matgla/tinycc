@@ -8,8 +8,10 @@
 A view parameter's target is const unless the parameter says inout or out
 (drop consumes it); owned pointers, int handles and regular-C pointers are
 not views and are unchanged.  Writing the read-only target is an error in
-yasc, and so is handing it on where something may write it.  `in` is a
-keyword only where a parameter's declaration starts.
+yasc, and so is handing it on where something may write it.  `in`, `out`,
+`inout` and `drop` are keywords only where a parameter's declaration starts
+(and out / inout / drop before an int handle's words: `int drop owned(close)
+fd`): names everywhere else, `out char *out` included.
 """
 
 import subprocess
@@ -22,7 +24,7 @@ TCC = CURRENT_DIR.parent.parent / "armv8m-tcc"
 
 pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 
-Y = "#pragma yasc\nvoid free(drop void * owned maybe p);\nstruct box { int n; char * owned maybe s; };\n"
+Y = "#pragma yasc\nvoid free(drop void *?owned p);\nstruct box { int n; char *?owned s; };\n"
 RO = "assignment of read-only location"
 
 
@@ -45,11 +47,20 @@ CLEAN = {
     "array_out": "void f(out char a[2]) { a[0] = 0; a[1] = 0; }\n",
     "inout_to_inout": "void g(inout int *p);\nvoid f(inout int *p) { g(p); }\n",
     "in_to_in": "int g(int *p);\nint f(int *p) { return g(p); }\n",
-    "owned_writable": "void f(char * owned p) { p[0] = 0; free(p); }\n",
+    "owned_writable": "void f(char *owned p) { p[0] = 0; free(p); }\n",
     "handle_untouched": "int f(int view fd) { return cast<as(int)>(fd); }\n",
     # `in` is a name everywhere but where a parameter's declaration starts
     "in_as_name": "int f(int in) { int out_ = in; return out_; }\nint g(void) { int in = 2; return in; }\n",
     "free_member_inout": "void f(inout struct box *b) { free(b->s); b->s = nullptr; }\n",
+    # out / inout / drop too: `out char *out` is an out parameter named out
+    "out_named_out": "void f(out char *out, char c) { out[0] = c; }\n",
+    "inout_named_inout": "void f(inout int *inout) { *inout += 1; }\n",
+    "words_as_param_names": "int f(int out, int inout, int drop) { return out + inout + drop; }\n",
+    "words_as_locals": "int f(void) { int out = 1, inout = 2; int drop = 3; return out + inout + drop; }\n",
+    "words_as_members": "struct w { int out; int inout; int drop; };\nint f(struct w *p) { return p->out + p->drop; }\n",
+    "words_as_globals": "int out;\nint drop[2];\nint f(void) { return out + drop[1]; }\n",
+    "out_param_to_out": "void g(out char *p);\nvoid f(out char *out) { g(out); }\n",
+    "drop_handle": "int close(int drop ?owned(close) fd);\nvoid f(int owned(close) fd) { close(fd); }\n",
 }
 
 
@@ -65,9 +76,12 @@ ERRORS = {
     "write_member_in": ("void f(struct box *b) { b->n = 1; }\n", RO),
     "write_array_in": ("void f(char a[2]) { a[0] = 0; }\n", RO),
     "in_to_inout": ("void g(inout int *p);\nvoid f(int *p) { g(p); }\n", "discards 'const'"),
-    "return_in_writable": ("int * view f(int *p) { return p; }\n", "discards 'const'"),
+    "return_in_writable": ("inout int *view f(int *p) { return p; }\n", "discards 'const'"),
     "both_words": ("void f(in inout int *p);\n", "a parameter is in, inout or out: one of them"),
-    "inout_owned": ("void f(inout char * owned p);\n", "inout: only a view parameter's target"),
+    "out_after_type": ("void f(int out *p);\n", "'out' qualifies the object: write it before the type"),
+    "drop_after_star": ("void f(char * drop p);\n", "'drop' qualifies the object: write it before the type"),
+    "out_named_in_param": ("void f(char *out) { out[0] = 0; }\n", RO),
+    "inout_owned": ("void f(inout char *owned p);\n", "inout: only a view parameter's target"),
     "inout_int": ("void f(inout int n);\n", "inout: only a view parameter's target"),
     "redecl": ("void f(inout int *p);\nvoid f(int *p) { (void)p; }\n",
                "differs in in / inout (whether its target is written)"),
@@ -111,3 +125,21 @@ def test_c_header_spells_in_as_const(tmp_path):
     assert "int arr(int const a[4], char b[4]);" in text, text
     for w in ("inout", " in ", "out ", "view"):
         assert w not in text, (w, text)
+
+
+def test_c_header_keeps_words_used_as_names(tmp_path):
+    """-fmodule-header: out / inout / drop that are names stay in the C header"""
+    (tmp_path / "m.c").write_text(
+        "#pragma yasc\nmodule io;\n"
+        "export void name(out char *out, int drop, inout int *inout);\n"
+        "export int close(int drop ?owned(close) fd);\n"
+    )
+    proc = subprocess.run(
+        [str(TCC), "-ccompat", "-c", str(tmp_path / "m.c"), "-o", str(tmp_path / "m.o"),
+         f"-fmodule-header={tmp_path / 'inc'}"],
+        capture_output=True, text=True, cwd=tmp_path,
+    )
+    assert proc.returncode == 0 and not proc.stderr, proc.stderr
+    text = (tmp_path / "inc" / "io.h").read_text()
+    assert "void name(char * out, int drop, int * inout);" in text, text
+    assert "int close(int fd);" in text, text

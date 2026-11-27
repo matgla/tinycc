@@ -115,7 +115,7 @@ def test_lifetime_says_it_in_yasc(tmp_path):
     (tmp_path / "alloc.h").write_text("void free(void *p);\n"
                                       "void *malloc(unsigned long n) __attribute__((malloc, malloc(free, 1)));\n")
     body = ('#include "alloc.h"\n'
-            "int f(void) { int *maybe owned p = malloc(4); if (!p) return 0; free(p); return *p; }\n")
+            "int f(void) { int *?owned p = malloc(4); if (!p) return 0; free(p); return *p; }\n")
     proc = _run(tmp_path, body, ccompat=False, prelude="")
     assert "used after it was freed" in proc.stderr, proc.stderr
     assert proc.stderr.count("used after it was freed") == 1, proc.stderr

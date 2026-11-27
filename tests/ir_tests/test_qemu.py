@@ -2424,6 +2424,8 @@ TEST_FILES = [
     ("c23_auto.c", 0),
     # yasc move(p) / borrow(p)
     ("yasc_move.c", 0),
+    # @src() and yasc default arguments (docs/yasc_default_args.md)
+    ("yasc_src.c", 0),
 ]
 
 # Per-test compiler defines (e.g. for missing platform macros)
@@ -3068,6 +3070,22 @@ def test_abi_gcc_interop(float_abi, opt_level, tmp_path):
     assert r.returncode == 0, r.stderr
     _run_qemu_test(["abi_mix_main.c", "abi_mix_a.c"], 0, opt_level=opt_level, output_dir=tmp_path / "build",
                    float_abi=float_abi, extra_objs=[gcc_obj])
+
+
+# yasc_src across compilers: yasc_src_gcc.c is built by arm-none-eabi-gcc
+# with <yasc_src.h>'s fallback (self-relative words as integers, YASC_SRC
+# filled in at the call), yasc_src_gcc_main.c by tcc; each reads the other's.
+@pytest.mark.parametrize("opt_level", OPT_LEVELS, ids=[f"yasc_src_gcc_interop{o}" for o in OPT_LEVELS])
+def test_yasc_src_gcc_interop(opt_level, tmp_path):
+    import subprocess
+    (tmp_path / "gcc").mkdir()
+    gcc_obj = tmp_path / "gcc" / "yasc_src_gcc.o"
+    r = subprocess.run(["arm-none-eabi-gcc", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft", "-O2", "-ffunction-sections",
+                        f"-I{CURRENT_DIR.parent.parent / 'include'}", "-c", str(CURRENT_DIR / "yasc_src_gcc.c"),
+                        "-o", str(gcc_obj)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    _run_qemu_test("yasc_src_gcc_main.c", 0, opt_level=opt_level, output_dir=tmp_path / "build", extra_objs=[gcc_obj])
 
 
 # Hard-float HFAs against gcc: abi_hfa_b.c is built by arm-none-eabi-gcc

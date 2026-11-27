@@ -118,8 +118,8 @@ def test_no_and_error_forms(tmp_path):
 @pytest.mark.parametrize("level", LEVELS)
 def test_safe_default_error_once(tmp_path, level):
     # the safe default: int-conversion is an error -- reported at its line
-    body = ("static inline int f(int a) { int * view p = a; return p != 0; }\n"
-            "int main(int argc, char * view *argv) { (void)argv; return f(argc) + f(argc + 1); }\n")
+    body = ("static inline int f(int a) { int *view p = a; return p != 0; }\n"
+            "int main(int argc, char *view *argv) { (void)argv; return f(argc) + f(argc + 1); }\n")
     proc = _run(tmp_path, body, level, compat=False)
     assert proc.returncode != 0
     assert _diags(proc, "error") == [(1, INT_PTR)], proc.stderr
@@ -158,9 +158,9 @@ def test_uncalled_static_inline(tmp_path, level):
 
 
 YASC = """\
-char * owned make(void);
+char *owned make(void);
 static inline void f(void) { make(); }
-static inline void g(void) { char * view v = make(); (void)v; }
+static inline void g(void) { char *view v = make(); (void)v; }
 void h(void) { f(); f(); g(); g(); }
 """
 

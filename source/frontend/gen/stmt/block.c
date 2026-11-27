@@ -213,6 +213,39 @@ int stmt_ft, stmt_ft_line;
 int attr_fallthrough_seen;
 /* -Wdangling-else: the statement block() last parsed is an if with an else,
  * or a loop whose body is one -- an `else` after it would bind to that if */
+/* yasc `unused(a, b);` (after `unused`, at the '('): parameters or locals
+   the function leaves alone on purpose, as the parameter word `unused T a`
+   says -- no -Wunused-parameter / -Wunused-variable, and for a parameter no
+   -Wparam-access.  No code.  Out of line: block() is recursive. */
+static __attribute__((noinline)) void yasc_unused_stmt(void)
+{
+  Sym *f = tcc_state->cur_func_sym;
+  skip('(');
+  for (;;)
+  {
+    Sym *s = tok >= TOK_UIDENT ? sym_find(tok) : NULL;
+    if (!s || !sym_scope(s) || IS_ENUM_VAL(s->type.t) || (s->type.t & VT_TYPEDEF) ||
+        (s->type.t & VT_BTYPE) == VT_FUNC)
+      tcc_error("unused(...) names the function's parameters or locals: '%s' is not one", get_tok_str(tok, NULL));
+    s->ymod |= SYM_UNUSED_OK;
+    /* a parameter (scope 1, the body's blocks are deeper): its declaration
+       too, which -Wparam-access reads */
+    if (sym_scope(s) == 1 && f && f->type.ref)
+      for (Sym *p = sym_first(f->type.ref); p; p = p->next)
+        if ((p->v & ~SYM_FIELD) == s->v)
+        {
+          p->ymod |= SYM_UNUSED_OK;
+          break;
+        }
+    next();
+    if (tok != ',')
+      break;
+    next();
+  }
+  skip(')');
+  skip(';');
+}
+
 static int stmt_dangling;
 
 /* -Wimplicit-fallthrough: a case or default label on LINE, reached from the
@@ -1337,6 +1370,10 @@ again:
   else if (t == TOK_unsafe && tcc_state->yasc && tok == '{' && !sym_find(TOK_unsafe))
   {
     yasc_unsafe_block();
+  }
+  else if (t == TOK_UNUSED1 && tcc_state->yasc && tok == '(' && !sym_find(TOK_UNUSED1) && !pp_in_c())
+  {
+    yasc_unused_stmt();
   }
   else if (t == TOK_defer && tcc_state->yasc)
   {

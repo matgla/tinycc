@@ -58,11 +58,11 @@ static __attribute__((noinline)) void bump([:0]char s, int i) { s[i]++; }
 static __attribute__((noinline)) void mark([:0]char s, int i) { s[i] = 'x'; }
 static __attribute__((noinline)) [:0]char terminated(inout char *p, int n) { return p[0:n:0]; }
 
-int main(int argc, const char * view *argv)
+int main(int argc, const char *view *argv)
 {
   if (argc < 2)
     return 1;
-  const char * view c = argv[1];
+  const char *view c = argv[1];
   long long r = 0;
   printf("go %s\n", c);
   []const int all = nums;
@@ -82,7 +82,7 @@ int main(int argc, const char * view *argv)
     r = sum(nums[1:3]) + sum(nums[:2]) * 100 + sum(nums[3:]) * 10000;
   else if (!strcmp(c, "pointer_slice"))
   {
-    const int * view p = &nums[1];
+    const int *view p = &nums[1];
     r = sum(p[0:3]);
   }
   else if (!strcmp(c, "fill"))
@@ -131,7 +131,7 @@ int main(int argc, const char * view *argv)
   else if (!strcmp(c, "terminated_pointer"))
   {
     char buf[8] = "ab\0cd";
-    char * view p = buf;
+    char *view p = buf;
     r = terminated(p, v_two).len * 10 + walk(terminated(p + 3, v_two));   /* 2, 2 */
   }
   else if (!strcmp(c, "terminated_array"))

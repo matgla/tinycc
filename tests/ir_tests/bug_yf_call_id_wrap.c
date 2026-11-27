@@ -28,7 +28,7 @@ __attribute__((noinline)) static void fill(inout int *p)
   *p = 7;
 }
 
-__attribute__((noinline)) static int * borrows(p) keep(inout int *p)
+__attribute__((noinline)) static int *borrows(p) keep(inout int *p)
 {
   return p;
 }
@@ -45,7 +45,7 @@ __attribute__((noinline)) static int f(void)
   int x = 1;
   fill(&x);
   C15(C4096) C15(C256) C15(C16) C4 C4 C4 nop(); nop(); nop();
-  int * view q = keep(&x);
+  int *view q = keep(&x);
   x = 5;
   return *q * 100 + x;
 }

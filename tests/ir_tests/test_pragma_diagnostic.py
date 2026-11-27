@@ -109,17 +109,17 @@ def test_pragma_operator(tmp_path):
 
 LIFETIME = """\
 #pragma yasc
-void free(drop void * owned maybe p);
+void free(drop void *?owned p);
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wlifetime"
-void quiet(char * owned p) { free(p); free(p); }
+void quiet(char *owned p) { free(p); free(p); }
 #pragma GCC diagnostic pop
-void loud(char * owned p) { free(p); free(p); }
+void loud(char *owned p) { free(p); free(p); }
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wlifetime"
-static void quiet_static(char * owned p) { free(p); free(p); }
+static void quiet_static(char *owned p) { free(p); free(p); }
 #pragma GCC diagnostic pop
-void caller(char * owned p) { quiet_static(move(p)); }
+void caller(char *owned p) { quiet_static(move(p)); }
 """
 
 

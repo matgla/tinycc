@@ -41,7 +41,7 @@ Quick reference:
 ## 1. The safe default, and `-ccompat`
 
 Without options, tcc compiles **yasc**: C23 plus ownership qualifiers
-(`owned`, `view`, `maybe`, ...) for the main file, with `-Wall`, the safe
+(`owned`, `view`, `?`, ...) for the main file, with `-Wall`, the safe
 default's extra checks (the table in section 2) and the unsafe C errors on.
 Headers stay regular C unless they say `#pragma yasc`, so libc's headers
 keep working. The yasc tutorial explains the dialect.
@@ -63,7 +63,7 @@ int main(int argc, char **argv)
 $ tcc -c plain.c
 plain.c:6: error: implicit declaration of function 'count'
 plain.c:3: error: plain pointer in yasc: say owned or view for 'argv'
-plain.c:3: note: the function only borrows 'argv': write '* view'
+plain.c:3: note: the function only borrows 'argv': write '*view'
 ```
 
 **`-ccompat`** compiles regular C, as tcc always did: no yasc, no extra
@@ -137,7 +137,7 @@ unused-but-set-parameter.
 
 | Check | What | |
 |---|---|---|
-| `lifetime` | yasc ownership, `maybe`, `out`, borrows (section 5) | warning |
+| `lifetime` | yasc ownership, `?`, `out`, borrows (section 5) | warning |
 | `uninitialized`, `maybe-uninitialized` | a variable read before it is set: yasc enforces initialization (section 5) | **error** |
 | `dangling-pointer` | a local's address that outlives the function | warning |
 | `null-dereference` | a load or store the optimizer proves is at address 0 | warning |
@@ -711,8 +711,9 @@ void fill(char *d, size_t n) __attribute__((access(write_only, 1, 2)));
 
 - `null_terminated_string_arg(n)`: argument n's NUL has to be inside its
   buffer (the closest member). Before the call, `__tcc_fortify_str(p, size)`
-  ends the program through `__chk_fail` when there is none; a null pointer
-  passes. A literal or a `const` array is not checked, and a local buffer
+  ends the program through `__chk_fail` when there is none (libtcc1's, weak:
+  "*** buffer overflow detected ***: terminated" through write(2), then
+  abort; a program's or a C library's own wins); a null pointer passes. A literal or a `const` array is not checked, and a local buffer
   whose bytes the function wrote is dropped from `-O1`.
 - `access(mode, ref, size)`: argument `size` elements of argument ref's
   pointed-to type fit its buffer (the whole object): `cmp` + `udf #254`
@@ -729,6 +730,33 @@ or with `-ffortify`; `-fno-fortify` turns it off (a check per call: 2
 instructions for a size, a call for a string).  YasOS libc's `libgen.h`
 declares `dirname` and `basename` this way.
 
+### strcpy, strcat, sprintf: checked by name
+
+No argument gives their destination's size, so no attribute can say it:
+with fortify on, tcc knows the C library's `strcpy`, `stpcpy`, `strcat`,
+`sprintf` and `vsprintf` by name (gcc's builtin knowledge; not a `static`
+one, not one this unit defines, not under `-fno-builtin`).  Where the
+caller names the destination (its object's size, the closest member):
+
+- `strcpy` / `stpcpy` / `strcat`: before the call (whose arguments, checks
+  and yasc contract stay those of the plain call) libtcc1's
+  `__tcc_fortify_strcpy(src, size)` / `__tcc_fortify_strcat(dst, src,
+  size)` end the program through `__chk_fail` when the string (and, for
+  strcat, what is there already) does not fit.  A literal known to fit, or
+  `""` appended, costs nothing.
+- `sprintf` / `vsprintf`: the call becomes `__builtin___sprintf_chk` with
+  that size -- the plain function when the output provably fits, else
+  libtcc1's `__tcc_sprintf_chk` / `__tcc_vsprintf_chk`, which format into the
+  size and end the program when the output needed more (nothing past the
+  destination is written).  The arguments are converted as the plain
+  call's.
+
+A constant size that does not fit gets one warning: the check's (`... the
+call ends the program`), not the plain function's `-Wstringop-overflow` as
+well.  yasos libc also marks these functions `yasc_unsafe`: yasc code calls
+them inside `unsafe` only (`-Wyasc-unsafe-call`, with the fix-it to
+`strlcpy(d, s, sizeof d)` / `snprintf(d, sizeof d, ...)`).
+
 ## 5. Flow checks
 
 These follow every path through a function (`if`, loops, `goto`, early
@@ -738,7 +766,7 @@ depend on `-O`.
 ### yasc ownership: `-Wlifetime`
 
 In yasc, each pointer says whether it owns its target, and the checks hold
-the code to it: leaks, double frees, use after free, a `maybe` pointer
+the code to it: leaks, double frees, use after free, a `?` pointer
 dereferenced untested, a borrow outliving its owner, a handle never closed.
 With YasOS libc's headers, whose allocators carry the attributes:
 
@@ -746,16 +774,16 @@ With YasOS libc's headers, whose allocators carry the attributes:
 #include <stdlib.h>
 #include <string.h>
 
-char * owned maybe dup_upper(const char *s)
+char *?owned dup_upper(const char *s)
 {
-  char * owned maybe d = malloc(strlen(s) + 1);
+  char *?owned d = malloc(strlen(s) + 1);
   strcpy(d, s);
   return d;
 }
 
 void twice(void)
 {
-  char * owned maybe p = malloc(4);
+  char *?owned p = malloc(4);
   free(p);
   free(p);
 }
@@ -763,7 +791,7 @@ void twice(void)
 
 ```
 $ tcc -c own2.c
-own2.c:7: warning: a pointer that may be null is passed as argument 1 of 'strcpy', which is not maybe
+own2.c:7: warning: a pointer that may be null is passed as argument 1 of 'strcpy', which is not '?'
 own2.c:15: warning: 'p' is freed twice
 own2.c:14: note: 'p' was freed here
 ```
@@ -773,11 +801,11 @@ dialect). [The yasc tutorial](../examples/yasc/README.md) teaches it
 chapter by chapter: chapter 3 lists every mistake it catches, chapter 10
 covers arrays of owned pointers and file-descriptor handles. Converting C
 code is helped by the plain-pointer error's note, which says whether the
-body frees the pointer (`* owned`), only borrows it (`* view`) or tests it
-for null (`maybe`), with a fix-it (section 8).
+body frees the pointer (`*owned`), only borrows it (`*view`) or tests it
+for null (`?`), with a fix-it (section 8).
 
 A parameter says what it does with what it points to, before its type:
-nothing (or `in`) reads it -- the target of a `T * view` parameter is
+nothing (or `in`) reads it -- the target of a `T *view` parameter is
 const -- `inout` reads and writes it, `out` writes it before it reads it.
 Writing a read-only target is an error in yasc, so is handing it to a
 pointer that may write it.  `out` is checked in the body: `'*p' is read
@@ -788,9 +816,9 @@ another yasc contract: parameter 1 ('p') differs in ...`.
 
 A pointer handed back through an out parameter says where it points the
 same way a result does: `long strtol(const char *s, out char *
-borrows(s) * maybe end, int base)`.  The callee may store a pointer
+borrows(s) *?end, int base)`.  The callee may store a pointer
 into `s` through `end` (any other view parameter stored there still
-escapes), and the caller's `char * view e` whose address it passed borrows,
+escapes), and the caller's `char *view e` whose address it passed borrows,
 after the call, from the owned variable passed for `s` -- `free(buf)` then
 `*e` is reported as a use after free.  Only an `out` parameter's target
 says it (an in/out one may hand back what it read).  A callee in the same
@@ -926,12 +954,12 @@ global (line 21, the safe default). A store through a parameter
 (`*slot = &local`) is reported too; a global cleared again before the
 function returns is not. In yasc the address is followed through a call
 whose result borrows from the argument it went to: `return f(buf);` with
-`char * borrows(p) f(char *p)` (or the elision) is reported.
+`char *borrows(p) f(char *p)` (or the elision) is reported.
 
 **`-Wnull-dereference`:** `*p` with `p` null (line 27). This check runs after optimisation, so it
 finds more at `-O1` and up (a callee returning null, once inlined), and its
 results may differ by level. In yasc, `-Wlifetime` reports a dereference of
-anything declared `maybe`, at every level.
+anything declared `?`, at every level.
 
 ### Released pointers: `-Wuse-after-free`
 
@@ -1111,7 +1139,7 @@ fix-it:"fix.c":{6:14-6:14}:", sizeof buf"
 Fix-its are given for `sprintf`/`vsprintf`/`strcpy`/`strcat` into an
 object of known size (bounded call), for deprecated libc functions with a
 replacement, for yasc's "write move(p)", and for a plain pointer in yasc
-(the `* owned` / `* view` / `maybe` the body implies).
+(the `*owned` / `*view` / `*?` the body implies).
 
 ## 9. Stack budgets
 

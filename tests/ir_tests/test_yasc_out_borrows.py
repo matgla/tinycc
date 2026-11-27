@@ -1,6 +1,6 @@
 """yasc `borrows(...)` on the pointer an out parameter points to:
 
-    long sl(const char *s, out const char * borrows(s) * maybe end, int base);
+    long sl(const char *s, out const char *borrows(s) *?end, int base);
 
 what the callee writes into *end points into s (strtol's end pointer).  The
 names are the function's parameters, before or after this one; `static` says
@@ -26,11 +26,11 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 
 PRELUDE = """\
 #pragma yasc
-void free(drop void * owned maybe p);
-char * owned maybe dup(const char *s);
-long sl(const char *s, out const char * borrows(s) * maybe end, int base);
-long sl2(out char * borrows(s) *end, inout char *s);
-void name(int e, out const char * borrows(static) *msg);
+void free(drop void *?owned p);
+char *?owned dup(char *s);
+long sl(const char *s, out const char *borrows(s) *?end, int base);
+long sl2(out char *borrows(s) *end, inout char *s);
+void name(int e, out const char *borrows(static) *msg);
 void use(const char *p);
 """
 PRELUDE_LINES = PRELUDE.count("\n")
@@ -58,25 +58,25 @@ def _diags(tmp_path, body, *flags):
     return out
 
 
-OWNER = "  char * owned maybe buf = dup(\"12x\");\n  if (!buf)\n    return 0;\n"
+OWNER = "  char *?owned buf = dup(\"12x\");\n  if (!buf)\n    return 0;\n"
 
 CLEAN = {
     # the callee: a pointer into s stored through end
-    "callee_stores_s": "long sl(const char *s, out const char * borrows(s) * maybe end, int base)\n"
+    "callee_stores_s": "long sl(const char *s, out const char *borrows(s) *?end, int base)\n"
     "{\n  if (end)\n    *end = s + base;\n  return 0;\n}\n",
-    "callee_names_later_param": "long sl2(out char * borrows(s) *end, inout char *s)\n{\n  *end = s;\n  return 0;\n}\n",
-    "callee_static": "void name(int e, out const char * borrows(static) *msg)\n{\n  *msg = e ? \"a\" : \"b\";\n}\n",
+    "callee_names_later_param": "long sl2(out char *borrows(s) *end, inout char *s)\n{\n  *end = s;\n  return 0;\n}\n",
+    "callee_static": "void name(int e, out const char *borrows(static) *msg)\n{\n  *msg = e ? \"a\" : \"b\";\n}\n",
     # the caller: the end used while its owner lives
-    "end_used_before_free": "int f(void)\n{\n" + OWNER + "  const char * view end;\n  sl(buf, &end, 10);\n"
+    "end_used_before_free": "int f(void)\n{\n" + OWNER + "  const char *view end;\n  sl(buf, &end, 10);\n"
     "  int c = *end;\n  free(buf);\n  return c;\n}\n",
     "no_end": "int f(void)\n{\n" + OWNER + "  long v = sl(buf, nullptr, 10);\n  free(buf);\n  return (int)v;\n}\n",
     # the source a view, not an owned variable: nothing to follow
-    "source_is_view": "int f(const char *s)\n{\n  const char * view end;\n  sl(s, &end, 10);\n"
+    "source_is_view": "int f(char *s)\n{\n  const char *view end;\n  sl(s, &end, 10);\n"
     "  return *end;\n}\n",
-    "static_end": "int f(void)\n{\n  const char * view m;\n  name(1, &m);\n  use(m);\n  return 0;\n}\n",
+    "static_end": "int f(void)\n{\n  const char *view m;\n  name(1, &m);\n  use(m);\n  return 0;\n}\n",
     # written again from another owner: borrows from that one
-    "rebound": "int f(void)\n{\n" + OWNER + "  char * owned maybe b2 = dup(\"7\");\n  if (!b2) {\n"
-    "    free(buf);\n    return 0;\n  }\n  const char * view end;\n  sl(buf, &end, 10);\n  sl(b2, &end, 10);\n"
+    "rebound": "int f(void)\n{\n" + OWNER + "  char *?owned b2 = dup(\"7\");\n  if (!b2) {\n"
+    "    free(buf);\n    return 0;\n  }\n  const char *view end;\n  sl(buf, &end, 10);\n  sl(b2, &end, 10);\n"
     "  free(buf);\n  int c = *end;\n  free(b2);\n  return c;\n}\n",
 }
 
@@ -91,28 +91,34 @@ UAF = "'end' is used after 'buf', which it borrows from, was freed"
 
 BAD = {
     "end_used_after_free": (
-        "int f(void)\n{\n" + OWNER + "  const char * view end;\n  sl(buf, &end, 10);\n  free(buf);\n"
+        "int f(void)\n{\n" + OWNER + "  const char *view end;\n  sl(buf, &end, 10);\n  free(buf);\n"
         "  return *end;\n}\n",
         [(9, "warning", UAF), (8, "note", "'buf' was freed here")],
     ),
     "end_passed_after_free": (
-        "int f(void)\n{\n" + OWNER + "  char * view end;\n  sl2(&end, buf);\n  free(buf);\n  use(end);\n"
+        "int f(void)\n{\n" + OWNER + "  char *view end;\n  sl2(&end, buf);\n  free(buf);\n  use(end);\n"
         "  return 0;\n}\n",
         [(9, "warning", UAF), (8, "note", "'buf' was freed here")],
     ),
     # a copy of the end borrows what it borrows
     "copy_used_after_free": (
-        "int f(void)\n{\n" + OWNER + "  const char * view end;\n  sl(buf, &end, 10);\n"
-        "  const char * view p = end + 1;\n  free(buf);\n  return *p;\n}\n",
+        "int f(void)\n{\n" + OWNER + "  const char *view end;\n  sl(buf, &end, 10);\n"
+        "  const char *view p = end + 1;\n  free(buf);\n  return *p;\n}\n",
         [(10, "warning", "'p' is used after 'buf', which it borrows from, was freed"),
          (9, "note", "'buf' was freed here")],
     ),
     # the callee: a pointer into another parameter still escapes
     "callee_stores_other": (
-        "long sl(const char *s, out const char * borrows(s) * maybe end, int base)\n{\n"
-        "  return 0;\n}\nvoid h(const char *s, const char *t, out const char * borrows(s) *e)\n"
+        "long sl(const char *s, out const char *borrows(s) *?end, int base)\n{\n"
+        "  if (end) *end = s;\n  return base;\n}\nvoid h(const char *s, const char *t, out const char *borrows(s) *e)\n"
         "{\n  *e = t;\n}\n",
-        [(7, "warning", "'t' is a view: it cannot leave the function (it is stored through 'e')")],
+        [(8, "warning", "'t' is a view: it cannot leave the function (it is stored through 'e')")],
+    ),
+    # a target that borrows from nothing (a view by default): the note says borrows
+    "callee_stores_into_view_target": (
+        "void h(const char *s, inout const char **e)\n{\n  *e = s + 1;\n}\n",
+        [(3, "warning", "'s' is a view: it cannot leave the function (it is stored through 'e')"),
+         (3, "note", "when what 'e' points at comes from 's', say so: '*borrows(s) *e'")],
     ),
 }
 
@@ -125,16 +131,16 @@ def test_bad(tmp_path, name, opt):
 
 
 ERRORS = {
-    "not_out": ("void g(const char *s, const char * borrows(s) *e);\n",
+    "not_out": ("void g(const char *s, const char *borrows(s) *e);\n",
                 "borrows(...) on the pointer a parameter points to needs out"),
-    "three_levels": ("void g(const char *s, out const char * borrows(s) * view *e);\n",
+    "three_levels": ("void g(const char *s, out const char *borrows(s) *view *e);\n",
                      "borrows(...) qualifies the outermost pointer"),
-    "local": ("void g(void)\n{\n  const char * borrows(s) * view e;\n}\n",
+    "local": ("void g(void)\n{\n  const char *borrows(s) *view e;\n}\n",
               "borrows(...) qualifies the outermost pointer"),
-    "no_such_param": ("void g(const char *s, out const char * borrows(t) *e);\n",
+    "no_such_param": ("void g(const char *s, out const char *borrows(t) *e);\n",
                       "borrows(t): no parameter is called 't'"),
-    "not_a_pointer": ("void g(int n, out const char * borrows(n) *e);\n", "borrows(n): 'n' is not a pointer"),
-    "itself": ("void g(out const char * borrows(e) *e);\n",
+    "not_a_pointer": ("void g(int n, out const char *borrows(n) *e);\n", "borrows(n): 'n' is not a pointer"),
+    "itself": ("void g(out const char *borrows(e) *e);\n",
                "borrows(e): an out parameter's target does not borrow from the parameter itself"),
 }
 

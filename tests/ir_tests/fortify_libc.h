@@ -1,8 +1,8 @@
-/* _FORTIFY_SOURCE as yasos libc's headers do it (libs/libc/sys/_fortify.h,
- * the ends of string.h and stdio.h), for test_fortify.py: the QEMU runs link
- * newlib, whose own fortify headers are kept out (they wrap the functions in
- * always_inline functions, whose parameters tcc's __builtin_object_size never
- * looks through).  Keep it in step with libc. */
+/* _FORTIFY_SOURCE as glibc-style headers do it -- yasos libc had these
+ * wrappers until tcc checked the calls itself -- for test_fortify.py's
+ * __builtin___*_chk cases: the QEMU runs link newlib, whose own fortify
+ * headers are kept out (they wrap the functions in always_inline functions,
+ * whose parameters tcc's __builtin_object_size never looks through). */
 #ifndef FORTIFY_LIBC_H
 #define FORTIFY_LIBC_H
 

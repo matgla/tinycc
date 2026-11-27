@@ -1,4 +1,4 @@
-"""yasc int handles: `int owned(close) maybe fd = open(...)`
+"""yasc int handles: `int ?owned(close) fd = open(...)`
 (docs/static_analysis_todo.md).
 
 Ownership for ints, only where written (a plain int stays plain): the int
@@ -23,14 +23,14 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 
 PRELUDE = """\
 #pragma yasc
-int owned(close) maybe open(const char *p, int flags);
+int ?owned(close) open(const char *p, int flags);
 int close(int drop owned(close) fd);
-int read(int view fd, char * maybe buf, int n);
+int read(int view fd, char *?buf, int n);
 int keep_fd(int owned(close) fd);
 int g_fd;
 """
 PRELUDE_LINES = PRELUDE.count("\n")
-OPEN = "void f(void)\n{\n  int owned(close) maybe fd = open(\"a\", 0);\n"
+OPEN = "void f(void)\n{\n  int ?owned(close) fd = open(\"a\", 0);\n"
 LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 
 
@@ -56,7 +56,7 @@ CLEAN = {
     "tested_ge": OPEN + "  if (fd >= 0)\n  {\n    read(fd, 0, 0);\n    close(fd);\n  }\n}\n",
     "tested_eq_minus_one": OPEN + "  if (fd == -1)\n    return;\n  close(fd);\n}\n",
     "auto_and_move": "void f(void)\n{\n  auto fd = open(\"a\", 0);\n  if (fd != -1)\n    keep_fd(move(fd));\n}\n",
-    "constants": "void f(void)\n{\n  int owned(close) maybe fd = -1;\n  read(0, 0, 0);\n  (void)fd;\n}\n",
+    "constants": "void f(void)\n{\n  int ?owned(close) fd = -1;\n  read(0, 0, 0);\n  (void)fd;\n}\n",
     "plain_int_is_plain": "int f(int x)\n{\n  int y = x + 1;\n  return read(y, 0, 0);\n}\n",
 }
 
@@ -69,12 +69,12 @@ def test_clean(tmp_path, name, opt):
 
 BAD = {
     "untested_view_argument": (OPEN + "  read(fd, 0, 0);\n  if (fd >= 0)\n    close(fd);\n}\n", 4,
-                               "a handle that may be invalid is passed as argument 1 of 'read', which is not maybe"),
+                               "a handle that may be invalid is passed as argument 1 of 'read', which is not '?'"),
     "leak": (OPEN + "  if (fd < 0)\n    return;\n  read(fd, 0, 0);\n}\n", 7,
              "'fd' leaks: it still owns a handle at the end of its scope"),
     "released_twice": (OPEN + "  if (fd == -1)\n    return;\n  close(fd);\n  close(fd);\n}\n", 7, "'fd' is released twice"),
     "zero_test_is_not_validity": (OPEN + "  if (fd)\n    read(fd, 0, 0);\n  if (fd >= 0)\n    close(fd);\n}\n", 5,
-                                  "a handle that may be invalid is passed as argument 1 of 'read', which is not maybe"),
+                                  "a handle that may be invalid is passed as argument 1 of 'read', which is not '?'"),
     "view_escapes": ("void f(int view fd)\n{\n  g_fd = fd;\n}\n", 3,
                      "'fd' is a view: it cannot leave the function (it is stored in global 'g_fd')"),
     "implicit_move": (OPEN + "  if (fd >= 0)\n    keep_fd(fd);\n}\n", 5, "ownership of 'fd' moves here: write move(fd)"),
@@ -92,22 +92,22 @@ def test_reported(tmp_path, name, opt):
 
 
 def test_wrong_deallocator(tmp_path):
-    body = "void free(drop void * owned maybe p);\nvoid f(void)\n{\n  int owned(close) maybe fd = open(\"a\", 0);\n" \
+    body = "void free(drop void *?owned p);\nvoid f(void)\n{\n  int ?owned(close) fd = open(\"a\", 0);\n" \
            "  if (fd >= 0)\n    close(fd);\n}\n"
     assert [d for d in _diags(tmp_path, body) if "released by" in d[2]] == []
 
 
 def test_handle_declarations(tmp_path):
-    body = "int f(int owned);\ntypedef int owned(close) fd_t;\nfd_t g(void);\nint h(int view, int owned(close) maybe);\n"
+    body = "int f(int owned);\ntypedef int owned(close) fd_t;\nfd_t g(void);\nint h(int view, int ?owned(close));\n"
     assert _diags(tmp_path, body) == []
 
 
 def test_takes_a_handle(tmp_path):
     """fdopen-like: the stream takes the descriptor over; null: still the caller's."""
     body = (
-        "typedef struct F F;\nint fcl(drop F * owned(fcl) f);\n"
-        "F * owned(fcl) maybe takes(fd) wrap(int owned(close) fd);\n"
+        "typedef struct F F;\nint fcl(drop F *owned(fcl) f);\n"
+        "F *?@(owned(fcl), takes(fd)) wrap(int owned(close) fd);\n"
         "void f(void)\n{\n  auto fd = open(\"a\", 0);\n  if (fd < 0)\n    return;\n"
-        "  F * owned maybe s = wrap(move(fd));\n  if (!s)\n  {\n    close(fd);\n    return;\n  }\n  fcl(s);\n}\n"
+        "  F *?owned s = wrap(move(fd));\n  if (!s)\n  {\n    close(fd);\n    return;\n  }\n  fcl(s);\n}\n"
     )
     assert _diags(tmp_path, body) == []

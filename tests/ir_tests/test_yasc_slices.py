@@ -87,7 +87,7 @@ ERRORS = {
     "arith": ("int f([]int s) { return s + 1; }", "a slice is used by"),
     "compare": ("int f([]int s) { return s == s; }", "a slice is used by"),
     "from_pointer": ("void f(int *p) { []int s = p; (void)s; }", "slice it, p[0:n]"),
-    "to_pointer": ("void f([]int s) { int * view p = s; (void)p; }", "use .ptr and .len"),
+    "to_pointer": ("void f([]int s) { int *view p = s; (void)p; }", "use .ptr and .len"),
     "member": ("int f([]int s) { return s.size; }", "a slice has .ptr and .len, not .size"),
     "len_store": ("void f([]int s) { s.len = 3; }", ""),
     "drop_const": ("void f([]const int s) { []int t = s; (void)t; }", "does not convert"),
@@ -96,7 +96,7 @@ ERRORS = {
     "vla": ("void f(int n) { int v[n]; []int s = v; (void)s; }", "slice the VLA with its length"),
     "cast": ("void f(unsigned long long x) { []int s = ([]int)x; (void)s; }", "a cast to a slice"),
     "terminated_not_zero": ("void f(char *p) { [:0]char s = p[0:2:1]; (void)s; }", "x[a:b:0]"),
-    "terminated_pointers": ("void f(int * view *p) { (void)p[0:2:0]; }", "holds integers"),
+    "terminated_pointers": ("void f(int *view *p) { (void)p[0:2:0]; }", "holds integers"),
     "terminated_drops": ("void f([]char s) { [:0]char t = s; (void)t; }", "does not convert"),
 }
 
@@ -130,8 +130,8 @@ void f([]int s, [:0]const char z)
 def test_slice_parameter_is_a_view_source(tmp_path):
     """a view result may point into a slice parameter (the elision, borrows(s))"""
     proc, _ = _compile(tmp_path, """
-const int * view first([]const int s) { return s.ptr; }
-const int * borrows(s) at([]const int s, const int *q, unsigned i) { (void)q; return &s[i]; }
+const int *view first([]const int s) { return s.ptr; }
+const int *borrows(s) at([]const int s, int *q, unsigned i) { (void)q; return &s[i]; }
 """)
     assert proc.returncode == 0, proc.stderr
 
@@ -179,7 +179,7 @@ void put([:0]char s, unsigned i, char c) { s[i] = c; }
     assert fn("mk").count("udf") == 1 and fn("mk").count("ldrb") == 1, dis
 
 
-STRNLEN_DECL = "typedef unsigned size_t;\nsize_t strnlen(const char *s, size_t max);\n"
+STRNLEN_DECL = "typedef unsigned size_t;\nsize_t strnlen(char *s, size_t max);\n"
 STRNLEN_PROVEN = STRNLEN_DECL + """
 unsigned len(char *p, unsigned m)
 {
@@ -188,7 +188,7 @@ unsigned len(char *p, unsigned m)
     return 0;
   return p[0:n:0].len;           /* p[n] is strnlen's zero */
 }
-static inline __attribute__((always_inline)) unsigned plen(const char *p, unsigned m)
+static inline __attribute__((always_inline)) unsigned plen(char *p, unsigned m)
 {
   unsigned n = strnlen(p, m);
   if (n == m)
@@ -250,7 +250,7 @@ def test_vrp_keeps_strnlen_checks_it_cannot_prove(tmp_path, case):
     assert "udf" in _disasm(obj)
 
 
-STRLEN_DECL = "typedef unsigned size_t;\nsize_t strlen(const char *s);\nvoid use([:0]char s);\nvoid touch(char *p);\n"
+STRLEN_DECL = "typedef unsigned size_t;\nsize_t strlen(char *s);\nvoid use([:0]char s);\nvoid touch(char *p);\n"
 STRLEN_PROVEN = STRLEN_DECL + """
 unsigned len(char *p)
 {
@@ -258,7 +258,7 @@ unsigned len(char *p)
   return p[0:n:0].len;           /* p[n] is strlen's zero: no test needed */
 }
 /* libgen's shape: "" answered before the slice */
-unsigned nonempty(char * maybe p)
+unsigned nonempty(char *?p)
 {
   unsigned n;
   if (p == nullptr || (n = strlen(p)) == 0)

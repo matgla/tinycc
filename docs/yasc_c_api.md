@@ -2,17 +2,17 @@
 
 A yasc library often wants a stricter type than its C API can have. POSIX says
 `char *dlerror(void)`, but the text belongs to libc and nobody may write it:
-yasc wants `const char * borrows(static) maybe`. Before `c_api`, the yasc header
+yasc wants `const char *?borrows(static)`. Before `c_api`, the yasc header
 had to keep the C type, and the definition needed
 `unsafe_cast<ptr(char *), const>(...)` to return a constant string.
 
 `c_api(T)` lets one declaration state both types:
 
 ```c
-const char * borrows(static) maybe c_api(char *) dlerror(void);
-int execv(const char *path, const char * view const c_api(char * const) argv[]);
-long strtol(const char *s, out const char * borrows(s) c_api(char *) * maybe endptr, int base);
-struct passwd { const char * view c_api(char *) pw_name; /* ... */ };
+const char *?@(borrows(static), c_api(char *)) dlerror(void);
+int execv(const char *path, const char *@(view, const, c_api(char * const)) argv[]);
+long strtol(const char *s, out const char *@(borrows(s), c_api(char *)) *?endptr, int base);
+struct passwd { const char *c_api(char *) pw_name; /* ... */ };
 ```
 
 ## What it replaces
@@ -23,12 +23,15 @@ comes from the yasc declaration: more `*`s, the name, `[ ]`, the parameter list.
 
 | yasc declaration | yasc type | C type |
 |---|---|---|
-| `const char * borrows(static) maybe c_api(char *) dlerror(void)` | result `const char *` | `char *dlerror(void)` |
-| `const char * view const c_api(char * const) argv[]` (a parameter) | `const char * const argv[]` | `char * const argv[]` |
-| `out const char * borrows(s) c_api(char *) * maybe endptr` | `const char **` | `char **endptr`: only the inner level is replaced |
+| `const char *?@(borrows(static), c_api(char *)) dlerror(void)` | result `const char *` | `char *dlerror(void)` |
+| `const char *@(view, const, c_api(char * const)) argv[]` (a parameter) | `const char *const argv[]` | `char *const argv[]` |
+| `out const char *@(borrows(s), c_api(char *)) *?endptr` | `const char **` | `char **endptr`: only the inner level is replaced |
 
 In yasc, `c_api` after a `*` is always this word, as `borrows` is. The definition
-does not need to repeat it.
+does not need to repeat it. It is a yasc word only: in regular C (a
+`#pragma tcc c_begin` section, a header without `#pragma yasc`) it is an error
+that says so -- move the declaration out of the C section, or write the C type
+alone there.
 
 ## What T may differ in
 
@@ -36,14 +39,14 @@ T and the type it replaces must be the same except for `const` and `volatile`
 at some pointer level, and the yasc words. The ABI stays the same, so no code is
 generated for the conversion. The compiler refuses:
 
-- a pointer for something that is not one: `void * c_api(int)`;
-- another base type: `int * c_api(long *)`. `int` and `long` have the same size
+- a pointer for something that is not one: `void *c_api(int)`;
+- another base type: `int *c_api(long *)`. `int` and `long` have the same size
   on ARM but not on the x86_64 target, so tcc compares the types, not their
   sizes. `char` vs `int`, `void *` vs `T *`, different array sizes and an
   array vs a pointer are refused too;
 - a C type that tells C callers the target is const where the yasc declaration
-  may write it: `inout char * c_api(const char *) p`, or a member
-  `char * view c_api(const char *) name`. A function's result may say more
+  may write it: `inout char *c_api(const char *) p`, or a member
+  `char *c_api(const char *) name`. A function's result may say more
   `const` in C than in yasc, because C only reads it.
 
 ## What the compiler does with it
@@ -61,11 +64,12 @@ generated for the conversion. The compiler refuses:
 - **`tcc -yasc-c-header`** (docs/yasc_c_headers.md) writes T in place of the
   replaced part. On a prototype it also adds
   `__yl_c_api(n, the yasc type without its words)`, where n is 0 for the result
-  and k for parameter k:
+  and k for parameter k (an `in` parameter's type with the `const` of every
+  level it points to, written or not):
 
   ```c
   char *dlerror(void) __yl_c_api(0, const char *);
-  int execv(const char *path, char * const argv[]) __yl_c_api(2, const char * const []);
+  int execv(const char *path, char *const argv[]) __yl_c_api(2, const char *const []);
   long strtol(const char *s, char **endptr, int base) __yl_c_api(2, const char * *);
   ```
 

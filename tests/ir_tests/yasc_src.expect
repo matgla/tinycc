@@ -1,0 +1,13 @@
+main yasc_src.c:64 main []
+explicit yasc_src.c:65 main []
+helper yasc_src.c:36 helper []
+[def][def][x]scale 6 8 8
+apply 14 first 7 1 deref -1
+bump 1 11
+remembered yasc_src.c:70 main
+line 73
+here main 74
+pick 76 76
+copy 77 78 main
+sizeof 8
+ptr 5

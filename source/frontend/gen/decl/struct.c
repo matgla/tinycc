@@ -568,6 +568,18 @@ ST_FUNC YascFieldBorrows *yasc_field_borrows(int i)
   return i >= 0 && i < nb_field_borrows ? &field_borrows[i] : NULL;
 }
 
+ST_FUNC void yasc_note_field_sources(Sym *st, int mtok, int vreg)
+{
+  for (int i = 0; i < nb_field_borrows; i++)
+    if (field_borrows[i].st == st)
+      for (int k = 0; k < field_borrows[i].nsrc; k++)
+        if (field_borrows[i].src_tok[k] == mtok && field_borrows[i].src_off[k] >= 0)
+        {
+          tcc_ir_lt_note_field_src(tcc_state->ir, vreg, i);
+          break;
+        }
+}
+
 /* borrowing structs: the tag and its borrows(...) names */
 static struct
 {
@@ -889,6 +901,7 @@ static void yasc_resolve_field_borrows(Sym *ref, PendingFieldBorrows *fb, int nf
     e.self_tok = m->v & ~SYM_FIELD;
     e.self_off = m->c;
     e.is_static = fb[i].st != 0;
+    e.st = ref;
     for (int k = 0; k < fb[i].nb; k++)
     {
       int name = fb[i].names[k];
@@ -986,6 +999,7 @@ static void struct_member(void *arg)
         type_decl(&type1, &ad1, &v, TYPE_DIRECT);
         yasc_borrows_field_ok = saved_ok;
       }
+      yasc_src_object_check(&type1, "a member");
       if (v == 0)
       {
         if ((type1.t & VT_BTYPE) != VT_STRUCT)
@@ -1185,6 +1199,8 @@ void struct_decl(CType *type, int u)
   {
     /* struct already defined ? return it */
     s = struct_find(v);
+    if (!s && (v == TOK___yasc_src || v == TOK___yasc_src_fn) && u == VT_STRUCT)
+      s = (yasc_src_tag(), struct_find(v)); /* @src()'s types, made when first named (builtin/misc.c) */
     if (s && (s->sym_scope == local_scope || (tok != '{' && tok != ';')))
     {
       if (u == s->type.t)

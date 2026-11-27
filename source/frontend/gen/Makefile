@@ -32,6 +32,7 @@ GEN_SRC = \
 	source/frontend/gen/decl/c_api.c \
 	source/frontend/gen/decl/decl.c \
 	source/frontend/gen/decl/declarator.c \
+	source/frontend/gen/decl/default_arg.c \
 	source/frontend/gen/decl/method.c \
 	source/frontend/gen/decl/module.c \
 	source/frontend/gen/decl/plain_param.c \

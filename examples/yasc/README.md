@@ -21,7 +21,7 @@ stack budgets, sanitizers, ...), see the guide
 | Chapter | File | What it shows |
 |---|---|---|
 | 1 | `01_hello.c` | yasc is the default; every pointer says what it is |
-| 2 | `02_ownership.c` | `owned`, `view`, `maybe`, `inout`, `out`, `drop` |
+| 2 | `02_ownership.c` | `owned`, `view`, `?`, `inout`, `out`, `drop` |
 | 3 | `03_mistakes.c` | the mistakes the checks catch (meant to warn) |
 | 4 | `04_defer.c` | `defer` |
 | 5 | `05_errors.c` | error sets, `!T`, `try`, `catch`, `errdefer` |
@@ -66,23 +66,24 @@ In yasc a pointer either **owns** its target (`owned`: it must be freed or
 handed on, exactly once) or **borrows** it (`view`: it never frees). A
 plain `char *` is an error, "plain pointer in yasc: say owned or view".
 The qualifier goes after the `*`, so each level of a pointer to a pointer
-says what it is: `char * owned * view argv`.
+says what it is: `char *owned *view argv`.
 
 Two pointers need no word. A parameter's own (the last `*` before its
 name) is a view unless it says `owned`, since the least a function can do
-with it -- look -- is the default. `int len(const char *s)` borrows `s`.
+with it -- look -- is the default. `int len(char *s)` borrows `s`.
 A local pointer variable, like `greeting`, is a view too unless its
 function owns it (gives it a `malloc` result, frees it, hands it on as
 owned); then the compiler says "'p' owns what it points at, say owned". A
 local view may hold null: what it holds is what flows into it, and the
-checks follow that. `T * view p` on a local says more -- never null -- but
-`view` on a parameter, or `view maybe` on a local, says nothing new and
+checks follow that. `T *view p` on a local says more -- never null -- but
+`view` on a parameter, or `?view` on a local, says nothing new and
 draws a warning (-Wredundant-view). Inner levels still say it: `main`'s
-`const char * view *argv`.
+`const char *view *argv`.
 
-A view parameter is read-only unless it says `inout` or `out`: `main`'s
-`argv` cannot reassign `argv[i]`, and the `const` keeps the strings
-read-only too. A local you only read through is `const T *p`.
+A view parameter is read-only, every level of it, unless it says `inout`
+or `out`: `main`'s `argv` can neither reassign `argv[i]` nor write the
+strings, and needs no `const` for it (one written there draws a warning,
+-Wredundant-const). A local you only read through is `const T *p`.
 
 A string literal, an array decaying to a pointer, and `&x` are views.
 
@@ -94,8 +95,8 @@ node owns its text:
 ```c
 struct name
 {
-  struct name * owned maybe next; /* the rest of the list, or null */
-  char * owned text;              /* never null once the node exists */
+  struct name *?owned next; /* the rest of the list, or null */
+  char *owned text;              /* never null once the node exists */
 };
 ```
 
@@ -105,21 +106,21 @@ The six words:
 |---|---|---|
 | `owned` | after `*` | this pointer owns its target: free it or hand it on, once |
 | `view` | after `*` | this pointer borrows; it never frees |
-| `maybe` | after `*` | it may be null; test it before you dereference it |
+| `?` | after `*` | it may be null; test it before you dereference it |
 | `inout` | before the type | the callee may read and write `*p` |
 | `out` | before the type | the callee writes `*p` before it returns, and does not read it first |
 | `drop` | before the type | the callee consumes the pointer (frees it, or hands it on) |
 
-Plain pointers without `maybe` are never null. `maybe` combines with
-either kind: `struct name * owned maybe next`.
+Plain pointers without `?` are never null. `?` combines with
+either kind: `struct name *?owned next`.
 
 Handing an owned pointer on is a **move**, and the code says so with
 `move(p)`:
 
 ```c
-static struct name * owned maybe push(struct name * owned maybe head, char * owned text)
+static struct name *?owned push(struct name *?owned head, char *owned text)
 {
-  struct name * owned maybe n = mem_new(sizeof *n);
+  struct name *?owned n = mem_new(sizeof *n);
   if (!n)
   {
     mem_free(text);   /* out of memory: text is freed here */
@@ -151,17 +152,18 @@ spelling in scope (a variable or function called `move`) wins over both.
 A function that only looks takes views:
 
 ```c
-static int count(const struct name * maybe list, out int *chars)
+static int count(struct name *?list, out int *chars)
 ```
 
 A view parameter's target is read-only unless the parameter says `inout`
-(or `out`): `T *p` there means `const T * view p`, and a function that
-changes `*p` says so, `void rename(inout struct name *n)`.
+(or `out`): `T *p` there means `const T *view p` (`T **pp`, `const T *
+const * pp`: every level), and a function that changes `*p` says so,
+`void rename(inout struct name *n)`.
 
 and one that frees says `drop`:
 
 ```c
-static void free_all(drop struct name * owned maybe list)
+static void free_all(drop struct name *?owned list)
 ```
 
 The program prints `blocks left: 0`: everything it allocated was freed,
@@ -181,13 +183,13 @@ mistakes are errors: the file does not compile, which is the point of it.
 03_mistakes.c:28: note: 's' was freed here
 03_mistakes.c:35: error: 's' may be null where it is dereferenced
 03_mistakes.c:42: error: an owned result is discarded: it is never freed
-03_mistakes.c:47: error: the parameter 'borrowed' owns nothing (a view unless it says owned): write '* owned borrowed' when the function takes it over, 'drop' before the type too when it frees it
+03_mistakes.c:47: error: the parameter 'borrowed' owns nothing (a view unless it says owned): write '*owned borrowed' when the function takes it over, 'drop' before the type too when it frees it
 03_mistakes.c:52: error: '*n' is read before it is written
 03_mistakes.c:60: error: 'x' may be used uninitialized: yasc wants a value on every path
 03_mistakes.c:66: error: 'local_address' returns the address of a local variable
 03_mistakes.c:71: warning: null passed as argument 1, which is declared nonnull
 03_mistakes.c:86: error: 'q->next' may be null where it is dereferenced
-03_mistakes.c:99: error: a pointer that may be null is passed as argument 1 of 'length', which is not maybe
+03_mistakes.c:99: error: a pointer that may be null is passed as argument 1 of 'length', which is not '?'
 03_mistakes.c:109: error: 'tail' is used after 's', which it borrows from, was freed
 03_mistakes.c:108: note: 's' was freed here
 03_mistakes.c:115: error: the address of a local variable is stored through 'slot', which outlives 'dangling'
@@ -195,7 +197,7 @@ mistakes are errors: the file does not compile, which is the point of it.
 03_mistakes.c:140: error: 'a[i]' leaks: it may still own memory at return
 03_mistakes.c:152: error: 'a[i]' is freed twice
 03_mistakes.c:160: error: 'h' leaks: it still owns a handle at return
-03_mistakes.c:166: error: a handle that may be invalid is passed as argument 1 of 'slot_read', which is not maybe
+03_mistakes.c:166: error: a handle that may be invalid is passed as argument 1 of 'slot_read', which is not '?'
 ```
 
 How to fix each:
@@ -205,8 +207,8 @@ How to fix each:
 - **Freed twice / used after it was freed:** after `mem_free(s)` (or any
   move), `s` owns nothing. Do not touch it again, or give it a new value
   first.
-- **May be null:** test a `maybe` pointer before you dereference it. After
-  `if (!s) return;`, the checks know `s` is set. A `maybe` struct member is
+- **May be null:** test a `?` pointer before you dereference it. After
+  `if (!s) return;`, the checks know `s` is set. A `?` struct member is
   followed the same way: `if (q->next) q->next->v` is fine, `q->next->v`
   alone is not. Calling a function that may change `*q` (its parameter says
   `inout`) or assigning `q` again means testing `q->next` again.
@@ -224,11 +226,11 @@ How to fix each:
   the code fills it later (chapter 10).
 - **Address of a local:** the C classic, caught on every path.
 - **Null for a `nonnull` parameter:** see chapter 6.
-- **A `maybe` member:** `q->next` is `owned maybe`, so `q->next->v` needs
-  `if (q->next)` first, exactly like a `maybe` variable.
-- **A `maybe` value for a parameter that is not `maybe`:** `length` says its
+- **A `?` member:** `q->next` is `?owned`, so `q->next->v` needs
+  `if (q->next)` first, exactly like a `?` variable.
+- **A `?` value for a parameter that is not `?`:** `length` says its
   argument is never null, so test `s` before the call (or make the
-  parameter `maybe` and test it inside).
+  parameter `?` and test it inside).
 - **A borrow outliving its owner:** `tail = s + 1` owns nothing; it points
   into `s`. Once `s` is freed (or moved, or assigned again), `tail` is dead.
   Read through it before the free, or copy what you need.
@@ -239,7 +241,7 @@ How to fix each:
   `-O1` and up `nothing()` is inlined and `*nothing()` becomes a load from
   address 0. That finding depends on the optimizer, which is why this
   chapter is compiled with `-O1`. At `-O0` the flow check reports the same
-  line differently: `nothing()` returns a `maybe` pointer, so "a pointer
+  line differently: `nothing()` returns a `?` pointer, so "a pointer
   that may be null is dereferenced". All the other reports are the same at
   every level.
 - **Owned array elements** (chapter 10): the first loop fills `a`, nothing
@@ -263,7 +265,7 @@ parse and every check and writes nothing.
 first. Cleanup then sits next to what needs it:
 
 ```c
-char * owned maybe buf = mem_strdup(s);
+char *?owned buf = mem_strdup(s);
 if (!buf)
   return -1;
 defer mem_free(buf);      /* freed on every way out */
@@ -286,7 +288,7 @@ group names into sets:
 ```c
 error ParseError { Empty, BadDigit, TooBig };
 
-static !int parse_int(const char *s)
+static !int parse_int(char *s)
 {
   if (!*s)
     return error.Empty;   /* fail */
@@ -331,10 +333,10 @@ function that builds something then gives it to the caller on success,
 and frees it on every error path:
 
 ```c
-static !char * owned make_label(const char *num)
+static !char *owned make_label(char *num)
 {
   int v = try parse_int(num);
-  char * owned maybe buf = mem_new(32);
+  char *?owned buf = mem_new(32);
   if (!buf)
     return error.ENOMEM;  /* errno names are errors too */
   errdefer mem_free(buf);
@@ -362,7 +364,7 @@ it is. Three rules decide how its pointers behave.
 yasc does not guess. An unchecked pointer can be held, copied, compared
 and handed back to C freely; it becomes an `owned`, `view` or `borrows`
 pointer only where the code vouches for it, with `unsafe(...)`:
-`const char * view name = unsafe(counter_name(borrow(c)));`. Without it that
+`const char *view name = unsafe(counter_name(borrow(c)));`. Without it that
 is an error, "a pointer from regular C becomes a view here: write
 unsafe(...)" (`-Wunchecked`). Null needs no vouching. Pointers written in
 a C macro (`COUNTER_NONE`, `NULL`) are unchecked too. yasc code itself
@@ -388,9 +390,9 @@ counter_t *counter_new(const char *name) __attribute__((malloc, malloc(counter_f
 
 | Attribute | yasc reads it as |
 |---|---|
-| `malloc` | the result is `owned maybe` |
-| `malloc(dealloc, n)` | also: `dealloc`'s n-th argument is `owned maybe drop` |
-| `returns_nonnull` | with `malloc`: the result is `owned`, not `maybe` |
+| `malloc` | the result is `?owned` |
+| `malloc(dealloc, n)` | also: `dealloc`'s n-th argument is `?owned drop` |
+| `returns_nonnull` | with `malloc`: the result is `owned`, not `?` |
 | `nonnull(i, ...)` | a null constant there is a `-Wnonnull` warning (in `-Wall`) |
 
 So `06_c_library.c` must store `counter_new`'s result in an owned pointer,
@@ -407,9 +409,9 @@ functions that read a whole string. With it, yasc code calls them
 directly:
 
 ```c
-char * owned maybe s = strdup(name);   /* the yasc way */
-char * view t = strdup(name);          /* warns: never freed */
-char * owned u = malloc(n);            /* warns: may be null */
+char *?owned s = strdup(name);   /* the yasc way */
+char *view t = strdup(name);          /* warns: never freed */
+char *owned u = malloc(n);            /* warns: may be null */
 ```
 
 The examples use `mem.h` instead, so they build with any C library.
@@ -425,13 +427,13 @@ A function written in a struct body is a method:
 ```c
 struct stack
 {
-  int * owned items;
+  int *owned items;
   int len, cap;
 
   int push(inout struct stack *self, int v) { ... }
   int empty(const struct stack *self) { return self->len == 0; }
-  void destroy(drop struct stack * owned self) { ... }
-  struct stack * owned maybe create(int cap) { ... }
+  void destroy(drop struct stack *owned self) { ... }
+  struct stack *?owned create(int cap) { ... }
 };
 ```
 
@@ -447,26 +449,26 @@ s->destroy();       /* s is moved: using it again is an error in the checks */
 ```
 
 `obj.m()` passes `&obj`, `p->m()` passes `p` itself, so `owned` and
-`maybe` on `p` count exactly as they would for any call. A self taken by
+`?` on `p` count exactly as they would for any call. A self taken by
 value (`struct range self`) gets a copy.
 
 The object's owned fields stay its own across an `inout` self, and the checks
 hold both sides to that:
 
 - **The method** may free an owned field, but must give it a new value (or
-  null, if the field is `maybe`) before it returns: `'b->buf' is freed when
+  null, if the field is `?`) before it returns: `'b->buf' is freed when
   'reset' returns: 'b' still owns it`.
 - **The caller** hands the object over with its owned fields set and not
   freed (`'s.buf' is freed when its struct is handed to 'touch'`). After
   the call the fields still own memory, so `s.buf` must still be freed (a
-  `maybe` one may now be null).
+  `?` one may now be null).
 - **A `drop struct T *self`** method (a `clear` or `deinit`) frees
   the owned fields instead. It must free every one before it returns, and the
   caller's fields count as freed after the call, so `defer s.clear();` is
   enough to keep `s` from leaking.
 
 ```c
-struct buf { char * owned maybe data; int len; };
+struct buf { char *?owned data; int len; };
 void buf_fill(inout struct buf *b);    /* keeps data valid */
 void buf_clear(drop struct buf *b);    /* frees data */
 
@@ -548,14 +550,14 @@ strings, then the entry, and `errdefer` frees what is already made when a
 later step fails. On success they move into the entry:
 
 ```c
-!int add(inout struct config *self, const char *s, int n)
+!int add(inout struct config *self, char *s, int n)
 {
   ...
-  char * owned key = try copy(s, key_end);
+  char *owned key = try copy(s, key_end);
   errdefer mem_free(key);    /* freed if a later step fails */
-  char * owned value = try copy(s + v, n - v);
+  char *owned value = try copy(s + v, n - v);
   errdefer mem_free(value);
-  struct entry * owned maybe e = mem_new(sizeof *e);
+  struct entry *?owned e = mem_new(sizeof *e);
   if (!e)
     return error.ENOMEM;     /* key and value are freed */
   e->key = move(key);        /* the entry owns them now */
@@ -574,7 +576,7 @@ own, so the entries are freed before the program prints `blocks left: 0`.
 
 ```c
 #pragma tcc diagnostic error "-Wformat"
-static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void say(char *fmt, ...) __attribute__((format(printf, 1, 2)));
 ```
 
 The `format` attribute has tcc check every call of `say()` the way it checks
@@ -605,7 +607,7 @@ blocks left: 0
 element by element, and a counted loop over it as a whole:
 
 ```c
-char * owned maybe copy[N] = undefined;
+char *?owned copy[N] = undefined;
 int i;
 for (i = 0; i < N; i++)
   copy[i] = mem_strdup(words[i]);   /* every element owns a string (or is null) */
@@ -636,12 +638,12 @@ certain mistakes are reported for them. The limits are listed in
 declares `slots.c`'s functions in yasc:
 
 ```c
-int owned(slot_close) maybe slot_open(int which);  /* -1 when it fails */
-int slot_close(int drop owned(slot_close) maybe h);
+int ?owned(slot_close) slot_open(int which);  /* -1 when it fails */
+int slot_close(int drop ?owned(slot_close) h);
 int slot_read(int view h);
 ```
 
-`owned(slot_close)` names the function that releases the handle, and `maybe`
+`owned(slot_close)` names the function that releases the handle, and `?`
 means it may be invalid. For an int, invalid means `< 0`, so `h < 0`,
 `h == -1` and `h >= 0` are the tests (`if (h)` is not: 0 is a valid
 handle). The rules are the pointer rules: close it on every path (`defer
@@ -651,7 +653,7 @@ pointers. YasOS's libc declares `open`, `close`, `read`, `write`, `socket`,
 `pipe` and friends this way, so a file descriptor in yasc code is checked
 like any other handle.
 
-`owned(dealloc)` works for pointers too: `FILE * owned(fclose) maybe f =
+`owned(dealloc)` works for pointers too: `FILE *?owned(fclose) f =
 fopen(...)`, and freeing it with `free` instead of `fclose` is an error.
 
 The program prints:
@@ -676,7 +678,7 @@ cannot follow it, say so in the code:
 unsafe {
   /* lifetime errors are not said here */
 }
-char * owned p = unsafe(adopt(raw));   /* one expression */
+char *owned p = unsafe(adopt(raw));   /* one expression */
 ```
 
 `unsafe` works by lines, so a region has its lines to itself: `unsafe {`
@@ -704,7 +706,7 @@ compare it, pass it to C, but use it as a view only in `unsafe`. Storing
 into it is checked as usual. An owned member in a union is an error.
 
 ```c
-union val { char * view s; uintptr_t addr; };
+union val { char *s; uintptr_t addr; };
 int count(const char *s);
 
 int len(union val *v)
@@ -726,7 +728,7 @@ struct value {
   enum vkind k;                       /* the tag: declared before the union */
   union(k) {
     long i          when(V_INT);
-    char * view s   when(V_STR);
+    char *s   when(V_STR);
   } u;
 };
 
@@ -746,7 +748,7 @@ void set_int(inout struct value *v, long n)
 }
 ```
 
-A call that may write through `v` (an `inout struct value * view`
+A call that may write through `v` (an `inout struct value *view`
 parameter) forgets what was known about `v->k`: test it again after it. A
 `switch` on the tag with no `default` must handle every variant. A copy of
 the tag works too (`enum vkind k = v->k; switch (k)`) while neither changes.
@@ -759,7 +761,7 @@ struct name {
   enum { N_NONE, N_HEAP } k;
   union(k) {
     int none                 when(N_NONE);
-    char * owned maybe heap  when(N_HEAP);
+    char *?owned heap  when(N_HEAP);
   } u;
 };
 
@@ -808,13 +810,13 @@ u->status = RX_DONE;    /* clears RX_DONE only */
 ## Cheat sheet
 
 ```
-T * owned p          owns *p: free it or hand it on, once
-T * view p           borrows *p: never frees
+T *owned p          owns *p: free it or hand it on, once
+T *view p           borrows *p: never frees
 borrow(p)  move(p)   an owned p lent / handed over (also to a C function)
-T * owned maybe p    may be null: test it before *p
-inout T * view p     the callee may write *p (a view parameter's *p is read-only without it)
-out T * view p       the callee writes *p
-drop T * owned p     the callee consumes p
+T *?owned p    may be null: test it before *p
+inout T *view p     the callee may write *p (a view parameter's *p is read-only without it)
+out T *view p       the callee writes *p
+drop T *owned p     the callee consumes p
 defer STMT;          run STMT when the scope is left
 !T f(void)           a T or an error
 return error.NAME;   fail
@@ -828,8 +830,8 @@ module a.b;          this file is module a.b
 export DECL          visible to importers
 import a.b;          use module a.b
 #embed "f" suffix(, 0)            a file's bytes, at compile time
-int owned(close) maybe fd           a handle: close it once; invalid when < 0
-T * owned(fclose) maybe f          owned, released by fclose (not free)
+int ?owned(close) fd           a handle: close it once; invalid when < 0
+T *?owned(fclose) f          owned, released by fclose (not free)
 #pragma tcc diagnostic ignored "-Wx"   turn a warning off (push / pop)
 unsafe { ... }  unsafe(e)          the lifetime errors are not said there
 unsafe(u.s)                        a view read from a union member

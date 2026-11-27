@@ -25,7 +25,7 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 
 PRELUDE = """\
 #pragma yasc
-struct tokenizer borrows(text) { const char * borrows(text) pos; int n; };
+struct tokenizer borrows(text) { const char *borrows(text) pos; int n; };
 struct tokenizer borrows(src) tok_init(const char *src);
 struct tokenizer tok_from(const char *src, int k);
 struct tokenizer borrows(static) tok_static(void);
@@ -58,7 +58,7 @@ def _diags(tmp_path, body, *flags):
 
 @pytest.mark.parametrize("opt", ["-O0", "-O2"])
 def test_local_value_is_fine(tmp_path, opt):
-    body = "void f(const char *s)\n{\n  struct tokenizer t = tok_init(s);\n  t.pos = s + 1;\n  (void)t;\n}\n"
+    body = "void f(char *s)\n{\n  struct tokenizer t = tok_init(s);\n  t.pos = s + 1;\n  (void)t;\n}\n"
     assert _diags(tmp_path, body, opt) == []
 
 
@@ -68,7 +68,7 @@ def test_static_value_into_a_global(tmp_path, opt):
 
 
 STORES = {
-    "global": "void f(const char *s)\n{\n  g_tok = tok_init(s);\n}\n",
+    "global": "void f(char *s)\n{\n  g_tok = tok_init(s);\n}\n",
     "through_a_pointer": "void f(inout struct tokenizer *o, const char *s)\n{\n  *o = tok_from(s, 1);\n}\n",
 }
 
@@ -110,13 +110,13 @@ def test_errors(tmp_path, name):
 # struct returned in registers.
 
 FLOW_PRELUDE = """\
-void free(drop void * owned maybe p);
-void take(char * owned p);
-char * owned make(void);
+void free(drop void *?owned p);
+void take(char *owned p);
+char *owned make(void);
 struct tokenizer borrows(a, b) tok2(const char *a, const char *b);
 int tok_next(inout struct tokenizer *t);
 int tok_peek(const struct tokenizer *t);
-struct span borrows(t) { const char * borrows(t) p; };
+struct span borrows(t) { const char *borrows(t) p; };
 struct span borrows(src) span_of(const char *src);
 static inline struct tokenizer borrows(src) tok_lit(const char *src)
 {
@@ -157,82 +157,82 @@ def _uaf(line, name, owner, at, how="freed", is_="is", borrows="borrows"):
 
 FLOW_BAD = {
     "initialised": (
-        "int f(void)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(b);\n  free(b);\n  return *t.pos;\n}\n",
+        "int f(void)\n{\n  char *owned b = make();\n  struct tokenizer t = tok_init(b);\n  free(b);\n  return *t.pos;\n}\n",
         _uaf(6, "t", "b", 5),
     ),
     "assigned": (
-        "int f(void)\n{\n  char * owned b = make();\n  struct tokenizer t = undefined;\n  t = tok_from(b, 1);\n  free(b);\n"
+        "int f(void)\n{\n  char *owned b = make();\n  struct tokenizer t = undefined;\n  t = tok_from(b, 1);\n  free(b);\n"
         "  return *t.pos;\n}\n",
         _uaf(7, "t", "b", 6),
     ),
     "copied": (
-        "int f(void)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(b);\n  struct tokenizer u = t;\n"
+        "int f(void)\n{\n  char *owned b = make();\n  struct tokenizer t = tok_init(b);\n  struct tokenizer u = t;\n"
         "  free(b);\n  return *u.pos + t.n;\n}\n",
         _uaf(7, "u", "b", 6),
     ),
     "moved": (
-        "int f(void)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(b);\n  take(move(b));\n"
+        "int f(void)\n{\n  char *owned b = make();\n  struct tokenizer t = tok_init(b);\n  take(move(b));\n"
         "  return *t.pos;\n}\n",
         _uaf(6, "t", "b", 5, how="moved"),
     ),
     "read_through_a_view": (
-        "int f(void)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(b);\n  free(b);\n"
+        "int f(void)\n{\n  char *owned b = make();\n  struct tokenizer t = tok_init(b);\n  free(b);\n"
         "  return tok_peek(&t);\n}\n",
         _uaf(6, "t", "b", 5),
     ),
     "two_sources": (
-        "int f(void)\n{\n  char * owned a = make();\n  char * owned b = make();\n  struct tokenizer t = tok2(a, b);\n"
+        "int f(void)\n{\n  char *owned a = make();\n  char *owned b = make();\n  struct tokenizer t = tok2(a, b);\n"
         "  free(a);\n  int r = *t.pos;\n  free(b);\n  return r;\n}\n",
         _uaf(7, "t", "a", 6),
     ),
     "freed_on_one_path": (
-        "int f(int c)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(b);\n  if (c)\n  {\n    free(b);\n"
+        "int f(int c)\n{\n  char *owned b = make();\n  struct tokenizer t = tok_init(b);\n  if (c)\n  {\n    free(b);\n"
         "    b = make();\n  }\n  int r = *t.pos;\n  free(b);\n  return r;\n}\n",
         _uaf(10, "t", "b", 7, is_="may be"),
     ),
     "member_stored": (
-        "int f(void)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_static();\n  t.pos = b + 1;\n  free(b);\n"
+        "int f(void)\n{\n  char *owned b = make();\n  struct tokenizer t = tok_static();\n  t.pos = b + 1;\n  free(b);\n"
         "  return *t.pos;\n}\n",
         _uaf(7, "t", "b", 6),
     ),
     # the inlined body stores a literal: the call's type still says src
     "inlined_body_says_otherwise": (
-        "int f(void)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_lit(b);\n  free(b);\n  return *t.pos;\n}\n",
+        "int f(void)\n{\n  char *owned b = make();\n  struct tokenizer t = tok_lit(b);\n  free(b);\n  return *t.pos;\n}\n",
         _uaf(6, "t", "b", 5),
     ),
     # a static callee (in registers at -O1, inlined at -O2)
     "static_callee": (
-        "int f(int c)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_wrap(b, c);\n  free(b);\n"
+        "int f(int c)\n{\n  char *owned b = make();\n  struct tokenizer t = tok_wrap(b, c);\n  free(b);\n"
         "  return *t.pos;\n}\n",
         _uaf(6, "t", "b", 5),
     ),
     # four bytes: returned in r0
     "in_a_register": (
-        "int f(void)\n{\n  char * owned b = make();\n  struct span s = span_of(b);\n  free(b);\n  return *s.p;\n}\n",
+        "int f(void)\n{\n  char *owned b = make();\n  struct span s = span_of(b);\n  free(b);\n  return *s.p;\n}\n",
         _uaf(6, "s", "b", 5),
     ),
 }
 
 FLOW_CLEAN = {
-    "used_before": "int f(void)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(b);\n  int r = *t.pos;\n"
+    "used_before": "int f(void)\n{\n  char *owned b = make();\n  struct tokenizer t = tok_init(b);\n  int r = *t.pos;\n"
     "  free(b);\n  return r;\n}\n",
-    "borrowed_again": "int f(void)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(b);\n  free(b);\n"
+    "borrowed_again": "int f(void)\n{\n  char *owned b = make();\n  struct tokenizer t = tok_init(b);\n  free(b);\n"
     "  b = make();\n  t = tok_init(b);\n  int r = *t.pos;\n  free(b);\n  return r;\n}\n",
-    "member_repointed": "int f(const char *s)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(b);\n"
+    "member_repointed": "int f(char *s)\n{\n  char *owned b = make();\n  struct tokenizer t = tok_init(b);\n"
     "  free(b);\n  t.pos = s;\n  return *t.pos;\n}\n",
-    "other_member_read": "int f(void)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(b);\n  free(b);\n"
+    "other_member_read": "int f(void)\n{\n  char *owned b = make();\n  struct tokenizer t = tok_init(b);\n  free(b);\n"
     "  return t.n;\n}\n",
     # a callee that may write the struct: it forgets what it borrowed
-    "written_by_a_call": "int f(void)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(b);\n"
+    "written_by_a_call": "int f(void)\n{\n  char *owned b = make();\n  struct tokenizer t = tok_init(b);\n"
     "  tok_next(&t);\n  free(b);\n  return *t.pos;\n}\n",
     # its address kept: not followed
-    "address_kept": "int f(void)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(b);\n"
-    "  struct tokenizer * view tp = &t;\n  free(b);\n  return *tp->pos;\n}\n",
-    "static_source": "int f(void)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_static();\n  free(b);\n"
+    "address_kept": "int f(void)\n{\n  char *owned b = make();\n  struct tokenizer t = tok_init(b);\n"
+    "  struct tokenizer *view tp = &t;\n  free(b);\n  return *tp->pos;\n}\n",
+    "static_source": "int f(void)\n{\n  char *owned b = make();\n  struct tokenizer t = tok_static();\n  free(b);\n"
     "  return *t.pos;\n}\n",
-    "in_a_loop": "int f(int n)\n{\n  char * owned b = make();\n  int r = 0;\n  for (int i = 0; i < n; i++)\n  {\n"
+    "in_a_loop": "int f(int n)\n{\n  char *owned b = make();\n  int r = 0;\n  for (int i = 0; i < n; i++)\n  {\n"
     "    struct tokenizer t = tok_init(b);\n    r += *t.pos;\n  }\n  free(b);\n  return r;\n}\n",
-    "view_source": "int f(const char *s)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(s);\n"
+    "view_source": "int f(char *s)\n{\n  char *owned b = make();\n  struct tokenizer t = tok_init(s);\n"
     "  free(b);\n  return *t.pos;\n}\n",
 }
 
@@ -253,7 +253,7 @@ def test_flow_clean(tmp_path, name, opt):
 def test_flow_inline_twice_once(tmp_path):
     """In a static inline called twice: reported once, at every -O."""
     body = (
-        "static inline int two(void)\n{\n  char * owned b = make();\n  struct tokenizer t = tok_init(b);\n  free(b);\n"
+        "static inline int two(void)\n{\n  char *owned b = make();\n  struct tokenizer t = tok_init(b);\n  free(b);\n"
         "  return *t.pos;\n}\nint f(void)\n{\n  return two() + two();\n}\n"
     )
     for opt in LEVELS:

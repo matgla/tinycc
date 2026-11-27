@@ -350,6 +350,7 @@ void init_putz(init_params *p, unsigned long c, int size)
     zero.vr = -1;
     zero.c.i = 0;
 
+    const int clear_from = tcc_state->ir->next_instruction_index;
     for (int off = 0; off < size; off += 4)
     {
       SValue d;
@@ -360,6 +361,9 @@ void init_putz(init_params *p, unsigned long c, int size)
       d.c.i = c + off;
       tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &zero, NULL, &d);
     }
+    /* yasc: the zeroing is no null stored in a member that is not '?' */
+    if (tcc_state->yasc && tcc_state->ir->lt_on)
+      tcc_ir_lt_note_init_store(tcc_state->ir, clear_from, tcc_state->ir->next_instruction_index, -1);
   }
   else if (tcc_state->ir && size > 0 && size <= 16)
   {
@@ -772,9 +776,13 @@ static __attribute__((noinline)) void ovr_after(init_params *p)
    index.  'flags' is as in decl_initializer.
    'al' contains the already initialized length of the
    current container (starting at c).  This returns the new length of that.  */
+/* the member decl_initializer is filling (an array element: none), for yasc's
+   "null into a member that is not '?'" (yasc_init_null) */
+Sym *yasc_init_field;
+
 int decl_designator(init_params *p, CType *type, unsigned long c, Sym **cur_field, int flags, int al)
 {
-  Sym *s, *f;
+  Sym *s, *f, *yf = NULL;
   int index, index_last, align, l, nb_elems, elem_size;
   unsigned long corig = c;
   /* -Woverride-init: what this element is goes to p->ovr (ovr_before) */
@@ -825,6 +833,7 @@ int decl_designator(init_params *p, CType *type, unsigned long c, Sym **cur_fiel
       elem_size = type_size(type, &align);
       c += index * elem_size;
       nb_elems = index_last - index + 1;
+      yf = NULL;
     }
     else
     {
@@ -839,6 +848,7 @@ int decl_designator(init_params *p, CType *type, unsigned long c, Sym **cur_fiel
       type = &f->type;
       c += cumofs;
       sso_be = f->a.sso_be;
+      yf = f;
     }
     cur_field = NULL;
   }
@@ -868,6 +878,7 @@ int decl_designator(init_params *p, CType *type, unsigned long c, Sym **cur_fiel
       type = pointed_type(type);
       elem_size = type_size(type, &align);
       c += index * elem_size;
+      yf = NULL;
     }
     else
     {
@@ -882,6 +893,7 @@ int decl_designator(init_params *p, CType *type, unsigned long c, Sym **cur_fiel
       type = &f->type;
       c += f->c;
       sso_be = f->a.sso_be;
+      yf = f;
     }
   }
 
@@ -905,8 +917,11 @@ int decl_designator(init_params *p, CType *type, unsigned long c, Sym **cur_fiel
     ovr_before(p, type, c, elem_size * nb_elems);
 
   const int sso_be_outer = p->sso_be;
+  Sym *const yf_outer = yasc_init_field;
   p->sso_be = sso_be;
+  yasc_init_field = yf;
   decl_initializer(p, type, c, flags & ~DIF_FIRST, -1);
+  yasc_init_field = yf_outer;
   p->sso_be = sso_be_outer;
 
   if (OVR_ON)

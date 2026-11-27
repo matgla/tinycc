@@ -26,12 +26,12 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 
 PRELUDE = """\
 #pragma yasc
-void * owned malloc(unsigned n);
-void free(drop void * owned maybe p);
-void take(char * owned p);
+void *owned malloc(unsigned n);
+void free(drop void *?owned p);
+void take(char *owned p);
 int use(char *p);
-struct box { char * owned buf; char * view peek; };
-char * owned g;
+struct box { char *owned buf; char *peek; };
+char *owned g;
 #pragma tcc c_begin
 void c_use(char *p);
 #pragma tcc c_end
@@ -69,36 +69,36 @@ def _moves(name):
 MEMBER = "ownership moves out of a member or through a pointer here: write move(...)"
 
 NEEDS_MOVE = {
-    "owned_parameter": ("void f(void)\n{\n  char * owned p = malloc(1);\n  take(p);\n}\n", 4, _moves("p")),
+    "owned_parameter": ("void f(void)\n{\n  char *owned p = malloc(1);\n  take(p);\n}\n", 4, _moves("p")),
     "owned_variable": (
-        "void f(void)\n{\n  char * owned p = malloc(1);\n  char * owned q = p;\n  free(q);\n}\n",
+        "void f(void)\n{\n  char *owned p = malloc(1);\n  char *owned q = p;\n  free(q);\n}\n",
         4,
         _moves("p"),
     ),
     "assignment": (
-        "void f(void)\n{\n  char * owned p = malloc(1);\n  char * owned q;\n  q = p;\n  free(q);\n}\n",
+        "void f(void)\n{\n  char *owned p = malloc(1);\n  char *owned q;\n  q = p;\n  free(q);\n}\n",
         5,
         _moves("p"),
     ),
     "owned_member": (
-        "void f(inout struct box *s)\n{\n  char * owned p = malloc(1);\n  free(s->buf);\n  s->buf = p;\n}\n",
+        "void f(inout struct box *s)\n{\n  char *owned p = malloc(1);\n  free(s->buf);\n  s->buf = p;\n}\n",
         5,
         _moves("p"),
     ),
     "out_of_member": (
-        "void f(inout struct box *s)\n{\n  char * owned p = s->buf;\n  s->buf = 0;\n  free(p);\n}\n",
+        "void f(inout struct box *s)\n{\n  char *owned p = s->buf;\n  s->buf = malloc(1);\n  free(p);\n}\n",
         3,
         MEMBER,
     ),
-    "return_member": ("char * owned f(inout struct box *s)\n{\n  return s->buf;\n}\n", 3, MEMBER),
-    "return_global": ("char * owned f(void)\n{\n  return g;\n}\n", 3, _moves("g")),
+    "return_member": ("char *owned f(inout struct box *s)\n{\n  return s->buf;\n}\n", 3, MEMBER),
+    "return_global": ("char *owned f(void)\n{\n  return g;\n}\n", 3, _moves("g")),
     "return_static_local": (
-        "char * owned f(void)\n{\n  static char * owned keep;\n  return keep;\n}\n",
+        "char *owned f(void)\n{\n  static char *owned keep;\n  return keep;\n}\n",
         4,
         _moves("keep"),
     ),
     "drop_parameter_assigned": (
-        "void f(drop char * owned p, char * owned q)\n{\n  free(p);\n  p = q;\n  free(p);\n}\n",
+        "void f(drop char *owned p, char *owned q)\n{\n  free(p);\n  p = q;\n  free(p);\n}\n",
         4,
         _moves("q"),
     ),
@@ -135,15 +135,15 @@ def test_with_move_is_clean(tmp_path, name):
 
 
 NO_MOVE_NEEDED = {
-    "drop_argument": "void f(void)\n{\n  char * owned p = malloc(1);\n  free(p);\n}\n",
-    "return_local": "char * owned f(void)\n{\n  char * owned p = malloc(1);\n  return p;\n}\n",
-    "return_parameter": "char * owned f(char * owned p)\n{\n  return p;\n}\n",
-    "view_argument": "void f(void)\n{\n  char * owned p = malloc(1);\n  use(p);\n  free(p);\n}\n",
-    "view_variable": "void f(void)\n{\n  char * owned p = malloc(1);\n  char * view v = p;\n  use(v);\n  free(p);\n}\n",
+    "drop_argument": "void f(void)\n{\n  char *owned p = malloc(1);\n  free(p);\n}\n",
+    "return_local": "char *owned f(void)\n{\n  char *owned p = malloc(1);\n  return p;\n}\n",
+    "return_parameter": "char *owned f(char *owned p)\n{\n  return p;\n}\n",
+    "view_argument": "void f(void)\n{\n  char *owned p = malloc(1);\n  use(p);\n  free(p);\n}\n",
+    "view_variable": "void f(void)\n{\n  char *owned p = malloc(1);\n  char *view v = p;\n  use(v);\n  free(p);\n}\n",
     "view_member": "void f(inout struct box *s)\n{\n  s->peek = s->buf;\n}\n",
-    "call_result": "void f(void)\n{\n  take(malloc(1));\n  char * owned q = malloc(2);\n  free(q);\n}\n",
-    "move_on_drop": "void f(void)\n{\n  char * owned p = malloc(1);\n  free(move(p));\n}\n",
-    "move_on_return": "char * owned f(char * owned p)\n{\n  return move(p);\n}\n",
+    "call_result": "void f(void)\n{\n  take(malloc(1));\n  char *owned q = malloc(2);\n  free(q);\n}\n",
+    "move_on_drop": "void f(void)\n{\n  char *owned p = malloc(1);\n  free(move(p));\n}\n",
+    "move_on_return": "char *owned f(char *owned p)\n{\n  return move(p);\n}\n",
 }
 
 
@@ -155,7 +155,7 @@ def test_no_move_needed(tmp_path, name, opt):
 
 def test_wno_implicit_move(tmp_path):
     """Off, the flow checks still follow the implicit move."""
-    body = "void f(void)\n{\n  char * owned p = malloc(1);\n  take(p);\n  use(p);\n}\n"
+    body = "void f(void)\n{\n  char *owned p = malloc(1);\n  take(p);\n  use(p);\n}\n"
     assert _diags(tmp_path, body, "-Wno-implicit-move") == [
         (5, "warning", "'p' is used after it was moved"),
         (4, "note", "'p' was moved here"),
@@ -164,7 +164,7 @@ def test_wno_implicit_move(tmp_path):
 
 @pytest.mark.parametrize("opt", LEVELS)
 def test_use_after_explicit_move(tmp_path, opt):
-    body = "void f(void)\n{\n  char * owned p = malloc(1);\n  auto q = move(p);\n  use(p);\n  free(q);\n}\n"
+    body = "void f(void)\n{\n  char *owned p = malloc(1);\n  auto q = move(p);\n  use(p);\n  free(q);\n}\n"
     assert _diags(tmp_path, body, opt) == [
         (5, "warning", "'p' is used after it was moved"),
         (4, "note", "'p' was moved here"),
@@ -173,7 +173,7 @@ def test_use_after_explicit_move(tmp_path, opt):
 
 @pytest.mark.parametrize("opt", LEVELS)
 def test_borrow_follows_its_owner(tmp_path, opt):
-    body = "void f(void)\n{\n  char * owned p = malloc(1);\n  auto v = borrow(p);\n  use(v);\n  free(p);\n  use(v);\n}\n"
+    body = "void f(void)\n{\n  char *owned p = malloc(1);\n  auto v = borrow(p);\n  use(v);\n  free(p);\n  use(v);\n}\n"
     assert _diags(tmp_path, body, opt) == [
         (7, "warning", "'v' is used after 'p', which it borrows from, was freed"),
         (6, "note", "'p' was freed here"),
@@ -181,19 +181,19 @@ def test_borrow_follows_its_owner(tmp_path, opt):
 
 
 def test_borrow_owns_nothing(tmp_path):
-    body = "void f(void)\n{\n  char * owned p = malloc(1);\n  take(borrow(p));\n  free(p);\n}\n"
+    body = "void f(void)\n{\n  char *owned p = malloc(1);\n  take(borrow(p));\n  free(p);\n}\n"
     assert (4, "warning", "a pointer that owns nothing is stored in an owned pointer") in _diags(tmp_path, body)
 
 
 def test_moved_into_a_view_is_never_freed(tmp_path):
-    body = "void f(void)\n{\n  char * owned p = malloc(1);\n  char * view v = move(p);\n  use(v);\n}\n"
+    body = "void f(void)\n{\n  char *owned p = malloc(1);\n  char *view v = move(p);\n  use(v);\n}\n"
     assert (4, "warning", "an owned result is stored in a pointer that owns nothing: it is never freed") in _diags(
         tmp_path, body
     )
 
 
 def test_move_discarded(tmp_path):
-    body = "void f(void)\n{\n  char * owned p = malloc(1);\n  move(p);\n}\n"
+    body = "void f(void)\n{\n  char *owned p = malloc(1);\n  move(p);\n}\n"
     assert (4, "warning", "an owned result is discarded: it is never freed") in _diags(tmp_path, body)
 
 
@@ -223,7 +223,7 @@ def test_identifiers_outside_yasc(tmp_path):
 
 def test_auto_with_move_and_borrow(tmp_path):
     body = (
-        "void f(void)\n{\n  char * owned p = malloc(1);\n  auto v = borrow(p);\n  use(v);\n"
+        "void f(void)\n{\n  char *owned p = malloc(1);\n  auto v = borrow(p);\n  use(v);\n"
         "  auto q = move(p);\n  free(q);\n}\n"
     )
     assert _diags(tmp_path, body) == []
@@ -235,13 +235,13 @@ C_PARAM = "'p' is owned and goes to a regular-C parameter: write borrow(p) or mo
 
 @pytest.mark.parametrize("opt", LEVELS)
 def test_owned_to_c_parameter_says_which(tmp_path, opt):
-    body = "void f(void)\n{\n  char * owned p = malloc(1);\n  c_use(p);\n  free(p);\n}\n"
+    body = "void f(void)\n{\n  char *owned p = malloc(1);\n  c_use(p);\n  free(p);\n}\n"
     assert _diags(tmp_path, body, opt) == [(4, "warning", C_PARAM)]
 
 
 @pytest.mark.parametrize("opt", LEVELS)
 def test_borrow_to_c_parameter(tmp_path, opt):
-    body = "void f(void)\n{\n  char * owned p = malloc(1);\n  c_use(borrow(p));\n  free(p);\n}\n"
+    body = "void f(void)\n{\n  char *owned p = malloc(1);\n  c_use(borrow(p));\n  free(p);\n}\n"
     assert _diags(tmp_path, body, opt) == []
 
 
@@ -249,9 +249,9 @@ def test_borrow_to_c_parameter(tmp_path, opt):
 def test_move_to_c_parameter(tmp_path, opt):
     """move(p) to a C parameter: p is gone there -- no leak, and freeing it
     afterwards is reported."""
-    kept = "void f(void)\n{\n  char * owned p = malloc(1);\n  c_use(move(p));\n}\n"
+    kept = "void f(void)\n{\n  char *owned p = malloc(1);\n  c_use(move(p));\n}\n"
     assert _diags(tmp_path, kept, opt) == []
-    freed = "void f2(void)\n{\n  char * owned p = malloc(1);\n  c_use(move(p));\n  free(p);\n}\n"
+    freed = "void f2(void)\n{\n  char *owned p = malloc(1);\n  c_use(move(p));\n  free(p);\n}\n"
     assert _diags(tmp_path, freed, opt) == [
         (5, "warning", "'p' is used after it was moved"),
         (4, "note", "'p' was moved here"),
@@ -266,19 +266,19 @@ def test_move_to_c_member(tmp_path, opt):
     """move(p) into a regular-C member (a context the kernel takes, libc
     dlclose): p is gone there, as into a C parameter -- by an initializer or
     an assignment; freeing it afterwards is reported."""
-    init = C_CTX + "int f(void)\n{\n  char * owned p = malloc(1);\n  struct cctx c = {.p = move(p)};\n  return sink(&c);\n}\n"
+    init = C_CTX + "int f(void)\n{\n  char *owned p = malloc(1);\n  struct cctx c = {.p = move(p)};\n  return sink(&c);\n}\n"
     assert _diags(tmp_path, init, opt) == []
-    assign = C_CTX + "int f(void)\n{\n  char * owned p = malloc(1);\n  struct cctx c = undefined;\n  c.p = move(p);\n" \
+    assign = C_CTX + "int f(void)\n{\n  char *owned p = malloc(1);\n  struct cctx c = undefined;\n  c.p = move(p);\n" \
         "  return sink(&c);\n}\n"
     assert _diags(tmp_path, assign, opt) == []
-    freed = C_CTX + "int f(void)\n{\n  char * owned p = malloc(1);\n  struct cctx c = {.p = move(p)};\n  free(p);\n" \
+    freed = C_CTX + "int f(void)\n{\n  char *owned p = malloc(1);\n  struct cctx c = {.p = move(p)};\n  free(p);\n" \
         "  return sink(&c);\n}\n"
     assert _diags(tmp_path, freed, opt) == [
         (9, "warning", "'p' is used after it was moved"),
         (8, "note", "'p' was moved here"),
     ]
     # a drop parameter handed over the same way (libc dlclose)
-    param = C_CTX + "int give(drop char * owned h);\nint give(drop char * owned h)\n{\n  struct cctx c = {.p = move(h)};\n" \
+    param = C_CTX + "int give(drop char *owned h);\nint give(drop char *owned h)\n{\n  struct cctx c = {.p = move(h)};\n" \
         "  return sink(&c);\n}\n"
     assert _diags(tmp_path, param, opt) == []
 

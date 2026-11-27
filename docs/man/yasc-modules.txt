@@ -119,8 +119,8 @@ REGULAR C
        a diagnostic, it is neither maybe nor null, and the checks start at
        the yasc variable it lands in.
 
-           char * owned p = c_name();       /* silent: c_name is C */
-           char * owned q = y_view();       /* warns: y_view is yasc */
+           char *owned p = c_name();       /* silent: c_name is C */
+           char *owned q = y_view();       /* warns: y_view is yasc */
 
        Handing an owned result to a C function is silent too; to a view
        declared in yasc it warns (never freed). A header written in yasc
@@ -132,9 +132,9 @@ REGULAR C
        deallocator's n-th argument owned. The YasOS libc says so for malloc,
        calloc, strdup, fopen, opendir and the others, so
 
-           char * owned maybe s = strdup(name);   /* the yasc way */
-           char * view t = strdup(name);    /* warns: never freed */
-           char * owned u = malloc(n);      /* warns: may be null */
+           char *?owned s = strdup(name);   /* the yasc way */
+           char *view t = strdup(name);    /* warns: never freed */
+           char *owned u = malloc(n);      /* warns: may be null */
            free(y_view());                  /* warns: owns nothing */
 
        nonnull marks parameters: a null constant for one is a -Wnonnull

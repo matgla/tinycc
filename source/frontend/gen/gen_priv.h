@@ -422,6 +422,9 @@ FortifyCall *fortify_call_begin(Sym *fsym);
 void fortify_arg_before(FortifyCall *fc, int i);
 void fortify_arg(FortifyCall *fc, int i);
 void fortify_arg_emit(FortifyCall *fc, int i);
+int fortify_call_warned(const FortifyCall *fc);
+int fortify_wanted(void);
+int chk_implicit_call(Sym *fsym);
 void fortify_call_end(FortifyCall *fc);
 void fortify_calls_unwind(void *mark);
 void *fortify_calls_mark(void);
@@ -502,6 +505,8 @@ void objsize_rhs_begin(ObjRec *saved);
 void objsize_rhs_end(const ObjRec *saved);
 void objsize_cond_result(const ObjHeap *t, const ObjHeap *f);
 void objsize_alloca_result(SValue *size);
+void objsize_call_overflow_said(ObjCall *oc);
+void objsize_call_dep(ObjCall *oc, Sym *fsym, int line);
 void objsize_chk_overflow(ObjCall *oc, const char *name, unsigned long long n, unsigned long long size);
 int objsize_bound_fixit(ObjCall *oc, int line);
 
@@ -539,8 +544,27 @@ void unary_builtin_fp2(void);
 void unary_at_builtin(void);
 void gen_bswap(int size);
 
+/* --- decl/default_arg.c --- */
+typedef struct YascDefaults YascDefaults;
+Sym *yasc_default_marker(void);
+void yasc_default_param(YascDefaults **pd, int idx, CType *pt);
+void yasc_default_attach(YascDefaults *d, Sym *fn, int nparams);
+void yasc_default_bind(int v, CType *type, int own_functype);
+int yasc_default_have(Sym *fsym, int idx);
+void yasc_default_push(Sym *fsym, int idx, int line);
+void yasc_default_reset(void);
+
 /* --- builtin/misc.c --- */
 int gcc_classify_type(CType *type);
+/* @src() */
+Sym *yasc_src_tag(void);
+void yasc_src_push(Sym *marker, int line);
+int yasc_src_object_type(CType *type);
+int yasc_src_header_member(int name);
+void yasc_src_object_check(CType *type, const char *what);
+void self_rel_rvalue(void);
+void self_rel_addr_error(void);
+void yasc_src_reset(void);
 void gen_bitop1(TccIrOp op);
 void gen_builtin_libcall(int func_tok, int argc, int ret_type);
 int gen_ir_call_args(SValue *args, int argc, int func_tok, CType *ret_ctype);
@@ -599,6 +623,7 @@ extern int yasc_capi_pending; /* a c_api(...) waits for the declarator, paramete
 int yasc_capi_levels(CType *type);
 void yasc_capi_word(int nstar);
 void yasc_capi_star(int nstar, CType *type);
+void yasc_capi_in_c(void);
 void yasc_capi_param(Sym *s);
 void yasc_capi_function(Sym *f);
 void yasc_capi_declarator(CType *type, int td, int nested);
@@ -625,7 +650,7 @@ void expr_landor(int op);
 
 /* --- expr/indir.c --- */
 void expr_type(CType *type, void (*expr_fn)(void));
-void gfunc_param_typed(Sym *func, Sym *arg);
+void gfunc_param_typed(Sym *func, Sym *arg, Sym *callee);
 void parse_builtin_params(int nc, const char *args);
 void parse_expr_type(CType *type);
 void btype_no_auto(AttributeDef *ad);
@@ -749,11 +774,20 @@ int yasc_pp_hold(int line, CType *target);
 /* "T *", the plain pointer to TARGET, as its error names it (decl/declarator.c) */
 void yasc_plain_spell(char *buf, int size, CType *target);
 extern int yasc_pp_local_decl, yasc_pp_binding;
+/* decl() reads a global's or a static's declarator: 1 a global (file scope or
+   a local extern), 2 a local static (declarator.c: its pointers are views) */
+extern int yasc_global_decl;
 int yasc_pp_hold_local(int line, CType *target);
 int yasc_pp_local_begin(void);
 void yasc_pp_local_end(int mark, int tok, int keep);
 void yasc_pp_local_bind(Sym *sym);
 void yasc_pp_redundant_view(CType *type, int keep);
+/* -Wredundant-const: `const` tokens parse_btype() has read (a parameter's
+   base type says const itself, not through a typedef) */
+extern int yasc_btype_consts, yasc_btype_const_line, yasc_btype_const_col;
+/* vstore -> verify_assign_cast: a plain yasc local may take a read-only value
+   (the lifetime check follows it); whether it did */
+extern int yasc_ro_local_ok, yasc_ro_dropped;
 extern int yasc_pp_view_line;
 void yasc_pp_name(int mark, int tok, int idx);
 int yasc_pp_mark(void);
@@ -1106,6 +1140,13 @@ int mark_value_bytes(CType *type, int base, unsigned char *map, int map_size);
 void verify_assign_cast(CType *dt);
 extern int yasc_returning, yasc_argument;
 extern int yasc_argument_c;
+/* unary.c: how the lvalue the last unary() left was reached, and its first name */
+#define FE_LVAL_ELEM 2  /* a[i] */
+#define FE_LVAL_DEREF 3 /* *p */
+extern int fe_lval_kind, fe_lval_tok;
+int yasc_store_flow_wanted(CType *type);
+extern int fe_arg_index;    /* gfunc_param_typed: the argument converted (1-based), 0 = none */
+extern Sym *fe_arg_callee; /* ... and the function called, NULL through a pointer */
 extern int yasc_stmt_bol, yasc_unsafe_expr_line; /* the statement read now begins its line; unsafe(expr)'s line */
 extern int yasc_rbrace_line;                     /* the line of the last compound statement's '}' */
 void yasc_unsafe_line_check(int line);
@@ -1135,6 +1176,12 @@ int compare_types_structural(CType *type1, CType *type2);
 CType *find_assignable_transparent_union_member(CType *type);
 int is_null_pointer(SValue *p);
 void yasc_null_spelling(SValue *p);
+void yasc_init_null(CType *type, int is_static, int in_aggregate);
+int yasc_paren_type_begin(void);
+int yasc_pp_held_array(void);
+int yasc_init_flow_tok(CType *type);
+void yasc_paren_type_end(int mark, int literal);
+extern Sym *yasc_init_field;
 void yasc_null_pair(SValue *a, SValue *b);
 int is_transparent_union_type(CType *type);
 int pointed_size(CType *type);
@@ -1180,6 +1227,7 @@ void rodata_rel_init(Section *sec, unsigned long c);
 
 /* --- value/strlit_pool.c --- */
 void str_lit_pool_free(void);
+addr_t str_lit_pool_intern(const char *bytes, addr_t len);
 void str_lit_pool_merge(addr_t pre_off);
 void str_lit_pool_reset(void);
 

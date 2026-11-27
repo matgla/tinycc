@@ -12,12 +12,12 @@
 
 #define N 4
 
-static const char * view const words[N] = {"alpha", "beta", "gamma", "delta"};
+static const char *const words[N] = {"alpha", "beta", "gamma", "delta"};
 
 /* an array of owned strings: one loop fills it, one frees it */
 static int total_length(void)
 {
-  char * owned maybe copy[N] = undefined; /* the first loop fills it */
+  char *?owned copy[N] = undefined; /* the first loop fills it */
   int i, total = 0;
   for (i = 0; i < N; i++)
     copy[i] = mem_strdup(words[i]);
@@ -33,7 +33,7 @@ static int total_length(void)
 /* an array of handles: the same, with slot_close for mem_free */
 static int read_all(void)
 {
-  int owned(slot_close) maybe h[N] = undefined;
+  int ?owned(slot_close) h[N] = undefined;
   int i, sum = 0;
   for (i = 0; i < N; i++)
     h[i] = slot_open(i);
@@ -49,7 +49,7 @@ static int read_all(void)
 /* one handle, with every way out closing it */
 static int first_value(int which)
 {
-  int owned(slot_close) maybe h = slot_open(which);
+  int ?owned(slot_close) h = slot_open(which);
   if (h < 0)
     return -1; /* nothing was opened: nothing to close */
   defer slot_close(h);
@@ -59,7 +59,7 @@ static int first_value(int which)
 /* a struct array whose elements own a buffer each */
 struct line
 {
-  char * owned maybe text;
+  char *?owned text;
   int n;
 };
 

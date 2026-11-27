@@ -1,11 +1,11 @@
-"""The method self rules (docs/static_analysis_todo.md): a `struct T * view`
+"""The method self rules (docs/static_analysis_todo.md): a `struct T *view`
 parameter keeps the owned members of the struct valid.
 
 - the callee: an owned member it frees (or moves out) must get a new value,
   or null, before it returns;
 - the caller: the struct is handed over with its owned members set and not
   freed; afterwards they still own memory (a maybe one may be null);
-- `drop struct T * view self`: the callee frees every owned member, and the
+- `drop struct T *view self`: the callee frees every owned member, and the
   caller's count as freed after the call (`defer s.clear();`).
 
 Every case is checked with the methods declared (a call) and defined in the
@@ -26,20 +26,20 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 
 PRELUDE = """\
-void * owned maybe malloc(unsigned n);
-void free(drop void * owned maybe p);
+void *?owned malloc(unsigned n);
+void free(drop void *?owned p);
 int use(char *p);
-struct box { char * owned maybe buf; char * owned maybe aux; int n; };
+struct box { char *?owned buf; char *?owned aux; int n; };
 """
 DECLARED = """\
 void touch(inout struct box *b);
-int peek(const struct box *b);
+int peek(struct box *b);
 void clear(drop struct box *b);
 """
 # the same methods with bodies, inlined at -O1+
 DEFINED = """\
 static void touch(inout struct box *b) { b->n++; }
-static int peek(const struct box *b) { return b->n; }
+static int peek(struct box *b) { return b->n; }
 static void clear(drop struct box *b) { free(b->buf); free(b->aux); }
 """
 PRELUDE_LINES = PRELUDE.count("\n") + 3
@@ -66,7 +66,7 @@ CALLEE_BAD = {
     "freed_on_one_path": ("void reset(inout struct box *b, int c)\n{\n  if (c)\n    free(b->buf);\n}\n",
                           (5, "'b->buf' is freed when 'reset' returns: 'b' still owns it -- give it a new value "
                               "or null")),  # said on the exit where it is
-    "moved_out": ("char * owned maybe take(inout struct box *b)\n{\n  return move(b->buf);\n}\n",
+    "moved_out": ("char *?owned take(inout struct box *b)\n{\n  return move(b->buf);\n}\n",
                   (3, "'b->buf' is moved when 'take' returns: 'b' still owns it -- give it a new value or null")),
     "drop_partial": ("void wipe(drop struct box *b)\n{\n  free(b->buf);\n}\n",
                      (4, "'b->aux' is not freed when 'wipe' returns, which drops 'b'")),
@@ -77,15 +77,15 @@ CALLEE_BAD = {
 }
 
 CALLEE_CLEAN = {
-    "replaced": "void reset(inout struct box *b)\n{\n  char * owned maybe n = malloc(8);\n  free(b->buf);\n"
+    "replaced": "void reset(inout struct box *b)\n{\n  char *?owned n = malloc(8);\n  free(b->buf);\n"
     "  b->buf = move(n);\n}\n",
     "nulled": "void reset(inout struct box *b)\n{\n  free(b->buf);\n  b->buf = nullptr;\n}\n",
-    "moved_out_null": "void pop(inout struct box *b)\n{\n  char * owned maybe n = move(b->buf);\n  if (n)\n  {\n"
+    "moved_out_null": "void pop(inout struct box *b)\n{\n  char *?owned n = move(b->buf);\n  if (n)\n  {\n"
     "    b->buf = malloc(4);\n    free(n);\n  }\n}\n",
     "drop_all": "void wipe(drop struct box *b)\n{\n  free(b->buf);\n  free(b->aux);\n}\n",
     "drop_null_member": "void wipe(drop struct box *b)\n{\n  free(b->buf);\n  b->buf = nullptr;\n  free(b->aux);\n}\n",
     "drop_by_method": "void wipe(drop struct box *b)\n{\n  clear(b);\n}\n",
-    "const_view": "int f(const struct box *b)\n{\n  return peek(b) + b->n;\n}\n",
+    "const_view": "int f(struct box *b)\n{\n  return peek(b) + b->n;\n}\n",
 }
 
 # the caller's side: a local struct handed to the methods
@@ -150,7 +150,7 @@ def test_same_at_every_level(tmp_path, name):
 
 
 def test_tutorial_example_is_clean(tmp_path):
-    body = ("struct buf { char * owned maybe data; int len; };\n"
+    body = ("struct buf { char *?owned data; int len; };\n"
             "void buf_fill(inout struct buf *b);\nvoid buf_clear(drop struct buf *b);\n"
             "void f(void)\n{\n  struct buf b = {};\n  defer buf_clear(&b);\n  buf_fill(&b);\n}\n")
     for opt in LEVELS:

@@ -150,6 +150,8 @@ ST_FUNC void tccgen_init(TCCState *s1)
   tcc_ir_sym_canonicalizer = canonical_global_sym;
 
   str_lit_pool_reset();
+  yasc_src_reset();
+  yasc_default_reset();
 
   /* define some often used types */
   int_type.t = VT_INT;
@@ -406,6 +408,7 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   inline_release_hidden_label_bindings();
   free_deferred_functions(s1);
   yasc_tagged_free(); /* their tag Syms die with the unit */
+  yasc_gborrows_free(); /* keyed by the unit's global Syms */
   yasc_tb_pending_free();
   /* a body save an error cut (decl.c save_body_cut): its entry and message;
      the tokens went with the macro stack */
@@ -427,6 +430,8 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   tcc_gen_machine_outline_reset();
 
   str_lit_pool_free();
+  yasc_src_reset();
+  yasc_default_reset();
   attr_checks_reset();
   call_arg_checks_unwind(NULL); /* an error out of a call's arguments */
   objsize_calls_unwind(NULL);

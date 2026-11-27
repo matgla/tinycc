@@ -3,7 +3,7 @@
 A pointer written in regular C is unchecked in yasc code: dereferencing it
 needs `unsafe` (test_yasc_unsafe.py).  A regular-C header can say more without
 a yasc copy of its structs: `__attribute__((yasc_view))` on a member makes its
-pointer `view`, with `yasc_maybe` `view maybe` -- believed, as malloc is
+pointer `view`, with `yasc_maybe` `?view` -- believed, as malloc is
 (test_yasc_ownership.py).  libc spells them __yl_view / __yl_view_maybe
 (sys/_attrs.h), nothing outside tcc.  Regular C (-ccompat) sees no change.
 """
@@ -58,9 +58,9 @@ def test_view_member_needs_no_unsafe(tmp_path, opt):
     """The consumer dereferences the view and the checked maybe; the producer
     hands it a local for the call."""
     body = """\
-void consume(const void *args)
+void consume(void *args)
 {
-  const ctx * view c = cast<ptr(const ctx * view)>(args);
+  const ctx *view c = cast<ptr(const ctx *view)>(args);
   *c->result = cast<as(long)>(c->fd);
   if (c->opt)
     *c->opt = 2;
@@ -82,10 +82,10 @@ long produce(void)
 @pytest.mark.parametrize(
     "body, message",
     [
-        ("long f(const ctx *c) { return *c->plain; }", UNCHECKED),
+        ("long f(ctx *c) { return *c->plain; }", UNCHECKED),
         # the attribute is one declarator's: `*a V, *b` leaves b unchecked
-        ("long f(const ctx *c) { return *c->b; }", UNCHECKED),
-        ("void f(const ctx *c) { *c->opt = 1; }", "'c->opt' may be null where it is dereferenced"),
+        ("long f(ctx *c) { return *c->b; }", UNCHECKED),
+        ("void f(ctx *c) { *c->opt = 1; }", "'c->opt' may be null where it is dereferenced"),
         ("static ctx g;\nvoid f(void) { long r; g.result = &r; }", "the address of a local variable is stored in global 'g', which outlives 'f'"),
     ],
     ids=["unannotated", "next_declarator", "maybe_unchecked", "local_escapes"],

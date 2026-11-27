@@ -69,9 +69,9 @@ static int builtin(int x)
   __builtin_unreachable(); /* LINE builtin */
 }
 
-int main(int argc, char * view *argv)
+int main(int argc, char *view *argv)
 {
-  const char * view c = argc > 1 ? argv[1] : "none";
+  const char *view c = argc > 1 ? argv[1] : "none";
   int r = 0;
   printf("go %s\n", c);
   if (!strcmp(c, "switch_ok"))

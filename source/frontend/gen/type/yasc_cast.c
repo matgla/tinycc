@@ -459,7 +459,7 @@ static void yc_yasc_quals(CType *s, CType *t)
   if (sq & YASC_UNCHECKED)
     tcc_warning_once(warn_unchecked, "a pointer from regular C becomes %s here: write unsafe(...)", what);
   else if ((sq & YASC_MAYBE) && !(dq & YASC_MAYBE))
-    tcc_warning_once(warn_unchecked, "a cast drops maybe: test the pointer, or write unsafe(...)");
+    tcc_warning_once(warn_unchecked, "a cast drops '?': test the pointer, or write unsafe(...)");
   else if ((dq & YASC_OWNED) && !(sq & YASC_OWNED))
     tcc_warning_once(warn_unchecked, "a cast makes a pointer that owns nothing owned: write unsafe(...)");
   else if (!(dq & YASC_OWNED) && (sq & YASC_OWNED))

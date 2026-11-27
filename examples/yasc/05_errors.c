@@ -12,7 +12,7 @@
 
 error ParseError { Empty, BadDigit, TooBig };
 
-static !int parse_int(const char *s)
+static !int parse_int(char *s)
 {
   int v = 0;
   if (!*s)
@@ -29,17 +29,17 @@ static !int parse_int(const char *s)
 }
 
 /* try: a failure of either parse is this function's failure */
-static !int add(const char *a, const char *b)
+static !int add(char *a, char *b)
 {
   return try parse_int(a) + try parse_int(b);
 }
 
 /* errdefer runs only when the function fails: the buffer is freed on the
    error paths, and handed to the caller on success. */
-static !char * owned make_label(const char *num)
+static !char *owned make_label(char *num)
 {
   int v = try parse_int(num);
-  char * owned maybe buf = mem_new(32);
+  char *?owned buf = mem_new(32);
   if (!buf)
     return error.ENOMEM;
   errdefer mem_free(buf);
@@ -60,10 +60,10 @@ int main(void)
   printf("sum %d\n", sum);
   add("1", "") catch |e| { printf("add failed: %s\n", error_name(e)); };
 
-  const char * view inputs[] = {"7", "0", "x", "123456"};
+  const char *inputs[] = {"7", "0", "x", "123456"};
   for (int i = 0; i < 4; i++)
   {
-    char * owned label = make_label(inputs[i]) catch |e| {
+    char *owned label = make_label(inputs[i]) catch |e| {
       printf("label %s: %s\n", inputs[i], error_name(e));
       continue;
     };

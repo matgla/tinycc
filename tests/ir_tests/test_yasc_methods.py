@@ -95,7 +95,7 @@ def test_unknown_member_is_still_a_field_error(tmp_path):
 
 
 def test_method_not_called(tmp_path):
-    proc = _yasc(tmp_path, VEC + "int f(void) { struct vec v = {1, 2}; int (*p)(const struct vec * view) = v.len2; return 0; }\n")
+    proc = _yasc(tmp_path, VEC + "int f(void) { struct vec v = {1, 2}; int (*p)(const struct vec *view) = v.len2; return 0; }\n")
     assert _error(proc) == "method 'len2' of struct vec is not called: write vec.len2 for the function itself"
 
 
@@ -158,15 +158,15 @@ def test_variable_shadows_the_tag(tmp_path):
 BUF = """#include "mem.h"
 struct buf
 {
-  char * owned data;
+  char *owned data;
   int len;
 
-  struct buf * owned maybe create(int n)
+  struct buf *?owned create(int n)
   {
-    struct buf * owned maybe b = mem_new(sizeof *b);
+    struct buf *?owned b = mem_new(sizeof *b);
     if (!b)
       return b;
-    char * owned maybe d = mem_new(n);
+    char *?owned d = mem_new(n);
     if (!d)
     {
       mem_free(b);
@@ -177,7 +177,7 @@ struct buf
     return b;
   }
   int size(const struct buf *self) { return self->len; }
-  void destroy(drop struct buf * owned self)
+  void destroy(drop struct buf *owned self)
   {
     mem_free(self->data);
     mem_free(self);
@@ -185,7 +185,7 @@ struct buf
 };
 """
 
-OPEN = "  struct buf * owned maybe b = buf.create(8);\n  if (!b)\n    return -1;\n"
+OPEN = "  struct buf *?owned b = buf.create(8);\n  if (!b)\n    return -1;\n"
 
 
 def _lifetime(tmp_path, body):
@@ -218,8 +218,8 @@ def test_lifetime_use_after_drop(tmp_path):
 def test_lifetime_maybe_self(tmp_path):
     assert _lifetime(
         tmp_path,
-        "int f(void)\n{\n  struct buf * owned maybe b = buf.create(8);\n  int n = b->size();\n  mem_free(b);\n  return n;\n}\n",
-    ) == ["a pointer that may be null is passed as argument 1 of 'buf__size', which is not maybe"]
+        "int f(void)\n{\n  struct buf *?owned b = buf.create(8);\n  int n = b->size();\n  mem_free(b);\n  return n;\n}\n",
+    ) == ["a pointer that may be null is passed as argument 1 of 'buf__size', which is not '?'"]
 
 
 def test_lifetime_stack_object_cannot_drop(tmp_path):

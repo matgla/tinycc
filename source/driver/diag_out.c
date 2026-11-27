@@ -685,6 +685,128 @@ PUB_FUNC int tcc_fixit(int line, const char *word, int where, const char *text)
   return 1;
 }
 
+/* yasc: WORD at TEXT[S..S+LEN) leaves its pointer's words.  In a group,
+   `*@(const, view)` (or `*?@(...)`), the group is written again without it:
+   one word left stands against the '*' (`*const`), more stay in @( ).  Sets
+   the half-open 1-based columns *COL..*END and the text REPL (REPLSZ bytes)
+   that replaces them; 0 when WORD is not in a group. */
+static int fixit_group_drop(const char *text, int s, int len, int *col, int *end, char *repl, int replsz)
+{
+  int open = -1, close = -1, depth = 0, i, n = 0, kept = 0;
+  const int tlen = strlen(text);
+  char items[8][64];
+  for (i = s - 1; i >= 0; i--)
+  {
+    if (text[i] == ')')
+      depth++;
+    else if (text[i] == '(')
+    {
+      if (depth-- == 0)
+      {
+        open = i;
+        break;
+      }
+    }
+  }
+  if (open < 2 || text[open - 1] != '@' || !(text[open - 2] == '*' || text[open - 2] == '?'))
+    return 0;
+  for (i = open + 1, depth = 0; i < tlen; i++)
+  {
+    if (text[i] == '(')
+      depth++;
+    else if (text[i] == ')' && depth-- == 0)
+    {
+      close = i;
+      break;
+    }
+  }
+  if (close < 0 || s + len > close)
+    return 0;
+  /* the items, at the group's own level */
+  for (i = open + 1; i <= close;)
+  {
+    int b = i, e, d = 0;
+    while (i < close && (text[i] != ',' || d))
+    {
+      d += text[i] == '(' ? 1 : text[i] == ')' ? -1 : 0;
+      i++;
+    }
+    e = i++;
+    while (b < e && (text[b] == ' ' || text[b] == '\t'))
+      b++;
+    while (e > b && (text[e - 1] == ' ' || text[e - 1] == '\t'))
+      e--;
+    if (b == s && e == s + len)
+      continue; /* the word that goes */
+    if (n == 8 || e - b >= 64)
+      return 0;
+    memcpy(items[n], text + b, e - b);
+    items[n++][e - b] = 0;
+  }
+  repl[0] = 0;
+  if (n > 1)
+    pstrcat(repl, replsz, "@(");
+  for (i = 0; i < n; i++)
+  {
+    if (kept++)
+      pstrcat(repl, replsz, ", ");
+    pstrcat(repl, replsz, items[i]);
+  }
+  if (n > 1)
+    pstrcat(repl, replsz, ")");
+  *col = open; /* the '@', 1-based */
+  *end = close + 2;
+  return 1;
+}
+
+/* tcc_fixit_col(): see tcc.h */
+PUB_FUNC int tcc_fixit_col(int line, int col, const char *word, const char *text)
+{
+  TCCState *s1 = tcc_state;
+  CString src;
+  int end = 0, len = strlen(word);
+  if (!s1->diag_last_shown || !dout.file[0] || col <= 0)
+    return 0;
+  if (!line)
+    line = dout.line;
+  cstr_new(&src);
+  if (fixit_line(dout.file, line, &src) && col - 1 + len <= src.size - 1 && !memcmp(src.data + col - 1, word, len))
+  {
+    char repl[256];
+    if (!*text && fixit_group_drop(src.data, col - 1, len, &col, &end, repl, sizeof repl))
+    {
+      cstr_free(&src);
+      fixit_emit(s1, line, col, end, repl);
+      return 1;
+    }
+    end = col + len;
+    while (src.data[end - 1] == ' ' || src.data[end - 1] == '\t')
+      end++;
+  }
+  cstr_free(&src);
+  if (!end)
+    return 0;
+  fixit_emit(s1, line, col, end, text);
+  return 1;
+}
+
+/* tcc_fixit_drop(): see tcc.h */
+PUB_FUNC int tcc_fixit_drop(int line, const char *word)
+{
+  TCCState *s1 = tcc_state;
+  CString src;
+  int col = 0;
+  if (!s1->diag_last_shown || !dout.file[0])
+    return 0;
+  if (!line)
+    line = dout.line;
+  cstr_new(&src);
+  if (fixit_line(dout.file, line, &src))
+    col = fixit_find_in(src.data, word);
+  cstr_free(&src);
+  return col ? tcc_fixit_col(line, col, word, "") : 0;
+}
+
 /* tcc_fixit_call(): see tcc.h */
 PUB_FUNC int tcc_fixit_call(int line, const char *name, int arg, char *buf, int bufsz)
 {

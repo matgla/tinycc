@@ -31,7 +31,8 @@ UNSAFE = [
     ("int f(void) { return; }", "return-type", "'return' with no value"),
     ("void f(int x) { return x; }", "return-type", "void function returns a value"),
     ("x;", "implicit-int", "type defaults to int"),
-    ("char * VIEW f(const char * VIEW s) { char * VIEW t = s; return t; }", "discarded-qualifiers",
+    # (a yasc local takes it -- what flows in is followed -- a member does not)
+    ("struct h { char *p; };\nint f(const char * VIEW s) { struct h x = { s }; return x.p != 0; }", "discarded-qualifiers",
      "discards 'const' qualifier from pointer target type"),
 ]
 
@@ -89,7 +90,7 @@ def test_wall_is_on_by_default(tmp_path):
 
 
 def test_yasc_is_on_by_default(tmp_path):
-    body = "#ifndef __YASC__\n#error no yasc\n#endif\nchar * owned f(void);"
+    body = "#ifndef __YASC__\n#error no yasc\n#endif\nchar *owned f(void);"
     assert _compile(tmp_path, body).returncode == 0
     assert _compile(tmp_path, body, "-ccompat").returncode != 0
     proc = _compile(tmp_path, "int out;")
@@ -98,7 +99,7 @@ def test_yasc_is_on_by_default(tmp_path):
 
 
 def test_yasc_keyword_used_as_a_name(tmp_path):
-    # after a '*' they qualify the pointer (`f(char * owned)` is a parameter
+    # after a '*' they qualify the pointer (`f(char *owned)` is a parameter
     # with no name), and after an int a handle (`f(int owned)` too), so the
     # misuse is a name where one is expected
     for body, kw in [("int view = 1;", "view"), ("int f(int out);", "out"), ("int owned;", "owned"),
@@ -109,10 +110,10 @@ def test_yasc_keyword_used_as_a_name(tmp_path):
 
 def test_safe_code_compiles_cleanly(tmp_path):
     body = """\
-void * owned maybe alloc(unsigned n);
-void release(drop void * owned maybe p);
+void *?owned alloc(unsigned n);
+void release(drop void *?owned p);
 int use(void);
-static int sum(const int *v, int n)
+static int sum(int *v, int n)
 {
   int s = 0;
   for (int i = 0; i < n; i++)
@@ -121,7 +122,7 @@ static int sum(const int *v, int n)
 }
 int use(void)
 {
-  int * owned maybe v = alloc(4 * sizeof(int));
+  int *?owned v = alloc(4 * sizeof(int));
   int r = 0;
   if (v)
     r = sum(v, 0);
@@ -136,7 +137,7 @@ def test_pragma_yasc_is_c23_under_ccompat(tmp_path):
     """yasc is C23: a regular-C build (-ccompat, C11) of a file that says
     #pragma yasc has nullptr, true and false there (libc's libgen.c)"""
     src = tmp_path / "p.c"
-    src.write_text("#pragma yasc\nint t0(int * maybe q)\n{\n  return q == nullptr;\n}\n"
+    src.write_text("#pragma yasc\nint t0(int *?q)\n{\n  return q == nullptr;\n}\n"
                    "bool t(void)\n{\n  return true && !false;\n}\n")
     proc = subprocess.run([str(TCC), "-ccompat", "-Wall", "-Werror", "-c", str(src), "-o", str(tmp_path / "p.o")],
                           capture_output=True, text=True)

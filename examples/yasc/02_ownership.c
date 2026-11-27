@@ -10,16 +10,16 @@
 
 struct name
 {
-  struct name * owned maybe next; /* the rest of the list, or null */
-  char * owned text;              /* never null once the node exists */
+  struct name *?owned next; /* the rest of the list, or null */
+  char *owned text;              /* never null once the node exists */
 };
 
 /* Takes ownership of `head` and `text` (owned parameters) and returns the new
    head: both end up in the new node -- or, out of memory, text is freed and
    the old head comes back. */
-static struct name * owned maybe push(struct name * owned maybe head, char * owned text)
+static struct name *?owned push(struct name *?owned head, char *owned text)
 {
-  struct name * owned maybe n = mem_new(sizeof *n);
+  struct name *?owned n = mem_new(sizeof *n);
   if (!n)
   {
     mem_free(text);
@@ -32,7 +32,7 @@ static struct name * owned maybe push(struct name * owned maybe head, char * own
 
 /* Only looks: the list is borrowed (view) and may be empty (maybe).  `out`
    says the function writes *chars before it returns. */
-static int count(const struct name * maybe list, out int *chars)
+static int count(struct name *?list, out int *chars)
 {
   int n = 0;
   *chars = 0;
@@ -45,11 +45,11 @@ static int count(const struct name * maybe list, out int *chars)
 }
 
 /* drop: the list is consumed -- every node and every text is freed here. */
-static void free_all(drop struct name * owned maybe list)
+static void free_all(drop struct name *?owned list)
 {
   while (list)
   {
-    struct name * owned maybe next = move(list->next);
+    struct name *?owned next = move(list->next);
     mem_free(list->text);
     mem_free(list);
     list = move(next);
@@ -58,13 +58,13 @@ static void free_all(drop struct name * owned maybe list)
 
 int main(void)
 {
-  const char * view words[] = {"ada", "grace", "barbara"};
-  struct name * owned maybe list = nullptr;
+  const char *words[] = {"ada", "grace", "barbara"};
+  struct name *?owned list = nullptr;
   int chars;
 
   for (int i = 0; i < 3; i++)
   {
-    char * owned maybe text = mem_strdup(words[i]);
+    char *?owned text = mem_strdup(words[i]);
     if (!text)
       break;
     list = push(move(list), move(text));

@@ -72,7 +72,7 @@ def test_switches(tmp_path):
     assert _lines(_run(tmp_path, body)) == []
     assert _lines(_run(tmp_path, body, "-Wall")) == []
     src = tmp_path / "s.c"
-    src.write_text("int f(void)\n{\n  int * view p = 0;\n  return *p;\n}\n")
+    src.write_text("int f(void)\n{\n  int *view p = 0;\n  return *p;\n}\n")
     proc = subprocess.run([str(TCC), "-c", str(src), "-o", str(tmp_path / "s.o")], capture_output=True, text=True)
     assert MSG in proc.stderr, proc.stderr
 

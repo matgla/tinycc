@@ -1,5 +1,6 @@
-/* The _FORTIFY_SOURCE runtime as yasos libc has it (libs/libc/fortify.c),
- * for the QEMU runs of test_fortify.py, which link newlib.  Never fortified
+/* A _FORTIFY_SOURCE runtime with glibc's names (yasos libc had it until tcc
+ * checked the calls itself), for the QEMU runs of test_fortify.py, which
+ * link newlib.  Never fortified
  * itself (libc's Makefile says -U_FORTIFY_SOURCE): it defines the functions
  * the fortified headers turn into macros.  The str* checks tcc calls are
  * libtcc1's __tcc_*_chk, which end in this __chk_fail too. */

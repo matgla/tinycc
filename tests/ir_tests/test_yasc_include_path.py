@@ -20,12 +20,12 @@ pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 
 YASC_H = """\
-char * owned yalloc(void);
-void yfree(drop char * owned p);
+char *owned yalloc(void);
+void yfree(drop char *owned p);
 #include "ynext.h"
 static inline int ylen(char *s) { return s[0]; }
 """
-YNEXT_H = "char * borrows(static) ynext(void);\n"
+YNEXT_H = "char *borrows(static) ynext(void);\n"
 C_H = "int view(int owned);\n"
 
 MAIN = """\
@@ -33,7 +33,7 @@ MAIN = """\
 #include <ya.h>
 int f(void)
 {
-  char * owned p = yalloc();
+  char *owned p = yalloc();
   int r = ylen(p) + view(1) + ylen(ynext()) + ylen(ynext());
   yfree(move(p));
   return r;

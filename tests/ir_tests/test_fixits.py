@@ -11,14 +11,14 @@ decl/plain_param.c).
    arguments up to the one the size follows on the call's line; otherwise only
    the note.
 2. yasc's "plain pointer in yasc: say owned or view for 'p'" on a
-   definition's parameter is given at the end of the body, with `* owned`
+   definition's parameter is given at the end of the body, with `*owned`
    when the body frees it, passes it to an owned or drop parameter, keeps it
-   where it outlives the call or returns it as owned, else `* view`; `maybe`
+   where it outlives the call or returns it as owned, else `*view`; `maybe`
    as well when it is tested for null or passed to a maybe parameter.  A
-   prototype keeps `* view`.  A local pointer is a view (`view maybe`: what
+   prototype keeps `*view`.  A local pointer is a view (`?view`: what
    it holds is what flows into it) unless the body owns it the same way, or
    gives it an owned result (`malloc(n)`): then the error says owned, with
-   `* owned` (`maybe` as well when it is given null or a maybe value).  An
+   `*owned` (`maybe` as well when it is given null or a maybe value).  An
    alias (`q = p`) carries its uses to what it copies.
 
 Each fix-it is applied (test_diag_format._apply) and the result compiled.
@@ -284,10 +284,10 @@ void f(void) { strcpy(buf + 10, "abcdefg"); }
 # --------------------------------------------- owned or view, from the body
 
 YASC_SRC = """\
-void free(drop void * owned maybe p);
-struct box { char * owned p; };
-void take(char * owned p);
-void peek(char * maybe p);
+void free(drop void *?owned p);
+struct box { char *owned p; };
+void take(char *owned p);
+void peek(char *?p);
 int borrow(char *s) { return s[0]; }
 void freeit(char *s)
 {
@@ -301,7 +301,7 @@ void pass(char *s)
 {
   take(s);
 }
-char * owned ret(char *s)
+char *owned ret(char *s)
 {
   return s;
 }
@@ -326,7 +326,7 @@ int proto(char *s);
 # a parameter is a view unless it says owned: what needs it owned is an error
 # at the use, with a note naming the parameter
 YASC_OWN_LINES = [8, 12, 16, 20, 35]
-YASC_PARAM_ERR = ("the parameter 's' owns nothing (a view unless it says owned): write '* owned s' when the "
+YASC_PARAM_ERR = ("the parameter 's' owns nothing (a view unless it says owned): write '*owned s' when the "
                   "function takes it over, 'drop' before the type too when it frees it")
 
 
@@ -346,8 +346,8 @@ def test_plain_param_error_order(tmp_path):
     # (a sizeof's plain pointer is said at once); the body's parameters and
     # locals in line order
     src = """\
-void free(drop void * owned maybe p);
-void * owned maybe malloc(unsigned long n);
+void free(drop void *?owned p);
+void *?owned malloc(unsigned long n);
 int f(char *s)
 {
   int z = sizeof(char *) == 4;
@@ -365,8 +365,8 @@ int f(char *s)
         "t.c:6: error: an owned result is stored in a pointer that owns nothing: it is never freed",
         "t.c:7: error: a pointer that owns nothing is stored in an owned pointer",
         "t.c:6: error: plain pointer in yasc: 'loc' owns what it points at, say owned",
-        "t.c:6: note: the function gives 'loc' an owned value that may be null (line 6): write '* owned maybe'",
-        'fix-it:"t.c":{6:9-6:9}:" owned maybe "',
+        "t.c:6: note: the function gives 'loc' an owned value that may be null (line 6): write '*?owned'",
+        'fix-it:"t.c":{6:9-6:9}:"?owned "',
     ], proc.stderr
     assert proc.returncode == 1
 
@@ -380,14 +380,14 @@ def test_plain_param_same_at_every_level(tmp_path):
     assert outs[0] == outs[1] == outs[2]
     # a static function's body may be compiled at the end of the unit (as its
     # other diagnostics are): the same reports, in another order
-    src = "void free(drop void * owned maybe p);\nstatic void s1(char *p) { free(p); }\nvoid g(char *p) { s1(p); }\n"
+    src = "void free(drop void *?owned p);\nstatic void s1(char *p) { free(p); }\nvoid g(char *p) { s1(p); }\n"
     _write(tmp_path, "s.c", src)
     outs = [
         sorted(_tcc(tmp_path, o, "-fdiagnostics-parseable-fixits", "-c", "s.c", "-o", "s.o").stderr.splitlines())
         for o in ("-O0", "-O2")
     ]
     assert outs[0] == outs[1]
-    assert ("s.c:2: error: the parameter 'p' owns nothing (a view unless it says owned): write '* owned p' when "
+    assert ("s.c:2: error: the parameter 'p' owns nothing (a view unless it says owned): write '*owned p' when "
             "the function takes it over, 'drop' before the type too when it frees it") in outs[0]
 
 
@@ -412,10 +412,10 @@ def test_default_view_param_of_a_function_pointer(tmp_path):
 # ------------------------------------------------- locals, aliases, two on a line
 
 LOCAL_SRC = """\
-void * owned maybe malloc(unsigned long n);
-void free(drop void * owned maybe p);
-void take(char * owned p);
-char * view maybe find(char *s);
+void *?owned malloc(unsigned long n);
+void free(drop void *?owned p);
+void take(char *owned p);
+char *?view find(char *s);
 int sum(char *s)
 {
   const char *p = s;
@@ -426,7 +426,7 @@ void freeit(void)
   char *p = malloc(4);
   free(p);
 }
-char * owned maybe make(void)
+char *?owned make(void)
 {
   char *p = malloc(8);
   return p;
@@ -443,12 +443,12 @@ int tested(char *s)
     return 0;
   return p[1];
 }
-void hand(char * owned s)
+void hand(char *owned s)
 {
   char *p = s;
   take(p);
 }
-void alias(char * owned s)
+void alias(char *owned s)
 {
   char *q;
   q = s;
@@ -472,15 +472,15 @@ LOCAL_VIEW_LINES = [7, 22, 27, 45, 52]
 LOCAL_NOTES = [
     # (line of, name, note, the line once fixed)
     ("  char *p = malloc(4);", 12, "p",
-     "the function gives 'p' an owned value that may be null (line 12): write '* owned maybe'",
-     "  char * owned maybe p = malloc(4);"),
+     "the function gives 'p' an owned value that may be null (line 12): write '*?owned'",
+     "  char *?owned p = malloc(4);"),
     ("  char *p = malloc(8);", 17, "p",
-     "the function gives 'p' an owned value that may be null (line 17): write '* owned maybe'",
-     "  char * owned maybe p = malloc(8);"),
+     "the function gives 'p' an owned value that may be null (line 17): write '*?owned'",
+     "  char *?owned p = malloc(8);"),
     # given an owned variable: a borrow, until it is passed on or freed
-    ("void hand", 34, "p", "the function passes 'p' on to an owned parameter (line 35): write '* owned'",
-     "  char * owned p = s;"),
-    ("  char *q;", 39, "q", "the function frees 'q' (line 41): write '* owned'", "  char * owned q;"),
+    ("void hand", 34, "p", "the function passes 'p' on to an owned parameter (line 35): write '*owned'",
+     "  char *owned p = s;"),
+    ("  char *q;", 39, "q", "the function frees 'q' (line 41): write '*owned'", "  char *owned q;"),
 ]
 
 
@@ -510,26 +510,26 @@ def test_plain_local_and_alias_decided(tmp_path):
 
 def test_plain_two_on_one_line_text(tmp_path):
     # the same place, two pointers: both errors and both notes are said
-    src = ("void free(drop void * owned maybe p);\nint g;\n"
-           "void f(char * owned o, char * owned u) { int *a = &g, *b = &g; char *c = o, *d = u; free(c); free(d); }\n")
+    src = ("void free(drop void *?owned p);\nint g;\n"
+           "void f(char *owned o, char *owned u) { int *a = &g, *b = &g; char *c = o, *d = u; free(c); free(d); }\n")
     _write(tmp_path, "t.c", src)
     proc = _tcc(tmp_path, "-fdiagnostics-parseable-fixits", "-c", "t.c", "-o", "t.o")
     # a and b only borrow: views
     assert [l for l in proc.stderr.splitlines() if "plain pointer" in l or "note:" in l or "fix-it" in l] == [
         "t.c:3: error: plain pointer in yasc: 'c' owns what it points at, say owned",
-        "t.c:3: note: the function frees 'c' (line 3): write '* owned'",
-        'fix-it:"t.c":{3:69-3:71}:"* owned c"',
+        "t.c:3: note: the function frees 'c' (line 3): write '*owned'",
+        'fix-it:"t.c":{3:67-3:69}:"*owned c"',
         "t.c:3: error: plain pointer in yasc: 'd' owns what it points at, say owned",
-        "t.c:3: note: the function frees 'd' (line 3): write '* owned'",
-        'fix-it:"t.c":{3:77-3:79}:"* owned d"',
+        "t.c:3: note: the function frees 'd' (line 3): write '*owned'",
+        'fix-it:"t.c":{3:75-3:77}:"*owned d"',
     ], proc.stderr
 
 
 def test_plain_alias_given_something_else(tmp_path):
     # q copies s, then o: freeing q says nothing of s
     src = """\
-void free(drop void * owned maybe p);
-void f(char *s, char * owned o)
+void free(drop void *?owned p);
+void f(char *s, char *owned o)
 {
   char *q = s;
   int c = q[0];
@@ -541,13 +541,13 @@ void f(char *s, char * owned o)
     _write(tmp_path, "t.c", src)
     proc = _tcc(tmp_path, "-c", "t.c", "-o", "t.o")
     assert "for 's'" not in proc.stderr, proc.stderr  # a view parameter
-    assert "t.c:4: note: the function frees 'q' (line 7): write '* owned'" in proc.stderr
+    assert "t.c:4: note: the function frees 'q' (line 7): write '*owned'" in proc.stderr
 
 
 def test_plain_local_not_decided(tmp_path):
     # an inner level, a static, a typedef: said at once, no note
     src = """\
-void f(inout char * view *v)
+void f(inout char *view *v)
 {
   char **pp = v;
   static char *keep;
@@ -581,15 +581,15 @@ def test_plain_local_same_at_every_level(tmp_path):
         for o in ("-O0", "-O1", "-O2", "-Os", "-fsyntax-only")
     ]
     assert all(o == outs[0] for o in outs), outs
-    src = ("void free(drop void * owned maybe p);\n"
-           "static inline int si(char * owned p) { char *q = p; int c = q[0]; free(q); return c; }\n"
-           "void * owned maybe mk(void);\n"
-           "int g(void) { char * owned maybe p = mk(); return p ? si(p) : 0; }\n")
+    src = ("void free(drop void *?owned p);\n"
+           "static inline int si(char *owned p) { char *q = p; int c = q[0]; free(q); return c; }\n"
+           "void *?owned mk(void);\n"
+           "int g(void) { char *?owned p = mk(); return p ? si(p) : 0; }\n")
     _write(tmp_path, "s.c", src)
     for o in ("-O0", "-O2"):
         proc = _tcc(tmp_path, o, "-c", "s.c", "-o", "s.o")
         assert proc.stderr.count("plain pointer") == 1, proc.stderr
-        assert "s.c:2: note: the function frees 'q' (line 2): write '* owned'" in proc.stderr, proc.stderr
+        assert "s.c:2: note: the function frees 'q' (line 2): write '*owned'" in proc.stderr, proc.stderr
     # a local that only borrows: nothing, at every level
     src = "static inline int sv(char *p) { const char *q = p; return q[0]; }\nint h(char *p) { return sv(p) + sv(p); }\n"
     _write(tmp_path, "v.c", src)
@@ -608,7 +608,7 @@ def test_plain_local_const_target_in_a_list(tmp_path):
     assert "plain pointer" not in proc.stderr, lines
     # (said once for the line)
     assert [l for l in lines if "discards 'const' qualifier" in l] == [
-        "t.c:2: error: assignment to 'char * view maybe' from 'const char * view' discards 'const' qualifier from "
+        "t.c:2: error: assignment to 'char *?view' from 'const char *view' discards 'const' qualifier from "
         "pointer target type"], lines
     src = "#pragma yasc\nint f(char *s) { const char *a = s, *b = s + 1; return a[0] + b[0]; }\n"
     _write(tmp_path, "t.c", src)

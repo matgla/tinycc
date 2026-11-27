@@ -587,10 +587,23 @@ typedef struct IRLtVar
   int16_t arg_index;  /* ... its argument number (from 0), -1 for any other variable */
   uint8_t yinit;      /* -W[maybe-]uninitialized: in yasc, where initialization is enforced (errors) */
   uint8_t yundef;     /* ... declared `= undefined`: its address may be taken before it has a value */
+  uint8_t inout;      /* an `inout` parameter (a view whose target is not const): -Wparam-access; 2: a struct's */
   uint8_t outarg;     /* an `out` parameter, at its own level or the pointer it points at (`out T * maybe * view p`) */
+  uint8_t implicit_view; /* a yasc local whose pointer says nothing: a view, never null (`* maybe` fix-it) */
   int arg_callee;     /* ... the callee's name (token), 0 when called through a pointer */
   int dealloc;        /* `owned(fclose)` as declared: the deallocator's name, 0 not said */
 } IRLtVar;
+
+/* yasc: an array, struct or union declared `= undefined` -- followed in its
+   frame slot [off, off + size) until something is written to it */
+typedef struct IRUnAgg
+{
+  int off, size;
+  int tok;        /* its name */
+  int line;       /* where it is declared */
+  int idx;        /* the instruction its declaration comes before */
+  uint8_t silent; /* declared in an inlined body */
+} IRUnAgg;
 #define LTV_OWNED 1 /* `T * owned`: followed for ownership */
 #define LTV_MAYBE 2 /* `T * maybe`: followed for null */
 #define LTV_OUT 4   /* `out T *`: the function must write *p, and not read it first */
@@ -721,6 +734,7 @@ typedef struct IRLtCall
   uint32_t handles;  /* int handle parameters: invalid is < 0, not 0 */
   uint32_t restricts; /* `T * restrict view` parameters: no other argument may point into the same object */
   uint32_t out;        /* `out T * p` parameters: the callee writes *p (yasc's enforced initialization) */
+  uint32_t yread;      /* pointer parameters declared in yasc, not `out`: the callee may read *p */
   uint32_t outown;     /* parameters pointing at an owned pointer (getline's lineptr): the callee may replace it */
   uint32_t outown_out; /* of them, `out`: the callee writes one there without reading what was */
   uint32_t outown_maybe; /* of them, the owned pointer is maybe */
@@ -940,12 +954,22 @@ typedef struct TCCIRState
   int32_t *lt_fnames; /* (frame offset, name) of local arrays and structs: names for messages */
   int lt_nb_fnames;
   int lt_nb_ostores;
+  int *lt_rostores; /* [from, to, kind] triples: tcc_ir_lt_note_ro */
+  int lt_nb_rostores;
   int32_t *lt_mtemps; /* temps holding move(p) handed to a regular-C parameter: p moves there */
   int lt_nb_mtemps;
   int *lt_fstores; /* [from, to, entry] triples: a store into a borrows(member) member */
   int lt_nb_fstores;
   int *lt_floads; /* [temp, entry] pairs: the temp holds a borrows(member) member's address */
   int lt_nb_floads;
+  int *lt_fsrcs; /* [temp, entry] pairs: the temp holds the address of a member ENTRY borrows from */
+  int lt_nb_fsrcs;
+  int *lt_istores; /* [from, to, tok]: an initializer's store into a pointer member (tok; 0: an element) that
+                      is not maybe -- the value must not be null */
+  int lt_nb_istores;
+  int *lt_astores; /* [from, to, tok, deref]: `a[i] = v` / `*p = v` (deref) into a pointer that is not maybe,
+                      tok the name it starts from (0: none) -- the value must not be null */
+  int lt_nb_astores;
   IRLtSlot *lt_slots;     /* owned items of local structs and arrays */
   int lt_nb_slots;
   IRLtSobj *lt_sobjs;     /* local structs whose values borrow */
@@ -1028,6 +1052,9 @@ typedef struct TCCIRState
    * before the lifetime check frees its variables */
   uint32_t *un_outparam;
   int un_outparam_words;
+  /* ... yasc's `= undefined` arrays and structs (un_agg_check) */
+  IRUnAgg *un_aggs;
+  int un_nb_aggs;
   /* The VARs the last SRA run on this function created, [lo, hi); -1 when it
    * made none or did not run.  ssa_var_promotable relaxes its rules for them. */
   int sra_var_lo, sra_var_hi;
@@ -1321,6 +1348,7 @@ void tcc_ir_taint_unit_end(void);
 void tcc_ir_taint_unit_free(void);
 void tcc_ir_lt_add_var(TCCIRState *ir, int32_t vreg, struct Sym *sym);
 void tcc_ir_lt_silence(TCCIRState *ir, int32_t vreg);
+void tcc_ir_lt_implicit_view(TCCIRState *ir, int32_t vreg);
 void tcc_ir_lt_scope_end(TCCIRState *ir, struct Sym *top, struct Sym *bottom);
 void tcc_ir_lt_return(TCCIRState *ir, int line);
 void tcc_ir_lt_inline_param(TCCIRState *ir, int32_t vreg, struct Sym *callee, int index);
@@ -1330,6 +1358,12 @@ void tcc_ir_lt_note_call(TCCIRState *ir, int call_id, struct Sym *ftype, struct 
 void tcc_ir_lt_note_implicit(TCCIRState *ir, int call_id);
 void tcc_ir_lt_copy_call(TCCIRState *ir, int from, int to);
 void tcc_ir_lt_note_owned_store(TCCIRState *ir, int from, int to);
+/* yasc: instructions [from, to) store a read-only value into a plain local
+   (LT_RO_LOCAL: it holds one now), or store into memory whose pointer is to
+   const (LT_RO_CONSTDEST: a read-only value may go there) */
+#define LT_RO_LOCAL 1
+#define LT_RO_CONSTDEST 2
+void tcc_ir_lt_note_ro(TCCIRState *ir, int from, int to, int kind);
 void tcc_ir_lt_note_moved_temp(TCCIRState *ir, int32_t vreg);
 void tcc_ir_lt_note_member(TCCIRState *ir, int32_t vreg, int offset, int tok, int owned, int esize);
 void tcc_ir_note_tagged(TCCIRState *ir, int kind, int32_t vr, int32_t off, struct Sym *sym, int tu, int m, int line);
@@ -1345,6 +1379,7 @@ void tcc_ir_lifetime_check(TCCIRState *ir, struct Sym *func);
 void tcc_ir_lt_free(TCCIRState *ir);
 int tcc_ir_un_wanted(void);
 void tcc_ir_un_add_var(TCCIRState *ir, int32_t vreg, struct Sym *sym);
+void tcc_ir_un_add_agg(TCCIRState *ir, int off, int size, struct Sym *sym);
 void tcc_ir_flow_checks(TCCIRState *ir, struct Sym *func);
 void tcc_ir_null_deref_check(TCCIRState *ir);
 int tcc_ir_dp_wanted(void);
@@ -1371,6 +1406,9 @@ void tcc_ir_lt_note_slot(TCCIRState *ir, int addr, struct CType *type, int tok, 
 void tcc_ir_slot_check(TCCIRState *ir, struct Sym *func);
 void tcc_ir_lt_note_field_store(TCCIRState *ir, int from, int to, int entry);
 void tcc_ir_lt_note_field_load(TCCIRState *ir, int idx, int entry);
+void tcc_ir_lt_note_field_src(TCCIRState *ir, int vreg, int entry);
+void tcc_ir_lt_note_init_store(TCCIRState *ir, int from, int to, int tok);
+void tcc_ir_lt_note_assign_store(TCCIRState *ir, int from, int to, int tok, int deref);
 void tcc_ir_dp_add_name(TCCIRState *ir, int32_t vreg, struct Sym *sym);
 int tcc_ir_flow_checks_wanted(void);
 int tcc_ir_get_vreg_param(TCCIRState *ir);

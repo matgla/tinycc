@@ -144,7 +144,7 @@ def test_safe_default(tmp_path):
     # on in the safe default; in yasc the cast that drops const is
     # unsafe_cast<qual(...)> (test_yasc_casts.py), which says it was meant:
     # no -Wcast-qual for it
-    body = "char * view f(const char *s)\n{\n  return unsafe_cast<qual(char * view)>(s);\n}\n"
+    body = "char *view f(char *s)\n{\n  return unsafe_cast<qual(char *view)>(s);\n}\n"
     proc = _run(tmp_path, body, compat=False)
     assert proc.returncode == 0 and _diags(proc) == [], proc.stderr
     proc = _run(tmp_path, body, "-Wno-cast-qual", compat=False)

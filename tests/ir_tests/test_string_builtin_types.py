@@ -4,7 +4,7 @@ tcc redirects strchr, strrchr, strstr, strpbrk, strcpy and friends to
 `__tcc_*` helpers and folds memchr of a constant string.  The call's value
 must still be what the declaration says: in C, strchr returns `char *` even
 for a `const char *` argument (no "discards qualifiers"), and in yasc the
-result keeps its qualifiers, so `char * view maybe strchr(...)` is followed
+result keeps its qualifiers, so `char *?view strchr(...)` is followed
 for null as with -fno-builtin.  The -Wlifetime record of the call (what may
 be null, which arguments may not) goes to the helper call too.
 """
@@ -24,27 +24,27 @@ LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 
 YASC_DECLS = """\
 typedef unsigned size_t;
-char * view maybe strchr(const char *s, int c);
-char * view maybe strrchr(const char *s, int c);
-char * view maybe strstr(const char *s, const char *n);
-char * view maybe strpbrk(const char *s, const char *a);
-char * view maybe index(const char *s, int c);
-void * view maybe memchr(const void *s, int c, size_t n);
-size_t strlen(const char *s);
+char *?view strchr(const char *s, int c);
+char *?view strrchr(const char *s, int c);
+char *?view strstr(const char *s, const char *n);
+char *?view strpbrk(const char *s, const char *a);
+char *?view index(const char *s, int c);
+void *?view memchr(const void *s, int c, size_t n);
+size_t strlen(char *s);
 """
 YASC_LINES = YASC_DECLS.count("\n")
 
 # each line marked HIT warns, no other line does
 YASC_USES = """\
-int a(const char *s) { const char * view p = strchr(s, 'x'); return *p; } /* HIT store */
-int b(const char *s) { char * view maybe p = strrchr(s, 'x'); return *p; } /* HIT deref */
-int c(const char *s) { const char * view p = strstr(s, "ab"); return p != 0; } /* HIT store */
-int d(const char *s) { char * view maybe p = strpbrk(s, "ab"); return *p; } /* HIT deref */
-int e(const char *s) { char * view maybe p = index(s, 'x'); return *p; } /* HIT deref */
-int f(const char *s) { const char * view maybe p = memchr(s, 'x', 4); return *p; } /* HIT deref */
-int g(const char *s) { const char * view maybe p = strchr(s, 'x'); return p ? *p : 0; }
-int h(const char *s) { char * view maybe p = strstr(s, "ab"); if (!p) return 0; return *p; }
-int i(char * maybe s) { return strlen(s) != 0; } /* HIT maybe arg */
+int a(const char *s) { const char *view p = strchr(s, 'x'); return *p; } /* HIT store */
+int b(const char *s) { char *?view p = strrchr(s, 'x'); return *p; } /* HIT deref */
+int c(const char *s) { const char *view p = strstr(s, "ab"); return p != 0; } /* HIT store */
+int d(const char *s) { char *?view p = strpbrk(s, "ab"); return *p; } /* HIT deref */
+int e(const char *s) { char *?view p = index(s, 'x'); return *p; } /* HIT deref */
+int f(char *s) { const char *?view p = memchr(s, 'x', 4); return *p; } /* HIT deref */
+int g(const char *s) { const char *?view p = strchr(s, 'x'); return p ? *p : 0; }
+int h(const char *s) { char *?view p = strstr(s, "ab"); if (!p) return 0; return *p; }
+int i(char *?s) { return strlen(s) != 0; } /* HIT maybe arg */
 int j(const char *s) { return strlen(s) != 0; }
 """
 
@@ -99,7 +99,7 @@ char *f5(char *s) { char *p = strpbrk(s, "ab"); return p; }
 char *f6(char *d, const char *s) { char *p = strcpy(d, s); return p; }
 char *f7(char *s) { char *p = memchr("abc", 'b', 3); return p ? p : s; }
 char *f8(char *s) { char *p = memchr("abc", 'z', 3); return p ? p : s; }
-int f9(const char *s) { return strchr(s, 'x') == s; }
+int f9(char *s) { return strchr(s, 'x') == s; }
 """
 
 
@@ -116,14 +116,14 @@ def test_c_result_in_the_safe_default(tmp_path):
     (tmp_path / "decls.h").write_text(C_DECLS)
     body = '#include "decls.h"\n'
     # (not f8: its memchr folds to a null constant, which -Wlifetime reports
-    # stored in a pointer that is not maybe)
+    # stored in a pointer that is not '?')
     # unsafe(...) takes its whole line: one statement per line; a parameter
-    # written through or handed back as `char * view` says inout; a parameter's
+    # written through or handed back as `char *view` says inout; a parameter's
     # own pointer is a view without saying it
-    uses = "".join(re.sub(r"(\(|, )((?:inout |const )*)(char|void) \* view ", r"\1\2\3 *",
+    uses = "".join(re.sub(r"(\(|, )((?:inout |const )*)(char|void) \*view ", r"\1\2\3 *",
                           re.sub(r"char \*p = (.*?); return", r"char *p = unsafe(\1); return", line)
                           .replace("(char *", "(inout char *")
-                          .replace("char *", "char * view ").replace("void *", "void * view "))
+                          .replace("char *", "char *view ").replace("void *", "void *view "))
                    .replace("{ ", "{\n  ").replace("; ", ";\n  ").replace(" }", "\n}") + "\n"
                    for line in C_USES.splitlines() if not line.startswith("char *f8"))
     proc = _compile(tmp_path, body + uses)

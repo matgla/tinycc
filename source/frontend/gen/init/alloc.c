@@ -363,6 +363,11 @@ void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, i
           expect("string constant");
         parse_init_elem(!p->sec ? EXPR_ANY : EXPR_CONST);
       }
+      /* yasc: null into a pointer that is not '?' -- a member, or a
+         static object (an automatic pointer's own is the flow check's) */
+      if (tcc_state->yasc && (type->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR && (p->sec || !(flags & DIF_FIRST)) &&
+          !(flags & DIF_SIZE_ONLY))
+        yasc_init_null(type, p->sec != NULL, !(flags & DIF_FIRST));
       if (!p->sec && (flags & DIF_CLEAR) /* container was already zero'd */
           && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && vtop->c.i == 0 &&
           btype_size(type->t & VT_BTYPE) /* not for fp constants */
@@ -376,11 +381,19 @@ void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, i
       {
         int align;
         int size = type_size(type, &align);
+        /* yasc: a member's value the lifetime check looks at (not null) */
+        const int flow_tok = tcc_state->yasc && !p->sec && !(flags & DIF_FIRST) &&
+                                     (type->t & (VT_BTYPE | VT_ARRAY)) == VT_PTR
+                                 ? yasc_init_flow_tok(type)
+                                 : -1;
+        const int flow_from = flow_tok >= 0 ? tcc_state->ir->next_instruction_index : 0;
         /* Don't try to store empty structs (size 0) */
         if (size > 0)
           init_putv(p, type, c, vreg);
         else
           vpop(); /* pop the empty struct value */
+        if (flow_tok >= 0)
+          tcc_ir_lt_note_init_store(tcc_state->ir, flow_from, tcc_state->ir->next_instruction_index, flow_tok);
       }
     }
 }
@@ -727,6 +740,10 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
                            "'%s' has no value: yasc does not follow what is stored in %s later: initialize it, or write '= undefined'",
                            get_tok_str(v, NULL), what);
       }
+      /* `= undefined`: followed until something is written to it (un_agg_check) */
+      else if (!has_init && vreg < 0 && yasc_decl_undefined && tcc_state->yasc && tcc_ir_lt_active() &&
+               !(type->t & VT_VLA))
+        tcc_ir_un_add_agg(tcc_state->ir, addr, size, sym);
 #ifdef CONFIG_TCC_ASM
       /* `register T x __asm("rN")`: x is an ordinary local whose value is
        * placed in rN only where it is an asm operand.  Record rN in sym->r

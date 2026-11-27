@@ -114,7 +114,7 @@ def test_switches(tmp_path):
 
 def test_safe_default(tmp_path):
     src = tmp_path / "t.c"
-    src.write_text("int * view g;\nvoid f(void)\n{\n  int x = 1;\n  g = &x;\n}\n")
+    src.write_text("int *view g;\nvoid f(void)\n{\n  int x = 1;\n  g = &x;\n}\n")
     proc = subprocess.run([str(TCC), "-c", str(src), "-o", str(tmp_path / "t.o")], capture_output=True, text=True)
     # an error in safe mode (strict lifetimes)
     assert proc.returncode != 0 and "error:" in proc.stderr and "stored in global 'g'" in proc.stderr, proc.stderr

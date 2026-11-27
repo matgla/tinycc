@@ -28,55 +28,55 @@ LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 
 PRELUDE = """\
 #pragma yasc
-void * owned maybe malloc(unsigned n);
-void free(drop void * owned maybe p);
+void *?owned malloc(unsigned n);
+void free(drop void *?owned p);
 typedef struct FILE FILE;
-FILE * owned(fclose) maybe fopen(const char *path, const char *mode);
-int fclose(drop FILE * owned maybe f);
+FILE *?owned(fclose) fopen(const char *path, const char *mode);
+int fclose(drop FILE *?owned f);
 """
 PRELUDE_LINES = PRELUDE.count("\n")
 
 ALLOC = "  for (int k = 0; k < n; k++)\n    a[k] = malloc(1);\n"
 
 CLEAN = {
-    "same_bound": "void f(int n)\n{\n  char * owned maybe a[8] = undefined;\n" + ALLOC
+    "same_bound": "void f(int n)\n{\n  char *?owned a[8] = undefined;\n" + ALLOC
     + "  for (int k = 0; k < n; k++)\n    free(a[k]);\n}\n",
-    "other_index": "void f(int n)\n{\n  char * owned maybe a[8] = undefined;\n" + ALLOC
+    "other_index": "void f(int n)\n{\n  char *?owned a[8] = undefined;\n" + ALLOC
     + "  for (int j = 0; j < n; j++)\n    free(a[j]);\n}\n",
-    "alias_bound": "void f(int n)\n{\n  char * owned maybe a[8] = undefined;\n  int m = n;\n" + ALLOC
+    "alias_bound": "void f(int n)\n{\n  char *?owned a[8] = undefined;\n  int m = n;\n" + ALLOC
     + "  for (int j = 0; j < m; j++)\n    free(a[j]);\n}\n",
-    "deallocator_from_type": "void f(int n)\n{\n  FILE * owned(fclose) maybe a[8] = undefined;\n"
+    "deallocator_from_type": "void f(int n)\n{\n  FILE *?owned(fclose) a[8] = undefined;\n"
     "  for (int k = 0; k < n; k++)\n    a[k] = fopen(\"x\", \"r\");\n"
     "  for (int j = 0; j < n; j++)\n    fclose(a[j]);\n}\n",
-    "used_between": "int use(char * maybe p);\nvoid f(int n)\n{\n  char * owned maybe a[8] = undefined;\n" + ALLOC
+    "used_between": "int use(char *?p);\nvoid f(int n)\n{\n  char *?owned a[8] = undefined;\n" + ALLOC
     + "  for (int k = 0; k < n; k++)\n    use(a[k]);\n  for (int k = 0; k < n; k++)\n    free(a[k]);\n}\n",
 }
 
 # name -> (body, line of the expected report counted from the body's first line)
 REPORTED = {
-    "no_release": ("void f(int n)\n{\n  char * owned maybe a[8] = undefined;\n" + ALLOC + "}\n", 6),
+    "no_release": ("void f(int n)\n{\n  char *?owned a[8] = undefined;\n" + ALLOC + "}\n", 6),
     "bound_changed": (
-        "void f(int n)\n{\n  char * owned maybe a[8] = undefined;\n" + ALLOC
+        "void f(int n)\n{\n  char *?owned a[8] = undefined;\n" + ALLOC
         + "  n++;\n  for (int k = 0; k < n; k++)\n    free(a[k]);\n}\n",
         9,
     ),
     "other_bound": (
-        "void f(int n, int m)\n{\n  char * owned maybe a[8] = undefined;\n" + ALLOC
+        "void f(int n, int m)\n{\n  char *?owned a[8] = undefined;\n" + ALLOC
         + "  for (int k = 0; k < m; k++)\n    free(a[k]);\n}\n",
         8,
     ),
     "other_start": (
-        "void f(int n)\n{\n  char * owned maybe a[8] = undefined;\n" + ALLOC
+        "void f(int n)\n{\n  char *?owned a[8] = undefined;\n" + ALLOC
         + "  for (int k = 1; k < n; k++)\n    free(a[k]);\n}\n",
         8,
     ),
     "released_twice": (
-        "void f(int n)\n{\n  char * owned maybe a[8] = undefined;\n" + ALLOC
+        "void f(int n)\n{\n  char *?owned a[8] = undefined;\n" + ALLOC
         + "  for (int k = 0; k < n; k++)\n    free(a[k]);\n  for (int j = 0; j < n; j++)\n    free(a[j]);\n}\n",
         9,
     ),
     "wrong_deallocator": (
-        "void f(int n)\n{\n  FILE * owned(fclose) maybe a[8] = undefined;\n"
+        "void f(int n)\n{\n  FILE *?owned(fclose) a[8] = undefined;\n"
         "  for (int k = 0; k < n; k++)\n    a[k] = fopen(\"x\", \"r\");\n"
         "  for (int j = 0; j < n; j++)\n    free(a[j]);\n}\n",
         7,

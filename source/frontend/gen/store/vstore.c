@@ -116,6 +116,23 @@ static __attribute__((noinline)) void vstore_w1c_end(IRW1cNote *w, int from)
   tcc_free(w);
 }
 
+/* yasc, for the lifetime check: LT_RO_LOCAL when D is a plain local pointer
+   (a view, not owned, regular C or a parameter) whose target is not const --
+   it may take a read-only value; LT_RO_CONSTDEST when D is memory (not a
+   variable) of a pointer type whose target is const -- a read-only value may
+   go there; else 0 */
+static int vstore_ro_kind(SValue *d)
+{
+  int q;
+  if ((d->type.t & (VT_BTYPE | VT_ARRAY)) != VT_PTR || !d->type.ref || !(d->r & VT_LVAL))
+    return 0;
+  q = type_yasc(&d->type);
+  if ((d->r & VT_VALMASK) == VT_LOCAL && d->vr >= 0 && TCCIR_DECODE_VREG_TYPE(d->vr) == TCCIR_VREG_TYPE_VAR)
+    return (q & YASC_VIEW) && !(q & (YASC_OWNED | YASC_UNCHECKED)) && !(d->type.ref->type.t & VT_CONSTANT) ? LT_RO_LOCAL
+                                                                                                         : 0;
+  return (d->type.ref->type.t & VT_CONSTANT) ? LT_RO_CONSTDEST : 0;
+}
+
 ST_FUNC void vstore(void)
 {
   /* -Wlifetime: a store into an owned pointer in memory moves what it stores
@@ -143,7 +160,17 @@ ST_FUNC void vstore(void)
   IRW1cNote *w1c = ir && yasc_nreg && tcc_state->yasc && !nocode_wanted ? vstore_w1c_begin() : NULL;
   int field = ir && ir->lt_on ? type_borrows_field(&vtop[-1].type) : -1;
   int from = ir ? ir->next_instruction_index : 0;
+  /* yasc: a read-only value into a plain local is followed, not refused; a
+     store into memory whose pointer is to const may take one */
+  int ro_kind = ir && ir->lt_on && tcc_state->yasc && !pp_in_c() ? vstore_ro_kind(vtop - 1) : 0;
+  const int saved_ro_ok = yasc_ro_local_ok, saved_ro_dropped = yasc_ro_dropped;
+  yasc_ro_local_ok = ro_kind == LT_RO_LOCAL, yasc_ro_dropped = 0;
   vstore_value();
+  if (ro_kind == LT_RO_LOCAL && yasc_ro_dropped)
+    tcc_ir_lt_note_ro(ir, from, ir->next_instruction_index, LT_RO_LOCAL);
+  else if (ro_kind == LT_RO_CONSTDEST)
+    tcc_ir_lt_note_ro(ir, from, ir->next_instruction_index, LT_RO_CONSTDEST);
+  yasc_ro_local_ok = saved_ro_ok, yasc_ro_dropped = saved_ro_dropped;
   if (w1c)
     vstore_w1c_end(w1c, from);
   if (owned_dst)

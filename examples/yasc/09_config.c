@@ -23,9 +23,9 @@ error ConfigError { NoEquals, EmptyKey, BadNumber, NotFound };
    (-Wformat): a %d given a string is a warning.  From here on this file
    makes it an error instead, whatever the command line says. */
 #pragma tcc diagnostic error "-Wformat"
-static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void say(char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
-static void say(const char *fmt, ...)
+static void say(char *fmt, ...)
 {
   va_list ap;
   va_start(ap, fmt);
@@ -34,9 +34,9 @@ static void say(const char *fmt, ...)
 }
 
 /* s[0..n) as a new string */
-static !char * owned copy(const char *s, int n)
+static !char *owned copy(char *s, int n)
 {
-  char * owned maybe buf = mem_new(cast<int(size_t)>(n) + 1);
+  char *?owned buf = mem_new(cast<int(size_t)>(n) + 1);
   if (!buf)
     return error.ENOMEM;
   for (int i = 0; i < n; i++)
@@ -45,7 +45,7 @@ static !char * owned copy(const char *s, int n)
   return buf;
 }
 
-static int same(const char *a, const char *b)
+static int same(char *a, char *b)
 {
   while (*a && *a == *b)
     a++, b++;
@@ -54,18 +54,18 @@ static int same(const char *a, const char *b)
 
 struct entry
 {
-  struct entry * owned maybe next;
-  char * owned key;
-  char * owned value;
+  struct entry *?owned next;
+  char *owned key;
+  char *owned value;
 };
 
 struct config
 {
-  struct entry * owned maybe first;
+  struct entry *?owned first;
   int count;
 
   /* one "key = value" line, s[0..n) */
-  !int add(inout struct config *self, const char *s, int n)
+  !int add(inout struct config *self, char *s, int n)
   {
     int eq = 0;
     while (eq < n && s[eq] != '=')
@@ -81,11 +81,11 @@ struct config
     while (v < n && s[v] == ' ')
       v++;
 
-    char * owned key = try copy(s, key_end);
+    char *owned key = try copy(s, key_end);
     errdefer mem_free(key); /* freed if a later step fails */
-    char * owned value = try copy(s + v, n - v);
+    char *owned value = try copy(s + v, n - v);
     errdefer mem_free(value);
-    struct entry * owned maybe e = mem_new(sizeof *e);
+    struct entry *?owned e = mem_new(sizeof *e);
     if (!e)
       return error.ENOMEM; /* key and value are freed */
     e->key = move(key);    /* the entry owns them now */
@@ -96,10 +96,10 @@ struct config
   }
 
   /* every line of text; a bad one is reported and skipped */
-  int parse(inout struct config *self, const char *text)
+  int parse(inout struct config *self, char *text)
   {
     int line = 0;
-    for (const char * view p = text; *p;)
+    for (const char *view p = text; *p;)
     {
       int n = 0;
       while (p[n] && p[n] != '\n')
@@ -114,7 +114,7 @@ struct config
     return self->count;
   }
 
-  const char * view maybe text(const struct config *self, const char *key)
+  const char *?view text(struct config *self, char *key)
   {
     for (const struct entry *e = self->first; e; e = e->next)
       if (same(e->key, key))
@@ -122,9 +122,9 @@ struct config
     return nullptr;
   }
 
-  !int number(const struct config *self, const char *key)
+  !int number(struct config *self, char *key)
   {
-    const char * maybe s = self->text(key);
+    const char *?s = self->text(key);
     if (!s)
       return error.NotFound;
     int v = 0;
@@ -141,7 +141,7 @@ struct config
   {
     while (self->first)
     {
-      struct entry * owned maybe e = move(self->first);
+      struct entry *?owned e = move(self->first);
       self->first = move(e->next);
       mem_free(e->key);
       mem_free(e->value);
@@ -152,7 +152,7 @@ struct config
 };
 
 /* try: a missing or bad number is area's failure */
-static !int area(const struct config *cfg)
+static !int area(struct config *cfg)
 {
   return try cfg->number("width") * try cfg->number("height");
 }
@@ -164,10 +164,10 @@ int main(void)
     defer cfg.clear(); /* the entries are freed when this block ends */
 
     say("%d settings\n", cfg.parse(settings));
-    const char * maybe name = cfg.text("name");
+    const char *?name = cfg.text("name");
     say("name: %s\n", name ? name : "(none)");
     say("area: %d\n", area(&cfg) catch -1);
-    const char * view keys[] = {"depth", "speed"};
+    const char *view keys[] = {"depth", "speed"};
     for (int i = 0; i < 2; i++)
     {
       int v = cfg.number(keys[i]) catch |e| {

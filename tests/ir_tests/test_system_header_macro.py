@@ -290,8 +290,8 @@ def test_arguments_in_yasc(tmp_path, opt):
         "#define SYS_CASTP(x) ((char *)(x) + ((x) << 40) * 0)\n#define SYS_ID(x) (x)\n")
     (tmp_path / "t.c").write_text(
         "#include <s.h>\n#define U_CAST(x) SYS_CASTP(x)\nint f(int v)\n{\n"
-        "  char * view p = SYS_CASTP(v << 40);\n  char * view q = SYS_CASTP(v);\n"
-        "  char * view r = U_CAST(v);\n  return p[0] + q[0] + r[0] + SYS_ID(v << 40);\n}\n")
+        "  char *view p = SYS_CASTP(v << 40);\n  char *view q = SYS_CASTP(v);\n"
+        "  char *view r = U_CAST(v);\n  return p[0] + q[0] + r[0] + SYS_ID(v << 40);\n}\n")
     p = subprocess.run([str(TCC), "-B" + str(TCC.parent), "-ccompat", "-std=yasc", "-Wno-lifetime", "-Wall", "-isystem", "sys",
                         opt, "-c", "t.c", "-o", "t.o"], capture_output=True, text=True, cwd=tmp_path, timeout=60)
     assert p.returncode == 0, p.stderr

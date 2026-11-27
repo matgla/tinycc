@@ -5,6 +5,7 @@
 #include "../frontend/gen/decl/declarator.c"
 #undef YASC_BORROWS_MAX
 #undef YASC_PLAIN_MAX
+#include "../frontend/gen/decl/default_arg.c"
 #include "../frontend/gen/decl/method.c"
 #undef MS_CLOSE
 #undef MS_END

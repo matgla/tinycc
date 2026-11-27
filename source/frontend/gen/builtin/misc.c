@@ -389,11 +389,391 @@ static __attribute__((noinline)) void at_minmax(int is_max)
   vtop->vr = rv;
 }
 
+/* ---- @src(): where the code is --------------------------------------
+ *
+ *   printf("%s:%u: %s\n", @src().file, @src().line, @src().func);
+ *   void log_warn(const char *msg, yasc_src at = @src());
+ *
+ * @src() is a value of type struct __yasc_src (yasc_src in <yasc_src.h>),
+ * two words passed in two registers:
+ *
+ *   __fn    the function's header, a const struct __yasc_src_fn in .rodata,
+ *           one per function: file (as __FILE__), func (as __func__, "" at
+ *           file scope), module (the yasc module, "" outside one)
+ *   line    the line, as __LINE__
+ *
+ * at.file / at.func / at.module read through __fn (yasc_src_header_member).
+ * A call that passes @src() costs the line as an immediate and the header's
+ * address, which every call in the function shares: nothing per call in
+ * .rodata.  A yasc_src is copied as any struct.
+ *
+ * The header's names are words holding the distance from the word itself to
+ * the string (VT_SELF_REL), filled in by the linker (a PC-relative
+ * relocation): no load-time relocation, so the header stays in the shared
+ * .rodata.  An ordinary pointer there would put it into each process's .data
+ * on YasOS (-share-rodata), and a __rodata_relative one would mean nothing in
+ * another module (libc.so reading the application's header).  The header is
+ * never copied, so no object has its type (yasc_src_object_check).  The
+ * value's __fn is an address computed in code, not stored in data -- which is
+ * also why @src() has no static form: `static yasc_src g = @src();` would
+ * need a load-time relocation.  @src().NAME written out makes nothing at all
+ * (src_member).  Default arguments (decl/default_arg.c) make @src() the
+ * caller's location. */
+
+static Sym *src_tag, *src_fn_tag;
+/* the names' ELF symbols, by .rodata offset (src_name_sym) */
+typedef struct SrcName
+{
+  addr_t off;
+  int elf;
+} SrcName;
+static SrcName *src_names;
+static int nb_src_names;
+/* the headers, by their names' .rodata offsets (src_header_sym) */
+typedef struct SrcHead
+{
+  addr_t names[3], off;
+  Sym *sym; /* one symbol, so a function's calls share its literal pool word */
+} SrcHead;
+static SrcHead *src_heads;
+static int nb_src_heads;
+
+/* a pointer @src() hands out: a view of .rodata, which outlives
+   everything -- `* borrows(static)`, so it may be kept and returned */
+static void src_pointer(CType *t)
+{
+  t->ref = sym_pointer_node_b(t, YASC_VIEW, YASC_BORROWS_STATIC);
+  t->t = VT_PTR | (t->t & VT_STORAGE);
+}
+
+/* struct TAG { FIELDS }, on global_stack */
+static Sym *src_struct(int tag, int nf, const char *const *names, CType *types)
+{
+  Sym *s, **ps;
+  CType type = {VT_STRUCT, NULL};
+  AttributeDef ad;
+  s = sym_push(tag | SYM_STRUCT, &type, 0, -1);
+  s->r = 0;
+  ps = &s->next;
+  for (int i = 0; i < nf; i++)
+  {
+    Sym *f = sym_push(tok_alloc(names[i], strlen(names[i]))->tok | SYM_FIELD, &types[i], 0, 0);
+    *ps = f;
+    ps = &f->next;
+  }
+  type.ref = s;
+  memset(&ad, 0, sizeof ad);
+  struct_layout(&type, &ad);
+  return s;
+}
+
+/* struct __yasc_src and its header, made at file scope the first time one
+   is named */
+Sym *yasc_src_tag(void)
+{
+  static const char *const hnames[] = {"file", "func", "module"};
+  static const char *const vnames[] = {"__fn", "line"};
+  Sym *saved_stack = local_stack, *above = global_stack;
+  int saved_scope = local_scope;
+  CType ht[3], vt[2];
+
+  if (src_tag)
+    return src_tag;
+  /* on global_stack whatever block the first use is in: the types outlive
+     it -- and under an open parameter list, which pops what is above it */
+  local_stack = NULL;
+  local_scope = 0;
+  for (int i = 0; i < 3; i++)
+  {
+    ht[i] = char_type;
+    ht[i].t |= VT_CONSTANT;
+    src_pointer(&ht[i]);
+    ht[i].t |= VT_SELF_REL | VT_CONSTANT;
+  }
+  src_fn_tag = src_struct(TOK___yasc_src_fn, 3, hnames, ht);
+  vt[0].t = VT_STRUCT | VT_CONSTANT;
+  vt[0].ref = src_fn_tag;
+  src_pointer(&vt[0]);
+  vt[1].t = VT_INT | VT_UNSIGNED;
+  vt[1].ref = NULL;
+  src_tag = src_struct(TOK___yasc_src, 2, vnames, vt);
+  sym_sink_to_bottom(above);
+  local_stack = saved_stack;
+  local_scope = saved_scope;
+  return src_tag;
+}
+
+void yasc_src_reset(void)
+{
+  src_tag = src_fn_tag = NULL;
+  tcc_free(src_names);
+  src_names = NULL;
+  nb_src_names = 0;
+  tcc_free(src_heads);
+  src_heads = NULL;
+  nb_src_heads = 0;
+}
+
+/* A PC-relative word: target - &word, filled in by the linker (in the
+ * linked image, not at load time: both ends are in the module's .rodata). */
+#if defined TCC_TARGET_ARM
+#define SRC_REL R_ARM_REL32
+#elif defined TCC_TARGET_X86_64
+#define SRC_REL R_X86_64_PC64
+#endif
+
+/* The ELF symbols on the names, one per string of the unit: the words are
+ * relocations against them, so dropping an unreferenced static from .rodata
+ * (gc_unreferenced_statics), which moves what follows it, keeps them right
+ * -- a distance written by hand would not follow. */
+static int src_name_sym(const char *str, addr_t *off_out)
+{
+  addr_t len = strlen(str) + 1, off = str_lit_pool_intern(str, len);
+  Sym *sym;
+  *off_out = off;
+  for (int i = 0; i < nb_src_names; i++)
+    if (src_names[i].off == off)
+      return src_names[i].elf;
+  sym = get_sym_ref(&char_type, rodata_section, off, len);
+  src_names = tcc_realloc(src_names, (nb_src_names + 1) * sizeof *src_names);
+  src_names[nb_src_names].off = off;
+  src_names[nb_src_names].elf = sym->c;
+  return src_names[nb_src_names++].elf;
+}
+
+/* the current file's, function's and module's names */
+static void src_names_here(const char *names[3])
+{
+  BufferedFile *bf = file;
+  /* a macro's or a pasted buffer's pseudo-file: the file it is in */
+  while (bf && bf->filename[0] == ':' && bf->prev)
+    bf = bf->prev;
+  names[0] = bf ? bf->filename : "";
+  names[1] = funcname ? funcname : "";
+  names[2] = tcc_state->yasc_module ? tcc_state->yasc_module : "";
+}
+
+/* A symbol on the current function's header, written the first time.
+ * Nothing is written where no static data is wanted (sizeof, a dead
+ * branch): the symbol is then a zero-sized one, as a string literal's. */
+static Sym *src_header_sym(void)
+{
+  CType ht = {VT_STRUCT | VT_CONSTANT, src_fn_tag};
+  const char *names[3];
+  addr_t offs[3], o;
+  int elf[3], align, size = type_size(&ht, &align), i;
+  Sym *f;
+
+  if (NOSTATIC_WANTED)
+    return get_sym_ref(&ht, rodata_section, rodata_section->data_offset, 0);
+  src_names_here(names);
+  for (i = 0; i < 3; i++)
+    elf[i] = src_name_sym(names[i], &offs[i]);
+  for (i = 0; i < nb_src_heads; i++)
+    if (!memcmp(src_heads[i].names, offs, sizeof offs))
+      return src_heads[i].sym;
+  o = section_add(rodata_section, size, align);
+  memset(rodata_section->data + o, 0, size); /* the addends: 0 */
+  for (i = 0, f = src_fn_tag->next; i < 3; i++, f = f->next)
+    put_elf_reloca(symtab_section, rodata_section, o + f->c, SRC_REL, elf[i], 0);
+  src_heads = tcc_realloc(src_heads, (nb_src_heads + 1) * sizeof *src_heads);
+  memcpy(src_heads[nb_src_heads].names, offs, sizeof offs);
+  src_heads[nb_src_heads].off = o;
+  {
+    /* kept for the unit: on global_stack, under any open parameter list */
+    Sym *saved_stack = local_stack, *above = global_stack;
+    local_stack = NULL;
+    src_heads[nb_src_heads].sym = get_sym_ref(&ht, rodata_section, o, size);
+    sym_sink_to_bottom(above);
+    local_stack = saved_stack;
+  }
+  return src_heads[nb_src_heads++].sym;
+}
+
+/* `@src().NAME` written out: what it reads is known here, so nothing is
+ * made -- the line a constant, a name the address of its string, as __LINE__
+ * and __FILE__ would be.  0 when NAME is none of them. */
+static int src_member(int name, int line)
+{
+  static const char *const names[] = {"file", "func", "module", "line"};
+  const char *n = get_tok_str(name, NULL), *here[3];
+  int i;
+  for (i = 0; i < 4 && strcmp(n, names[i]); i++)
+    ;
+  if (i == 4)
+    return 0;
+  if (i == 3)
+  {
+    CValue cv;
+    CType ut = {VT_INT | VT_UNSIGNED, NULL};
+    cv.i = (unsigned)line;
+    vsetc(&ut, VT_CONST, &cv);
+    return 1;
+  }
+  src_names_here(here);
+  {
+    CType pt = char_type;
+    addr_t len = strlen(here[i]) + 1, off;
+    pt.t |= VT_CONSTANT;
+    src_pointer(&pt);
+    if (NOSTATIC_WANTED) /* sizeof, a dead branch: the type only */
+      off = rodata_section->data_offset, len = 0;
+    else
+      off = str_lit_pool_intern(here[i], len);
+    vpushsym(&pt, get_sym_ref(&char_type, rodata_section, off, len));
+  }
+  return 1;
+}
+
+/* push @src() for LINE: a new value in a temporary, or MARKER, the stand-in
+ * a default argument is checked with (decl/default_arg.c) */
+void yasc_src_push(Sym *marker, int line)
+{
+  CType st;
+  int align, size, vr, base;
+  SValue dst;
+  Sym *lf;
+
+  st.t = VT_STRUCT;
+  st.ref = yasc_src_tag();
+  if (marker)
+  {
+    vpushsym(&st, marker);
+    vtop->r |= VT_LVAL;
+    return;
+  }
+  if (NOEVAL_WANTED)
+  {
+    vset(&st, VT_LOCAL | VT_LVAL, 0); /* sizeof, typeof: the type only */
+    return;
+  }
+  if (nocode_wanted & DATA_ONLY_WANTED)
+    tcc_error("@src() is made in a function: a static yasc_src would need a relocation at load time (read "
+              "@src().line, .file, .func or .module here)");
+  size = type_size(&st, &align);
+  svalue_init(&dst);
+  dst.r = VT_LOCAL | VT_LVAL;
+  if (TCC_OPT(tcc_state, optimize))
+  {
+    /* a frame slot of its own, as a compound literal's: ra:struct_arg_split
+       turns an argument built there into the two words in registers, and the
+       slot goes */
+    loc = tcc_ir_frame_alloc(loc, size, -align);
+    tcc_ir_frame_note_type(loc, &st);
+    dst.vr = -1;
+    dst.c.i = loc;
+  }
+  else
+  {
+    /* -O0: one shared temporary, so the frame does not grow per call */
+    dst.c.i = get_temp_local_var(size, align, &vr);
+    dst.vr = vr;
+  }
+  base = dst.c.i;
+  dst.type = src_tag->next->type; /* __fn */
+  vpushv(&dst);
+  vpushsym(&dst.type, src_header_sym());
+  vstore();
+  vpop();
+  lf = src_tag->next->next; /* line */
+  dst.type = lf->type;
+  dst.c.i = base + lf->c;
+  vpushv(&dst);
+  {
+    CValue cv;
+    cv.i = (unsigned)line;
+    vsetc(&lf->type, VT_CONST, &cv);
+  }
+  vstore();
+  vpop();
+  dst.type = st;
+  dst.c.i = base;
+  vpushv(&dst);
+}
+
+/* `at.file`, `.func`, `.module` of a yasc_src (vtop) named by NAME: vtop
+ * becomes its header, whose member NAME the caller then reads */
+int yasc_src_header_member(int name)
+{
+  const char *n;
+  if (!src_tag || (vtop->type.t & VT_BTYPE) != VT_STRUCT || vtop->type.ref != src_tag)
+    return 0;
+  n = get_tok_str(name, NULL);
+  if (strcmp(n, "file") && strcmp(n, "func") && strcmp(n, "module"))
+    return 0;
+  vtop->type = src_tag->next->type; /* __fn, at offset 0 */
+  indir();
+  return 1;
+}
+
+/* TYPE is the header, struct __yasc_src_fn, or an array of it */
+int yasc_src_object_type(CType *type)
+{
+  while ((type->t & (VT_BTYPE | VT_ARRAY)) == (VT_PTR | VT_ARRAY))
+    type = &type->ref->type;
+  return src_fn_tag && (type->t & VT_BTYPE) == VT_STRUCT && type->ref == src_fn_tag;
+}
+
+void yasc_src_object_check(CType *type, const char *what)
+{
+  if (yasc_src_object_type(type))
+    tcc_error("%s of type 'struct __yasc_src_fn': a header's names are stored relative to it, so a copy would point "
+              "nowhere; use yasc_src",
+              what);
+}
+
+/* vtop, a self-relative lvalue (a yasc_src name), becomes the pointer it
+ * names: the word's address plus the word. */
+void self_rel_rvalue(void)
+{
+  CType ptype = vtop->type, word, bytes;
+
+  ptype.t &= ~(VT_SELF_REL | VT_CONSTANT | VT_VOLATILE);
+  word.t = PTR_SIZE == 8 ? VT_LLONG : VT_INT;
+  word.ref = NULL;
+  bytes.t = VT_BYTE | VT_CONSTANT;
+  bytes.ref = NULL;
+  mk_pointer(&bytes);
+  vdup();
+  vtop->type = word;
+  gv(RC_INT);   /* lv, w */
+  vswap();      /* w, lv */
+  gaddrof();
+  vtop->type = bytes; /* w, &word */
+  vswap();
+  gen_op('+');
+  vtop->type = ptype;
+}
+
+void self_rel_addr_error(void)
+{
+  tcc_error("cannot take the address of a yasc_src name: its word is a distance, not a pointer");
+}
+
 /* '@' NAME ( ... ): tok is '@' */
 __attribute__((noinline)) void unary_at_builtin(void)
 {
+  const int line = file->line_num;
   next();
   const char *name = tok >= TOK_IDENT ? get_tok_str(tok, NULL) : "";
+  if (!strcmp(name, "src"))
+  {
+    next();
+    skip('(');
+    skip(')');
+    if (tok == '.' && !yasc_default_marker())
+    {
+      next();
+      if (src_member(tok, line))
+      {
+        next();
+        return;
+      }
+      unget_tok('.'); /* not a name of it: the usual "no member" */
+    }
+    yasc_src_push(yasc_default_marker(), line);
+    return;
+  }
   if (!strcmp(name, "min") || !strcmp(name, "max"))
   {
     int is_max = name[1] == 'a';
@@ -401,5 +781,5 @@ __attribute__((noinline)) void unary_at_builtin(void)
     at_minmax(is_max);
     return;
   }
-  tcc_error("unknown builtin '@%s' (there are @min and @max)", get_tok_str(tok, &tokc));
+  tcc_error("unknown builtin '@%s' (there are @min, @max and @src)", get_tok_str(tok, &tokc));
 }

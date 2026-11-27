@@ -11,9 +11,9 @@
 #define SLOTS_H
 
 /* takes the handle back; an invalid one (< 0) is fine, as free(NULL) is */
-int slot_close(int drop owned(slot_close) maybe h);
+int slot_close(int drop ?owned(slot_close) h);
 /* a handle on file number `which`, or -1 when every slot is taken */
-int owned(slot_close) maybe slot_open(int which);
+int ?owned(slot_close) slot_open(int which);
 /* reads through a valid handle: a view borrows it */
 int slot_read(int view h);
 /* how many handles are open: the examples print it to show none leaked */

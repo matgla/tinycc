@@ -49,7 +49,7 @@ PL = PRELUDE.count("\n")
 
 PRELUDE_YASC = """\
 typedef unsigned int size_t;
-void * view memcpy(void *d, const void *s, size_t n);
+void *view memcpy(void *d, const void *s, size_t n);
 int sprintf(char *d, const char *f, ...);
 """
 
@@ -155,7 +155,7 @@ def test_clean(tmp_path):
 
 
 def test_switches(tmp_path):
-    body = "void f(const char *s) { char b[4]; memcpy(b, s, 5); sprintf(b, \"%s\", \"abcd\"); }\n"
+    body = "void f(char *s) { char b[4]; memcpy(b, s, 5); sprintf(b, \"%s\", \"abcd\"); }\n"
     sop = "'memcpy' writing 5 bytes"
     fov = "'sprintf' writing at least 5 bytes"
     proc = _run(tmp_path, body)
@@ -178,7 +178,7 @@ def test_switches(tmp_path):
 
 def test_levels(tmp_path):
     body = (
-        "int f(const char *s) { char b[4]; struct S t; strcpy(t.name, \"0123456789\");\n"
+        "int f(char *s) { char b[4]; struct S t; strcpy(t.name, \"0123456789\");\n"
         " return snprintf(b, 4, \"%s\", \"abcd\"); }\n"
     )
     tr = "'snprintf' output truncated"
@@ -208,7 +208,7 @@ def test_once_per_place(tmp_path):
 
 def test_pragma(tmp_path):
     body = (
-        "void f(const char *s)\n{\n  char b[4];\n"
+        "void f(char *s)\n{\n  char b[4];\n"
         "#pragma GCC diagnostic push\n"
         "#pragma GCC diagnostic ignored \"-Wstringop-overflow\"\n"
         "  memcpy(b, s, 5);\n"
@@ -231,7 +231,7 @@ def test_system_header_quiet(tmp_path):
 
 
 def test_safe_default(tmp_path):
-    body = "void f(const char *s) { char b[4] = undefined; memcpy(b, s, 5); sprintf(b, \"%d\", 12345); }\n"
+    body = "void f(char *s) { char b[4] = undefined; memcpy(b, s, 5); sprintf(b, \"%d\", 12345); }\n"
     proc = _run(tmp_path, body, prelude=PRELUDE_YASC, ccompat=False)
     assert proc.returncode == 0, proc.stderr
     assert "warning: 'memcpy' writing 5 bytes into a region of size 4" in proc.stderr, proc.stderr
@@ -240,5 +240,5 @@ def test_safe_default(tmp_path):
 
 def test_no_builtin_names(tmp_path):
     """-fno-builtin: memcpy is any function"""
-    body = "void f(const char *s) { char b[4]; memcpy(b, s, 5); }\n"
+    body = "void f(char *s) { char b[4]; memcpy(b, s, 5); }\n"
     assert "memcpy" not in _run(tmp_path, body, "-Wall", "-fno-builtin").stderr

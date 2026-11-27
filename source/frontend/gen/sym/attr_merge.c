@@ -151,7 +151,7 @@ static const char *yasc_level_diff(CType *a, CType *b)
   if (d & (YASC_OWNED | YASC_VIEW))
     return "owned / view";
   if (d & YASC_MAYBE)
-    return "maybe";
+    return "? (may be null)";
   if (d & YASC_OUT)
     return "out";
   /* in (the default: a const target) or inout */

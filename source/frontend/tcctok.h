@@ -456,11 +456,15 @@ DEF(TOK_push_macro, "push_macro")
 DEF(TOK_pop_macro, "pop_macro")
 DEF(TOK_once, "once")
 /* the yasc dialect: #pragma yasc, and its keywords (identifiers outside it);
-   owned..drop stay consecutive: the parser tests the range */
+   owned..drop stay consecutive: the parser tests the range (owned..maybe:
+   the pointer words, never names; out..drop: words only where a parameter's
+   declaration starts, names everywhere else) */
 DEF(TOK_yasc, "yasc")
 DEF(TOK_owned, "owned")
 DEF(TOK_view, "view")
-DEF(TOK_maybe, "maybe")
+/* `*?`, `[?4]`, `int ?owned(close) fd`: read in tccpp.c (yasc_glue), spelled
+   so no identifier is it */
+DEF(TOK_maybe, "?")
 DEF(TOK_out, "out")
 /* yasc `inout T * view p`: the callee may read and write *p (without it,
    a view parameter's target is read-only: `in`, which may be written) */
@@ -471,6 +475,8 @@ DEF(TOK_drop, "drop")
 DEF(TOK_in, "in")
 /* not a yasc word (it was `const T * view`): only its error knows it */
 DEF(TOK_readonly, "readonly")
+/* not a yasc word (it was `T * maybe p`, now `T *? p`): only its error knows it */
+DEF(TOK_maybe_gone, "maybe")
 DEF(TOK_option, "option")
 /* yasc move(p) / borrow(p), unless a name of that spelling is in scope */
 DEF(TOK_move, "move")
@@ -540,6 +546,9 @@ DEF(TOK___fixunsdfdi, "__fixunsdfdi")
 /* the linker-defined start of .rodata a __rodata_relative pointer is an
    offset from (rodata_rel.c) */
 DEF(TOK___tcc_rodata_base, "__tcc_rodata_base")
+/* the struct tag of @src() (builtin/misc.c) */
+DEF(TOK___yasc_src, "__yasc_src")
+DEF(TOK___yasc_src_fn, "__yasc_src_fn")
 DEF(TOK___bswapdi3, "__bswapdi3")
 DEF(TOK___bswapsi2, "__bswapsi2")
 

@@ -19,7 +19,7 @@ int printf(const char *fmt, ...);
 
 struct B
 {
-  int * view data;
+  int *data;
   int n;
 };
 
@@ -44,7 +44,7 @@ __attribute__((noinline)) static int peek(const struct B *b, int v)
 }
 
 /* the argument before the nested call may be written */
-__attribute__((noinline)) static int sum(inout struct B * restrict b, int n)
+__attribute__((noinline)) static int sum(inout struct B *restrict b, int n)
 {
   int s = 0;
   for (int i = 0; i < n; i++)
@@ -56,7 +56,7 @@ __attribute__((noinline)) static int sum(inout struct B * restrict b, int n)
 }
 
 /* a read-only parameter with a nested call: b->data still hoists, same result */
-__attribute__((noinline)) static int sum_ro(struct B * restrict b, int n)
+__attribute__((noinline)) static int sum_ro(struct B *restrict b, int n)
 {
   int s = 0;
   for (int i = 0; i < n; i++)

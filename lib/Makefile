@@ -77,7 +77,7 @@ OBJ-arm-vfp = $(OBJ-arm)
 OBJ-arm-eabi = $(OBJ-arm)
 OBJ-arm-eabihf = $(OBJ-arm)
 OBJ-arm-wince = $(ARM_O) $(WIN_O)
-OBJ-armv8m = libtcc1.o alloca.o armeabi.o armeabi_divmod.o va_list.o builtin.o arm_string.o arm_mem.o arm_copystub.o armv8m_atomic.o yasc.o
+OBJ-armv8m = libtcc1.o alloca.o armeabi.o armeabi_divmod.o va_list.o builtin.o arm_string.o arm_mem.o arm_copystub.o armv8m_atomic.o yasc.o fortify_printf.o
 OBJ-riscv64 = $(RISCV64_O) $(LIN_O)
 
 OBJ-extra = $(filter $(EXTRA_O),$(OBJ-$T))

@@ -11,7 +11,7 @@
 
 int main(void)
 {
-  counter_t * owned maybe c = counter_new("clicks"); /* owned: the attribute says so */
+  counter_t *?owned c = counter_new("clicks"); /* owned: the attribute says so */
   if (!c)
     return 1;
   counter_add(borrow(c), COUNTER_STEP); /* lent: c is still owned */
@@ -20,7 +20,7 @@ int main(void)
   printf("%s = %d\n", name, counter_get(borrow(c)));
   counter_free(c); /* the deallocator counter_new named */
 
-  counter_t * maybe none = COUNTER_NONE; /* a C macro's cast is C too */
+  counter_t *?none = COUNTER_NONE; /* a C macro's cast is C too */
   printf("none is %s\n", none ? "set" : "null");
   return 0;
 }

@@ -95,6 +95,7 @@ static const char help[] = "Tiny C Compiler " TCC_VERSION " - Copyright (C) 2001
                            "Tools:\n"
                            "  create library  : tcc -ar [crstvx] lib [files]\n"
                            "  C header of yasc: tcc -yasc-c-header yasc/x.h [-o x.h]\n"
+                           "  lay out source  : tcc -format [-i] [-n] [files] (docs/tcc_format.md)\n"
 #ifdef TCC_TARGET_PE
                            "  create def file : tcc -impdef lib.dll [-v] [-o lib.def]\n"
 #endif
@@ -390,6 +391,11 @@ redo:
     if (opt == OPT_YASC_C_HEADER)
     {
       ret = tcc_tool_yasc_c_header(s, argc, argv);
+      goto cleanup_early;
+    }
+    if (opt == OPT_FORMAT)
+    {
+      ret = tcc_tool_format(s, argc, argv);
       goto cleanup_early;
     }
 #ifdef TCC_TARGET_PE
